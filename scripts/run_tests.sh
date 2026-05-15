@@ -3,6 +3,8 @@ set -euo pipefail
 
 mkdir -p build/test-bin build/nimcache
 
+./scripts/build_apps.sh
+
 found=0
 while IFS= read -r -d '' test_file; do
   found=1
