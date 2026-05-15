@@ -1,0 +1,13 @@
+# Libraries that must compile with --mm:arc --app:staticlib and must not use Nim ref types.
+runquota_core
+runquota_codec
+runquota_protocol
+runquota_ipc
+runquota_client
+runquota_c
+runquota_process
+runquota_exec
+runquota_host
+runquota_host_linux
+runquota_host_macos
+runquota_host_windows

@@ -1,0 +1,6 @@
+version = "0.1.0"
+author = "Metacraft Labs"
+description = "RunQuota Linux host backend"
+license = "MIT"
+srcDir = "src"
+requires "nim >= 2.2.0"

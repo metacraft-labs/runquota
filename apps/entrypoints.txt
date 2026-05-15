@@ -1,0 +1,3 @@
+# name path
+runquota apps/runquota/runquota.nim
+runquotad apps/runquotad/runquotad.nim

@@ -1,0 +1,14 @@
+.direnv/
+result
+result-*
+
+build/
+nimcache/
+htmldocs/
+*.nimble-link
+
+test-logs/
+repomix/
+bench-results/
+
+.DS_Store
