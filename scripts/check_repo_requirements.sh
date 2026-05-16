@@ -59,7 +59,7 @@ require_contains flake.nix "static-helpers"
 require_contains flake.nix "git-hooks.lib"
 require_contains flake.nix "shellHook = pre-commit-check.shellHook"
 
-for recipe in build test lint format fmt t bump-version bench bench-quick repomix check-repo-requirements check-static-helpers; do
+for recipe in build test lint format fmt t bump-version bench bench-quick bench-runquota-process-execution bench-runquota-ipc repomix check-repo-requirements check-static-helpers; do
   just --summary | tr ' ' '\n' | grep -Fxq "${recipe}" || fail "missing Justfile recipe ${recipe}"
 done
 

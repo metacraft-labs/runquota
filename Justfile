@@ -36,6 +36,14 @@ bench *args:
 bench-quick:
     just bench --quick
 
+bench-runquota-process-execution *args:
+    mkdir -p bench-results test-logs
+    ./scripts/run-m5-benchmark.sh process {{args}} 2> >(tee test-logs/bench-runquota-process-execution.log >&2)
+
+bench-runquota-ipc *args:
+    mkdir -p bench-results test-logs
+    ./scripts/run-m5-benchmark.sh ipc {{args}} 2> >(tee test-logs/bench-runquota-ipc.log >&2)
+
 repomix *args:
     mkdir -p {{REPOMIX_OUT_DIR}}
     repomix \

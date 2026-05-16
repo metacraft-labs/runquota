@@ -2,6 +2,7 @@ import std/[os, osproc, strutils]
 
 import runquota_client
 import runquota_core
+import runquota_exec
 import runquota_protocol
 
 proc wantsVersion*(args: openArray[string]): bool =
@@ -19,7 +20,7 @@ proc renderUsage*(programName: string): string =
     "  " & programName & " leases --json\n" &
     "  " & programName & " explain SESSION_ID\n" &
     "  " & programName & " daemon start|status\n" &
-    "  " & programName & " acquire --cpu N --mem BYTES [--label TEXT]"
+    "  " & programName & " acquire --cpu N --mem BYTES [--label TEXT] [-- COMMAND [ARG...]]"
 
 proc parseMemory(value: string): uint64 =
   let lower = value.toLowerAscii()
@@ -90,6 +91,7 @@ proc runDebugAcquire(args: seq[string]): int =
   var cpu = 1000'u32
   var memory = 128'u64 * 1024'u64 * 1024'u64
   var label = "debug"
+  var command: seq[string] = @[]
   var i = 0
   while i < args.len:
     case args[i]
@@ -106,8 +108,11 @@ proc runDebugAcquire(args: seq[string]): int =
       label = args[i + 1]
       i += 2
     of "--":
-      echo "process execution starts in a later RunQuota milestone"
-      return 2
+      if i + 1 >= args.len:
+        echo "missing command after --"
+        return 2
+      command = args[i + 1 .. ^1]
+      i = args.len
     else:
       echo "unknown acquire argument: " & args[i]
       return 2
@@ -115,6 +120,16 @@ proc runDebugAcquire(args: seq[string]): int =
   defer: client.close()
   var session = client.registerSession("runquota acquire", versionString())
   var request = resourceRequest(label, milliCpu(cpu), bytes(memory))
+  if command.len > 0:
+    let execution = session.runWithLease(request, command)
+    stdout.write(execution.process.stdout)
+    stderr.write(execution.process.stderr)
+    session.closeSession()
+    if execution.process.exited:
+      return execution.process.exitCode
+    if execution.process.signaled:
+      return 128 + execution.process.signal
+    return 1
   var lease = session.requestLease(request)
   echo "lease " & $lease.id & " granted"
   lease.release()

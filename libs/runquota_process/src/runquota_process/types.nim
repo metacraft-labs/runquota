@@ -1,16 +1,58 @@
-import std/osproc
-
 type
   LibraryInfo* = object
     name*: string
 
-  LaunchResult* = object
-    processId*: uint64
-    running*: bool
+  ProcessBackendProfile* = object
+    name*: string
+    launchPrimitive*: string
+    outputCapture*: string
+    completionWait*: string
+    cancellation*: string
+    telemetry*: string
+    directArgv*: bool
+    implicitShell*: bool
 
-  LaunchedProcess* = object
-    handle*: Process
-    info*: LaunchResult
   CommandSpec* = object
     argv*: seq[string]
     cwd*: string
+    env*: seq[string]
+    stdoutLimit*: int
+    stderrLimit*: int
+    createProcessGroup*: bool
+
+  LaunchResult* = object
+    processId*: uint64
+    processGroupId*: uint64
+    running*: bool
+    backend*: ProcessBackendProfile
+
+  ProcessCompletion* = object
+    processId*: uint64
+    processGroupId*: uint64
+    exitCode*: int
+    signal*: int
+    exited*: bool
+    signaled*: bool
+    cancelled*: bool
+    timedOut*: bool
+    stdout*: string
+    stderr*: string
+    stdoutBytes*: uint64
+    stderrBytes*: uint64
+    elapsedMillis*: uint64
+    peakResidentMemoryBytes*: uint64
+    processCount*: uint32
+    telemetrySource*: string
+
+  LaunchedProcess* = object
+    pid*: int
+    processGroupId*: int
+    stdoutFd*: int
+    stderrFd*: int
+    stdoutLimit*: int
+    stderrLimit*: int
+    startedSeconds*: float
+    runningFlag*: bool
+    cancelSent*: bool
+    info*: LaunchResult
+    completion*: ProcessCompletion
