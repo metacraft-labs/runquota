@@ -2,6 +2,7 @@ import std/tables
 
 import runquota_core
 import runquota_ipc
+import runquota_persistence
 import runquota_protocol
 
 type
@@ -21,6 +22,11 @@ type
     leaseStateFinished
     leaseStateSupervisorLost
 
+  PressureSourceKind* = enum
+    pressureSourceHost
+    pressureSourceDeterministicFile
+    pressureSourceUnavailable
+
   DaemonConfig* = object
     endpoint*: Endpoint
     daemonId*: uint64
@@ -29,6 +35,12 @@ type
     ioSlots*: uint32
     namedPoolCaps*: Table[string, uint32]
     version*: string
+    pressureSource*: PressureSourceKind
+    pressureFile*: string
+    pressureRequired*: bool
+    memoryPressureHeavyBytes*: Bytes
+    estimateDbPath*: string
+    estimateQueueCapacity*: int
 
   SessionRow* = object
     id*: SessionId
@@ -42,6 +54,7 @@ type
     id*: LeaseId
     sessionId*: SessionId
     label*: string
+    commandStatsId*: string
     clientCandidateId*: uint64
     resources*: ResourceVector
     priority*: PriorityClass
@@ -56,6 +69,12 @@ type
     cleanupRegistered*: bool
     finishOutcome*: LeaseFinishOutcome
     finishDiagnostic*: Diagnostic
+    peakMemoryBytes*: uint64
+    processCount*: uint32
+    majorPageFaults*: uint64
+    pressureEvents*: uint32
+    hardLimitOrOom*: bool
+    queueDiagnostic*: Diagnostic
 
   ConnectionContext* = object
     supervisorProcessId*: uint64
@@ -74,3 +93,5 @@ type
     totalFinished*: uint64
     sessions*: Table[uint64, SessionRow]
     leases*: Table[uint64, LeaseRow]
+    estimates*: Table[string, LearnedEstimateRow]
+    estimateStore*: EstimateStore

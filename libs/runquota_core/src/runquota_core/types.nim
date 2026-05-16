@@ -35,6 +35,32 @@ type
     diagInvalidArgument
     diagInternal
 
+  MemoryLimitMode* = enum
+    memoryLimitAdvisory
+    memoryLimitEnforced
+
+  MemoryPressureLevel* = enum
+    pressureUnavailable
+    pressureLow
+    pressureWarning
+    pressureCritical
+
+  HostMemoryPressureSample* = object
+    level*: MemoryPressureLevel
+    available*: bool
+    required*: bool
+    source*: string
+    diagnostic*: Diagnostic
+
+  HostProcessTreeTelemetrySample* = object
+    rootProcessId*: uint64
+    rootAlive*: bool
+    processCount*: uint32
+    residentMemoryBytes*: uint64
+    cpuTimeMicros*: uint64
+    source*: string
+    diagnostic*: Diagnostic
+
   Diagnostic* = object
     code*: DiagnosticCode
     message*: string
@@ -50,7 +76,10 @@ type
     cpuSlots*: MilliCpu
     memoryBytes*: Bytes
     hardMemoryLimitEnforced*: bool
+    hardMemoryLimitMode*: MemoryLimitMode
     processTelemetry*: bool
+    memoryPressureAvailable*: bool
+    memoryPressureRequired*: bool
 
   NamedPoolDemand* = object
     name*: string

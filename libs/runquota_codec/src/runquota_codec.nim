@@ -204,7 +204,10 @@ proc writeCapabilities*(w: var BinaryWriter; caps: CapabilityRecord) =
   w.writeU32(caps.cpuSlots.value)
   w.writeU64(caps.memoryBytes.value)
   w.writeBool(caps.hardMemoryLimitEnforced)
+  w.writeU32(uint32(ord(caps.hardMemoryLimitMode)))
   w.writeBool(caps.processTelemetry)
+  w.writeBool(caps.memoryPressureAvailable)
+  w.writeBool(caps.memoryPressureRequired)
 
 proc readCapabilities*(r: var BinaryReader; caps: var CapabilityRecord): bool =
   var protocolMajor: uint16
@@ -216,7 +219,10 @@ proc readCapabilities*(r: var BinaryReader; caps: var CapabilityRecord): bool =
   var cpuSlots: uint32
   var memoryBytes: uint64
   var hardMemoryLimitEnforced: bool
+  var hardMemoryLimitModeRaw: uint32
   var processTelemetry: bool
+  var memoryPressureAvailable: bool
+  var memoryPressureRequired: bool
   if not r.readU16(protocolMajor): return false
   if not r.readU16(protocolMinor): return false
   if not r.readString(platform): return false
@@ -226,7 +232,13 @@ proc readCapabilities*(r: var BinaryReader; caps: var CapabilityRecord): bool =
   if not r.readU32(cpuSlots): return false
   if not r.readU64(memoryBytes): return false
   if not r.readBool(hardMemoryLimitEnforced): return false
+  if not r.readU32(hardMemoryLimitModeRaw): return false
+  if hardMemoryLimitModeRaw > uint32(ord(high(MemoryLimitMode))):
+    r.error = codecUnknownTag
+    return false
   if not r.readBool(processTelemetry): return false
+  if not r.readBool(memoryPressureAvailable): return false
+  if not r.readBool(memoryPressureRequired): return false
   caps = CapabilityRecord(
     protocolMajor: protocolMajor,
     protocolMinor: protocolMinor,
@@ -237,7 +249,10 @@ proc readCapabilities*(r: var BinaryReader; caps: var CapabilityRecord): bool =
     cpuSlots: MilliCpu(cpuSlots),
     memoryBytes: Bytes(memoryBytes),
     hardMemoryLimitEnforced: hardMemoryLimitEnforced,
-    processTelemetry: processTelemetry
+    hardMemoryLimitMode: MemoryLimitMode(hardMemoryLimitModeRaw),
+    processTelemetry: processTelemetry,
+    memoryPressureAvailable: memoryPressureAvailable,
+    memoryPressureRequired: memoryPressureRequired
   )
   true
 

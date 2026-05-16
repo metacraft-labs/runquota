@@ -320,7 +320,10 @@ proc markRunning*(lease: var RunQuotaLease; childProcessId = 0'u64;
   lease.state = leaseClientRunning
 
 proc finish*(lease: var RunQuotaLease; outcome = leaseFinishSucceeded;
-             exitCode = 0'u32; signal = 0'u32; finishDiagnostic = okDiagnostic()) =
+             exitCode = 0'u32; signal = 0'u32; finishDiagnostic = okDiagnostic();
+             peakMemoryBytes = 0'u64; processCount = 0'u32;
+             majorPageFaults = 0'u64; pressureEvents = 0'u32;
+             hardLimitOrOom = false) =
   if not lease.active:
     return
   let msg = LeaseFinishedMessage(
@@ -329,6 +332,11 @@ proc finish*(lease: var RunQuotaLease; outcome = leaseFinishSucceeded;
     outcome: outcome,
     exitCode: exitCode,
     signal: signal,
+    peakMemoryBytes: peakMemoryBytes,
+    processCount: processCount,
+    majorPageFaults: majorPageFaults,
+    pressureEvents: pressureEvents,
+    hardLimitOrOom: hardLimitOrOom,
     diagnostic: finishDiagnostic
   )
   let requestId = lease.session[].client[].requestFrame(rqLeaseFinished, encodeLeaseFinished(msg))

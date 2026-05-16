@@ -4,3 +4,4 @@ type
   MacosCapability* = enum
     mcMemoryPressure
     mcProcessGroups
+    mcProcessTreeTelemetry

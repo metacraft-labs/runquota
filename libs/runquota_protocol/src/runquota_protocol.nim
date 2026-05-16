@@ -9,6 +9,7 @@ const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 1'u16
 const RqspProtocolMinor* = 1'u16
 const RqspHeaderLen* = 24'u16
+const MaxCommandStatsIdBytes* = 64
 const FrameFlagRequest* = 0x0001'u16
 const FrameFlagResponse* = 0x0002'u16
 const FrameFlagError* = 0x0004'u16
@@ -40,7 +41,10 @@ proc defaultCapabilities*(platform: string; transport: string; cpuSlots: MilliCp
     cpuSlots: cpuSlots,
     memoryBytes: memoryBytes,
     hardMemoryLimitEnforced: false,
-    processTelemetry: false
+    hardMemoryLimitMode: memoryLimitAdvisory,
+    processTelemetry: false,
+    memoryPressureAvailable: false,
+    memoryPressureRequired: false
   )
 
 proc messageKindFromWire*(value: uint16; kind: var RqspMessageKind): bool =
@@ -293,6 +297,7 @@ proc decodeLeaseRequest*(payload: string; msg: var LeaseRequestMessage): bool =
   if not r.readU64(id): return false
   if not r.readString(label): return false
   if not r.readBytes(commandStatsId): return false
+  if commandStatsId.len > MaxCommandStatsIdBytes: return false
   if not r.readResourceVector(resources): return false
   if not r.readDeadline(deadline): return false
   if not r.readU32(priorityRaw): return false
@@ -330,6 +335,7 @@ proc readLeaseCandidate(r: var BinaryReader; candidate: var LeaseCandidate): boo
   if not r.readU64(clientCandidateId): return false
   if not r.readString(label): return false
   if not r.readBytes(commandStatsId): return false
+  if commandStatsId.len > MaxCommandStatsIdBytes: return false
   if not r.readResourceVector(resources): return false
   if not r.readDeadline(deadline): return false
   if not r.readU32(priorityRaw): return false
@@ -581,6 +587,11 @@ proc encodeLeaseFinished*(msg: LeaseFinishedMessage): string =
   w.writeU32(uint32(ord(msg.outcome)))
   w.writeU32(msg.exitCode)
   w.writeU32(msg.signal)
+  w.writeU64(msg.peakMemoryBytes)
+  w.writeU32(msg.processCount)
+  w.writeU64(msg.majorPageFaults)
+  w.writeU32(msg.pressureEvents)
+  w.writeBool(msg.hardLimitOrOom)
   w.writeDiagnostic(msg.diagnostic)
   w.data
 
@@ -591,6 +602,11 @@ proc decodeLeaseFinished*(payload: string; msg: var LeaseFinishedMessage): bool 
   var outcomeRaw: uint32
   var exitCode: uint32
   var signal: uint32
+  var peakMemoryBytes: uint64
+  var processCount: uint32
+  var majorPageFaults: uint64
+  var pressureEvents: uint32
+  var hardLimitOrOom: bool
   var diagnostic: Diagnostic
   if not r.readU64(sessionRaw): return false
   if not r.readU64(leaseRaw): return false
@@ -598,6 +614,11 @@ proc decodeLeaseFinished*(payload: string; msg: var LeaseFinishedMessage): bool 
   if outcomeRaw > uint32(ord(high(LeaseFinishOutcome))): return false
   if not r.readU32(exitCode): return false
   if not r.readU32(signal): return false
+  if not r.readU64(peakMemoryBytes): return false
+  if not r.readU32(processCount): return false
+  if not r.readU64(majorPageFaults): return false
+  if not r.readU32(pressureEvents): return false
+  if not r.readBool(hardLimitOrOom): return false
   if not r.readDiagnostic(diagnostic): return false
   if r.remaining != 0: return false
   msg = LeaseFinishedMessage(
@@ -606,6 +627,11 @@ proc decodeLeaseFinished*(payload: string; msg: var LeaseFinishedMessage): bool 
     outcome: LeaseFinishOutcome(int(outcomeRaw)),
     exitCode: exitCode,
     signal: signal,
+    peakMemoryBytes: peakMemoryBytes,
+    processCount: processCount,
+    majorPageFaults: majorPageFaults,
+    pressureEvents: pressureEvents,
+    hardLimitOrOom: hardLimitOrOom,
     diagnostic: diagnostic
   )
   true

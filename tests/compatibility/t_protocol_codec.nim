@@ -70,12 +70,19 @@ suite "RQSP protocol and codec":
       outcome: leaseFinishCrashed,
       exitCode: 0'u32,
       signal: 11'u32,
+      peakMemoryBytes: 4096'u64,
+      processCount: 2'u32,
+      majorPageFaults: 3'u64,
+      pressureEvents: 1'u32,
+      hardLimitOrOom: true,
       diagnostic: diagnostic(diagCancelled, "child crashed")
     )
     var decodedFinished: LeaseFinishedMessage
     check decodeLeaseFinished(encodeLeaseFinished(finished), decodedFinished)
     check decodedFinished.outcome == leaseFinishCrashed
     check decodedFinished.signal == 11'u32
+    check decodedFinished.peakMemoryBytes == 4096'u64
+    check decodedFinished.hardLimitOrOom
 
   test "status reports supervisor-lost and finished leases separately":
     let status = DaemonStatusMessage(

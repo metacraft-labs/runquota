@@ -12,12 +12,13 @@ when isMainModule:
     quit 0
 
   var config = defaultDaemonConfig(defaultEndpoint())
+  let usage = "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH]"
   var i = 0
   while i < args.len:
     case args[i]
     of "--socket":
       if i + 1 >= args.len:
-        echo "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--pool NAME=UNITS]"
+        echo usage
         quit 2
       config.endpoint = unixEndpoint(args[i + 1])
       i += 2
@@ -44,8 +45,40 @@ when isMainModule:
         quit 2
       config.namedPoolCaps[parts[0]] = uint32(parseUInt(parts[1]))
       i += 2
+    of "--memory-pressure-source":
+      if i + 1 >= args.len:
+        quit 2
+      case args[i + 1]
+      of "host":
+        config.pressureSource = pressureSourceHost
+      of "deterministic-file":
+        config.pressureSource = pressureSourceDeterministicFile
+      of "unavailable":
+        config.pressureSource = pressureSourceUnavailable
+      else:
+        echo "unknown memory pressure source: " & args[i + 1]
+        quit 2
+      i += 2
+    of "--memory-pressure-file":
+      if i + 1 >= args.len:
+        quit 2
+      config.pressureFile = args[i + 1]
+      i += 2
+    of "--memory-pressure-required":
+      config.pressureRequired = true
+      i += 1
+    of "--memory-pressure-heavy-bytes":
+      if i + 1 >= args.len:
+        quit 2
+      config.memoryPressureHeavyBytes = bytes(parseUInt(args[i + 1]))
+      i += 2
+    of "--estimate-db":
+      if i + 1 >= args.len:
+        quit 2
+      config.estimateDbPath = args[i + 1]
+      i += 2
     of "--help", "-h":
-      echo "runquotad " & versionString() & "\nusage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--pool NAME=UNITS]"
+      echo "runquotad " & versionString() & "\n" & usage
       quit 0
     else:
       echo "unknown runquotad argument: " & args[i]

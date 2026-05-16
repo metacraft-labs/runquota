@@ -1,9 +1,12 @@
-import std/[algorithm, cpuinfo, locks, os, tables]
+import std/[algorithm, cpuinfo, locks, os, strutils, tables]
 
 import runquota_daemon/types as daemonTypes
 import runquota_codec
 import runquota_core
+import runquota_host
+import runquota_host_macos
 import runquota_ipc
+import runquota_persistence
 import runquota_protocol
 
 export daemonTypes
@@ -21,11 +24,23 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     memoryBytes: bytes(16'u64 * 1024'u64 * 1024'u64 * 1024'u64),
     ioSlots: 1'u32,
     namedPoolCaps: initTable[string, uint32](),
-    version: "0.1.0"
+    version: "0.1.0",
+    pressureSource: pressureSourceHost,
+    pressureFile: "",
+    pressureRequired: false,
+    memoryPressureHeavyBytes: bytes(512'u64 * 1024'u64 * 1024'u64),
+    estimateDbPath: "",
+    estimateQueueCapacity: 128
   )
 
+proc estimateTableKey(scope, commandStatsId: string): string =
+  scope & "\0" & commandStatsId
+
+proc sessionScope(session: SessionRow): string =
+  "session:" & session.name
+
 proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
-  RunQuotaDaemon(
+  result = RunQuotaDaemon(
     config: config,
     state: dsStarting,
     nextSessionId: 1'u64,
@@ -35,8 +50,12 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
     totalGranted: 0'u64,
     totalFinished: 0'u64,
     sessions: initTable[uint64, SessionRow](),
-    leases: initTable[uint64, LeaseRow]()
+    leases: initTable[uint64, LeaseRow](),
+    estimates: initTable[string, LearnedEstimateRow](),
+    estimateStore: startEstimateStore(config.estimateDbPath, config.estimateQueueCapacity)
   )
+  for row in loadLearnedEstimates(config.estimateDbPath):
+    result.estimates[estimateTableKey(row.scope, row.commandStatsId)] = row
 
 proc countLeases(daemon: RunQuotaDaemon; state: LeaseLifecycleState): uint32 =
   for lease in daemon.leases.values:
@@ -130,6 +149,73 @@ proc possible(daemon: RunQuotaDaemon; resources: ResourceVector; reason: var str
       return false
   true
 
+proc configuredPressureSample(daemon: RunQuotaDaemon): HostMemoryPressureSample =
+  case daemon.config.pressureSource
+  of pressureSourceHost:
+    sampleMacosMemoryPressure(daemon.config.pressureRequired)
+  of pressureSourceUnavailable:
+    unavailablePressureSample("configured-unavailable", daemon.config.pressureRequired)
+  of pressureSourceDeterministicFile:
+    if daemon.config.pressureFile.len == 0 or not fileExists(daemon.config.pressureFile):
+      return unavailablePressureSample(
+        "deterministic-file",
+        daemon.config.pressureRequired,
+        "pressure file is missing"
+      )
+    let raw = readFile(daemon.config.pressureFile).strip().toLowerAscii()
+    case raw
+    of "low", "normal", "ok":
+      lowPressureSample("deterministic-file", daemon.config.pressureRequired)
+    of "warning", "warn":
+      HostMemoryPressureSample(
+        level: pressureWarning,
+        available: true,
+        required: daemon.config.pressureRequired,
+        source: "deterministic-file",
+        diagnostic: diagnostic(diagDenied, "host memory pressure is warning", "deterministic pressure file")
+      )
+    of "critical", "crit":
+      HostMemoryPressureSample(
+        level: pressureCritical,
+        available: true,
+        required: daemon.config.pressureRequired,
+        source: "deterministic-file",
+        diagnostic: diagnostic(diagDenied, "host memory pressure is critical", "deterministic pressure file")
+      )
+    of "unavailable", "missing":
+      unavailablePressureSample("deterministic-file", daemon.config.pressureRequired, "deterministic unavailable")
+    else:
+      unavailablePressureSample("deterministic-file", daemon.config.pressureRequired, "unknown level: " & raw)
+
+proc pressureAllows(daemon: RunQuotaDaemon; resources: ResourceVector;
+                    diagOut: var Diagnostic): bool =
+  if resources.memory.value < daemon.config.memoryPressureHeavyBytes.value:
+    diagOut = okDiagnostic()
+    return true
+  let sample = daemon.configuredPressureSample()
+  if not sample.available:
+    if daemon.config.pressureRequired:
+      diagOut = diagnostic(
+        diagDenied,
+        "waiting on host memory pressure",
+        "required memory-pressure signal unavailable from " & sample.source & ": " &
+          sample.diagnostic.detail
+      )
+      return false
+    diagOut = okDiagnostic()
+    return true
+  case sample.level
+  of pressureWarning, pressureCritical:
+    diagOut = diagnostic(
+      diagDenied,
+      "waiting on host memory pressure",
+      "pressure=" & $sample.level & " source=" & sample.source
+    )
+    false
+  else:
+    diagOut = okDiagnostic()
+    true
+
 proc fitsNow(daemon: RunQuotaDaemon; resources: ResourceVector): bool =
   var usedCpu: uint32
   var usedMemory: uint64
@@ -149,6 +235,12 @@ proc fitsNow(daemon: RunQuotaDaemon; resources: ResourceVector): bool =
       return false
   true
 
+proc waitingDiagnostic(daemon: RunQuotaDaemon; resources: ResourceVector): Diagnostic =
+  var pressureDiagnostic: Diagnostic
+  if not daemon.pressureAllows(resources, pressureDiagnostic):
+    return pressureDiagnostic
+  diagnostic(diagDenied, "waiting for resource budget", "candidate does not fit current CPU, memory, IO, or pool budget")
+
 proc stateName(state: LeaseLifecycleState): string =
   case state
   of leaseStateQueued: "queued"
@@ -165,7 +257,7 @@ proc leaseDecision(lease: LeaseRow; kind: LeaseDecisionKind;
     leaseId: lease.id,
     kind: kind,
     resources: lease.resources,
-    diagnostic: diagnostic
+    diagnostic: if kind == leaseDecisionQueued: lease.queueDiagnostic else: diagnostic
   )
 
 proc sessionsJson(daemon: RunQuotaDaemon): string =
@@ -201,10 +293,41 @@ proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
       "\"session_id\":" & $lease.sessionId.value & "," &
       "\"candidate_id\":" & $lease.clientCandidateId & "," &
       "\"label\":" & jsonEscape(lease.label) & "," &
+      "\"command_stats_id\":" & jsonEscape(lease.commandStatsId) & "," &
       "\"state\":" & jsonEscape(lease.state.stateName) & "," &
-      "\"resources\":" & inspectionResourceJson(lease.resources) &
+      "\"resources\":" & inspectionResourceJson(lease.resources) & "," &
+      "\"diagnostic\":{\"code\":" & jsonEscape($lease.queueDiagnostic.code) &
+        ",\"message\":" & jsonEscape(lease.queueDiagnostic.message) &
+        ",\"detail\":" & jsonEscape(lease.queueDiagnostic.detail) & "}" &
     "}")
   result.add("]}")
+
+proc estimatesJson(daemon: RunQuotaDaemon): string =
+  var keys: seq[string] = @[]
+  for key in daemon.estimates.keys:
+    keys.add(key)
+  keys.sort()
+  result = "{\"estimates\":["
+  for i, key in keys:
+    if i > 0:
+      result.add(",")
+    let row = daemon.estimates[key]
+    result.add("{" &
+      "\"scope\":" & jsonEscape(row.scope) & "," &
+      "\"command_stats_id\":" & jsonEscape(row.commandStatsId) & "," &
+      "\"conservative_memory_bytes\":" & $row.conservativeMemoryBytes & "," &
+      "\"recent_peak_memory_bytes\":" & $row.recentPeakMemoryBytes & "," &
+      "\"sample_count\":" & $row.sampleCount &
+    "}")
+  result.add("]}")
+
+proc pressureJson(daemon: RunQuotaDaemon): string =
+  let sample = daemon.configuredPressureSample()
+  "{\"pressure\":{\"level\":" & jsonEscape($sample.level) & "," &
+    "\"available\":" & $(sample.available) & "," &
+    "\"required\":" & $(daemon.config.pressureRequired) & "," &
+    "\"source\":" & jsonEscape(sample.source) & "," &
+    "\"diagnostic\":" & jsonEscape(sample.diagnostic.message) & "}}"
 
 proc inspectionJson(daemon: RunQuotaDaemon; request: InspectionRequestMessage): string =
   case request.subject
@@ -216,6 +339,10 @@ proc inspectionJson(daemon: RunQuotaDaemon; request: InspectionRequestMessage): 
     daemon.leasesJson(request.sessionId)
   of "status":
     inspectionStatusJson(daemon.status())
+  of "estimates":
+    daemon.estimatesJson()
+  of "pressure":
+    daemon.pressureJson()
   else:
     "{\"error\":\"unknown inspection subject\"}"
 
@@ -242,12 +369,18 @@ proc handleHello(daemon: RunQuotaDaemon; connection: var LocalConnection;
     daemon.config.cpuSlots,
     daemon.config.memoryBytes
   )
+  var effectiveCaps = caps
+  effectiveCaps.hardMemoryLimitEnforced = false
+  effectiveCaps.hardMemoryLimitMode = memoryLimitAdvisory
+  let pressureSample = daemon.configuredPressureSample()
+  effectiveCaps.memoryPressureAvailable = pressureSample.available
+  effectiveCaps.memoryPressureRequired = daemon.config.pressureRequired
   let helloOk = HelloOkMessage(
     selectedProtocolMajor: compatibility.selectedMajor,
     selectedProtocolMinor: compatibility.selectedMinor,
     daemonId: daemon.config.daemonId,
     daemonVersion: daemon.config.version,
-    capabilities: caps,
+    capabilities: effectiveCaps,
     flow: defaultFlowControlLimits()
   )
   connection.sendResponse(rqHelloOk, frame.header.requestId, encodeHelloOk(helloOk))
@@ -258,7 +391,8 @@ proc handleHello(daemon: RunQuotaDaemon; connection: var LocalConnection;
 
 proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
                        clientCandidateId: uint64; label: string;
-                       resources: ResourceVector; priority: PriorityClass): LeaseRow =
+                       commandStatsId: string; resources: ResourceVector;
+                       priority: PriorityClass): LeaseRow =
   let session = daemon.sessions[sessionId.value]
   let id = leaseId(daemon.nextLeaseId)
   inc daemon.nextLeaseId
@@ -268,6 +402,7 @@ proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
     id: id,
     sessionId: sessionId,
     label: label,
+    commandStatsId: commandStatsId,
     clientCandidateId: clientCandidateId,
     resources: resources,
     priority: priority,
@@ -281,9 +416,59 @@ proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
     processGroupId: 0'u64,
     cleanupRegistered: false,
     finishOutcome: leaseFinishCancelled,
-    finishDiagnostic: okDiagnostic()
+    finishDiagnostic: okDiagnostic(),
+    peakMemoryBytes: 0'u64,
+    processCount: 0'u32,
+    majorPageFaults: 0'u64,
+    pressureEvents: 0'u32,
+    hardLimitOrOom: false,
+    queueDiagnostic: okDiagnostic()
   )
   daemon.leases[id.value] = result
+
+proc effectiveResources(daemon: RunQuotaDaemon; sessionId: SessionId;
+                        commandStatsId: string; requested: ResourceVector): ResourceVector =
+  result = requested
+  if commandStatsId.len == 0 or not daemon.sessions.hasKey(sessionId.value):
+    return
+  let scope = daemon.sessions[sessionId.value].sessionScope()
+  let key = estimateTableKey(scope, commandStatsId)
+  if daemon.estimates.hasKey(key):
+    let learned = daemon.estimates[key].conservativeMemoryBytes
+    if learned > result.memory.value:
+      result.memory = bytes(learned)
+
+proc updateEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
+                              finish: LeaseFinishedMessage) =
+  if lease.commandStatsId.len == 0 or finish.peakMemoryBytes == 0:
+    return
+  if not daemon.sessions.hasKey(lease.sessionId.value):
+    return
+  let scope = daemon.sessions[lease.sessionId.value].sessionScope()
+  let key = estimateTableKey(scope, lease.commandStatsId)
+  let observed = finish.peakMemoryBytes
+  var conservative =
+    if finish.outcome == leaseFinishResourceLimit or finish.hardLimitOrOom:
+      max(observed, lease.resources.memory.value) * 2'u64
+    else:
+      max(observed, (observed * 125'u64) div 100'u64)
+  var sampleCount = 1'u32
+  if daemon.estimates.hasKey(key):
+    let current = daemon.estimates[key]
+    sampleCount = current.sampleCount + 1'u32
+    if conservative < current.conservativeMemoryBytes:
+      conservative = current.conservativeMemoryBytes
+  let row = LearnedEstimateRow(
+    scope: scope,
+    commandStatsId: lease.commandStatsId,
+    conservativeMemoryBytes: conservative,
+    recentPeakMemoryBytes: observed,
+    sampleCount: sampleCount,
+    lastOutcome: uint32(ord(finish.outcome)),
+    updatedUnixMillis: nowUnixMillis()
+  )
+  daemon.estimates[key] = row
+  discard enqueueEstimateWrite(daemon.estimateStore, row)
 
 proc grantQueuedLease(daemon: var RunQuotaDaemon; id: uint64; delivered: bool) =
   var lease = daemon.leases[id]
@@ -322,7 +507,9 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(ui
         if lease.state == leaseStateQueued and lease.sessionId.value == sessionIdValue:
           let rank = priorityRank(lease.priority)
           if rank < bestPriority or (rank == bestPriority and lease.queueOrder < bestOrder):
-            if daemon.fitsNow(lease.resources):
+            var pressureDiagnostic: Diagnostic
+            if daemon.pressureAllows(lease.resources, pressureDiagnostic) and
+                daemon.fitsNow(lease.resources):
               bestId = id
               bestPriority = rank
               bestOrder = lease.queueOrder
@@ -331,6 +518,11 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(ui
         result.add(bestId)
         inc promoted
         madeProgress = true
+  for id, lease in daemon.leases.pairs:
+    if lease.state == leaseStateQueued:
+      var updated = lease
+      updated.queueDiagnostic = daemon.waitingDiagnostic(lease.resources)
+      daemon.leases[id] = updated
 
 proc requireOwnedLease(daemon: RunQuotaDaemon; connection: var LocalConnection;
                        requestId: uint64; sessionId: SessionId;
@@ -433,8 +625,9 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     if not daemon.sessions.hasKey(msg.sessionId.value):
       connection.sendError(frame.header.requestId, diagnostic(diagInvalidArgument, "unknown session id"))
       return
+    let effective = daemon.effectiveResources(msg.sessionId, msg.commandStatsId, msg.resources)
     var reason = ""
-    if not daemon.possible(msg.resources, reason):
+    if not daemon.possible(effective, reason):
       let denied = LeaseDeniedMessage(
         sessionId: msg.sessionId,
         diagnostic: diagnostic(diagDenied, reason)
@@ -445,15 +638,17 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       msg.sessionId,
       frame.header.requestId,
       msg.label,
-      msg.resources,
+      msg.commandStatsId,
+      effective,
       msg.priority
     )
     discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
     if daemon.leases[queued.id.value].state != leaseStateGranted:
+      let deniedDiagnostic = daemon.leases[queued.id.value].queueDiagnostic
       daemon.leases.del(queued.id.value)
       let denied = LeaseDeniedMessage(
         sessionId: msg.sessionId,
-        diagnostic: diagnostic(diagDenied, "resources unavailable; use candidate offers for queued admission")
+        diagnostic: deniedDiagnostic
       )
       connection.sendResponse(rqLeaseDenied, frame.header.requestId, encodeLeaseDenied(denied))
       return
@@ -463,7 +658,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     let granted = LeaseGrantedMessage(
       sessionId: msg.sessionId,
       leaseId: queued.id,
-      resources: msg.resources
+      resources: grantedLease.resources
     )
     connection.sendResponse(rqLeaseGranted, frame.header.requestId, encodeLeaseGranted(granted))
   of rqReleaseLease:
@@ -504,12 +699,13 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     var decisions: seq[LeaseDecision] = @[]
     for candidate in msg.candidates:
       var reason = ""
-      if not daemon.possible(candidate.resources, reason):
+      let effective = daemon.effectiveResources(msg.sessionId, candidate.commandStatsId, candidate.resources)
+      if not daemon.possible(effective, reason):
         decisions.add(LeaseDecision(
           clientCandidateId: candidate.clientCandidateId,
           leaseId: leaseId(0),
           kind: leaseDecisionDenied,
-          resources: candidate.resources,
+          resources: effective,
           diagnostic: diagnostic(diagDenied, reason)
         ))
       else:
@@ -517,7 +713,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           msg.sessionId,
           candidate.clientCandidateId,
           candidate.label,
-          candidate.resources,
+          candidate.commandStatsId,
+          effective,
           candidate.priority
         )
         offeredIds.add(lease.id.value)
@@ -611,6 +808,12 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     lease.state = leaseStateFinished
     lease.finishOutcome = msg.outcome
     lease.finishDiagnostic = msg.diagnostic
+    lease.peakMemoryBytes = msg.peakMemoryBytes
+    lease.processCount = msg.processCount
+    lease.majorPageFaults = msg.majorPageFaults
+    lease.pressureEvents = msg.pressureEvents
+    lease.hardLimitOrOom = msg.hardLimitOrOom
+    daemon.updateEstimateFromFinish(lease, msg)
     inc daemon.totalFinished
     daemon.leases[msg.leaseId.value] = lease
     discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
@@ -721,8 +924,11 @@ proc serve*(config: DaemonConfig): int =
       createThread(threads[^1], handleSharedConnection, connection)
   finally:
     acquire(sharedDaemon.lock)
-    sharedDaemon.daemon.state = dsStopping
-    release(sharedDaemon.lock)
-    listener.close()
-    deinitLock(sharedDaemon.lock)
+    try:
+      sharedDaemon.daemon.state = dsStopping
+      stopEstimateStore(sharedDaemon.daemon.estimateStore)
+    finally:
+      release(sharedDaemon.lock)
+      listener.close()
+      deinitLock(sharedDaemon.lock)
   0

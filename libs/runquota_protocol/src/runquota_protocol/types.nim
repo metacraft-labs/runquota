@@ -174,6 +174,11 @@ type
     outcome*: LeaseFinishOutcome
     exitCode*: uint32
     signal*: uint32
+    peakMemoryBytes*: uint64
+    processCount*: uint32
+    majorPageFaults*: uint64
+    pressureEvents*: uint32
+    hardLimitOrOom*: bool
     diagnostic*: Diagnostic
 
   LeaseFinishedAckMessage* = object
