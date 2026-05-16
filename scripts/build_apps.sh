@@ -8,6 +8,7 @@ while read -r name path _; do
     ""|\#*) continue ;;
   esac
   nim c \
+    --threads:on \
     --nimcache:"build/nimcache/${name}" \
     --out:"build/bin/${name}" \
     "${path}"

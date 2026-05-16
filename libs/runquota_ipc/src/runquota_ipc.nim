@@ -15,6 +15,7 @@ when defined(posix):
     const SoPeerCred = cint(17)
 
 import runquota_ipc/types as ipcTypes
+import runquota_core
 import runquota_protocol
 
 export ipcTypes
@@ -126,17 +127,30 @@ proc readExact(socket: Socket; size: int; data: var string): bool =
 proc sendFrame*(connection: var LocalConnection; frame: string) =
   connection.socket.send(frame)
 
-proc receiveFrame*(connection: var LocalConnection; frame: var RqspFrame): bool =
+proc receiveFrame*(connection: var LocalConnection; frame: var RqspFrame;
+                   frameDiagnostic: var Diagnostic): bool =
+  frameDiagnostic = okDiagnostic()
   var headerBytes: string
   if not readExact(connection.socket, int(RqspHeaderLen), headerBytes):
     return false
   var header: FrameHeader
   if not decodeFrameHeader(headerBytes, header):
+    frameDiagnostic = diagnostic(diagProtocol, "invalid RQSP frame header")
     return false
   if header.payloadLen > DefaultMaxFrameBytes:
+    frame = RqspFrame(header: header, payload: "")
+    frameDiagnostic = diagnostic(
+      diagProtocol,
+      "RQSP frame exceeds negotiated flow-control limit",
+      "max_frame_bytes=" & $DefaultMaxFrameBytes
+    )
     return false
   var payload: string
   if not readExact(connection.socket, int(header.payloadLen), payload):
     return false
   frame = RqspFrame(header: header, payload: payload)
   true
+
+proc receiveFrame*(connection: var LocalConnection; frame: var RqspFrame): bool =
+  var frameDiagnostic = okDiagnostic()
+  connection.receiveFrame(frame, frameDiagnostic)

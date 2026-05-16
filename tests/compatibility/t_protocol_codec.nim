@@ -36,7 +36,7 @@ suite "RQSP protocol and codec":
     check decoded.metadata.kind == metadataCborPlaceholder
     check decoded.payload == "payload"
     check inspectionResourceJson(resourceVector(milliCpu(1000), bytes(128))) ==
-      "{\"cpu_milli\":1000,\"memory_bytes\":128,\"hard_memory_limit_bytes\":0,\"io_class\":\"ioNormal\",\"process_count\":1}"
+      "{\"cpu_milli\":1000,\"memory_bytes\":128,\"hard_memory_limit_bytes\":0,\"io_class\":\"ioNormal\",\"process_count\":1,\"named_pools\":[]}"
 
   test "compatibility rejects unsupported major versions":
     let result = compatible(HelloMessage(
@@ -81,6 +81,7 @@ suite "RQSP protocol and codec":
     let status = DaemonStatusMessage(
       activeSessions: 0'u32,
       activeLeases: 1'u32,
+      queuedLeases: 0'u32,
       supervisorLostLeases: 1'u32,
       finishedLeases: 0'u32,
       totalGranted: 3'u64,
@@ -91,4 +92,4 @@ suite "RQSP protocol and codec":
     check decoded.supervisorLostLeases == 1'u32
     check decoded.finishedLeases == 0'u32
     check inspectionStatusJson(decoded) ==
-      "{\"active_sessions\":0,\"active_leases\":1,\"supervisor_lost_leases\":1,\"finished_leases\":0,\"total_granted\":3,\"total_finished\":0}"
+      "{\"active_sessions\":0,\"active_leases\":1,\"queued_leases\":0,\"supervisor_lost_leases\":1,\"finished_leases\":0,\"total_granted\":3,\"total_finished\":0}"

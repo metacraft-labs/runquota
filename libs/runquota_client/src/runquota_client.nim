@@ -1,4 +1,4 @@
-import std/os
+import std/[os, tables]
 
 when defined(posix):
   import std/posix
@@ -30,27 +30,44 @@ proc resourceRequest*(label: string; cpu: MilliCpu; memory: Bytes): ResourceRequ
   )
 
 proc requestFrame(client: var RunQuotaClient; kind: RqspMessageKind; payload: string): uint64 =
+  if uint32(client.inflightRequestIds.len) >= client.flow.maxInflightRequests:
+    client.lastDiagnostic = diagnostic(diagProtocol, "in-flight request limit exceeded")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
   inc client.nextRequestId
   let requestId = client.nextRequestId
   client.connection.sendFrame(encodeFrame(kind, FrameFlagRequest, requestId, payload))
+  client.inflightRequestIds.add(requestId)
   requestId
 
+proc forgetInflight(client: var RunQuotaClient; requestId: uint64) =
+  for i, id in client.inflightRequestIds:
+    if id == requestId:
+      client.inflightRequestIds.delete(i)
+      return
+
 proc readResponse(client: var RunQuotaClient; requestId: uint64): RqspFrame =
-  var frame: RqspFrame
-  if not client.connection.receiveFrame(frame):
-    client.lastDiagnostic = diagnostic(diagProtocol, "daemon closed the RQSP connection")
-    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
-  if frame.header.requestId != requestId:
-    client.lastDiagnostic = diagnostic(diagProtocol, "unexpected RQSP response id")
-    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
-  if (frame.header.flags and FrameFlagError) != 0 or frame.header.messageKind == rqError:
+  if client.responseBuffer.hasKey(requestId):
+    result = client.responseBuffer[requestId]
+    client.responseBuffer.del(requestId)
+    client.forgetInflight(requestId)
+  else:
+    while true:
+      var frame: RqspFrame
+      if not client.connection.receiveFrame(frame):
+        client.lastDiagnostic = diagnostic(diagProtocol, "daemon closed the RQSP connection")
+        raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+      if frame.header.requestId == requestId:
+        result = frame
+        client.forgetInflight(requestId)
+        break
+      client.responseBuffer[frame.header.requestId] = frame
+  if (result.header.flags and FrameFlagError) != 0 or result.header.messageKind == rqError:
     var errorMessage: ProtocolErrorMessage
-    if decodeProtocolError(frame.payload, errorMessage):
+    if decodeProtocolError(result.payload, errorMessage):
       client.lastDiagnostic = errorMessage.diagnostic
       raise newException(RunQuotaClientError, errorMessage.diagnostic.message)
     client.lastDiagnostic = diagnostic(diagProtocol, "invalid RQSP error payload")
     raise newException(RunQuotaClientError, client.lastDiagnostic.message)
-  frame
 
 proc connect*(endpoint: Endpoint; clientName = "runquota-nim";
               clientVersion = "0.1.0"): RunQuotaClient =
@@ -62,7 +79,9 @@ proc connect*(endpoint: Endpoint; clientName = "runquota-nim";
     daemonVersion: "",
     capabilities: defaultCapabilities("unknown", "unknown", milliCpu(0), bytes(0)),
     flow: defaultFlowControlLimits(),
-    lastDiagnostic: okDiagnostic()
+    lastDiagnostic: okDiagnostic(),
+    responseBuffer: initTable[uint64, RqspFrame](),
+    inflightRequestIds: @[]
   )
   let pid =
     when declared(getCurrentProcessId):
@@ -171,6 +190,81 @@ proc requestLease*(session: var RunQuotaSession; request: ResourceRequest): RunQ
   else:
     session.client[].lastDiagnostic = diagnostic(diagProtocol, "daemon did not answer with a lease decision")
     raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+
+proc toCandidate*(clientCandidateId: uint64; request: ResourceRequest): LeaseCandidate =
+  LeaseCandidate(
+    clientCandidateId: clientCandidateId,
+    label: request.label,
+    commandStatsId: request.commandStatsId,
+    resources: request.resources,
+    deadline: request.deadline,
+    priority: request.priority,
+    metadata: request.metadata
+  )
+
+proc sendCandidateOffer*(session: var RunQuotaSession;
+                         candidates: openArray[LeaseCandidate]): uint64 =
+  if not session.active:
+    session.client[].lastDiagnostic = diagnostic(diagInvalidArgument, "session is not active")
+    raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+  if uint32(candidates.len) > session.client[].flow.maxCandidatesPerBatch:
+    session.client[].lastDiagnostic = diagnostic(diagInvalidArgument, "candidate batch exceeds flow-control limit")
+    raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+  var copied: seq[LeaseCandidate] = @[]
+  for candidate in candidates:
+    copied.add(candidate)
+  let msg = CandidateOfferMessage(sessionId: session.id, candidates: copied)
+  session.client[].requestFrame(rqOfferCandidates, encodeCandidateOffer(msg))
+
+proc decodeDecisionBatch(session: var RunQuotaSession; frame: RqspFrame): seq[OfferedLease] =
+  if frame.header.messageKind != rqLeaseDecisionBatch:
+    session.client[].lastDiagnostic = diagnostic(diagProtocol, "daemon did not answer with a lease decision batch")
+    raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+  var batch: LeaseDecisionBatchMessage
+  if not decodeLeaseDecisionBatch(frame.payload, batch) or batch.sessionId.value != session.id.value:
+    session.client[].lastDiagnostic = diagnostic(diagProtocol, "invalid LeaseDecisionBatch payload")
+    raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+  for decision in batch.decisions:
+    let active = decision.kind == leaseDecisionGranted or decision.kind == leaseDecisionQueued
+    result.add(OfferedLease(
+      clientCandidateId: decision.clientCandidateId,
+      lease: RunQuotaLease(
+        session: addr session,
+        id: decision.leaseId,
+        resources: decision.resources,
+        active: active,
+        state: if decision.kind == leaseDecisionGranted: leaseClientGranted else: leaseClientQueued
+      ),
+      queued: decision.kind == leaseDecisionQueued,
+      diagnostic: decision.diagnostic
+    ))
+
+proc receiveCandidateDecisions*(session: var RunQuotaSession; requestId: uint64): seq[OfferedLease] =
+  session.decodeDecisionBatch(session.client[].readResponse(requestId))
+
+proc offerCandidates*(session: var RunQuotaSession;
+                      candidates: openArray[LeaseCandidate]): seq[OfferedLease] =
+  let requestId = session.sendCandidateOffer(candidates)
+  session.receiveCandidateDecisions(requestId)
+
+proc pollNextGrant*(session: var RunQuotaSession): seq[OfferedLease] =
+  let msg = GrantNextMessage(sessionId: session.id)
+  let requestId = session.client[].requestFrame(rqGrantNext, encodeGrantNext(msg))
+  session.decodeDecisionBatch(session.client[].readResponse(requestId))
+
+proc inspectionJson*(client: var RunQuotaClient; subject: string;
+                     sessionId = sessionId(0)): string =
+  let msg = InspectionRequestMessage(subject: subject, sessionId: sessionId)
+  let requestId = client.requestFrame(rqInspectionRequest, encodeInspectionRequest(msg))
+  let frame = client.readResponse(requestId)
+  if frame.header.messageKind != rqInspectionResponse:
+    client.lastDiagnostic = diagnostic(diagProtocol, "daemon did not answer with inspection data")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  var response: InspectionResponseMessage
+  if not decodeInspectionResponse(frame.payload, response):
+    client.lastDiagnostic = diagnostic(diagProtocol, "invalid InspectionResponse payload")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  response.json
 
 proc release*(lease: var RunQuotaLease) =
   if not lease.active:

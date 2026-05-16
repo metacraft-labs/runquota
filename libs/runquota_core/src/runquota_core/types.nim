@@ -52,12 +52,17 @@ type
     hardMemoryLimitEnforced*: bool
     processTelemetry*: bool
 
+  NamedPoolDemand* = object
+    name*: string
+    units*: uint32
+
   ResourceVector* = object
     cpu*: MilliCpu
     memory*: Bytes
     hardMemoryLimit*: Bytes
     ioClass*: IoClass
     processCount*: uint32
+    namedPools*: seq[NamedPoolDemand]
 
 proc resourceVector*(cpu: MilliCpu; memory: Bytes): ResourceVector =
   ResourceVector(
@@ -65,8 +70,17 @@ proc resourceVector*(cpu: MilliCpu; memory: Bytes): ResourceVector =
     memory: memory,
     hardMemoryLimit: Bytes(0),
     ioClass: ioNormal,
-    processCount: 1'u32
+    processCount: 1'u32,
+    namedPools: @[]
   )
+
+proc namedPoolDemand*(name: string; units: SomeInteger): NamedPoolDemand =
+  NamedPoolDemand(name: name, units: uint32(units))
+
+proc withNamedPool*(resources: ResourceVector; name: string;
+                    units: SomeInteger): ResourceVector =
+  result = resources
+  result.namedPools.add(namedPoolDemand(name, units))
 
 proc sessionId*(value: uint64): SessionId =
   SessionId(value)

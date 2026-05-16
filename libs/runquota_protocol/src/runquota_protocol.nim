@@ -14,6 +14,8 @@ const FrameFlagResponse* = 0x0002'u16
 const FrameFlagError* = 0x0004'u16
 const DefaultMaxFrameBytes* = 1_048_576'u32
 const DefaultMaxInflightRequests* = 32'u32
+const DefaultMaxCandidatesPerBatch* = 16'u32
+const DefaultMaxLeaseDecisionsPerBatch* = 8'u32
 
 proc libraryInfo*(): protocolTypes.LibraryInfo =
   protocolTypes.LibraryInfo(name: libraryName)
@@ -22,8 +24,8 @@ proc defaultFlowControlLimits*(): FlowControlLimits =
   FlowControlLimits(
     maxInflightRequests: DefaultMaxInflightRequests,
     maxFrameBytes: DefaultMaxFrameBytes,
-    maxCandidatesPerBatch: 1'u32,
-    maxLeaseDecisionsPerBatch: 1'u32
+    maxCandidatesPerBatch: DefaultMaxCandidatesPerBatch,
+    maxLeaseDecisionsPerBatch: DefaultMaxLeaseDecisionsPerBatch
   )
 
 proc defaultCapabilities*(platform: string; transport: string; cpuSlots: MilliCpu;
@@ -308,6 +310,120 @@ proc decodeLeaseRequest*(payload: string; msg: var LeaseRequestMessage): bool =
   )
   true
 
+proc writeLeaseCandidate(w: var BinaryWriter; candidate: LeaseCandidate) =
+  w.writeU64(candidate.clientCandidateId)
+  w.writeString(candidate.label)
+  w.writeBytes(candidate.commandStatsId)
+  w.writeResourceVector(candidate.resources)
+  w.writeDeadline(candidate.deadline)
+  w.writeU32(uint32(ord(candidate.priority)))
+  w.writeMetadata(candidate.metadata)
+
+proc readLeaseCandidate(r: var BinaryReader; candidate: var LeaseCandidate): bool =
+  var clientCandidateId: uint64
+  var label: string
+  var commandStatsId: string
+  var resources: ResourceVector
+  var deadline: Deadline
+  var priorityRaw: uint32
+  var metadata: DynamicMetadata
+  if not r.readU64(clientCandidateId): return false
+  if not r.readString(label): return false
+  if not r.readBytes(commandStatsId): return false
+  if not r.readResourceVector(resources): return false
+  if not r.readDeadline(deadline): return false
+  if not r.readU32(priorityRaw): return false
+  if priorityRaw > uint32(ord(high(PriorityClass))): return false
+  if not r.readMetadata(metadata): return false
+  candidate = LeaseCandidate(
+    clientCandidateId: clientCandidateId,
+    label: label,
+    commandStatsId: commandStatsId,
+    resources: resources,
+    deadline: deadline,
+    priority: PriorityClass(int(priorityRaw)),
+    metadata: metadata
+  )
+  true
+
+proc encodeCandidateOffer*(msg: CandidateOfferMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU32(uint32(msg.candidates.len))
+  for candidate in msg.candidates:
+    w.writeLeaseCandidate(candidate)
+  w.data
+
+proc decodeCandidateOffer*(payload: string; msg: var CandidateOfferMessage): bool =
+  var r = reader(payload)
+  var sessionRaw: uint64
+  var count: uint32
+  if not r.readU64(sessionRaw): return false
+  if not r.readU32(count): return false
+  var candidates: seq[LeaseCandidate] = @[]
+  for _ in 0 ..< count:
+    var candidate: LeaseCandidate
+    if not r.readLeaseCandidate(candidate): return false
+    candidates.add(candidate)
+  if r.remaining != 0: return false
+  msg = CandidateOfferMessage(sessionId: sessionId(sessionRaw), candidates: candidates)
+  true
+
+proc encodeLeaseDecisionBatch*(msg: LeaseDecisionBatchMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU32(uint32(msg.decisions.len))
+  for decision in msg.decisions:
+    w.writeU64(decision.clientCandidateId)
+    w.writeU64(decision.leaseId.value)
+    w.writeU32(uint32(ord(decision.kind)))
+    w.writeResourceVector(decision.resources)
+    w.writeDiagnostic(decision.diagnostic)
+  w.data
+
+proc decodeLeaseDecisionBatch*(payload: string; msg: var LeaseDecisionBatchMessage): bool =
+  var r = reader(payload)
+  var sessionRaw: uint64
+  var count: uint32
+  if not r.readU64(sessionRaw): return false
+  if not r.readU32(count): return false
+  var decisions: seq[LeaseDecision] = @[]
+  for _ in 0 ..< count:
+    var clientCandidateId: uint64
+    var leaseRaw: uint64
+    var kindRaw: uint32
+    var resources: ResourceVector
+    var diagnostic: Diagnostic
+    if not r.readU64(clientCandidateId): return false
+    if not r.readU64(leaseRaw): return false
+    if not r.readU32(kindRaw): return false
+    if kindRaw > uint32(ord(high(LeaseDecisionKind))): return false
+    if not r.readResourceVector(resources): return false
+    if not r.readDiagnostic(diagnostic): return false
+    decisions.add(LeaseDecision(
+      clientCandidateId: clientCandidateId,
+      leaseId: leaseId(leaseRaw),
+      kind: LeaseDecisionKind(int(kindRaw)),
+      resources: resources,
+      diagnostic: diagnostic
+    ))
+  if r.remaining != 0: return false
+  msg = LeaseDecisionBatchMessage(sessionId: sessionId(sessionRaw), decisions: decisions)
+  true
+
+proc encodeGrantNext*(msg: GrantNextMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.data
+
+proc decodeGrantNext*(payload: string; msg: var GrantNextMessage): bool =
+  var r = reader(payload)
+  var sessionRaw: uint64
+  if not r.readU64(sessionRaw): return false
+  if r.remaining != 0: return false
+  msg = GrantNextMessage(sessionId: sessionId(sessionRaw))
+  true
+
 proc encodeLeaseGranted*(msg: LeaseGrantedMessage): string =
   var w = writer()
   w.writeU64(msg.sessionId.value)
@@ -514,6 +630,7 @@ proc encodeStatus*(msg: DaemonStatusMessage): string =
   var w = writer()
   w.writeU32(msg.activeSessions)
   w.writeU32(msg.activeLeases)
+  w.writeU32(msg.queuedLeases)
   w.writeU32(msg.supervisorLostLeases)
   w.writeU32(msg.finishedLeases)
   w.writeU64(msg.totalGranted)
@@ -524,12 +641,14 @@ proc decodeStatus*(payload: string; msg: var DaemonStatusMessage): bool =
   var r = reader(payload)
   var activeSessions: uint32
   var activeLeases: uint32
+  var queuedLeases: uint32
   var supervisorLostLeases: uint32
   var finishedLeases: uint32
   var totalGranted: uint64
   var totalFinished: uint64
   if not r.readU32(activeSessions): return false
   if not r.readU32(activeLeases): return false
+  if not r.readU32(queuedLeases): return false
   if not r.readU32(supervisorLostLeases): return false
   if not r.readU32(finishedLeases): return false
   if not r.readU64(totalGranted): return false
@@ -538,6 +657,7 @@ proc decodeStatus*(payload: string; msg: var DaemonStatusMessage): bool =
   msg = DaemonStatusMessage(
     activeSessions: activeSessions,
     activeLeases: activeLeases,
+    queuedLeases: queuedLeases,
     supervisorLostLeases: supervisorLostLeases,
     finishedLeases: finishedLeases,
     totalGranted: totalGranted,
@@ -558,10 +678,40 @@ proc decodeProtocolError*(payload: string; msg: var ProtocolErrorMessage): bool 
   msg = ProtocolErrorMessage(diagnostic: diagnostic)
   true
 
+proc encodeInspectionRequest*(msg: InspectionRequestMessage): string =
+  var w = writer()
+  w.writeString(msg.subject)
+  w.writeU64(msg.sessionId.value)
+  w.data
+
+proc decodeInspectionRequest*(payload: string; msg: var InspectionRequestMessage): bool =
+  var r = reader(payload)
+  var subject: string
+  var sessionRaw: uint64
+  if not r.readString(subject): return false
+  if not r.readU64(sessionRaw): return false
+  if r.remaining != 0: return false
+  msg = InspectionRequestMessage(subject: subject, sessionId: sessionId(sessionRaw))
+  true
+
+proc encodeInspectionResponse*(msg: InspectionResponseMessage): string =
+  var w = writer()
+  w.writeString(msg.json)
+  w.data
+
+proc decodeInspectionResponse*(payload: string; msg: var InspectionResponseMessage): bool =
+  var r = reader(payload)
+  var json: string
+  if not r.readString(json): return false
+  if r.remaining != 0: return false
+  msg = InspectionResponseMessage(json: json)
+  true
+
 proc inspectionStatusJson*(status: DaemonStatusMessage): string =
   "{" &
     "\"active_sessions\":" & $status.activeSessions & "," &
     "\"active_leases\":" & $status.activeLeases & "," &
+    "\"queued_leases\":" & $status.queuedLeases & "," &
     "\"supervisor_lost_leases\":" & $status.supervisorLostLeases & "," &
     "\"finished_leases\":" & $status.finishedLeases & "," &
     "\"total_granted\":" & $status.totalGranted & "," &

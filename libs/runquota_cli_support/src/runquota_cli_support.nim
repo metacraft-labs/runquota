@@ -15,6 +15,9 @@ proc renderUsage*(programName: string): string =
     "usage:\n" &
     "  " & programName & " --version\n" &
     "  " & programName & " status [--json]\n" &
+    "  " & programName & " sessions --json\n" &
+    "  " & programName & " leases --json\n" &
+    "  " & programName & " explain SESSION_ID\n" &
     "  " & programName & " daemon start|status\n" &
     "  " & programName & " acquire --cpu N --mem BYTES [--label TEXT]"
 
@@ -47,6 +50,12 @@ proc printStatus(json: bool): int =
     echo "finished_leases: " & $status.finishedLeases
     echo "total_granted: " & $status.totalGranted
     echo "total_finished: " & $status.totalFinished
+  0
+
+proc printInspection(subject: string; sessionId = sessionId(0)): int =
+  var client = connectDefault()
+  defer: client.close()
+  echo client.inspectionJson(subject, sessionId)
   0
 
 proc daemonProgramPath*(): string =
@@ -123,6 +132,15 @@ proc runThinApp*(programName: string): int =
       case args[0]
       of "status":
         return printStatus(args.len == 2 and args[1] == "--json")
+      of "sessions":
+        if args.len == 2 and args[1] == "--json":
+          return printInspection("sessions")
+      of "leases":
+        if args.len == 2 and args[1] == "--json":
+          return printInspection("leases")
+      of "explain":
+        if args.len == 2:
+          return printInspection("explain", sessionId(parseUInt(args[1])))
       of "daemon":
         if args.len == 2 and args[1] == "start":
           return runDaemonStart()

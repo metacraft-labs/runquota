@@ -123,6 +123,10 @@ proc writeResourceVector*(w: var BinaryWriter; resources: ResourceVector) =
   w.writeU64(resources.hardMemoryLimit.value)
   w.writeU32(uint32(ord(resources.ioClass)))
   w.writeU32(resources.processCount)
+  w.writeU32(uint32(resources.namedPools.len))
+  for demand in resources.namedPools:
+    w.writeString(demand.name)
+    w.writeU32(demand.units)
 
 proc readResourceVector*(r: var BinaryReader; resources: var ResourceVector): bool =
   var cpu: uint32
@@ -130,6 +134,7 @@ proc readResourceVector*(r: var BinaryReader; resources: var ResourceVector): bo
   var hardLimit: uint64
   var ioRaw: uint32
   var processCount: uint32
+  var namedPoolCount: uint32
   if not r.readU32(cpu): return false
   if not r.readU64(memory): return false
   if not r.readU64(hardLimit): return false
@@ -138,12 +143,21 @@ proc readResourceVector*(r: var BinaryReader; resources: var ResourceVector): bo
     r.error = codecUnknownTag
     return false
   if not r.readU32(processCount): return false
+  if not r.readU32(namedPoolCount): return false
+  var namedPools: seq[NamedPoolDemand] = @[]
+  for _ in 0 ..< namedPoolCount:
+    var name: string
+    var units: uint32
+    if not r.readString(name): return false
+    if not r.readU32(units): return false
+    namedPools.add(NamedPoolDemand(name: name, units: units))
   resources = ResourceVector(
     cpu: MilliCpu(cpu),
     memory: Bytes(memory),
     hardMemoryLimit: Bytes(hardLimit),
     ioClass: IoClass(ioRaw),
-    processCount: processCount
+    processCount: processCount,
+    namedPools: namedPools
   )
   true
 
@@ -298,12 +312,19 @@ proc jsonEscape*(value: string): string =
   result.add('"')
 
 proc inspectionResourceJson*(resources: ResourceVector): string =
+  var namedPools = "["
+  for i, demand in resources.namedPools:
+    if i > 0:
+      namedPools.add(",")
+    namedPools.add("{\"name\":" & jsonEscape(demand.name) & ",\"units\":" & $demand.units & "}")
+  namedPools.add("]")
   "{" &
     "\"cpu_milli\":" & $resources.cpu.value & "," &
     "\"memory_bytes\":" & $resources.memory.value & "," &
     "\"hard_memory_limit_bytes\":" & $resources.hardMemoryLimit.value & "," &
     "\"io_class\":" & jsonEscape($resources.ioClass) & "," &
-    "\"process_count\":" & $resources.processCount &
+    "\"process_count\":" & $resources.processCount & "," &
+    "\"named_pools\":" & namedPools &
   "}"
 
 proc inspectionDiagnosticJson*(diagnostic: Diagnostic): string =

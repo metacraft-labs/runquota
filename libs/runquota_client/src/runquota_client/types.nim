@@ -1,3 +1,5 @@
+import std/tables
+
 import runquota_core
 import runquota_codec
 import runquota_ipc
@@ -13,6 +15,7 @@ type
     csClosed
 
   LeaseClientState* = enum
+    leaseClientQueued
     leaseClientGranted
     leaseClientStarting
     leaseClientRunning
@@ -28,6 +31,8 @@ type
     capabilities*: CapabilityRecord
     flow*: FlowControlLimits
     lastDiagnostic*: Diagnostic
+    responseBuffer*: Table[uint64, RqspFrame]
+    inflightRequestIds*: seq[uint64]
 
   RunQuotaSession* = object
     client*: ptr RunQuotaClient
@@ -40,6 +45,12 @@ type
     resources*: ResourceVector
     active*: bool
     state*: LeaseClientState
+
+  OfferedLease* = object
+    clientCandidateId*: uint64
+    lease*: RunQuotaLease
+    queued*: bool
+    diagnostic*: Diagnostic
 
   ResourceRequest* = object
     label*: string

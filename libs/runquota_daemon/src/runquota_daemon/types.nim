@@ -14,6 +14,7 @@ type
     dsStopping
 
   LeaseLifecycleState* = enum
+    leaseStateQueued
     leaseStateGranted
     leaseStateStarting
     leaseStateRunning
@@ -25,6 +26,8 @@ type
     daemonId*: uint64
     cpuSlots*: MilliCpu
     memoryBytes*: Bytes
+    ioSlots*: uint32
+    namedPoolCaps*: Table[string, uint32]
     version*: string
 
   SessionRow* = object
@@ -39,7 +42,11 @@ type
     id*: LeaseId
     sessionId*: SessionId
     label*: string
+    clientCandidateId*: uint64
     resources*: ResourceVector
+    priority*: PriorityClass
+    queueOrder*: uint64
+    delivered*: bool
     state*: LeaseLifecycleState
     supervisorProcessId*: uint64
     supervisorUserId*: uint64
@@ -61,6 +68,8 @@ type
     state*: DaemonState
     nextSessionId*: uint64
     nextLeaseId*: uint64
+    nextQueueOrder*: uint64
+    lastGrantedSessionId*: uint64
     totalGranted*: uint64
     totalFinished*: uint64
     sessions*: Table[uint64, SessionRow]

@@ -26,6 +26,11 @@ type
     rqLeaseRunningAck = 18
     rqLeaseFinished = 19
     rqLeaseFinishedAck = 20
+    rqOfferCandidates = 21
+    rqLeaseDecisionBatch = 22
+    rqGrantNext = 23
+    rqInspectionRequest = 24
+    rqInspectionResponse = 25
 
   MessageKind* = RqspMessageKind
 
@@ -87,6 +92,38 @@ type
     priority*: PriorityClass
     metadata*: DynamicMetadata
 
+  LeaseCandidate* = object
+    clientCandidateId*: uint64
+    label*: string
+    commandStatsId*: string
+    resources*: ResourceVector
+    deadline*: Deadline
+    priority*: PriorityClass
+    metadata*: DynamicMetadata
+
+  CandidateOfferMessage* = object
+    sessionId*: SessionId
+    candidates*: seq[LeaseCandidate]
+
+  LeaseDecisionKind* = enum
+    leaseDecisionQueued
+    leaseDecisionGranted
+    leaseDecisionDenied
+
+  LeaseDecision* = object
+    clientCandidateId*: uint64
+    leaseId*: LeaseId
+    kind*: LeaseDecisionKind
+    resources*: ResourceVector
+    diagnostic*: Diagnostic
+
+  LeaseDecisionBatchMessage* = object
+    sessionId*: SessionId
+    decisions*: seq[LeaseDecision]
+
+  GrantNextMessage* = object
+    sessionId*: SessionId
+
   LeaseGrantedMessage* = object
     sessionId*: SessionId
     leaseId*: LeaseId
@@ -146,6 +183,7 @@ type
   DaemonStatusMessage* = object
     activeSessions*: uint32
     activeLeases*: uint32
+    queuedLeases*: uint32
     supervisorLostLeases*: uint32
     finishedLeases*: uint32
     totalGranted*: uint64
@@ -153,6 +191,13 @@ type
 
   ProtocolErrorMessage* = object
     diagnostic*: Diagnostic
+
+  InspectionRequestMessage* = object
+    subject*: string
+    sessionId*: SessionId
+
+  InspectionResponseMessage* = object
+    json*: string
 
   CompatibilityResult* = object
     compatible*: bool
