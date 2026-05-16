@@ -1,4 +1,4 @@
-import std/[net, os]
+import std/[net, nativesockets, os]
 
 when defined(posix):
   import std/posix
@@ -69,6 +69,18 @@ proc acceptConnection*(listener: var LocalListener): LocalConnection =
   listener.socket.accept(client)
   LocalConnection(socket: client, endpoint: listener.endpoint)
 
+proc acceptNativeConnection*(listener: var LocalListener): AcceptedConnection =
+  let accepted = nativesockets.accept(listener.socket.getFd())
+  if accepted[0] == osInvalidSocket:
+    raiseOSError(osLastError())
+  AcceptedConnection(handle: accepted[0])
+
+proc localConnection*(accepted: AcceptedConnection): LocalConnection =
+  LocalConnection(
+    socket: newSocket(accepted.handle, AF_UNIX, SOCK_STREAM, IPPROTO_NONE),
+    endpoint: Endpoint(kind: endpointUnixSocket, path: "")
+  )
+
 proc peerIdentity*(connection: LocalConnection): PeerIdentity =
   when defined(macosx) or defined(freebsd) or defined(openbsd):
     var uid: Uid
@@ -106,6 +118,7 @@ proc peerIdentity*(connection: LocalConnection): PeerIdentity =
 proc close*(connection: var LocalConnection) =
   if connection.socket != nil:
     connection.socket.close()
+    connection.socket = nil
 
 proc close*(listener: var LocalListener) =
   if listener.socket != nil:

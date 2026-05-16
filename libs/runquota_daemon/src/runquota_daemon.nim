@@ -867,9 +867,9 @@ type
 
 var sharedDaemon: SharedDaemon
 
-proc handleSharedConnection(connection: LocalConnection) {.thread, gcsafe.} =
+proc handleSharedConnection(accepted: AcceptedConnection) {.thread, gcsafe.} =
   {.cast(gcsafe).}:
-    var localConnection = connection
+    var localConnection = accepted.localConnection()
     var context = ConnectionContext(
       supervisorProcessId: 0'u64,
       supervisorUserId: 0'u64,
@@ -916,12 +916,12 @@ proc serve*(config: DaemonConfig): int =
   sharedDaemon.daemon.state = dsServing
   echo "runquotad listening " & config.endpoint.path
   flushFile(stdout)
-  var threads: seq[Thread[LocalConnection]] = @[]
+  var threads: seq[Thread[AcceptedConnection]] = @[]
   try:
     while true:
-      var connection = listener.acceptConnection()
-      threads.add(default(Thread[LocalConnection]))
-      createThread(threads[^1], handleSharedConnection, connection)
+      let accepted = listener.acceptNativeConnection()
+      threads.add(default(Thread[AcceptedConnection]))
+      createThread(threads[^1], handleSharedConnection, accepted)
   finally:
     acquire(sharedDaemon.lock)
     try:

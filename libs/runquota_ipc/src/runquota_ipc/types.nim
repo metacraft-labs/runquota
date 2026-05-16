@@ -1,4 +1,4 @@
-import std/net
+import std/[net, nativesockets]
 
 type
   LibraryInfo* = object
@@ -22,6 +22,9 @@ type
     processId*: uint64
     userId*: uint64
     groupId*: uint64
+
+  AcceptedConnection* = object
+    handle*: SocketHandle
 
   LocalConnection* = object
     socket*: Socket
