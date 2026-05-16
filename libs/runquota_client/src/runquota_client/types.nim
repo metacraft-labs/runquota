@@ -12,6 +12,13 @@ type
     csConnected
     csClosed
 
+  LeaseClientState* = enum
+    leaseClientGranted
+    leaseClientStarting
+    leaseClientRunning
+    leaseClientFinished
+    leaseClientReleased
+
   RunQuotaClient* = object
     connection*: LocalConnection
     nextRequestId*: uint64
@@ -32,6 +39,7 @@ type
     id*: LeaseId
     resources*: ResourceVector
     active*: bool
+    state*: LeaseClientState
 
   ResourceRequest* = object
     label*: string

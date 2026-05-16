@@ -7,7 +7,7 @@ export protocolTypes
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 1'u16
-const RqspProtocolMinor* = 0'u16
+const RqspProtocolMinor* = 1'u16
 const RqspHeaderLen* = 24'u16
 const FrameFlagRequest* = 0x0001'u16
 const FrameFlagResponse* = 0x0002'u16
@@ -379,26 +379,169 @@ proc decodeLeaseReleased*(payload: string; msg: var LeaseReleasedMessage): bool 
   msg = LeaseReleasedMessage(sessionId: sessionId(sessionRaw), leaseId: leaseId(leaseRaw))
   true
 
+proc encodeLeaseStarting*(msg: LeaseStartingMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU64(msg.leaseId.value)
+  w.data
+
+proc decodeLeaseStarting*(payload: string; msg: var LeaseStartingMessage): bool =
+  var r = reader(payload)
+  var sessionRaw: uint64
+  var leaseRaw: uint64
+  if not r.readU64(sessionRaw): return false
+  if not r.readU64(leaseRaw): return false
+  if r.remaining != 0: return false
+  msg = LeaseStartingMessage(sessionId: sessionId(sessionRaw), leaseId: leaseId(leaseRaw))
+  true
+
+proc encodeLeaseStartingAck*(msg: LeaseStartingAckMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU64(msg.leaseId.value)
+  w.data
+
+proc decodeLeaseStartingAck*(payload: string; msg: var LeaseStartingAckMessage): bool =
+  var r = reader(payload)
+  var sessionRaw: uint64
+  var leaseRaw: uint64
+  if not r.readU64(sessionRaw): return false
+  if not r.readU64(leaseRaw): return false
+  if r.remaining != 0: return false
+  msg = LeaseStartingAckMessage(sessionId: sessionId(sessionRaw), leaseId: leaseId(leaseRaw))
+  true
+
+proc encodeLeaseRunning*(msg: LeaseRunningMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU64(msg.leaseId.value)
+  w.writeU64(msg.childProcessId)
+  w.writeU64(msg.processGroupId)
+  w.writeBool(msg.cleanupRegistered)
+  w.data
+
+proc decodeLeaseRunning*(payload: string; msg: var LeaseRunningMessage): bool =
+  var r = reader(payload)
+  var sessionRaw: uint64
+  var leaseRaw: uint64
+  var childProcessId: uint64
+  var processGroupId: uint64
+  var cleanupRegistered: bool
+  if not r.readU64(sessionRaw): return false
+  if not r.readU64(leaseRaw): return false
+  if not r.readU64(childProcessId): return false
+  if not r.readU64(processGroupId): return false
+  if not r.readBool(cleanupRegistered): return false
+  if r.remaining != 0: return false
+  msg = LeaseRunningMessage(
+    sessionId: sessionId(sessionRaw),
+    leaseId: leaseId(leaseRaw),
+    childProcessId: childProcessId,
+    processGroupId: processGroupId,
+    cleanupRegistered: cleanupRegistered
+  )
+  true
+
+proc encodeLeaseRunningAck*(msg: LeaseRunningAckMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU64(msg.leaseId.value)
+  w.data
+
+proc decodeLeaseRunningAck*(payload: string; msg: var LeaseRunningAckMessage): bool =
+  var r = reader(payload)
+  var sessionRaw: uint64
+  var leaseRaw: uint64
+  if not r.readU64(sessionRaw): return false
+  if not r.readU64(leaseRaw): return false
+  if r.remaining != 0: return false
+  msg = LeaseRunningAckMessage(sessionId: sessionId(sessionRaw), leaseId: leaseId(leaseRaw))
+  true
+
+proc encodeLeaseFinished*(msg: LeaseFinishedMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU64(msg.leaseId.value)
+  w.writeU32(uint32(ord(msg.outcome)))
+  w.writeU32(msg.exitCode)
+  w.writeU32(msg.signal)
+  w.writeDiagnostic(msg.diagnostic)
+  w.data
+
+proc decodeLeaseFinished*(payload: string; msg: var LeaseFinishedMessage): bool =
+  var r = reader(payload)
+  var sessionRaw: uint64
+  var leaseRaw: uint64
+  var outcomeRaw: uint32
+  var exitCode: uint32
+  var signal: uint32
+  var diagnostic: Diagnostic
+  if not r.readU64(sessionRaw): return false
+  if not r.readU64(leaseRaw): return false
+  if not r.readU32(outcomeRaw): return false
+  if outcomeRaw > uint32(ord(high(LeaseFinishOutcome))): return false
+  if not r.readU32(exitCode): return false
+  if not r.readU32(signal): return false
+  if not r.readDiagnostic(diagnostic): return false
+  if r.remaining != 0: return false
+  msg = LeaseFinishedMessage(
+    sessionId: sessionId(sessionRaw),
+    leaseId: leaseId(leaseRaw),
+    outcome: LeaseFinishOutcome(int(outcomeRaw)),
+    exitCode: exitCode,
+    signal: signal,
+    diagnostic: diagnostic
+  )
+  true
+
+proc encodeLeaseFinishedAck*(msg: LeaseFinishedAckMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU64(msg.leaseId.value)
+  w.data
+
+proc decodeLeaseFinishedAck*(payload: string; msg: var LeaseFinishedAckMessage): bool =
+  var r = reader(payload)
+  var sessionRaw: uint64
+  var leaseRaw: uint64
+  if not r.readU64(sessionRaw): return false
+  if not r.readU64(leaseRaw): return false
+  if r.remaining != 0: return false
+  msg = LeaseFinishedAckMessage(sessionId: sessionId(sessionRaw), leaseId: leaseId(leaseRaw))
+  true
+
 proc encodeStatus*(msg: DaemonStatusMessage): string =
   var w = writer()
   w.writeU32(msg.activeSessions)
   w.writeU32(msg.activeLeases)
+  w.writeU32(msg.supervisorLostLeases)
+  w.writeU32(msg.finishedLeases)
   w.writeU64(msg.totalGranted)
+  w.writeU64(msg.totalFinished)
   w.data
 
 proc decodeStatus*(payload: string; msg: var DaemonStatusMessage): bool =
   var r = reader(payload)
   var activeSessions: uint32
   var activeLeases: uint32
+  var supervisorLostLeases: uint32
+  var finishedLeases: uint32
   var totalGranted: uint64
+  var totalFinished: uint64
   if not r.readU32(activeSessions): return false
   if not r.readU32(activeLeases): return false
+  if not r.readU32(supervisorLostLeases): return false
+  if not r.readU32(finishedLeases): return false
   if not r.readU64(totalGranted): return false
+  if not r.readU64(totalFinished): return false
   if r.remaining != 0: return false
   msg = DaemonStatusMessage(
     activeSessions: activeSessions,
     activeLeases: activeLeases,
-    totalGranted: totalGranted
+    supervisorLostLeases: supervisorLostLeases,
+    finishedLeases: finishedLeases,
+    totalGranted: totalGranted,
+    totalFinished: totalFinished
   )
   true
 
@@ -419,5 +562,8 @@ proc inspectionStatusJson*(status: DaemonStatusMessage): string =
   "{" &
     "\"active_sessions\":" & $status.activeSessions & "," &
     "\"active_leases\":" & $status.activeLeases & "," &
-    "\"total_granted\":" & $status.totalGranted &
+    "\"supervisor_lost_leases\":" & $status.supervisorLostLeases & "," &
+    "\"finished_leases\":" & $status.finishedLeases & "," &
+    "\"total_granted\":" & $status.totalGranted & "," &
+    "\"total_finished\":" & $status.totalFinished &
   "}"

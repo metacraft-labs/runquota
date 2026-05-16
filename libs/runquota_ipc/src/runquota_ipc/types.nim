@@ -8,9 +8,20 @@ type
     endpointUnsupported
     endpointUnixSocket
 
+  PeerIdentityKind* = enum
+    peerIdentityUnavailable
+    peerIdentityUser
+    peerIdentityProcess
+
   Endpoint* = object
     kind*: EndpointKind
     path*: string
+
+  PeerIdentity* = object
+    kind*: PeerIdentityKind
+    processId*: uint64
+    userId*: uint64
+    groupId*: uint64
 
   LocalConnection* = object
     socket*: Socket

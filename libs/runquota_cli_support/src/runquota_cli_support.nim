@@ -43,7 +43,10 @@ proc printStatus(json: bool): int =
   else:
     echo "sessions: " & $status.activeSessions
     echo "leases: " & $status.activeLeases
+    echo "supervisor_lost_leases: " & $status.supervisorLostLeases
+    echo "finished_leases: " & $status.finishedLeases
     echo "total_granted: " & $status.totalGranted
+    echo "total_finished: " & $status.totalFinished
   0
 
 proc daemonProgramPath*(): string =

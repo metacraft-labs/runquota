@@ -158,7 +158,8 @@ proc requestLease*(session: var RunQuotaSession; request: ResourceRequest): RunQ
       session: addr session,
       id: granted.leaseId,
       resources: granted.resources,
-      active: true
+      active: true,
+      state: leaseClientGranted
     )
   of rqLeaseDenied:
     var denied: LeaseDeniedMessage
@@ -185,6 +186,67 @@ proc release*(lease: var RunQuotaLease) =
     lease.session[].client[].lastDiagnostic = diagnostic(diagProtocol, "invalid LeaseReleased payload")
     raise newException(RunQuotaClientError, lease.session[].client[].lastDiagnostic.message)
   lease.active = false
+  lease.state = leaseClientReleased
+
+proc markStarting*(lease: var RunQuotaLease) =
+  if not lease.active:
+    return
+  let msg = LeaseStartingMessage(sessionId: lease.session[].id, leaseId: lease.id)
+  let requestId = lease.session[].client[].requestFrame(rqLeaseStarting, encodeLeaseStarting(msg))
+  let frame = lease.session[].client[].readResponse(requestId)
+  if frame.header.messageKind != rqLeaseStartingAck:
+    lease.session[].client[].lastDiagnostic = diagnostic(diagProtocol, "daemon did not mark the lease starting")
+    raise newException(RunQuotaClientError, lease.session[].client[].lastDiagnostic.message)
+  var acknowledged: LeaseStartingAckMessage
+  if not decodeLeaseStartingAck(frame.payload, acknowledged) or acknowledged.leaseId.value != lease.id.value:
+    lease.session[].client[].lastDiagnostic = diagnostic(diagProtocol, "invalid LeaseStartingAck payload")
+    raise newException(RunQuotaClientError, lease.session[].client[].lastDiagnostic.message)
+  lease.state = leaseClientStarting
+
+proc markRunning*(lease: var RunQuotaLease; childProcessId = 0'u64;
+                  processGroupId = 0'u64; cleanupRegistered = false) =
+  if not lease.active:
+    return
+  let msg = LeaseRunningMessage(
+    sessionId: lease.session[].id,
+    leaseId: lease.id,
+    childProcessId: childProcessId,
+    processGroupId: processGroupId,
+    cleanupRegistered: cleanupRegistered
+  )
+  let requestId = lease.session[].client[].requestFrame(rqLeaseRunning, encodeLeaseRunning(msg))
+  let frame = lease.session[].client[].readResponse(requestId)
+  if frame.header.messageKind != rqLeaseRunningAck:
+    lease.session[].client[].lastDiagnostic = diagnostic(diagProtocol, "daemon did not mark the lease running")
+    raise newException(RunQuotaClientError, lease.session[].client[].lastDiagnostic.message)
+  var acknowledged: LeaseRunningAckMessage
+  if not decodeLeaseRunningAck(frame.payload, acknowledged) or acknowledged.leaseId.value != lease.id.value:
+    lease.session[].client[].lastDiagnostic = diagnostic(diagProtocol, "invalid LeaseRunningAck payload")
+    raise newException(RunQuotaClientError, lease.session[].client[].lastDiagnostic.message)
+  lease.state = leaseClientRunning
+
+proc finish*(lease: var RunQuotaLease; outcome = leaseFinishSucceeded;
+             exitCode = 0'u32; signal = 0'u32; finishDiagnostic = okDiagnostic()) =
+  if not lease.active:
+    return
+  let msg = LeaseFinishedMessage(
+    sessionId: lease.session[].id,
+    leaseId: lease.id,
+    outcome: outcome,
+    exitCode: exitCode,
+    signal: signal,
+    diagnostic: finishDiagnostic
+  )
+  let requestId = lease.session[].client[].requestFrame(rqLeaseFinished, encodeLeaseFinished(msg))
+  let frame = lease.session[].client[].readResponse(requestId)
+  if frame.header.messageKind != rqLeaseFinishedAck:
+    lease.session[].client[].lastDiagnostic = diagnostic(diagProtocol, "daemon did not record LeaseFinished")
+    raise newException(RunQuotaClientError, lease.session[].client[].lastDiagnostic.message)
+  var acknowledged: LeaseFinishedAckMessage
+  if not decodeLeaseFinishedAck(frame.payload, acknowledged) or acknowledged.leaseId.value != lease.id.value:
+    lease.session[].client[].lastDiagnostic = diagnostic(diagProtocol, "invalid LeaseFinishedAck payload")
+    raise newException(RunQuotaClientError, lease.session[].client[].lastDiagnostic.message)
+  lease.state = leaseClientFinished
 
 proc daemonStatus*(client: var RunQuotaClient): DaemonStatusMessage =
   let requestId = client.requestFrame(rqStatusRequest, "")

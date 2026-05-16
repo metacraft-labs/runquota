@@ -20,6 +20,12 @@ type
     rqStatusRequest = 12
     rqStatusResponse = 13
     rqError = 14
+    rqLeaseStarting = 15
+    rqLeaseStartingAck = 16
+    rqLeaseRunning = 17
+    rqLeaseRunningAck = 18
+    rqLeaseFinished = 19
+    rqLeaseFinishedAck = 20
 
   MessageKind* = RqspMessageKind
 
@@ -98,10 +104,52 @@ type
     sessionId*: SessionId
     leaseId*: LeaseId
 
+  LeaseStartingMessage* = object
+    sessionId*: SessionId
+    leaseId*: LeaseId
+
+  LeaseStartingAckMessage* = object
+    sessionId*: SessionId
+    leaseId*: LeaseId
+
+  LeaseRunningMessage* = object
+    sessionId*: SessionId
+    leaseId*: LeaseId
+    childProcessId*: uint64
+    processGroupId*: uint64
+    cleanupRegistered*: bool
+
+  LeaseRunningAckMessage* = object
+    sessionId*: SessionId
+    leaseId*: LeaseId
+
+  LeaseFinishOutcome* = enum
+    leaseFinishSucceeded
+    leaseFinishFailed
+    leaseFinishCrashed
+    leaseFinishResourceLimit
+    leaseFinishCancelled
+    leaseFinishLaunchFailed
+
+  LeaseFinishedMessage* = object
+    sessionId*: SessionId
+    leaseId*: LeaseId
+    outcome*: LeaseFinishOutcome
+    exitCode*: uint32
+    signal*: uint32
+    diagnostic*: Diagnostic
+
+  LeaseFinishedAckMessage* = object
+    sessionId*: SessionId
+    leaseId*: LeaseId
+
   DaemonStatusMessage* = object
     activeSessions*: uint32
     activeLeases*: uint32
+    supervisorLostLeases*: uint32
+    finishedLeases*: uint32
     totalGranted*: uint64
+    totalFinished*: uint64
 
   ProtocolErrorMessage* = object
     diagnostic*: Diagnostic

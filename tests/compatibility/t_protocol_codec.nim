@@ -50,3 +50,45 @@ suite "RQSP protocol and codec":
     ))
     check not result.compatible
     check result.diagnostic.code == diagUnsupportedVersion
+
+  test "lease lifecycle messages keep child completion explicit":
+    let running = LeaseRunningMessage(
+      sessionId: sessionId(1),
+      leaseId: leaseId(2),
+      childProcessId: 123'u64,
+      processGroupId: 456'u64,
+      cleanupRegistered: false
+    )
+    var decodedRunning: LeaseRunningMessage
+    check decodeLeaseRunning(encodeLeaseRunning(running), decodedRunning)
+    check decodedRunning.leaseId.value == 2'u64
+    check decodedRunning.childProcessId == 123'u64
+
+    let finished = LeaseFinishedMessage(
+      sessionId: sessionId(1),
+      leaseId: leaseId(2),
+      outcome: leaseFinishCrashed,
+      exitCode: 0'u32,
+      signal: 11'u32,
+      diagnostic: diagnostic(diagCancelled, "child crashed")
+    )
+    var decodedFinished: LeaseFinishedMessage
+    check decodeLeaseFinished(encodeLeaseFinished(finished), decodedFinished)
+    check decodedFinished.outcome == leaseFinishCrashed
+    check decodedFinished.signal == 11'u32
+
+  test "status reports supervisor-lost and finished leases separately":
+    let status = DaemonStatusMessage(
+      activeSessions: 0'u32,
+      activeLeases: 1'u32,
+      supervisorLostLeases: 1'u32,
+      finishedLeases: 0'u32,
+      totalGranted: 3'u64,
+      totalFinished: 0'u64
+    )
+    var decoded: DaemonStatusMessage
+    check decodeStatus(encodeStatus(status), decoded)
+    check decoded.supervisorLostLeases == 1'u32
+    check decoded.finishedLeases == 0'u32
+    check inspectionStatusJson(decoded) ==
+      "{\"active_sessions\":0,\"active_leases\":1,\"supervisor_lost_leases\":1,\"finished_leases\":0,\"total_granted\":3,\"total_finished\":0}"

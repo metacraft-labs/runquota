@@ -58,7 +58,10 @@ suite "e2e_runquota_single_client_lease":
       statusClient.close()
       check status.activeSessions == 0'u32
       check status.activeLeases == 0'u32
+      check status.supervisorLostLeases == 0'u32
+      check status.finishedLeases == 0'u32
       check status.totalGranted == 1'u64
+      check status.totalFinished == 0'u64
     finally:
       if process.running:
         process.terminate()

@@ -2,6 +2,17 @@ import std/[net, os]
 
 when defined(posix):
   import std/posix
+  when defined(macosx) or defined(freebsd) or defined(openbsd):
+    proc getpeereid(socket: SocketHandle; euid: ptr Uid; egid: ptr Gid): cint {.
+      importc, header: "<unistd.h>".}
+  when defined(linux):
+    type
+      LinuxPeerCred {.importc: "struct ucred", header: "<sys/socket.h>", bycopy.} = object
+        pid {.importc: "pid".}: Pid
+        uid {.importc: "uid".}: Uid
+        gid {.importc: "gid".}: Gid
+
+    const SoPeerCred = cint(17)
 
 import runquota_ipc/types as ipcTypes
 import runquota_protocol
@@ -56,6 +67,40 @@ proc acceptConnection*(listener: var LocalListener): LocalConnection =
   var client: owned(Socket)
   listener.socket.accept(client)
   LocalConnection(socket: client, endpoint: listener.endpoint)
+
+proc peerIdentity*(connection: LocalConnection): PeerIdentity =
+  when defined(macosx) or defined(freebsd) or defined(openbsd):
+    var uid: Uid
+    var gid: Gid
+    if getpeereid(connection.socket.getFd(), addr uid, addr gid) == 0:
+      return PeerIdentity(
+        kind: peerIdentityUser,
+        processId: 0'u64,
+        userId: uint64(uid),
+        groupId: uint64(gid)
+      )
+  elif defined(linux):
+    var credentials: LinuxPeerCred
+    var credentialsLen = SockLen(sizeof(credentials))
+    if getsockopt(
+      connection.socket.getFd(),
+      SOL_SOCKET,
+      SoPeerCred,
+      addr credentials,
+      addr credentialsLen
+    ) == 0:
+      return PeerIdentity(
+        kind: peerIdentityProcess,
+        processId: uint64(credentials.pid),
+        userId: uint64(credentials.uid),
+        groupId: uint64(credentials.gid)
+      )
+  PeerIdentity(
+    kind: peerIdentityUnavailable,
+    processId: 0'u64,
+    userId: 0'u64,
+    groupId: 0'u64
+  )
 
 proc close*(connection: var LocalConnection) =
   if connection.socket != nil:
