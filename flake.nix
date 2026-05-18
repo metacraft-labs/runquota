@@ -25,6 +25,15 @@
       perSystem =
         { pkgs, system, ... }:
         let
+          version =
+            let
+              versionMatches = builtins.filter (match: match != null) (
+                map (line: builtins.match ''version = "([^"]+)"'' line) (
+                  pkgs.lib.splitString "\n" (builtins.readFile ./runquota.nimble)
+                )
+              );
+            in
+            builtins.elemAt (builtins.head versionMatches) 0;
           pre-commit-check = git-hooks.lib.${system}.run {
             src = ./.;
             hooks.just-lint = {
@@ -35,41 +44,78 @@
               pass_filenames = false;
             };
           };
-        in
-        {
-          packages.default = pkgs.stdenv.mkDerivation {
+          runquota = pkgs.stdenv.mkDerivation {
             pname = "runquota";
-            version = "0.1.0";
+            inherit version;
             src = ./.;
+
+            strictDeps = true;
+            dontConfigure = true;
+
             nativeBuildInputs = [
               pkgs.just
               pkgs.nim2
             ];
-            buildPhase = "just build";
-            doCheck = true;
-            checkPhase = "just test";
-            installPhase = ''
-              mkdir -p $out/bin
-              cp build/bin/* $out/bin/
+
+            buildPhase = ''
+              runHook preBuild
+              just build
+              runHook postBuild
             '';
+
+            installPhase = ''
+              runHook preInstall
+              mkdir -p "$out/bin"
+              install -m755 build/bin/runquota "$out/bin/runquota"
+              install -m755 build/bin/runquotad "$out/bin/runquotad"
+              runHook postInstall
+            '';
+
+            meta = {
+              description = "Local resource lease coordinator for concurrent process trees";
+              homepage = "https://github.com/metacraft-labs/runquota";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "runquota";
+              platforms = [
+                "x86_64-linux"
+                "aarch64-linux"
+                "x86_64-darwin"
+                "aarch64-darwin"
+              ];
+            };
           };
+        in
+        {
+          packages.default = runquota;
+          packages.runquota = runquota;
 
           checks = {
             inherit pre-commit-check;
-            repo-requirements = pkgs.runCommand "runquota-repo-requirements" { } ''
-              cp -R ${./.} source
-              chmod -R u+w source
-              cd source
-              ${pkgs.bash}/bin/bash scripts/check_repo_requirements.sh
-              mkdir -p $out
-            '';
-            static-helpers = pkgs.runCommand "runquota-static-helpers" { nativeBuildInputs = [ pkgs.nim2 ]; } ''
-              cp -R ${./.} source
-              chmod -R u+w source
-              cd source
-              ${pkgs.bash}/bin/bash scripts/check_static_helpers.sh
-              mkdir -p $out
-            '';
+            package-build = runquota;
+            repo-requirements =
+              pkgs.runCommand "runquota-repo-requirements" { nativeBuildInputs = [ pkgs.just ]; }
+                ''
+                  cp -R ${./.} source
+                  chmod -R u+w source
+                  cd source
+                  ${pkgs.bash}/bin/bash scripts/check_repo_requirements.sh
+                  mkdir -p $out
+                '';
+            static-helpers =
+              pkgs.runCommand "runquota-static-helpers"
+                {
+                  nativeBuildInputs = [
+                    pkgs.nim2
+                    pkgs.stdenv.cc
+                  ];
+                }
+                ''
+                  cp -R ${./.} source
+                  chmod -R u+w source
+                  cd source
+                  ${pkgs.bash}/bin/bash scripts/check_static_helpers.sh
+                  mkdir -p $out
+                '';
           };
 
           devShells.default = pkgs.mkShell {
