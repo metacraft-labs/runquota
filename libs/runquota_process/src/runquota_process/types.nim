@@ -56,3 +56,9 @@ type
     cancelSent*: bool
     info*: LaunchResult
     completion*: ProcessCompletion
+    # Windows: extra slots store the osproc Process pointer and the Job Object
+    # handle so the rest of the lifecycle (wait/terminate/close) can find them.
+    # The fields are present on all platforms (kept simple to avoid case-object
+    # constructor noise) but only populated on Windows.
+    winProcessPtr*: pointer
+    winJobHandle*: uint64

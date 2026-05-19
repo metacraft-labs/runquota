@@ -362,10 +362,14 @@ proc handleHello(daemon: RunQuotaDaemon; connection: var LocalConnection;
   let platformName =
     when defined(macosx): "macos"
     elif defined(linux): "linux"
+    elif defined(windows): "windows"  # Windows: spec-canonical platform name.
     else: "posix"
+  let transportName =
+    when defined(windows): "named-pipe"  # Windows: see RunQuota protocol spec.
+    else: "unix-socket"
   let caps = defaultCapabilities(
     platformName,
-    "unix-socket",
+    transportName,
     daemon.config.cpuSlots,
     daemon.config.memoryBytes
   )

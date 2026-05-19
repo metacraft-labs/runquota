@@ -3,6 +3,13 @@ import std/[envvars, os, strutils, times]
 when defined(posix):
   import std/posix
 
+when defined(windows):
+  # Windows: spawn child processes via std/osproc and assign them to a Job
+  # Object so the whole tree can be tracked and (optionally) killed atomically.
+  # The Job Object also gives us cheap accounting (CPU/IO/process count).
+  import std/[osproc, streams, strtabs]
+  import std/winlean
+
 import runquota_core
 import runquota_host_macos
 import runquota_process/types as processTypes
@@ -14,6 +21,122 @@ const DefaultOutputLimit* = 1_048_576
 
 when defined(posix):
   proc childExit(status: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
+
+when defined(windows):
+  # Windows: lightweight Job Object accounting wrappers. We pull in only the
+  # symbols we use rather than depend on a Job Objects helper module that does
+  # not exist in stdlib.
+  type
+    JobBasicLimitW = object
+      PerProcessUserTimeLimit: int64
+      PerJobUserTimeLimit: int64
+      LimitFlags: int32
+      MinimumWorkingSetSize: uint
+      MaximumWorkingSetSize: uint
+      ActiveProcessLimit: int32
+      Affinity: uint
+      PriorityClass: int32
+      SchedulingClass: int32
+
+    IoCountersW = object
+      ReadOperationCount: uint64
+      WriteOperationCount: uint64
+      OtherOperationCount: uint64
+      ReadTransferCount: uint64
+      WriteTransferCount: uint64
+      OtherTransferCount: uint64
+
+    JobExtendedLimitW = object
+      BasicLimitInformation: JobBasicLimitW
+      IoInfo: IoCountersW
+      ProcessMemoryLimit: uint
+      JobMemoryLimit: uint
+      PeakProcessMemoryUsed: uint
+      PeakJobMemoryUsed: uint
+
+    JobBasicAccountingW = object
+      TotalUserTime: int64
+      TotalKernelTime: int64
+      ThisPeriodTotalUserTime: int64
+      ThisPeriodTotalKernelTime: int64
+      TotalPageFaultCount: int32
+      TotalProcesses: int32
+      ActiveProcesses: int32
+      TotalTerminatedProcesses: int32
+
+    JobBasicAndIoAccountingW = object
+      BasicInfo: JobBasicAccountingW
+      IoInfo: IoCountersW
+
+  const
+    # Windows: JobObjectExtendedLimitInformation = 9,
+    # JobObjectBasicAndIoAccountingInformation = 8.
+    JobObjectExtendedLimitInformation = 9'i32
+    JobObjectBasicAndIoAccountingInformation = 8'i32
+    # Windows: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000 so when the daemon
+    # drops its handle the child tree is reaped automatically. We don't set
+    # JOB_OBJECT_LIMIT_BREAKAWAY_OK; child processes inherit job membership.
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000'i32
+
+  proc createJobObjectW(
+    lpJobAttributes: pointer, lpName: WideCString
+  ): Handle {.stdcall, dynlib: "kernel32.dll", importc: "CreateJobObjectW".}
+
+  proc assignProcessToJobObject(
+    hJob: Handle, hProcess: Handle
+  ): WINBOOL {.stdcall, dynlib: "kernel32.dll", importc: "AssignProcessToJobObject".}
+
+  proc setInformationJobObject(
+    hJob: Handle, JobObjectInformationClass: int32,
+    lpJobObjectInformation: pointer, cbJobObjectInformationLength: int32
+  ): WINBOOL {.stdcall, dynlib: "kernel32.dll", importc: "SetInformationJobObject".}
+
+  proc queryInformationJobObject(
+    hJob: Handle, JobObjectInformationClass: int32,
+    lpJobObjectInformation: pointer, cbJobObjectInformationLength: int32,
+    lpReturnLength: ptr int32
+  ): WINBOOL {.stdcall, dynlib: "kernel32.dll", importc: "QueryInformationJobObject".}
+
+  proc terminateJobObject(
+    hJob: Handle, uExitCode: uint32
+  ): WINBOOL {.stdcall, dynlib: "kernel32.dll", importc: "TerminateJobObject".}
+
+  # Windows: stdlib's std/osproc exposes Process.fProcessHandle and .id but on
+  # different versions/branches the field names move. Pull them out via a tiny
+  # accessor module so the only place that names them is here.
+  proc winProcessHandle(p: Process): Handle =
+    # Windows: std/osproc stores the handle in `p.fProcessHandle` on Windows.
+    when compiles(p.fProcessHandle):
+      Handle(p.fProcessHandle)
+    else:
+      Handle(0)
+
+  proc applyKillOnJobClose(job: Handle) =
+    var info: JobExtendedLimitW
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    discard setInformationJobObject(
+      job,
+      JobObjectExtendedLimitInformation,
+      addr info,
+      int32(sizeof(JobExtendedLimitW))
+    )
+
+  proc readJobAccounting(job: Handle; cpuMicros: var uint64;
+                         processCount: var uint32) =
+    var info: JobBasicAndIoAccountingW
+    var ret: int32 = 0
+    if queryInformationJobObject(
+      job,
+      JobObjectBasicAndIoAccountingInformation,
+      addr info,
+      int32(sizeof(JobBasicAndIoAccountingW)),
+      addr ret) != 0:
+      # Windows: TotalUserTime + TotalKernelTime are 100ns ticks. Divide by 10
+      # to get microseconds.
+      let totalTicks = info.BasicInfo.TotalUserTime + info.BasicInfo.TotalKernelTime
+      if totalTicks > 0:
+        cpuMicros = uint64(totalTicks div 10)
+      processCount = uint32(max(int32(0), info.BasicInfo.TotalProcesses))
 
 proc libraryInfo*(): processTypes.LibraryInfo =
   processTypes.LibraryInfo(name: libraryName)
@@ -27,6 +150,19 @@ proc backendProfile*(): ProcessBackendProfile =
       completionWait: "waitpid-wnohang",
       cancellation: "process-group-sigterm",
       telemetry: "macos-ps-when-available",
+      directArgv: true,
+      implicitShell: false
+    )
+  elif defined(windows):
+    # Windows: each lease's child tree runs in a Job Object so cancellation
+    # and accounting are scoped to the tree, not the leader process alone.
+    ProcessBackendProfile(
+      name: "windows-osproc-jobobject",
+      launchPrimitive: "CreateProcess+AssignProcessToJobObject",
+      outputCapture: "osproc-pipes",
+      completionWait: "waitForExit",
+      cancellation: "TerminateJobObject",
+      telemetry: "job-object-accounting",
       directArgv: true,
       implicitShell: false
     )
@@ -138,6 +274,67 @@ when defined(posix):
         result.signaled = true
         result.signal = int(WTERMSIG(status))
 
+when defined(windows):
+  # Windows: build a flat KEY=VALUE list from inherited + override env so
+  # std/osproc can apply it via the `env` table parameter.
+  proc windowsChildEnv(spec: CommandSpec): StringTableRef =
+    # Windows: start from the current process env, then layer overrides.
+    when compiles(newStringTable()):
+      result = newStringTable()
+    for k, v in envPairs():
+      result[k] = v
+    for entry in spec.env:
+      let eq = entry.find('=')
+      if eq <= 0:
+        continue
+      result[entry[0 ..< eq]] = entry[eq + 1 .. ^1]
+
+  proc launchWindowsProcess(spec: CommandSpec): LaunchedProcess =
+    if spec.argv.len == 0:
+      raise newException(ValueError, "empty argv")
+    let cwd = if spec.cwd.len > 0: spec.cwd else: getCurrentDir()
+    let args =
+      if spec.argv.len > 1: spec.argv[1 .. ^1]
+      else: @[]
+    # Windows: poEvalCommand + poUsePath were tried in earlier prototypes but
+    # cause quoting headaches; pass argv directly and let osproc CreateProcess
+    # for us.
+    var process = startProcess(
+      spec.argv[0],
+      workingDir = cwd,
+      args = args,
+      env = windowsChildEnv(spec),
+      options = {poStdErrToStdOut, poUsePath}
+    )
+    let processHandle = winProcessHandle(process)
+    let job = createJobObjectW(nil, nil)
+    if job != 0:
+      # Windows: best-effort assignment. The child has already started; if it
+      # was launched without CREATE_SUSPENDED it may have spawned a grandchild
+      # before we get here. We accept this race for now.
+      discard assignProcessToJobObject(job, processHandle)
+      applyKillOnJobClose(job)
+    let processId = uint64(process.processID)
+    result = LaunchedProcess(
+      pid: int(processId),
+      processGroupId: int(processId),
+      stdoutFd: -1,
+      stderrFd: -1,
+      stdoutLimit: spec.stdoutLimit,
+      stderrLimit: spec.stderrLimit,
+      startedSeconds: epochTime(),
+      runningFlag: true,
+      cancelSent: false,
+      info: LaunchResult(
+        processId: processId,
+        processGroupId: processId,
+        running: true,
+        backend: backendProfile()
+      ),
+      winProcessPtr: cast[pointer](process),
+      winJobHandle: uint64(job)
+    )
+
 proc launchProcess*(spec: CommandSpec): LaunchedProcess =
   when defined(posix):
     if spec.argv.len == 0:
@@ -199,6 +396,9 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         backend: backendProfile()
       )
     )
+  elif defined(windows):
+    # Windows: delegate to the Job-Object-aware launcher above.
+    launchWindowsProcess(spec)
   else:
     raise newException(OSError, "runquota_process is only implemented on POSIX")
 
@@ -214,6 +414,11 @@ proc running*(child: LaunchedProcess): bool =
       return false
     var status: cint
     waitpid(Pid(child.pid), status, WNOHANG) == 0
+  elif defined(windows):
+    if not child.runningFlag or child.winProcessPtr.isNil:
+      return false
+    let process = cast[Process](child.winProcessPtr)
+    process.running()
   else:
     false
 
@@ -224,6 +429,16 @@ proc terminate*(child: var LaunchedProcess) =
       discard kill(Pid(-child.processGroupId), SIGTERM)
     elif child.pid > 0:
       discard kill(Pid(child.pid), SIGTERM)
+  elif defined(windows):
+    # Windows: terminate the whole tree by terminating its Job Object. If the
+    # job handle is missing (assignment failed), fall back to terminating the
+    # primary process via osproc.
+    child.cancelSent = true
+    if child.winJobHandle != 0:
+      discard terminateJobObject(Handle(child.winJobHandle), 1'u32)
+    elif not child.winProcessPtr.isNil:
+      let process = cast[Process](child.winProcessPtr)
+      try: process.terminate() except CatchableError: discard
 
 proc killNow*(child: var LaunchedProcess) =
   when defined(posix):
@@ -232,6 +447,15 @@ proc killNow*(child: var LaunchedProcess) =
       discard kill(Pid(-child.processGroupId), SIGKILL)
     elif child.pid > 0:
       discard kill(Pid(child.pid), SIGKILL)
+  elif defined(windows):
+    # Windows: hard-kill via Job Object termination (same effect as terminate
+    # since TerminateJobObject is unconditional).
+    child.cancelSent = true
+    if child.winJobHandle != 0:
+      discard terminateJobObject(Handle(child.winJobHandle), 1'u32)
+    elif not child.winProcessPtr.isNil:
+      let process = cast[Process](child.winProcessPtr)
+      try: process.kill() except CatchableError: discard
 
 proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessCompletion =
   when defined(posix):
@@ -323,6 +547,77 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
     if result.processCount == 0 and not result.timedOut:
       result.processCount = 1
     child.completion = result
+  elif defined(windows):
+    # Windows: stream stdout (merged stderr via poStdErrToStdOut) into a
+    # bounded buffer while polling for exit, then collect Job Object
+    # accounting. We re-use osproc's Process.outputStream for capture.
+    if child.winProcessPtr.isNil:
+      raise newException(OSError, "runquota_process: missing Windows process handle")
+    let process = cast[Process](child.winProcessPtr)
+    var stdoutText = ""
+    var stdoutBytes = 0'u64
+    var timedOut = false
+    var exitCode = -1
+    let outputStream = process.outputStream
+    var buffer = newString(8192)
+    while true:
+      if outputStream != nil and not outputStream.atEnd:
+        let n = outputStream.readData(addr buffer[0], buffer.len)
+        if n > 0:
+          stdoutBytes += uint64(n)
+          if child.stdoutLimit <= 0 or stdoutText.len < child.stdoutLimit:
+            let take =
+              if child.stdoutLimit <= 0: n
+              else: min(n, child.stdoutLimit - stdoutText.len)
+            if take > 0:
+              let oldLen = stdoutText.len
+              stdoutText.setLen(oldLen + take)
+              copyMem(addr stdoutText[oldLen], addr buffer[0], take)
+          continue
+      if not process.running():
+        # Windows: drain any remaining buffered bytes after exit detection.
+        if outputStream != nil and not outputStream.atEnd:
+          continue
+        try:
+          exitCode = process.peekExitCode()
+        except CatchableError:
+          exitCode = -1
+        break
+      let elapsed = int((epochTime() - child.startedSeconds) * 1000.0)
+      if timeout >= 0 and elapsed >= timeout:
+        timedOut = true
+        child.terminate()
+        try: discard process.waitForExit(timeout = 0)
+        except CatchableError: discard
+        break
+      sleep(10)
+    let elapsedMillis = uint64(max(0, int((epochTime() - child.startedSeconds) * 1000.0)))
+    var cpuMicros = 0'u64
+    var processCount = 0'u32
+    if child.winJobHandle != 0:
+      readJobAccounting(Handle(child.winJobHandle), cpuMicros, processCount)
+    if processCount == 0 and not timedOut:
+      processCount = 1
+    child.runningFlag = false
+    result = ProcessCompletion(
+      processId: uint64(child.pid),
+      processGroupId: uint64(child.processGroupId),
+      exitCode: exitCode,
+      signal: 0,
+      exited: exitCode >= 0 and not timedOut,
+      signaled: false,
+      cancelled: child.cancelSent,
+      timedOut: timedOut,
+      stdout: stdoutText,
+      stderr: "",
+      stdoutBytes: stdoutBytes,
+      stderrBytes: 0'u64,
+      elapsedMillis: elapsedMillis,
+      peakResidentMemoryBytes: 0'u64,
+      processCount: processCount,
+      telemetrySource: backendProfile().telemetry
+    )
+    child.completion = result
   else:
     raise newException(OSError, "runquota_process is only implemented on POSIX")
 
@@ -343,3 +638,14 @@ proc close*(child: var LaunchedProcess) =
   when defined(posix):
     closeFd(child.stdoutFd)
     closeFd(child.stderrFd)
+  elif defined(windows):
+    # Windows: release osproc resources and let the Job Object close. With
+    # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set, closing the last handle reaps
+    # any straggler processes in the tree.
+    if not child.winProcessPtr.isNil:
+      let process = cast[Process](child.winProcessPtr)
+      try: process.close() except CatchableError: discard
+      child.winProcessPtr = nil
+    if child.winJobHandle != 0:
+      discard closeHandle(Handle(child.winJobHandle))
+      child.winJobHandle = 0
