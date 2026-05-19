@@ -51,6 +51,15 @@ proc printStatus(json: bool): int =
     echo "finished_leases: " & $status.finishedLeases
     echo "total_granted: " & $status.totalGranted
     echo "total_finished: " & $status.totalFinished
+    # Windows: surface memory-pressure capability + current sample so operators
+    # can see whether the host backend is wired in. Identical text on every
+    # platform; the value differs based on which backend signed off on it.
+    echo "memory_pressure_available: " & $client.capabilities.memoryPressureAvailable
+    echo "memory_pressure_required: " & $client.capabilities.memoryPressureRequired
+    try:
+      echo "memory_pressure: " & client.inspectionJson("pressure")
+    except CatchableError:
+      discard
   0
 
 proc printInspection(subject: string; sessionId = sessionId(0)): int =

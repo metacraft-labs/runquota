@@ -5,6 +5,11 @@ import runquota_codec
 import runquota_core
 import runquota_host
 import runquota_host_macos
+when defined(windows):
+  # Windows: pull in the Windows host backend so configuredPressureSample()
+  # below can route to GlobalMemoryStatusEx instead of the macOS stub (which
+  # always returns "unavailable" off-macOS).
+  import runquota_host_windows
 import runquota_ipc
 import runquota_persistence
 import runquota_protocol
@@ -152,7 +157,11 @@ proc possible(daemon: RunQuotaDaemon; resources: ResourceVector; reason: var str
 proc configuredPressureSample(daemon: RunQuotaDaemon): HostMemoryPressureSample =
   case daemon.config.pressureSource
   of pressureSourceHost:
-    sampleMacosMemoryPressure(daemon.config.pressureRequired)
+    when defined(windows):
+      # Windows: route host pressure through GlobalMemoryStatusEx-backed sampler.
+      sampleWindowsMemoryPressure(daemon.config.pressureRequired)
+    else:
+      sampleMacosMemoryPressure(daemon.config.pressureRequired)
   of pressureSourceUnavailable:
     unavailablePressureSample("configured-unavailable", daemon.config.pressureRequired)
   of pressureSourceDeterministicFile:
@@ -296,6 +305,8 @@ proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
       "\"command_stats_id\":" & jsonEscape(lease.commandStatsId) & "," &
       "\"state\":" & jsonEscape(lease.state.stateName) & "," &
       "\"resources\":" & inspectionResourceJson(lease.resources) & "," &
+      "\"peak_memory_bytes\":" & $lease.peakMemoryBytes & "," &
+      "\"process_count\":" & $lease.processCount & "," &
       "\"diagnostic\":{\"code\":" & jsonEscape($lease.queueDiagnostic.code) &
         ",\"message\":" & jsonEscape(lease.queueDiagnostic.message) &
         ",\"detail\":" & jsonEscape(lease.queueDiagnostic.detail) & "}" &

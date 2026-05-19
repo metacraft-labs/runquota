@@ -12,6 +12,10 @@ when defined(windows):
 
 import runquota_core
 import runquota_host_macos
+when defined(windows):
+  # Windows: per-lease RSS telemetry comes from the Windows host backend so
+  # waitForCompletion can record peakResidentMemoryBytes on the ProcessCompletion.
+  import runquota_host_windows
 import runquota_process/types as processTypes
 
 export processTypes
@@ -560,10 +564,31 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
     var exitCode = -1
     let outputStream = process.outputStream
     var buffer = newString(8192)
+    # Windows: track the peak RSS observed over the lifetime of the tree by
+    # sampling Toolhelp32 each poll iteration. We can't read RSS post-exit so
+    # the running loop must record it before the process drops out. We avoid
+    # blocking on outputStream.readData (which would stall RSS polling while
+    # the child is silent) and instead peek the pipe each iteration.
+    var peakResidentBytes = 0'u64
+    var observedProcessCount = 0'u32
+    var telemetrySource = backendProfile().telemetry
     while true:
-      if outputStream != nil and not outputStream.atEnd:
+      # Windows: sample the live tree first so even very short-lived children
+      # get at least one snapshot before they exit.
+      let sample = sampleWindowsProcessTreeTelemetry(uint64(child.pid))
+      telemetrySource = sample.source
+      if sample.diagnostic.code == diagOk:
+        if sample.residentMemoryBytes > peakResidentBytes:
+          peakResidentBytes = sample.residentMemoryBytes
+        if sample.processCount > observedProcessCount:
+          observedProcessCount = sample.processCount
+      # Windows: drain stdout only when there's data ready (PeekNamedPipe),
+      # so an idle child doesn't stall the RSS poller.
+      var pulled = false
+      if outputStream != nil and process.hasData():
         let n = outputStream.readData(addr buffer[0], buffer.len)
         if n > 0:
+          pulled = true
           stdoutBytes += uint64(n)
           if child.stdoutLimit <= 0 or stdoutText.len < child.stdoutLimit:
             let take =
@@ -573,11 +598,21 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
               let oldLen = stdoutText.len
               stdoutText.setLen(oldLen + take)
               copyMem(addr stdoutText[oldLen], addr buffer[0], take)
-          continue
       if not process.running():
-        # Windows: drain any remaining buffered bytes after exit detection.
-        if outputStream != nil and not outputStream.atEnd:
-          continue
+        # Windows: process has exited; drain anything still buffered in the
+        # pipe before breaking out.
+        while outputStream != nil and process.hasData():
+          let n = outputStream.readData(addr buffer[0], buffer.len)
+          if n <= 0: break
+          stdoutBytes += uint64(n)
+          if child.stdoutLimit <= 0 or stdoutText.len < child.stdoutLimit:
+            let take =
+              if child.stdoutLimit <= 0: n
+              else: min(n, child.stdoutLimit - stdoutText.len)
+            if take > 0:
+              let oldLen = stdoutText.len
+              stdoutText.setLen(oldLen + take)
+              copyMem(addr stdoutText[oldLen], addr buffer[0], take)
         try:
           exitCode = process.peekExitCode()
         except CatchableError:
@@ -590,12 +625,17 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
         try: discard process.waitForExit(timeout = 0)
         except CatchableError: discard
         break
-      sleep(10)
+      if not pulled:
+        # Windows: short sleep so we don't burn a core polling.
+        sleep(10)
     let elapsedMillis = uint64(max(0, int((epochTime() - child.startedSeconds) * 1000.0)))
     var cpuMicros = 0'u64
-    var processCount = 0'u32
+    var jobProcessCount = 0'u32
     if child.winJobHandle != 0:
-      readJobAccounting(Handle(child.winJobHandle), cpuMicros, processCount)
+      readJobAccounting(Handle(child.winJobHandle), cpuMicros, jobProcessCount)
+    # Windows: prefer the Job Object's TotalProcesses (counts every process the
+    # tree ever spawned, even short-lived ones) over the live toolhelp32 count.
+    var processCount = max(jobProcessCount, observedProcessCount)
     if processCount == 0 and not timedOut:
       processCount = 1
     child.runningFlag = false
@@ -613,9 +653,9 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
       stdoutBytes: stdoutBytes,
       stderrBytes: 0'u64,
       elapsedMillis: elapsedMillis,
-      peakResidentMemoryBytes: 0'u64,
+      peakResidentMemoryBytes: peakResidentBytes,
       processCount: processCount,
-      telemetrySource: backendProfile().telemetry
+      telemetrySource: telemetrySource
     )
     child.completion = result
   else:
