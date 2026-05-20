@@ -393,6 +393,14 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       startedSeconds: epochTime(),
       runningFlag: true,
       cancelSent: false,
+      doneFlag: false,
+      waitStatus: 0,
+      stdoutBytes: 0'u64,
+      stderrBytes: 0'u64,
+      peakResidentMemoryBytes: 0'u64,
+      processCount: 0'u32,
+      telemetrySource: backendProfile().telemetry,
+      lastTelemetrySampleSeconds: 0.0,
       info: LaunchResult(
         processId: uint64(pid),
         processGroupId: uint64(max(pgid, 0)),
@@ -416,8 +424,15 @@ proc running*(child: LaunchedProcess): bool =
   when defined(posix):
     if not child.runningFlag:
       return false
-    var status: cint
-    waitpid(Pid(child.pid), status, WNOHANG) == 0
+    if child.completion.exited or child.completion.signaled or
+        child.completion.timedOut:
+      return false
+    # This predicate must not reap the child. Completion status is consumed by
+    # pollCompletion/waitForCompletion so callers can still observe the real
+    # exit code after asking whether the process is probably still alive.
+    if child.pid <= 0:
+      return false
+    kill(Pid(child.pid), 0) == 0 or errno == EPERM
   elif defined(windows):
     if not child.runningFlag or child.winProcessPtr.isNil:
       return false
@@ -425,6 +440,75 @@ proc running*(child: LaunchedProcess): bool =
     process.running()
   else:
     false
+
+proc buildCompletion(child: LaunchedProcess; timedOut: bool): ProcessCompletion =
+  when defined(posix):
+    buildCompletion(
+      child,
+      cint(child.waitStatus),
+      uint64(max(0, int((epochTime() - child.startedSeconds) * 1000.0))),
+      child.stdoutText,
+      child.stderrText,
+      child.stdoutBytes,
+      child.stderrBytes,
+      timedOut,
+      child.peakResidentMemoryBytes,
+      child.processCount,
+      child.telemetrySource)
+  else:
+    raise newException(OSError, "runquota_process is only implemented on POSIX")
+
+proc pollCompletion*(child: var LaunchedProcess): bool =
+  ## Nonblocking completion check. This drains any currently available output
+  ## and performs a WNOHANG wait without reaping status behind the caller's
+  ## back. When it returns true, ``child.completion`` is populated.
+  when defined(posix):
+    if child.completion.exited or child.completion.signaled or
+        child.completion.timedOut:
+      return true
+
+    child.stdoutFd.drainFd(child.stdoutText, child.stdoutBytes,
+                           child.stdoutLimit)
+    child.stderrFd.drainFd(child.stderrText, child.stderrBytes,
+                           child.stderrLimit)
+
+    if not child.doneFlag:
+      let now = epochTime()
+      if child.lastTelemetrySampleSeconds == 0.0 or
+          now - child.lastTelemetrySampleSeconds >= 0.1:
+        let sample = sampleMacosProcessTreeTelemetry(uint64(child.pid))
+        child.lastTelemetrySampleSeconds = now
+        child.telemetrySource = sample.source
+        if sample.diagnostic.code == diagOk:
+          if sample.residentMemoryBytes > child.peakResidentMemoryBytes:
+            child.peakResidentMemoryBytes = sample.residentMemoryBytes
+          if sample.processCount > child.processCount:
+            child.processCount = sample.processCount
+      var status: cint = 0
+      let waited = waitpid(Pid(child.pid), status, WNOHANG)
+      if waited == Pid(child.pid):
+        child.doneFlag = true
+        child.runningFlag = false
+        child.waitStatus = int(status)
+      elif waited < 0:
+        if errno != EINTR:
+          child.doneFlag = true
+          child.runningFlag = false
+          child.waitStatus = 1 shl 8
+
+    if child.doneFlag:
+      child.stdoutFd.drainFd(child.stdoutText, child.stdoutBytes,
+                             child.stdoutLimit)
+      child.stderrFd.drainFd(child.stderrText, child.stderrBytes,
+                             child.stderrLimit)
+      if child.stdoutFd < 0 and child.stderrFd < 0:
+        child.completion = child.buildCompletion(timedOut = false)
+        if child.completion.processCount == 0:
+          child.completion.processCount = 1
+        return true
+    false
+  else:
+    raise newException(OSError, "runquota_process is only implemented on POSIX")
 
 proc terminate*(child: var LaunchedProcess) =
   when defined(posix):
@@ -463,38 +547,10 @@ proc killNow*(child: var LaunchedProcess) =
 
 proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessCompletion =
   when defined(posix):
-    var status: cint = 0
-    var done = false
     var timedOut = false
-    var stdoutText = ""
-    var stderrText = ""
-    var stdoutBytes = 0'u64
-    var stderrBytes = 0'u64
-    var peakResidentMemoryBytes = 0'u64
-    var processCount = 0'u32
-    var telemetrySource = backendProfile().telemetry
 
     while true:
-      child.stdoutFd.drainFd(stdoutText, stdoutBytes, child.stdoutLimit)
-      child.stderrFd.drainFd(stderrText, stderrBytes, child.stderrLimit)
-
-      if not done:
-        let sample = sampleMacosProcessTreeTelemetry(uint64(child.pid))
-        telemetrySource = sample.source
-        if sample.diagnostic.code == diagOk:
-          if sample.residentMemoryBytes > peakResidentMemoryBytes:
-            peakResidentMemoryBytes = sample.residentMemoryBytes
-          if sample.processCount > processCount:
-            processCount = sample.processCount
-        let waited = waitpid(Pid(child.pid), status, WNOHANG)
-        if waited == Pid(child.pid):
-          done = true
-          child.runningFlag = false
-        elif waited < 0:
-          done = true
-          child.runningFlag = false
-
-      if done and child.stdoutFd < 0 and child.stderrFd < 0:
+      if child.pollCompletion():
         break
 
       let elapsed = int((epochTime() - child.startedSeconds) * 1000.0)
@@ -503,20 +559,29 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
         child.terminate()
         let killDeadline = epochTime() + 1.0
         while epochTime() < killDeadline:
-          child.stdoutFd.drainFd(stdoutText, stdoutBytes, child.stdoutLimit)
-          child.stderrFd.drainFd(stderrText, stderrBytes, child.stderrLimit)
+          child.stdoutFd.drainFd(child.stdoutText, child.stdoutBytes,
+                                 child.stdoutLimit)
+          child.stderrFd.drainFd(child.stderrText, child.stderrBytes,
+                                 child.stderrLimit)
+          var status: cint = 0
           let waited = waitpid(Pid(child.pid), status, WNOHANG)
           if waited == Pid(child.pid):
-            done = true
+            child.doneFlag = true
             child.runningFlag = false
+            child.waitStatus = int(status)
             break
           sleep(10)
-        if not done:
+        if not child.doneFlag:
           child.killNow()
+          var status: cint = 0
           discard waitpid(Pid(child.pid), status, 0)
+          child.waitStatus = int(status)
+          child.doneFlag = true
           child.runningFlag = false
-        child.stdoutFd.drainFd(stdoutText, stdoutBytes, child.stdoutLimit)
-        child.stderrFd.drainFd(stderrText, stderrBytes, child.stderrLimit)
+        child.stdoutFd.drainFd(child.stdoutText, child.stdoutBytes,
+                               child.stdoutLimit)
+        child.stderrFd.drainFd(child.stderrText, child.stderrBytes,
+                               child.stderrLimit)
         closeFd(child.stdoutFd)
         closeFd(child.stderrFd)
         break
@@ -534,20 +599,9 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
       else:
         sleep(10)
 
-    let elapsedMillis = uint64(max(0, int((epochTime() - child.startedSeconds) * 1000.0)))
-    result = buildCompletion(
-      child,
-      status,
-      elapsedMillis,
-      stdoutText,
-      stderrText,
-      stdoutBytes,
-      stderrBytes,
-      timedOut,
-      peakResidentMemoryBytes,
-      processCount,
-      telemetrySource
-    )
+    if timedOut:
+      child.completion = child.buildCompletion(timedOut = true)
+    result = child.completion
     if result.processCount == 0 and not result.timedOut:
       result.processCount = 1
     child.completion = result

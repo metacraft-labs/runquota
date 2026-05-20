@@ -1,5 +1,8 @@
 import std/[json, os, osproc, strutils, unittest]
 
+when defined(posix):
+  import std/posix
+
 import runquota_client
 import runquota_core
 import runquota_exec
@@ -8,6 +11,7 @@ import runquota_process
 const FixtureOutput = "--m5-fixture-output"
 const FixtureCwdEnv = "--m5-fixture-cwd-env"
 const FixtureSleep = "--m5-fixture-sleep"
+const FixtureExit7 = "--m5-fixture-exit7"
 const FixtureEnvName = "RUNQUOTA_M5_CHILD_ENV"
 const FixtureRecord = "runquota-m5-cwd-env.txt"
 
@@ -28,6 +32,9 @@ if commandLineParams().len == 1 and commandLineParams()[0] == FixtureCwdEnv:
 if commandLineParams().len == 1 and commandLineParams()[0] == FixtureSleep:
   sleep(5000)
   quit 0
+
+if commandLineParams().len == 1 and commandLineParams()[0] == FixtureExit7:
+  quit 7
 
 proc daemonPath(): string =
   getCurrentDir() / "build" / "bin" / "runquotad"
@@ -128,6 +135,38 @@ suite "m5_process_exec_bench_contract":
     finally:
       if dirExists(cwdDir):
         removeDir(cwdDir)
+
+  test "process running predicate does not consume completion status":
+    var child = launchProcess(commandSpec([getAppFilename(), FixtureExit7]))
+    sleep(100)
+    discard child.running()
+    discard child.running()
+    let completion = child.waitForCompletion(3000)
+    child.close()
+
+    check completion.exited
+    check completion.exitCode == 7
+
+  test "pollCompletion reports externally reaped child as failure":
+    when defined(posix):
+      var child = launchProcess(commandSpec([getAppFilename(), FixtureExit7]))
+      var status: cint = 0
+      discard waitpid(Pid(child.pid), status, 0)
+
+      var done = false
+      for _ in 0 ..< 200:
+        if child.pollCompletion():
+          done = true
+          break
+        sleep(5)
+      let completion = child.completion
+      child.close()
+
+      check done
+      check completion.exited
+      check completion.exitCode == 1
+    else:
+      skip()
 
   test "lease-bound helper and CLI use real daemon protocol":
     let socketDir = getTempDir() / ("runquota-m5-test-" & $getCurrentProcessId())

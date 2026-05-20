@@ -54,6 +54,16 @@ type
     startedSeconds*: float
     runningFlag*: bool
     cancelSent*: bool
+    doneFlag*: bool
+    waitStatus*: int
+    stdoutText*: string
+    stderrText*: string
+    stdoutBytes*: uint64
+    stderrBytes*: uint64
+    peakResidentMemoryBytes*: uint64
+    processCount*: uint32
+    telemetrySource*: string
+    lastTelemetrySampleSeconds*: float
     info*: LaunchResult
     completion*: ProcessCompletion
     # Windows: extra slots store the osproc Process pointer and the Job Object

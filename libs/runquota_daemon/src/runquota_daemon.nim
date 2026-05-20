@@ -196,6 +196,22 @@ proc configuredPressureSample(daemon: RunQuotaDaemon): HostMemoryPressureSample 
     else:
       unavailablePressureSample("deterministic-file", daemon.config.pressureRequired, "unknown level: " & raw)
 
+proc configuredPressureAvailable(daemon: RunQuotaDaemon): bool =
+  case daemon.config.pressureSource
+  of pressureSourceHost:
+    when defined(macosx):
+      true
+    else:
+      false
+  of pressureSourceUnavailable:
+    false
+  of pressureSourceDeterministicFile:
+    if daemon.config.pressureFile.len == 0 or
+        not fileExists(daemon.config.pressureFile):
+      return false
+    let raw = readFile(daemon.config.pressureFile).strip().toLowerAscii()
+    raw in ["low", "normal", "ok", "warning", "warn", "critical", "crit"]
+
 proc pressureAllows(daemon: RunQuotaDaemon; resources: ResourceVector;
                     diagOut: var Diagnostic): bool =
   if resources.memory.value < daemon.config.memoryPressureHeavyBytes.value:
@@ -387,8 +403,7 @@ proc handleHello(daemon: RunQuotaDaemon; connection: var LocalConnection;
   var effectiveCaps = caps
   effectiveCaps.hardMemoryLimitEnforced = false
   effectiveCaps.hardMemoryLimitMode = memoryLimitAdvisory
-  let pressureSample = daemon.configuredPressureSample()
-  effectiveCaps.memoryPressureAvailable = pressureSample.available
+  effectiveCaps.memoryPressureAvailable = daemon.configuredPressureAvailable()
   effectiveCaps.memoryPressureRequired = daemon.config.pressureRequired
   let helloOk = HelloOkMessage(
     selectedProtocolMajor: compatibility.selectedMajor,
@@ -880,7 +895,58 @@ type
     lock: Lock
     daemon: RunQuotaDaemon
 
+  ConnectionQueue = object
+    lock: Lock
+    ready: Cond
+    stopping: bool
+    items: seq[AcceptedConnection]
+
 var sharedDaemon: SharedDaemon
+var connectionQueue: ConnectionQueue
+
+proc connectionWorkerCount(): int =
+  max(4, min(32, countProcessors()))
+
+proc initConnectionQueue() =
+  initLock(connectionQueue.lock)
+  initCond(connectionQueue.ready)
+  connectionQueue.stopping = false
+  connectionQueue.items = @[]
+
+proc deinitConnectionQueue() =
+  deinitCond(connectionQueue.ready)
+  deinitLock(connectionQueue.lock)
+
+proc enqueueConnection(accepted: AcceptedConnection) =
+  acquire(connectionQueue.lock)
+  try:
+    if connectionQueue.stopping:
+      return
+    connectionQueue.items.add(accepted)
+    signal(connectionQueue.ready)
+  finally:
+    release(connectionQueue.lock)
+
+proc dequeueConnection(accepted: var AcceptedConnection): bool {.gcsafe.} =
+  {.cast(gcsafe).}:
+    acquire(connectionQueue.lock)
+    try:
+      while connectionQueue.items.len == 0 and not connectionQueue.stopping:
+        wait(connectionQueue.ready, connectionQueue.lock)
+      if connectionQueue.items.len > 0:
+        accepted = connectionQueue.items[0]
+        connectionQueue.items.delete(0)
+        result = true
+    finally:
+      release(connectionQueue.lock)
+
+proc stopConnectionQueue() =
+  acquire(connectionQueue.lock)
+  try:
+    connectionQueue.stopping = true
+    broadcast(connectionQueue.ready)
+  finally:
+    release(connectionQueue.lock)
 
 proc handleSharedConnection(accepted: AcceptedConnection) {.thread, gcsafe.} =
   {.cast(gcsafe).}:
@@ -924,20 +990,33 @@ proc handleSharedConnection(accepted: AcceptedConnection) {.thread, gcsafe.} =
         release(sharedDaemon.lock)
       localConnection.close()
 
+proc connectionWorker() {.thread, gcsafe.} =
+  while true:
+    var accepted: AcceptedConnection
+    if not dequeueConnection(accepted):
+      break
+    handleSharedConnection(accepted)
+
 proc serve*(config: DaemonConfig): int =
   initLock(sharedDaemon.lock)
+  initConnectionQueue()
   sharedDaemon.daemon = initDaemon(config)
   var listener = bindEndpoint(config.endpoint)
   sharedDaemon.daemon.state = dsServing
   echo "runquotad listening " & config.endpoint.path
   flushFile(stdout)
-  var threads: seq[Thread[AcceptedConnection]] = @[]
+  var threads: seq[Thread[void]] = @[]
+  for _ in 0 ..< connectionWorkerCount():
+    threads.add(default(Thread[void]))
+    createThread(threads[^1], connectionWorker)
   try:
     while true:
       let accepted = listener.acceptNativeConnection()
-      threads.add(default(Thread[AcceptedConnection]))
-      createThread(threads[^1], handleSharedConnection, accepted)
+      enqueueConnection(accepted)
   finally:
+    stopConnectionQueue()
+    for i in 0 ..< threads.len:
+      joinThread(threads[i])
     acquire(sharedDaemon.lock)
     try:
       sharedDaemon.daemon.state = dsStopping
@@ -946,4 +1025,5 @@ proc serve*(config: DaemonConfig): int =
       release(sharedDaemon.lock)
       listener.close()
       deinitLock(sharedDaemon.lock)
+      deinitConnectionQueue()
   0
