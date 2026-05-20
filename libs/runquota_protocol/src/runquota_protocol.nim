@@ -7,7 +7,7 @@ export protocolTypes
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 1'u16
-const RqspProtocolMinor* = 1'u16
+const RqspProtocolMinor* = 2'u16
 const RqspHeaderLen* = 24'u16
 const MaxCommandStatsIdBytes* = 64
 const FrameFlagRequest* = 0x0001'u16
@@ -16,7 +16,7 @@ const FrameFlagError* = 0x0004'u16
 const DefaultMaxFrameBytes* = 1_048_576'u32
 const DefaultMaxInflightRequests* = 32'u32
 const DefaultMaxCandidatesPerBatch* = 16'u32
-const DefaultMaxLeaseDecisionsPerBatch* = 8'u32
+const DefaultMaxLeaseDecisionsPerBatch * = 8'u32
 
 proc libraryInfo*(): protocolTypes.LibraryInfo =
   protocolTypes.LibraryInfo(name: libraryName)
@@ -48,7 +48,8 @@ proc defaultCapabilities*(platform: string; transport: string; cpuSlots: MilliCp
   )
 
 proc messageKindFromWire*(value: uint16; kind: var RqspMessageKind): bool =
-  if value < uint16(ord(low(RqspMessageKind))) or value > uint16(ord(high(RqspMessageKind))):
+  if value < uint16(ord(low(RqspMessageKind))) or value > uint16(ord(high(
+      RqspMessageKind))):
     return false
   kind = RqspMessageKind(int(value))
   true
@@ -109,7 +110,8 @@ proc decodeFrame*(data: string; frame: var RqspFrame): bool =
   true
 
 proc compatible*(hello: HelloMessage): CompatibilityResult =
-  if hello.minProtocolMajor <= RqspProtocolMajor and RqspProtocolMajor <= hello.maxProtocolMajor:
+  if hello.minProtocolMajor <= RqspProtocolMajor and RqspProtocolMajor <=
+      hello.maxProtocolMajor:
     CompatibilityResult(
       compatible: true,
       selectedMajor: RqspProtocolMajor,
@@ -223,7 +225,8 @@ proc encodeRegisterSession*(msg: RegisterSessionMessage): string =
   w.writeMetadata(msg.metadata)
   w.data
 
-proc decodeRegisterSession*(payload: string; msg: var RegisterSessionMessage): bool =
+proc decodeRegisterSession*(payload: string;
+    msg: var RegisterSessionMessage): bool =
   var r = reader(payload)
   var name: string
   var version: string
@@ -240,7 +243,8 @@ proc encodeSessionRegistered*(msg: SessionRegisteredMessage): string =
   w.writeU64(msg.sessionId.value)
   w.data
 
-proc decodeSessionRegistered*(payload: string; msg: var SessionRegisteredMessage): bool =
+proc decodeSessionRegistered*(payload: string;
+    msg: var SessionRegisteredMessage): bool =
   var r = reader(payload)
   var id: uint64
   if not r.readU64(id): return false
@@ -266,7 +270,8 @@ proc encodeSessionClosed*(msg: SessionClosedMessage): string =
   w.writeU64(msg.sessionId.value)
   w.data
 
-proc decodeSessionClosed*(payload: string; msg: var SessionClosedMessage): bool =
+proc decodeSessionClosed*(payload: string;
+    msg: var SessionClosedMessage): bool =
   var r = reader(payload)
   var id: uint64
   if not r.readU64(id): return false
@@ -282,6 +287,7 @@ proc encodeLeaseRequest*(msg: LeaseRequestMessage): string =
   w.writeResourceVector(msg.resources)
   w.writeDeadline(msg.deadline)
   w.writeU32(uint32(ord(msg.priority)))
+  w.writeU32(uint32(ord(msg.purpose)))
   w.writeMetadata(msg.metadata)
   w.data
 
@@ -293,6 +299,7 @@ proc decodeLeaseRequest*(payload: string; msg: var LeaseRequestMessage): bool =
   var resources: ResourceVector
   var deadline: Deadline
   var priorityRaw: uint32
+  var purposeRaw: uint32
   var metadata: DynamicMetadata
   if not r.readU64(id): return false
   if not r.readString(label): return false
@@ -302,6 +309,8 @@ proc decodeLeaseRequest*(payload: string; msg: var LeaseRequestMessage): bool =
   if not r.readDeadline(deadline): return false
   if not r.readU32(priorityRaw): return false
   if priorityRaw > uint32(ord(high(PriorityClass))): return false
+  if not r.readU32(purposeRaw): return false
+  if purposeRaw > uint32(ord(high(LeasePurpose))): return false
   if not r.readMetadata(metadata): return false
   if r.remaining != 0: return false
   msg = LeaseRequestMessage(
@@ -311,6 +320,7 @@ proc decodeLeaseRequest*(payload: string; msg: var LeaseRequestMessage): bool =
     resources: resources,
     deadline: deadline,
     priority: PriorityClass(int(priorityRaw)),
+    purpose: LeasePurpose(int(purposeRaw)),
     metadata: metadata
   )
   true
@@ -322,15 +332,18 @@ proc writeLeaseCandidate(w: var BinaryWriter; candidate: LeaseCandidate) =
   w.writeResourceVector(candidate.resources)
   w.writeDeadline(candidate.deadline)
   w.writeU32(uint32(ord(candidate.priority)))
+  w.writeU32(uint32(ord(candidate.purpose)))
   w.writeMetadata(candidate.metadata)
 
-proc readLeaseCandidate(r: var BinaryReader; candidate: var LeaseCandidate): bool =
+proc readLeaseCandidate(r: var BinaryReader;
+    candidate: var LeaseCandidate): bool =
   var clientCandidateId: uint64
   var label: string
   var commandStatsId: string
   var resources: ResourceVector
   var deadline: Deadline
   var priorityRaw: uint32
+  var purposeRaw: uint32
   var metadata: DynamicMetadata
   if not r.readU64(clientCandidateId): return false
   if not r.readString(label): return false
@@ -340,6 +353,8 @@ proc readLeaseCandidate(r: var BinaryReader; candidate: var LeaseCandidate): boo
   if not r.readDeadline(deadline): return false
   if not r.readU32(priorityRaw): return false
   if priorityRaw > uint32(ord(high(PriorityClass))): return false
+  if not r.readU32(purposeRaw): return false
+  if purposeRaw > uint32(ord(high(LeasePurpose))): return false
   if not r.readMetadata(metadata): return false
   candidate = LeaseCandidate(
     clientCandidateId: clientCandidateId,
@@ -348,6 +363,7 @@ proc readLeaseCandidate(r: var BinaryReader; candidate: var LeaseCandidate): boo
     resources: resources,
     deadline: deadline,
     priority: PriorityClass(int(priorityRaw)),
+    purpose: LeasePurpose(int(purposeRaw)),
     metadata: metadata
   )
   true
@@ -360,7 +376,8 @@ proc encodeCandidateOffer*(msg: CandidateOfferMessage): string =
     w.writeLeaseCandidate(candidate)
   w.data
 
-proc decodeCandidateOffer*(payload: string; msg: var CandidateOfferMessage): bool =
+proc decodeCandidateOffer*(payload: string;
+    msg: var CandidateOfferMessage): bool =
   var r = reader(payload)
   var sessionRaw: uint64
   var count: uint32
@@ -372,7 +389,8 @@ proc decodeCandidateOffer*(payload: string; msg: var CandidateOfferMessage): boo
     if not r.readLeaseCandidate(candidate): return false
     candidates.add(candidate)
   if r.remaining != 0: return false
-  msg = CandidateOfferMessage(sessionId: sessionId(sessionRaw), candidates: candidates)
+  msg = CandidateOfferMessage(sessionId: sessionId(sessionRaw),
+      candidates: candidates)
   true
 
 proc encodeLeaseDecisionBatch*(msg: LeaseDecisionBatchMessage): string =
@@ -387,7 +405,8 @@ proc encodeLeaseDecisionBatch*(msg: LeaseDecisionBatchMessage): string =
     w.writeDiagnostic(decision.diagnostic)
   w.data
 
-proc decodeLeaseDecisionBatch*(payload: string; msg: var LeaseDecisionBatchMessage): bool =
+proc decodeLeaseDecisionBatch*(payload: string;
+    msg: var LeaseDecisionBatchMessage): bool =
   var r = reader(payload)
   var sessionRaw: uint64
   var count: uint32
@@ -414,7 +433,8 @@ proc decodeLeaseDecisionBatch*(payload: string; msg: var LeaseDecisionBatchMessa
       diagnostic: diagnostic
     ))
   if r.remaining != 0: return false
-  msg = LeaseDecisionBatchMessage(sessionId: sessionId(sessionRaw), decisions: decisions)
+  msg = LeaseDecisionBatchMessage(sessionId: sessionId(sessionRaw),
+      decisions: decisions)
   true
 
 proc encodeGrantNext*(msg: GrantNextMessage): string =
@@ -466,7 +486,8 @@ proc decodeLeaseDenied*(payload: string; msg: var LeaseDeniedMessage): bool =
   if not r.readU64(sessionRaw): return false
   if not r.readDiagnostic(diagnostic): return false
   if r.remaining != 0: return false
-  msg = LeaseDeniedMessage(sessionId: sessionId(sessionRaw), diagnostic: diagnostic)
+  msg = LeaseDeniedMessage(sessionId: sessionId(sessionRaw),
+      diagnostic: diagnostic)
   true
 
 proc encodeReleaseLease*(msg: ReleaseLeaseMessage): string =
@@ -491,7 +512,8 @@ proc encodeLeaseReleased*(msg: LeaseReleasedMessage): string =
   w.writeU64(msg.leaseId.value)
   w.data
 
-proc decodeLeaseReleased*(payload: string; msg: var LeaseReleasedMessage): bool =
+proc decodeLeaseReleased*(payload: string;
+    msg: var LeaseReleasedMessage): bool =
   var r = reader(payload)
   var sessionRaw: uint64
   var leaseRaw: uint64
@@ -507,7 +529,8 @@ proc encodeLeaseStarting*(msg: LeaseStartingMessage): string =
   w.writeU64(msg.leaseId.value)
   w.data
 
-proc decodeLeaseStarting*(payload: string; msg: var LeaseStartingMessage): bool =
+proc decodeLeaseStarting*(payload: string;
+    msg: var LeaseStartingMessage): bool =
   var r = reader(payload)
   var sessionRaw: uint64
   var leaseRaw: uint64
@@ -523,14 +546,16 @@ proc encodeLeaseStartingAck*(msg: LeaseStartingAckMessage): string =
   w.writeU64(msg.leaseId.value)
   w.data
 
-proc decodeLeaseStartingAck*(payload: string; msg: var LeaseStartingAckMessage): bool =
+proc decodeLeaseStartingAck*(payload: string;
+    msg: var LeaseStartingAckMessage): bool =
   var r = reader(payload)
   var sessionRaw: uint64
   var leaseRaw: uint64
   if not r.readU64(sessionRaw): return false
   if not r.readU64(leaseRaw): return false
   if r.remaining != 0: return false
-  msg = LeaseStartingAckMessage(sessionId: sessionId(sessionRaw), leaseId: leaseId(leaseRaw))
+  msg = LeaseStartingAckMessage(sessionId: sessionId(sessionRaw),
+      leaseId: leaseId(leaseRaw))
   true
 
 proc encodeLeaseRunning*(msg: LeaseRunningMessage): string =
@@ -570,14 +595,16 @@ proc encodeLeaseRunningAck*(msg: LeaseRunningAckMessage): string =
   w.writeU64(msg.leaseId.value)
   w.data
 
-proc decodeLeaseRunningAck*(payload: string; msg: var LeaseRunningAckMessage): bool =
+proc decodeLeaseRunningAck*(payload: string;
+    msg: var LeaseRunningAckMessage): bool =
   var r = reader(payload)
   var sessionRaw: uint64
   var leaseRaw: uint64
   if not r.readU64(sessionRaw): return false
   if not r.readU64(leaseRaw): return false
   if r.remaining != 0: return false
-  msg = LeaseRunningAckMessage(sessionId: sessionId(sessionRaw), leaseId: leaseId(leaseRaw))
+  msg = LeaseRunningAckMessage(sessionId: sessionId(sessionRaw),
+      leaseId: leaseId(leaseRaw))
   true
 
 proc encodeLeaseFinished*(msg: LeaseFinishedMessage): string =
@@ -595,7 +622,8 @@ proc encodeLeaseFinished*(msg: LeaseFinishedMessage): string =
   w.writeDiagnostic(msg.diagnostic)
   w.data
 
-proc decodeLeaseFinished*(payload: string; msg: var LeaseFinishedMessage): bool =
+proc decodeLeaseFinished*(payload: string;
+    msg: var LeaseFinishedMessage): bool =
   var r = reader(payload)
   var sessionRaw: uint64
   var leaseRaw: uint64
@@ -642,14 +670,16 @@ proc encodeLeaseFinishedAck*(msg: LeaseFinishedAckMessage): string =
   w.writeU64(msg.leaseId.value)
   w.data
 
-proc decodeLeaseFinishedAck*(payload: string; msg: var LeaseFinishedAckMessage): bool =
+proc decodeLeaseFinishedAck*(payload: string;
+    msg: var LeaseFinishedAckMessage): bool =
   var r = reader(payload)
   var sessionRaw: uint64
   var leaseRaw: uint64
   if not r.readU64(sessionRaw): return false
   if not r.readU64(leaseRaw): return false
   if r.remaining != 0: return false
-  msg = LeaseFinishedAckMessage(sessionId: sessionId(sessionRaw), leaseId: leaseId(leaseRaw))
+  msg = LeaseFinishedAckMessage(sessionId: sessionId(sessionRaw),
+      leaseId: leaseId(leaseRaw))
   true
 
 proc encodeStatus*(msg: DaemonStatusMessage): string =
@@ -696,7 +726,8 @@ proc encodeProtocolError*(msg: ProtocolErrorMessage): string =
   w.writeDiagnostic(msg.diagnostic)
   w.data
 
-proc decodeProtocolError*(payload: string; msg: var ProtocolErrorMessage): bool =
+proc decodeProtocolError*(payload: string;
+    msg: var ProtocolErrorMessage): bool =
   var r = reader(payload)
   var diagnostic: Diagnostic
   if not r.readDiagnostic(diagnostic): return false
@@ -710,7 +741,8 @@ proc encodeInspectionRequest*(msg: InspectionRequestMessage): string =
   w.writeU64(msg.sessionId.value)
   w.data
 
-proc decodeInspectionRequest*(payload: string; msg: var InspectionRequestMessage): bool =
+proc decodeInspectionRequest*(payload: string;
+    msg: var InspectionRequestMessage): bool =
   var r = reader(payload)
   var subject: string
   var sessionRaw: uint64
@@ -725,7 +757,8 @@ proc encodeInspectionResponse*(msg: InspectionResponseMessage): string =
   w.writeString(msg.json)
   w.data
 
-proc decodeInspectionResponse*(payload: string; msg: var InspectionResponseMessage): bool =
+proc decodeInspectionResponse*(payload: string;
+    msg: var InspectionResponseMessage): bool =
   var r = reader(payload)
   var json: string
   if not r.readString(json): return false

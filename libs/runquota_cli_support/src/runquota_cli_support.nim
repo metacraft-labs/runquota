@@ -18,9 +18,10 @@ proc renderUsage*(programName: string): string =
     "  " & programName & " status [--json]\n" &
     "  " & programName & " sessions --json\n" &
     "  " & programName & " leases --json\n" &
+    "  " & programName & " topology --json\n" &
     "  " & programName & " explain SESSION_ID\n" &
     "  " & programName & " daemon start|status\n" &
-    "  " & programName & " acquire --cpu N --mem BYTES [--label TEXT] [-- COMMAND [ARG...]]"
+    "  " & programName & " acquire --cpu N --mem BYTES [--label TEXT] [--machine ID] [--benchmark] [-- COMMAND [ARG...]]"
 
 proc parseMemory(value: string): uint64 =
   let lower = value.toLowerAscii()
@@ -54,7 +55,8 @@ proc printStatus(json: bool): int =
     # Windows: surface memory-pressure capability + current sample so operators
     # can see whether the host backend is wired in. Identical text on every
     # platform; the value differs based on which backend signed off on it.
-    echo "memory_pressure_available: " & $client.capabilities.memoryPressureAvailable
+    echo "memory_pressure_available: " &
+        $client.capabilities.memoryPressureAvailable
     echo "memory_pressure_required: " & $client.capabilities.memoryPressureRequired
     try:
       echo "memory_pressure: " & client.inspectionJson("pressure")
@@ -100,6 +102,8 @@ proc runDebugAcquire(args: seq[string]): int =
   var cpu = 1000'u32
   var memory = 128'u64 * 1024'u64 * 1024'u64
   var label = "debug"
+  var machineId = ""
+  var benchmark = false
   var command: seq[string] = @[]
   var i = 0
   while i < args.len:
@@ -116,6 +120,13 @@ proc runDebugAcquire(args: seq[string]): int =
       if i + 1 >= args.len: return 2
       label = args[i + 1]
       i += 2
+    of "--machine":
+      if i + 1 >= args.len: return 2
+      machineId = args[i + 1]
+      i += 2
+    of "--benchmark":
+      benchmark = true
+      i += 1
     of "--":
       if i + 1 >= args.len:
         echo "missing command after --"
@@ -129,8 +140,13 @@ proc runDebugAcquire(args: seq[string]): int =
   defer: client.close()
   var session = client.registerSession("runquota acquire", versionString())
   var request = resourceRequest(label, milliCpu(cpu), bytes(memory))
+  if machineId.len > 0:
+    request = request.forMachine(machineId)
+  if benchmark:
+    request = request.benchmarkRequest()
   if command.len > 0:
-    let execution = session.runWithLease(request, command)
+    let execution = session.runWithLease(request, command,
+        waitForQueued = benchmark)
     stdout.write(execution.process.stdout)
     stderr.write(execution.process.stderr)
     session.closeSession()
@@ -139,7 +155,11 @@ proc runDebugAcquire(args: seq[string]): int =
     if execution.process.signaled:
       return 128 + execution.process.signal
     return 1
-  var lease = session.requestLease(request)
+  var lease =
+    if benchmark:
+      session.requestLeaseWaiting(request)
+    else:
+      session.requestLease(request)
   echo "lease " & $lease.id & " granted"
   lease.release()
   session.closeSession()
@@ -162,6 +182,9 @@ proc runThinApp*(programName: string): int =
       of "leases":
         if args.len == 2 and args[1] == "--json":
           return printInspection("leases")
+      of "topology":
+        if args.len == 2 and args[1] == "--json":
+          return printInspection("topology")
       of "explain":
         if args.len == 2:
           return printInspection("explain", sessionId(parseUInt(args[1])))

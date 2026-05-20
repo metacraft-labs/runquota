@@ -27,12 +27,25 @@ type
     pressureSourceDeterministicFile
     pressureSourceUnavailable
 
+  MachineCapacity* = object
+    id*: string
+    cpuSlots*: MilliCpu
+    memoryBytes*: Bytes
+    ioSlots*: uint32
+    cpuShareGroup*: string
+
+  CpuShareGroup* = object
+    id*: string
+    cpuSlots*: MilliCpu
+
   DaemonConfig* = object
     endpoint*: Endpoint
     daemonId*: uint64
     cpuSlots*: MilliCpu
     memoryBytes*: Bytes
     ioSlots*: uint32
+    machines*: Table[string, MachineCapacity]
+    cpuShareGroups*: Table[string, CpuShareGroup]
     namedPoolCaps*: Table[string, uint32]
     version*: string
     pressureSource*: PressureSourceKind
@@ -58,6 +71,7 @@ type
     clientCandidateId*: uint64
     resources*: ResourceVector
     priority*: PriorityClass
+    purpose*: LeasePurpose
     queueOrder*: uint64
     delivered*: bool
     state*: LeaseLifecycleState

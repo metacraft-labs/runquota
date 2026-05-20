@@ -5,6 +5,40 @@ import runquota_core
 import runquota_daemon
 import runquota_ipc
 
+proc parseCpuShareGroupSpec(config: var DaemonConfig; spec: string): bool =
+  let parts = spec.split("=", 1)
+  if parts.len != 2 or parts[0].len == 0:
+    return false
+  config.cpuShareGroups[parts[0]] = cpuShareGroup(parts[0], milliCpu(parseUInt(
+      parts[1])))
+  true
+
+proc parseMachineSpec(config: var DaemonConfig; spec: string): bool =
+  let parts = spec.split("=", 1)
+  if parts.len != 2 or parts[0].len == 0:
+    return false
+  let fields = parts[1].split(",")
+  if fields.len < 2 or fields.len > 4:
+    return false
+  let ioSlots =
+    if fields.len >= 3 and fields[2].len > 0:
+      uint32(parseUInt(fields[2]))
+    else:
+      config.ioSlots
+  let group =
+    if fields.len >= 4 and fields[3].len > 0:
+      fields[3]
+    else:
+      parts[0]
+  config.machines[parts[0]] = machineCapacity(
+    parts[0],
+    milliCpu(parseUInt(fields[0])),
+    bytes(parseUInt(fields[1])),
+    ioSlots,
+    group
+  )
+  true
+
 when isMainModule:
   let args = commandLineParams()
   if args.len == 1 and args[0] in ["--version", "-V"]:
@@ -12,7 +46,7 @@ when isMainModule:
     quit 0
 
   var config = defaultDaemonConfig(defaultEndpoint())
-  let usage = "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH]"
+  let usage = "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH]"
   var i = 0
   while i < args.len:
     case args[i]
@@ -45,6 +79,16 @@ when isMainModule:
       if i + 1 >= args.len:
         quit 2
       config.ioSlots = uint32(parseUInt(args[i + 1]))
+      i += 2
+    of "--machine":
+      if i + 1 >= args.len or not config.parseMachineSpec(args[i + 1]):
+        echo usage
+        quit 2
+      i += 2
+    of "--cpu-share-group":
+      if i + 1 >= args.len or not config.parseCpuShareGroupSpec(args[i + 1]):
+        echo usage
+        quit 2
       i += 2
     of "--pool":
       if i + 1 >= args.len:

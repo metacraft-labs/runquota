@@ -36,7 +36,7 @@ suite "RQSP protocol and codec":
     check decoded.metadata.kind == metadataCborPlaceholder
     check decoded.payload == "payload"
     check inspectionResourceJson(resourceVector(milliCpu(1000), bytes(128))) ==
-      "{\"cpu_milli\":1000,\"memory_bytes\":128,\"hard_memory_limit_bytes\":0,\"io_class\":\"ioNormal\",\"process_count\":1,\"named_pools\":[]}"
+      "{\"machine_id\":\"local\",\"cpu_milli\":1000,\"memory_bytes\":128,\"hard_memory_limit_bytes\":0,\"io_class\":\"ioNormal\",\"process_count\":1,\"named_pools\":[]}"
 
   test "compatibility rejects unsupported major versions":
     let result = compatible(HelloMessage(

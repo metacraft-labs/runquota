@@ -1,3 +1,5 @@
+const DefaultMachineId* = "local"
+
 type
   SessionId* = distinct uint64
   LeaseId* = distinct uint64
@@ -15,6 +17,10 @@ type
     priorityNormal
     priorityInteractive
     priorityBackground
+
+  LeasePurpose* = enum
+    leasePurposeWork
+    leasePurposeBenchmark
 
   DeadlineKind* = enum
     deadlineNone
@@ -86,6 +92,7 @@ type
     units*: uint32
 
   ResourceVector* = object
+    machineId*: string
     cpu*: MilliCpu
     memory*: Bytes
     hardMemoryLimit*: Bytes
@@ -95,6 +102,7 @@ type
 
 proc resourceVector*(cpu: MilliCpu; memory: Bytes): ResourceVector =
   ResourceVector(
+    machineId: DefaultMachineId,
     cpu: cpu,
     memory: memory,
     hardMemoryLimit: Bytes(0),
@@ -110,6 +118,13 @@ proc withNamedPool*(resources: ResourceVector; name: string;
                     units: SomeInteger): ResourceVector =
   result = resources
   result.namedPools.add(namedPoolDemand(name, units))
+
+proc forMachine*(resources: ResourceVector; machineId: string): ResourceVector =
+  result = resources
+  if machineId.len == 0:
+    result.machineId = DefaultMachineId
+  else:
+    result.machineId = machineId
 
 proc sessionId*(value: uint64): SessionId =
   SessionId(value)
@@ -135,7 +150,8 @@ proc timeoutDeadline*(millis: DeadlineMillis): Deadline =
 proc noDeadline*(): Deadline =
   Deadline(kind: deadlineNone, millis: DeadlineMillis(0))
 
-proc diagnostic*(code: DiagnosticCode; message: string; detail = ""): Diagnostic =
+proc diagnostic*(code: DiagnosticCode; message: string;
+    detail = ""): Diagnostic =
   Diagnostic(code: code, message: message, detail: detail)
 
 proc okDiagnostic*(): Diagnostic =

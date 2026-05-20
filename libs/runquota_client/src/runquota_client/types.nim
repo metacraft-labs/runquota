@@ -58,4 +58,5 @@ type
     resources*: ResourceVector
     deadline*: Deadline
     priority*: PriorityClass
+    purpose*: LeasePurpose
     metadata*: DynamicMetadata

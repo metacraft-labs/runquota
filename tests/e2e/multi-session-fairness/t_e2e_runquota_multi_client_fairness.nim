@@ -37,10 +37,20 @@ proc req(label: string; cpu: int; memoryMiB: int;
   if poolName.len > 0:
     result.resources = result.resources.withNamedPool(poolName, poolUnits)
 
+proc benchmarkReq(label: string; cpu: int; memoryMiB: int): ResourceRequest =
+  result = req(label, cpu, memoryMiB)
+  result.purpose = leasePurposeBenchmark
+
+proc machineReq(label, machine: string; cpu: int;
+    memoryMiB: int): ResourceRequest =
+  result = req(label, cpu, memoryMiB)
+  result.resources = result.resources.forMachine(machine)
+
 proc candidate(id: uint64; request: ResourceRequest): LeaseCandidate =
   toCandidate(id, request)
 
-proc findDecision(decisions: seq[OfferedLease]; candidateId: uint64): OfferedLease =
+proc findDecision(decisions: seq[OfferedLease];
+    candidateId: uint64): OfferedLease =
   for decision in decisions:
     if decision.clientCandidateId == candidateId:
       return decision
@@ -58,7 +68,8 @@ proc sendRawCandidateOffer(session: var RunQuotaSession; requestId: uint64;
     copied.add(candidate)
   let msg = CandidateOfferMessage(sessionId: session.id, candidates: copied)
   session.client[].connection.sendFrame(
-    encodeFrame(rqOfferCandidates, FrameFlagRequest, requestId, encodeCandidateOffer(msg))
+    encodeFrame(rqOfferCandidates, FrameFlagRequest, requestId,
+        encodeCandidateOffer(msg))
   )
 
 proc oversizedStatusRequestFrame(requestId: uint64): string =
@@ -85,7 +96,8 @@ proc receiveProtocolError(client: var RunQuotaClient; requestId: uint64;
   check error.diagnostic.message.contains(messagePart)
   error.diagnostic
 
-proc waitForGrant(session: var RunQuotaSession; candidateId: uint64): RunQuotaLease =
+proc waitForGrant(session: var RunQuotaSession;
+    candidateId: uint64): RunQuotaLease =
   for _ in 0 ..< 100:
     let grants = session.pollNextGrant()
     for grant in grants:
@@ -351,6 +363,228 @@ suite "e2e_runquota_multi_client_fairness":
       if dirExists(socketDir):
         removeDir(socketDir)
 
+  test "real daemon grants benchmark leases only after outstanding work drains":
+    let socketDir = getTempDir() / ("runquota-m3-benchmark-" &
+        $getCurrentProcessId())
+    let socketPath = socketDir / "runquotad.sock"
+    if dirExists(socketDir):
+      removeDir(socketDir)
+    createDir(socketDir)
+    check fileExists(daemonPath())
+    check fileExists(cliPath())
+    var cliBenchmark: Process
+
+    let process = startProcess(
+      daemonPath(),
+      args = [
+        "--socket", socketPath,
+        "--cpu-milli", "3000",
+        "--memory-bytes", $(3072'u64 * 1024'u64 * 1024'u64)
+      ],
+      options = {poStdErrToStdOut}
+    )
+    try:
+      waitForDaemon(socketPath)
+
+      var clientWork = connectDefault()
+      var clientBench = connectDefault()
+      var clientLate = connectDefault()
+      var sessionWork = clientWork.registerSession("repro-work", "0.1.0")
+      var sessionBench = clientBench.registerSession("repro-bench", "0.1.0")
+      var sessionLate = clientLate.registerSession("repro-late-work", "0.1.0")
+      var progress = 0
+
+      let activeWorkDecisions = sessionWork.offerAndReceive([
+        candidate(701, req("active-work", 1000, 512))
+      ])
+      let activeWorkDecision = activeWorkDecisions.findDecision(701)
+      check not activeWorkDecision.queued
+      var activeWork = activeWorkDecision.lease
+      activeWork.markRunning()
+
+      let benchmarkDecisions = sessionBench.offerAndReceive([
+        candidate(801, benchmarkReq("isolated-benchmark", 1000, 512))
+      ])
+      let benchmarkDecision = benchmarkDecisions.findDecision(801)
+      check benchmarkDecision.queued
+      check benchmarkDecision.diagnostic.message.contains("benchmark isolation")
+
+      let lateWorkDecisions = sessionLate.offerAndReceive([
+        candidate(901, req("late-fitting-work", 500, 256))
+      ])
+      let lateWorkDecision = lateWorkDecisions.findDecision(901)
+      check lateWorkDecision.queued
+      check lateWorkDecision.diagnostic.message.contains("benchmark isolation")
+
+      let queuedSnapshot = runCli(["leases", "--json"])
+      check queuedSnapshot.contains("\"purpose\":\"benchmark\"")
+      check queuedSnapshot.contains("isolated-benchmark")
+      check queuedSnapshot.contains("late-fitting-work")
+
+      finishLease(activeWork, progress)
+      var benchmark = sessionBench.waitForGrant(801)
+      check benchmark.resources.cpu.value == 1000'u32
+      benchmark.markRunning()
+      check sessionLate.pollNextGrant().len == 0
+
+      finishLease(benchmark, progress)
+      var lateWork = sessionLate.waitForGrant(901)
+      lateWork.markRunning()
+      finishLease(lateWork, progress)
+
+      let cliBlockerDecisions = sessionWork.offerAndReceive([
+        candidate(702, req("cli-benchmark-blocker", 1000, 512))
+      ])
+      var cliBlocker = cliBlockerDecisions.findDecision(702).lease
+      check not cliBlockerDecisions.findDecision(702).queued
+      cliBlocker.markRunning()
+
+      let markerPath = socketDir / "cli-benchmark-marker.txt"
+      cliBenchmark = startProcess(
+        cliPath(),
+        args = [
+          "acquire",
+          "--benchmark",
+          "--cpu", "500",
+          "--mem", "64MiB",
+          "--label", "cli-benchmark",
+          "--",
+          "/bin/sh", "-c", "echo ok > \"$1\"", "sh", markerPath
+        ],
+        options = {poStdErrToStdOut}
+      )
+      sleep(200)
+      check cliBenchmark.running
+      check not fileExists(markerPath)
+
+      finishLease(cliBlocker, progress)
+      check cliBenchmark.waitForExit(5000) == 0
+      check readFile(markerPath).strip() == "ok"
+      cliBenchmark.close()
+      cliBenchmark = nil
+
+      check progress == 4
+      sessionWork.closeSession()
+      sessionBench.closeSession()
+      sessionLate.closeSession()
+      clientWork.close()
+      clientBench.close()
+      clientLate.close()
+
+      let finalStatus = readStatus()
+      check finalStatus.activeSessions == 0'u32
+      check finalStatus.activeLeases == 0'u32
+      check finalStatus.queuedLeases == 0'u32
+      check finalStatus.finishedLeases == 4'u32
+    finally:
+      if cliBenchmark != nil:
+        if cliBenchmark.running:
+          cliBenchmark.terminate()
+          discard cliBenchmark.waitForExit(3000)
+        cliBenchmark.close()
+      if process.running:
+        process.terminate()
+        discard process.waitForExit(3000)
+      process.close()
+      if dirExists(socketDir):
+        removeDir(socketDir)
+
+  test "real daemon models host and VM shared CPU topology":
+    let socketDir = getTempDir() / ("runquota-m3-topology-" &
+        $getCurrentProcessId())
+    let socketPath = socketDir / "runquotad.sock"
+    if dirExists(socketDir):
+      removeDir(socketDir)
+    createDir(socketDir)
+    check fileExists(daemonPath())
+    check fileExists(cliPath())
+
+    let process = startProcess(
+      daemonPath(),
+      args = [
+        "--socket", socketPath,
+        "--machine", "host=4000," & $(4096'u64 * 1024'u64 * 1024'u64) &
+            ",1,physical",
+        "--machine", "vm=4000," & $(4096'u64 * 1024'u64 * 1024'u64) &
+            ",1,physical",
+        "--cpu-share-group", "physical=4000"
+      ],
+      options = {poStdErrToStdOut}
+    )
+    try:
+      waitForDaemon(socketPath)
+
+      var clientHost = connectDefault()
+      var clientVm = connectDefault()
+      var clientDenied = connectDefault()
+      var sessionHost = clientHost.registerSession("ci-host", "0.1.0")
+      var sessionVm = clientVm.registerSession("ci-vm", "0.1.0")
+      var sessionDenied = clientDenied.registerSession("ci-denied", "0.1.0")
+      var progress = 0
+
+      let hostDecisions = sessionHost.offerAndReceive([
+        candidate(1001, machineReq("host-memory-heavy", "host", 1000, 3072))
+      ])
+      var hostLease = hostDecisions.findDecision(1001).lease
+      check not hostDecisions.findDecision(1001).queued
+      hostLease.markRunning()
+
+      let vmDecisions = sessionVm.offerAndReceive([
+        candidate(1101, machineReq("vm-memory-heavy", "vm", 1000, 3072))
+      ])
+      var vmLease = vmDecisions.findDecision(1101).lease
+      check not vmDecisions.findDecision(1101).queued
+      vmLease.markRunning()
+
+      let blockedDecisions = sessionHost.offerAndReceive([
+        candidate(1002, machineReq("host-shared-cpu-blocked", "host", 2500, 256))
+      ])
+      let blockedDecision = blockedDecisions.findDecision(1002)
+      check blockedDecision.queued
+
+      let topology = runCli(["topology", "--json"])
+      check topology.contains("\"id\":\"host\"")
+      check topology.contains("\"id\":\"vm\"")
+      check topology.contains("\"id\":\"physical\"")
+      check topology.contains("\"cpu_share_group\":\"physical\"")
+      let leases = runCli(["leases", "--json"])
+      check leases.contains("\"machine_id\":\"host\"")
+      check leases.contains("\"machine_id\":\"vm\"")
+
+      try:
+        discard sessionDenied.requestLease(machineReq("unknown-machine",
+            "missing-vm", 100, 64))
+        check false
+      except RunQuotaClientError as error:
+        check error.msg.contains("unknown machine")
+
+      finishLease(vmLease, progress)
+      var unblocked = sessionHost.waitForGrant(1002)
+      unblocked.markRunning()
+      finishLease(unblocked, progress)
+      finishLease(hostLease, progress)
+
+      check progress == 3
+      sessionHost.closeSession()
+      sessionVm.closeSession()
+      sessionDenied.closeSession()
+      clientHost.close()
+      clientVm.close()
+      clientDenied.close()
+
+      let finalStatus = readStatus()
+      check finalStatus.activeSessions == 0'u32
+      check finalStatus.activeLeases == 0'u32
+      check finalStatus.queuedLeases == 0'u32
+      check finalStatus.finishedLeases == 3'u32
+    finally:
+      if process.running:
+        process.terminate()
+        discard process.waitForExit(3000)
+      process.close()
+      if dirExists(socketDir):
+        removeDir(socketDir)
+
   test "real daemon reports candidate batch and frame flow-control diagnostics":
     let socketDir = getTempDir() / ("runquota-m3-flow-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
@@ -375,16 +609,19 @@ suite "e2e_runquota_multi_client_fairness":
       var session = client.registerSession("repro-flow-control", "0.1.0")
       var tooManyCandidates: seq[LeaseCandidate] = @[]
       for i in 0 .. int(DefaultMaxCandidatesPerBatch):
-        tooManyCandidates.add(candidate(400'u64 + uint64(i), req("over-batch-" & $i, 100, 64)))
+        tooManyCandidates.add(candidate(400'u64 + uint64(i), req("over-batch-" &
+            $i, 100, 64)))
 
       session.sendRawCandidateOffer(90'u64, tooManyCandidates)
       let batchDiagnostic = client.receiveProtocolError(90'u64, "candidate batch exceeds")
-      check batchDiagnostic.detail.contains("max_candidates_per_batch=" & $DefaultMaxCandidatesPerBatch)
+      check batchDiagnostic.detail.contains("max_candidates_per_batch=" &
+          $DefaultMaxCandidatesPerBatch)
       check readStatus().activeSessions == 1'u32
 
       client.connection.sendFrame(oversizedStatusRequestFrame(91'u64))
       let frameDiagnostic = client.receiveProtocolError(91'u64, "frame exceeds")
-      check frameDiagnostic.detail.contains("max_frame_bytes=" & $DefaultMaxFrameBytes)
+      check frameDiagnostic.detail.contains("max_frame_bytes=" &
+          $DefaultMaxFrameBytes)
       client.close()
       waitForNoActiveSessions()
     finally:

@@ -118,6 +118,7 @@ proc readString*(r: var BinaryReader; value: var string): bool =
   r.readBytes(value)
 
 proc writeResourceVector*(w: var BinaryWriter; resources: ResourceVector) =
+  w.writeString(resources.machineId)
   w.writeU32(resources.cpu.value)
   w.writeU64(resources.memory.value)
   w.writeU64(resources.hardMemoryLimit.value)
@@ -128,13 +129,16 @@ proc writeResourceVector*(w: var BinaryWriter; resources: ResourceVector) =
     w.writeString(demand.name)
     w.writeU32(demand.units)
 
-proc readResourceVector*(r: var BinaryReader; resources: var ResourceVector): bool =
+proc readResourceVector*(r: var BinaryReader;
+    resources: var ResourceVector): bool =
+  var machineId: string
   var cpu: uint32
   var memory: uint64
   var hardLimit: uint64
   var ioRaw: uint32
   var processCount: uint32
   var namedPoolCount: uint32
+  if not r.readString(machineId): return false
   if not r.readU32(cpu): return false
   if not r.readU64(memory): return false
   if not r.readU64(hardLimit): return false
@@ -152,6 +156,7 @@ proc readResourceVector*(r: var BinaryReader; resources: var ResourceVector): bo
     if not r.readU32(units): return false
     namedPools.add(NamedPoolDemand(name: name, units: units))
   resources = ResourceVector(
+    machineId: if machineId.len == 0: DefaultMachineId else: machineId,
     cpu: MilliCpu(cpu),
     memory: Bytes(memory),
     hardMemoryLimit: Bytes(hardLimit),
@@ -191,7 +196,8 @@ proc readDiagnostic*(r: var BinaryReader; diagnostic: var Diagnostic): bool =
     return false
   if not r.readString(message): return false
   if not r.readString(detail): return false
-  diagnostic = Diagnostic(code: DiagnosticCode(codeRaw), message: message, detail: detail)
+  diagnostic = Diagnostic(code: DiagnosticCode(codeRaw), message: message,
+      detail: detail)
   true
 
 proc writeCapabilities*(w: var BinaryWriter; caps: CapabilityRecord) =
@@ -331,9 +337,11 @@ proc inspectionResourceJson*(resources: ResourceVector): string =
   for i, demand in resources.namedPools:
     if i > 0:
       namedPools.add(",")
-    namedPools.add("{\"name\":" & jsonEscape(demand.name) & ",\"units\":" & $demand.units & "}")
+    namedPools.add("{\"name\":" & jsonEscape(demand.name) & ",\"units\":" &
+        $demand.units & "}")
   namedPools.add("]")
   "{" &
+    "\"machine_id\":" & jsonEscape(resources.machineId) & "," &
     "\"cpu_milli\":" & $resources.cpu.value & "," &
     "\"memory_bytes\":" & $resources.memory.value & "," &
     "\"hard_memory_limit_bytes\":" & $resources.hardMemoryLimit.value & "," &

@@ -22,11 +22,16 @@ proc finishOutcome(completion: ProcessCompletion): LeaseFinishOutcome =
     leaseFinishFailed
 
 proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
-                   command: CommandSpec; releaseAfterFinish = true): LeaseExecutionResult =
+                   command: CommandSpec; releaseAfterFinish = true;
+                   waitForQueued = false): LeaseExecutionResult =
   result = LeaseExecutionResult(
     state: esWaitingForLease
   )
-  var lease = session.requestLease(request)
+  var lease =
+    if waitForQueued:
+      session.requestLeaseWaiting(request)
+    else:
+      session.requestLease(request)
   result.leaseId = lease.id.value
   try:
     result.state = esStarting
@@ -43,8 +48,10 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
     child.close()
     lease.finish(
       outcome = finishOutcome(completion),
-      exitCode = if completion.exited: uint32(max(completion.exitCode, 0)) else: 0'u32,
-      signal = if completion.signaled: uint32(max(completion.signal, 0)) else: 0'u32,
+      exitCode = if completion.exited: uint32(max(completion.exitCode,
+          0)) else: 0'u32,
+      signal = if completion.signaled: uint32(max(completion.signal,
+          0)) else: 0'u32,
       peakMemoryBytes = completion.peakResidentMemoryBytes,
       processCount = completion.processCount
     )
@@ -68,7 +75,8 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
 proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
                    argv: openArray[string]; cwd = ""; env: openArray[string] = [];
                    stdoutLimit = DefaultOutputLimit;
-                   stderrLimit = DefaultOutputLimit): LeaseExecutionResult =
+                   stderrLimit = DefaultOutputLimit;
+                   waitForQueued = false): LeaseExecutionResult =
   session.runWithLease(
     request,
     commandSpec(
@@ -77,5 +85,6 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
       env = env,
       stdoutLimit = stdoutLimit,
       stderrLimit = stderrLimit
-    )
+    ),
+    waitForQueued = waitForQueued
   )
