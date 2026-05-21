@@ -11,6 +11,8 @@ when defined(windows):
   import std/winlean
 
 import runquota_core
+when defined(linux):
+  import runquota_host_linux
 import runquota_host_macos
 when defined(windows):
   # Windows: per-lease RSS telemetry comes from the Windows host backend so
@@ -476,7 +478,11 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
       let now = epochTime()
       if child.lastTelemetrySampleSeconds == 0.0 or
           now - child.lastTelemetrySampleSeconds >= 0.1:
-        let sample = sampleMacosProcessTreeTelemetry(uint64(child.pid))
+        let sample =
+          when defined(linux):
+            sampleLinuxProcessTreeTelemetry(uint64(child.pid))
+          else:
+            sampleMacosProcessTreeTelemetry(uint64(child.pid))
         child.lastTelemetrySampleSeconds = now
         child.telemetrySource = sample.source
         if sample.diagnostic.code == diagOk:

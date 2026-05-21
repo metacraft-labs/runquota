@@ -2,6 +2,8 @@ import std/[os, osproc, strutils, unittest]
 
 import runquota_client
 import runquota_core
+when defined(linux):
+  import runquota_host_linux
 import runquota_host_macos
 import runquota_process
 import runquota_protocol
@@ -9,7 +11,11 @@ import runquota_protocol
 const FixtureArg = "--pressure-fixture"
 
 if commandLineParams().len == 1 and commandLineParams()[0] == FixtureArg:
+  var ballast = newSeq[byte](8 * 1024 * 1024)
+  for i in countup(0, ballast.high, 4096):
+    ballast[i] = byte(i and 0xff)
   sleep(30_000)
+  doAssert ballast.len > 0
   quit 0
 
 proc daemonPath(): string =
@@ -65,7 +71,11 @@ proc launchForLease(lease: var RunQuotaLease): LaunchedProcess =
 
 proc waitForProcessTelemetry(processId: uint64): HostProcessTreeTelemetrySample =
   for _ in 0 ..< 100:
-    result = sampleMacosProcessTreeTelemetry(processId)
+    result =
+      when defined(linux):
+        sampleLinuxProcessTreeTelemetry(processId)
+      else:
+        sampleMacosProcessTreeTelemetry(processId)
     if result.diagnostic.code == diagOk and result.rootAlive and
         result.processCount > 0 and result.residentMemoryBytes > mib(1):
       return

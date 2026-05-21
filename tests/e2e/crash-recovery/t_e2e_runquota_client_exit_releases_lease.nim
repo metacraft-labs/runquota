@@ -87,6 +87,11 @@ proc blockUntilKilled() =
   while true:
     sleep(1000)
 
+proc sleepCommand(): string =
+  result = findExe("sleep")
+  if result.len == 0:
+    result = "/bin/sleep"
+
 proc forceKillSupervisor(process: var owned(Process)) =
   when defined(posix):
     check kill(Pid(process.processID), SIGKILL) == 0
@@ -129,7 +134,7 @@ proc runStartingUntilKilled(readyPath: string): int =
 
 proc runRunningLeak(pidPath: string): int =
   var child = startProcess(
-    "/bin/sleep",
+    sleepCommand(),
     args = ["30"],
     options = {poStdErrToStdOut}
   )
@@ -143,7 +148,7 @@ proc runRunningLeak(pidPath: string): int =
 
 proc runRunningUntilKilled(readyPath, pidPath: string): int =
   var child = startProcess(
-    "/bin/sleep",
+    sleepCommand(),
     args = ["30"],
     options = {poStdErrToStdOut}
   )

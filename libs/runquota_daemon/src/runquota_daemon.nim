@@ -304,7 +304,7 @@ proc configuredPressureSample(daemon: RunQuotaDaemon): HostMemoryPressureSample 
 proc configuredPressureAvailable(daemon: RunQuotaDaemon): bool =
   case daemon.config.pressureSource
   of pressureSourceHost:
-    when defined(macosx):
+    when defined(macosx) or defined(windows):
       true
     else:
       false
