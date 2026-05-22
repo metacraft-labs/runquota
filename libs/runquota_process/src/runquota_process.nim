@@ -295,6 +295,65 @@ when defined(windows):
         continue
       result[entry[0 ..< eq]] = entry[eq + 1 .. ^1]
 
+  proc winAppendBounded(target: var string; total: var uint64; data: pointer;
+                        count, limit: int) =
+    # Windows: mirrors the POSIX `appendBounded` — always accumulate the true
+    # byte count, but only keep up to `limit` bytes of text.
+    if count <= 0:
+      return
+    total += uint64(count)
+    if limit <= 0:
+      let oldLen = target.len
+      target.setLen(oldLen + count)
+      copyMem(addr target[oldLen], data, count)
+      return
+    if target.len >= limit:
+      return
+    let take = min(count, limit - target.len)
+    let oldLen = target.len
+    target.setLen(oldLen + take)
+    copyMem(addr target[oldLen], data, take)
+
+  proc winDrainOutput(child: var LaunchedProcess; process: Process;
+                      blocking: bool) =
+    # Windows: drain whatever the osproc output pipe currently holds into
+    # `child.stdoutText`. stderr is merged into stdout via poStdErrToStdOut at
+    # launch, so there is no separate stderr stream to drain. When `blocking`
+    # is false we only read while PeekNamedPipe reports data ready, so an idle
+    # child cannot stall the caller.
+    let outputStream = process.outputStream
+    if outputStream == nil:
+      return
+    var buffer: array[8192, char]
+    while true:
+      if not blocking and not process.hasData():
+        break
+      let n = outputStream.readData(addr buffer[0], buffer.len)
+      if n <= 0:
+        break
+      winAppendBounded(child.stdoutText, child.stdoutBytes,
+                       addr buffer[0], n, child.stdoutLimit)
+      if not blocking and not process.hasData():
+        break
+
+  proc winSampleTelemetry(child: var LaunchedProcess; force = false) =
+    # Windows: sample the live process tree's RSS / process count via the
+    # Windows host backend, throttled to ~10Hz like the POSIX path. Peak RSS
+    # cannot be read after the tree exits, so callers must sample while it is
+    # still alive.
+    let now = epochTime()
+    if not force and child.lastTelemetrySampleSeconds != 0.0 and
+        now - child.lastTelemetrySampleSeconds < 0.1:
+      return
+    child.lastTelemetrySampleSeconds = now
+    let sample = sampleWindowsProcessTreeTelemetry(uint64(child.pid))
+    child.telemetrySource = sample.source
+    if sample.diagnostic.code == diagOk:
+      if sample.residentMemoryBytes > child.peakResidentMemoryBytes:
+        child.peakResidentMemoryBytes = sample.residentMemoryBytes
+      if sample.processCount > child.processCount:
+        child.processCount = sample.processCount
+
   proc launchWindowsProcess(spec: CommandSpec): LaunchedProcess =
     if spec.argv.len == 0:
       raise newException(ValueError, "empty argv")
@@ -331,6 +390,14 @@ when defined(windows):
       startedSeconds: epochTime(),
       runningFlag: true,
       cancelSent: false,
+      doneFlag: false,
+      waitStatus: -1,
+      stdoutBytes: 0'u64,
+      stderrBytes: 0'u64,
+      peakResidentMemoryBytes: 0'u64,
+      processCount: 0'u32,
+      telemetrySource: backendProfile().telemetry,
+      lastTelemetrySampleSeconds: 0.0,
       info: LaunchResult(
         processId: processId,
         processGroupId: processId,
@@ -457,6 +524,32 @@ proc buildCompletion(child: LaunchedProcess; timedOut: bool): ProcessCompletion 
       child.peakResidentMemoryBytes,
       child.processCount,
       child.telemetrySource)
+  elif defined(windows):
+    # Windows: there are no POSIX-style signals — `child.waitStatus` holds the
+    # raw process exit code (or -1 if the child has not been observed to exit).
+    # The whole tree's CPU time comes from Job Object accounting; the same
+    # fields and semantics as the POSIX completion otherwise.
+    result = ProcessCompletion(
+      processId: uint64(child.pid),
+      processGroupId: uint64(child.processGroupId),
+      exitCode: -1,
+      signal: 0,
+      exited: false,
+      signaled: false,
+      cancelled: child.cancelSent,
+      timedOut: timedOut,
+      stdout: child.stdoutText,
+      stderr: child.stderrText,
+      stdoutBytes: child.stdoutBytes,
+      stderrBytes: child.stderrBytes,
+      elapsedMillis: uint64(max(0, int((epochTime() - child.startedSeconds) * 1000.0))),
+      peakResidentMemoryBytes: child.peakResidentMemoryBytes,
+      processCount: child.processCount,
+      telemetrySource: child.telemetrySource
+    )
+    if not timedOut and child.waitStatus >= 0:
+      result.exited = true
+      result.exitCode = child.waitStatus
   else:
     raise newException(OSError, "runquota_process is only implemented on POSIX")
 
@@ -512,6 +605,55 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
         if child.completion.processCount == 0:
           child.completion.processCount = 1
         return true
+    false
+  elif defined(windows):
+    # Windows: nonblocking completion check. We sample live tree telemetry,
+    # drain any output the pipe already holds (PeekNamedPipe-gated so an idle
+    # child doesn't stall us), and ask osproc whether the process has exited.
+    # When it has, drain the remainder and populate `child.completion`.
+    if child.completion.exited or child.completion.signaled or
+        child.completion.timedOut:
+      return true
+    if child.winProcessPtr.isNil:
+      return false
+    let process = cast[Process](child.winProcessPtr)
+
+    # Windows: sample RSS / process count before draining so even a very
+    # short-lived child gets at least one snapshot while still alive.
+    winSampleTelemetry(child)
+    winDrainOutput(child, process, blocking = false)
+
+    if not child.doneFlag:
+      var alive = true
+      try:
+        alive = process.running()
+      except CatchableError:
+        alive = false
+      if not alive:
+        child.doneFlag = true
+        child.runningFlag = false
+        try:
+          child.waitStatus = process.peekExitCode()
+        except CatchableError:
+          child.waitStatus = -1
+
+    if child.doneFlag:
+      # Windows: take one final telemetry snapshot and drain whatever the pipe
+      # still buffers before reporting completion.
+      winSampleTelemetry(child, force = true)
+      winDrainOutput(child, process, blocking = true)
+      if child.winJobHandle != 0:
+        var cpuMicros = 0'u64
+        var jobProcessCount = 0'u32
+        readJobAccounting(Handle(child.winJobHandle), cpuMicros, jobProcessCount)
+        # Windows: prefer the Job Object's TotalProcesses (counts every process
+        # the tree ever spawned) over the live toolhelp32 count.
+        if jobProcessCount > child.processCount:
+          child.processCount = jobProcessCount
+      child.completion = child.buildCompletion(timedOut = false)
+      if child.completion.processCount == 0:
+        child.completion.processCount = 1
+      return true
     false
   else:
     raise newException(OSError, "runquota_process is only implemented on POSIX")
@@ -612,111 +754,73 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
       result.processCount = 1
     child.completion = result
   elif defined(windows):
-    # Windows: stream stdout (merged stderr via poStdErrToStdOut) into a
-    # bounded buffer while polling for exit, then collect Job Object
-    # accounting. We re-use osproc's Process.outputStream for capture.
+    # Windows: mirror the POSIX structure — repeatedly call pollCompletion
+    # (which drains the bounded stdout buffer, samples Job Object / toolhelp32
+    # telemetry, and detects exit) until the child finishes or the deadline
+    # elapses. stderr is merged into stdout via poStdErrToStdOut at launch, so
+    # there is no separate stderr stream.
     if child.winProcessPtr.isNil:
       raise newException(OSError, "runquota_process: missing Windows process handle")
     let process = cast[Process](child.winProcessPtr)
-    var stdoutText = ""
-    var stdoutBytes = 0'u64
     var timedOut = false
-    var exitCode = -1
-    let outputStream = process.outputStream
-    var buffer = newString(8192)
-    # Windows: track the peak RSS observed over the lifetime of the tree by
-    # sampling Toolhelp32 each poll iteration. We can't read RSS post-exit so
-    # the running loop must record it before the process drops out. We avoid
-    # blocking on outputStream.readData (which would stall RSS polling while
-    # the child is silent) and instead peek the pipe each iteration.
-    var peakResidentBytes = 0'u64
-    var observedProcessCount = 0'u32
-    var telemetrySource = backendProfile().telemetry
+
     while true:
-      # Windows: sample the live tree first so even very short-lived children
-      # get at least one snapshot before they exit.
-      let sample = sampleWindowsProcessTreeTelemetry(uint64(child.pid))
-      telemetrySource = sample.source
-      if sample.diagnostic.code == diagOk:
-        if sample.residentMemoryBytes > peakResidentBytes:
-          peakResidentBytes = sample.residentMemoryBytes
-        if sample.processCount > observedProcessCount:
-          observedProcessCount = sample.processCount
-      # Windows: drain stdout only when there's data ready (PeekNamedPipe),
-      # so an idle child doesn't stall the RSS poller.
-      var pulled = false
-      if outputStream != nil and process.hasData():
-        let n = outputStream.readData(addr buffer[0], buffer.len)
-        if n > 0:
-          pulled = true
-          stdoutBytes += uint64(n)
-          if child.stdoutLimit <= 0 or stdoutText.len < child.stdoutLimit:
-            let take =
-              if child.stdoutLimit <= 0: n
-              else: min(n, child.stdoutLimit - stdoutText.len)
-            if take > 0:
-              let oldLen = stdoutText.len
-              stdoutText.setLen(oldLen + take)
-              copyMem(addr stdoutText[oldLen], addr buffer[0], take)
-      if not process.running():
-        # Windows: process has exited; drain anything still buffered in the
-        # pipe before breaking out.
-        while outputStream != nil and process.hasData():
-          let n = outputStream.readData(addr buffer[0], buffer.len)
-          if n <= 0: break
-          stdoutBytes += uint64(n)
-          if child.stdoutLimit <= 0 or stdoutText.len < child.stdoutLimit:
-            let take =
-              if child.stdoutLimit <= 0: n
-              else: min(n, child.stdoutLimit - stdoutText.len)
-            if take > 0:
-              let oldLen = stdoutText.len
-              stdoutText.setLen(oldLen + take)
-              copyMem(addr stdoutText[oldLen], addr buffer[0], take)
-        try:
-          exitCode = process.peekExitCode()
-        except CatchableError:
-          exitCode = -1
+      if child.pollCompletion():
         break
+
       let elapsed = int((epochTime() - child.startedSeconds) * 1000.0)
       if timeout >= 0 and elapsed >= timeout:
         timedOut = true
+        # Windows: terminate the whole tree via the Job Object, then give it a
+        # short grace period to actually drop before hard-killing.
         child.terminate()
-        try: discard process.waitForExit(timeout = 0)
-        except CatchableError: discard
+        let killDeadline = epochTime() + 1.0
+        while epochTime() < killDeadline:
+          winSampleTelemetry(child)
+          winDrainOutput(child, process, blocking = false)
+          var alive = true
+          try:
+            alive = process.running()
+          except CatchableError:
+            alive = false
+          if not alive:
+            child.doneFlag = true
+            child.runningFlag = false
+            try:
+              child.waitStatus = process.peekExitCode()
+            except CatchableError:
+              child.waitStatus = -1
+            break
+          sleep(10)
+        if not child.doneFlag:
+          child.killNow()
+          try: discard process.waitForExit(timeout = 1000)
+          except CatchableError: discard
+          try:
+            child.waitStatus = process.peekExitCode()
+          except CatchableError:
+            child.waitStatus = -1
+          child.doneFlag = true
+          child.runningFlag = false
+        # Windows: final telemetry + output drain, plus Job Object accounting.
+        winSampleTelemetry(child, force = true)
+        winDrainOutput(child, process, blocking = true)
+        if child.winJobHandle != 0:
+          var cpuMicros = 0'u64
+          var jobProcessCount = 0'u32
+          readJobAccounting(Handle(child.winJobHandle), cpuMicros, jobProcessCount)
+          if jobProcessCount > child.processCount:
+            child.processCount = jobProcessCount
         break
-      if not pulled:
-        # Windows: short sleep so we don't burn a core polling.
-        sleep(10)
-    let elapsedMillis = uint64(max(0, int((epochTime() - child.startedSeconds) * 1000.0)))
-    var cpuMicros = 0'u64
-    var jobProcessCount = 0'u32
-    if child.winJobHandle != 0:
-      readJobAccounting(Handle(child.winJobHandle), cpuMicros, jobProcessCount)
-    # Windows: prefer the Job Object's TotalProcesses (counts every process the
-    # tree ever spawned, even short-lived ones) over the live toolhelp32 count.
-    var processCount = max(jobProcessCount, observedProcessCount)
-    if processCount == 0 and not timedOut:
-      processCount = 1
-    child.runningFlag = false
-    result = ProcessCompletion(
-      processId: uint64(child.pid),
-      processGroupId: uint64(child.processGroupId),
-      exitCode: exitCode,
-      signal: 0,
-      exited: exitCode >= 0 and not timedOut,
-      signaled: false,
-      cancelled: child.cancelSent,
-      timedOut: timedOut,
-      stdout: stdoutText,
-      stderr: "",
-      stdoutBytes: stdoutBytes,
-      stderrBytes: 0'u64,
-      elapsedMillis: elapsedMillis,
-      peakResidentMemoryBytes: peakResidentBytes,
-      processCount: processCount,
-      telemetrySource: telemetrySource
-    )
+
+      # Windows: short sleep so we don't burn a core polling the pipe / tree.
+      sleep(10)
+
+    if timedOut:
+      child.completion = child.buildCompletion(timedOut = true)
+    result = child.completion
+    if result.processCount == 0 and not result.timedOut:
+      result.processCount = 1
     child.completion = result
   else:
     raise newException(OSError, "runquota_process is only implemented on POSIX")
