@@ -54,16 +54,11 @@ when isMainModule:
       if i + 1 >= args.len:
         echo usage
         quit 2
-      # Windows: accept a named-pipe path here so users and tests can override
-      # the per-user default endpoint with `runquotad --socket \\.\pipe\name`.
-      when defined(windows):
-        let raw = args[i + 1]
-        if raw.startsWith(r"\\.\pipe\") or raw.startsWith(r"\\?\pipe\"):
-          config.endpoint = Endpoint(kind: endpointNamedPipe, path: raw)
-        else:
-          config.endpoint = unixEndpoint(raw)
-      else:
-        config.endpoint = unixEndpoint(args[i + 1])
+      # Resolve the path to an endpoint: a Unix-domain socket on POSIX, a
+      # named pipe on Windows. A `\\.\pipe\...` value is used as-is; any other
+      # path (e.g. a `.sock` path from a cross-platform caller) is mapped
+      # deterministically onto a named pipe so the matching client agrees.
+      config.endpoint = endpointForPath(args[i + 1])
       i += 2
     of "--cpu-milli":
       if i + 1 >= args.len:

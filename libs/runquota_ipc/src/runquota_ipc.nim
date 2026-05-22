@@ -133,18 +133,38 @@ when defined(windows):
   proc defaultWindowsPipePath(): string =
     r"\\.\pipe\runquota-" & currentUserToken()
 
+  proc windowsPipeToken(path: string): string =
+    ## A stable, short, pipe-name-safe token derived from `path` (FNV-1a over
+    ## the case-folded path -- Windows paths are case-insensitive). Computed
+    ## inline rather than via std/hashes so it does not depend on that
+    ## module's build-specific string hashing: a server and a client given
+    ## the same path must always derive the same pipe name.
+    var h = 0xcbf29ce484222325'u64
+    for ch in path.toLowerAscii():
+      h = h xor uint64(ord(ch))
+      h = h * 0x100000001b3'u64
+    toHex(h)
+
+proc endpointForPath*(path: string): Endpoint =
+  ## Resolve a user-supplied endpoint path -- a `--socket` argument or the
+  ## RUNQUOTA_SOCKET override -- to a concrete endpoint. On POSIX this is a
+  ## Unix-domain socket. On Windows, which this transport serves with named
+  ## pipes, a path already in `\\.\pipe\...` form is used as-is; any other
+  ## path (e.g. a `.sock` path from a cross-platform caller such as the CMake
+  ## generator benchmark) is mapped deterministically onto a named pipe, so a
+  ## server and a client handed the same path always meet on the same pipe.
+  when defined(windows):
+    if path.startsWith(r"\\.\pipe\") or path.startsWith(r"\\?\pipe\"):
+      namedPipeEndpoint(path)
+    else:
+      namedPipeEndpoint(r"\\.\pipe\runquota-" & windowsPipeToken(path))
+  else:
+    unixEndpoint(path)
+
 proc defaultEndpoint*(): Endpoint =
   let overridePath = getEnv("RUNQUOTA_SOCKET")
   if overridePath.len > 0:
-    when defined(windows):
-      # Windows: respect the override but treat values starting with \\.\pipe\
-      # as named-pipe paths and everything else as a Unix-socket override
-      # (used in cross-platform fixtures that already set the env var).
-      if overridePath.startsWith(r"\\.\pipe\") or overridePath.startsWith(r"\\?\pipe\"):
-        return namedPipeEndpoint(overridePath)
-      return unixEndpoint(overridePath)
-    else:
-      return unixEndpoint(overridePath)
+    return endpointForPath(overridePath)
   when defined(posix):
     let base = getEnv("XDG_RUNTIME_DIR", getEnv("TMPDIR", getTempDir()))
     let dir = base / ("runquota-" & $getuid())
