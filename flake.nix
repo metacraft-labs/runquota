@@ -53,13 +53,16 @@
             dontConfigure = true;
 
             nativeBuildInputs = [
+              pkgs.bash
+              pkgs.coreutils
               pkgs.just
               pkgs.nim2
             ];
 
             buildPhase = ''
               runHook preBuild
-              just build
+              mkdir -p test-logs
+              ${pkgs.bash}/bin/bash scripts/build_apps.sh 2>&1 | tee test-logs/build.log
               runHook postBuild
             '';
 
