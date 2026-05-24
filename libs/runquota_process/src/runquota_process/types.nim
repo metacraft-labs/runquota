@@ -1,3 +1,5 @@
+import std/osproc
+
 type
   LibraryInfo* = object
     name*: string
@@ -66,9 +68,18 @@ type
     lastTelemetrySampleSeconds*: float
     info*: LaunchResult
     completion*: ProcessCompletion
-    # Windows: extra slots store the osproc Process pointer and the Job Object
-    # handle so the rest of the lifecycle (wait/terminate/close) can find them.
-    # The fields are present on all platforms (kept simple to avoid case-object
-    # constructor noise) but only populated on Windows.
-    winProcessPtr*: pointer
+    # Windows: extra slots store the osproc Process ref and the Job Object
+    # handle so the rest of the lifecycle (wait/terminate/close) can find
+    # them. The fields are present on all platforms (kept simple to avoid
+    # case-object constructor noise) but only populated on Windows.
+    #
+    # `winProcess` MUST be a typed `Process` ref (not a raw `pointer`):
+    # Nim's Process is a ref ProcessObj, and storing only an untyped
+    # pointer cast hides the reference from the GC. At higher concurrency
+    # the GC can collect the underlying ProcessObj before the LaunchedProcess
+    # is finished with it; the next pollCompletion then dereferences freed
+    # memory, occasionally tripping the
+    # `poParentStreams notin p.options` assert inside osproc.outputStream
+    # when the freed memory happens to alias a Process with those options.
+    winProcess*: Process
     winJobHandle*: uint64

@@ -404,7 +404,7 @@ when defined(windows):
         running: true,
         backend: backendProfile()
       ),
-      winProcessPtr: cast[pointer](process),
+      winProcess: process,
       winJobHandle: uint64(job)
     )
 
@@ -503,10 +503,9 @@ proc running*(child: LaunchedProcess): bool =
       return false
     kill(Pid(child.pid), 0) == 0 or errno == EPERM
   elif defined(windows):
-    if not child.runningFlag or child.winProcessPtr.isNil:
+    if not child.runningFlag or child.winProcess.isNil:
       return false
-    let process = cast[Process](child.winProcessPtr)
-    process.running()
+    child.winProcess.running()
   else:
     false
 
@@ -614,9 +613,9 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
     if child.completion.exited or child.completion.signaled or
         child.completion.timedOut:
       return true
-    if child.winProcessPtr.isNil:
+    if child.winProcess.isNil:
       return false
-    let process = cast[Process](child.winProcessPtr)
+    let process = child.winProcess
 
     # Windows: sample RSS / process count before draining so even a very
     # short-lived child gets at least one snapshot while still alive.
@@ -672,9 +671,8 @@ proc terminate*(child: var LaunchedProcess) =
     child.cancelSent = true
     if child.winJobHandle != 0:
       discard terminateJobObject(Handle(child.winJobHandle), 1'u32)
-    elif not child.winProcessPtr.isNil:
-      let process = cast[Process](child.winProcessPtr)
-      try: process.terminate() except CatchableError: discard
+    elif not child.winProcess.isNil:
+      try: child.winProcess.terminate() except CatchableError: discard
 
 proc killNow*(child: var LaunchedProcess) =
   when defined(posix):
@@ -689,9 +687,8 @@ proc killNow*(child: var LaunchedProcess) =
     child.cancelSent = true
     if child.winJobHandle != 0:
       discard terminateJobObject(Handle(child.winJobHandle), 1'u32)
-    elif not child.winProcessPtr.isNil:
-      let process = cast[Process](child.winProcessPtr)
-      try: process.kill() except CatchableError: discard
+    elif not child.winProcess.isNil:
+      try: child.winProcess.kill() except CatchableError: discard
 
 proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessCompletion =
   when defined(posix):
@@ -759,9 +756,9 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
     # telemetry, and detects exit) until the child finishes or the deadline
     # elapses. stderr is merged into stdout via poStdErrToStdOut at launch, so
     # there is no separate stderr stream.
-    if child.winProcessPtr.isNil:
+    if child.winProcess.isNil:
       raise newException(OSError, "runquota_process: missing Windows process handle")
-    let process = cast[Process](child.winProcessPtr)
+    let process = child.winProcess
     var timedOut = false
 
     while true:
@@ -846,10 +843,9 @@ proc close*(child: var LaunchedProcess) =
     # Windows: release osproc resources and let the Job Object close. With
     # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set, closing the last handle reaps
     # any straggler processes in the tree.
-    if not child.winProcessPtr.isNil:
-      let process = cast[Process](child.winProcessPtr)
-      try: process.close() except CatchableError: discard
-      child.winProcessPtr = nil
+    if not child.winProcess.isNil:
+      try: child.winProcess.close() except CatchableError: discard
+      child.winProcess = nil
     if child.winJobHandle != 0:
       discard closeHandle(Handle(child.winJobHandle))
       child.winJobHandle = 0
