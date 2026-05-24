@@ -96,6 +96,17 @@ type
     peer*: PeerIdentity
     sessionIds*: seq[SessionId]
 
+  MachineUsage* = object
+    cpu*: uint32
+    memory*: uint64
+    ioSlots*: uint32
+
+  PressureFileCache* = object
+    path*: string
+    mtimeUnix*: int64
+    sizeBytes*: int64
+    raw*: string
+
   RunQuotaDaemon* = object
     config*: DaemonConfig
     state*: DaemonState
@@ -109,3 +120,9 @@ type
     leases*: Table[uint64, LeaseRow]
     estimates*: Table[string, LearnedEstimateRow]
     estimateStore*: EstimateStore
+    activeLeaseCount*: uint32
+    activeBenchmarkCount*: uint32
+    machineUsage*: Table[string, MachineUsage]
+    cpuShareGroupUsage*: Table[string, uint32]
+    namedPoolUsage*: Table[string, uint32]
+    pressureFileCache*: PressureFileCache
