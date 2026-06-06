@@ -1,0 +1,7 @@
+version = "0.1.0"
+author = "Metacraft Labs"
+description = "RunQuota generic multi-way DAG partitioner (bin-packing)"
+license = "MIT"
+srcDir = "src"
+requires "nim >= 2.2.0"
+requires "runquota_core >= 0.1.0"
