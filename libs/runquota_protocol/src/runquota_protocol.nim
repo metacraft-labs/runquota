@@ -304,7 +304,15 @@ proc decodeLeaseRequest*(payload: string; msg: var LeaseRequestMessage): bool =
   if not r.readU64(id): return false
   if not r.readString(label): return false
   if not r.readBytes(commandStatsId): return false
-  if commandStatsId.len > MaxCommandStatsIdBytes: return false
+  # ``commandStatsId`` is a best-effort stats-grouping hint, not a load-bearing
+  # field. An over-long value (e.g. a caller that defaults it to a long, unique
+  # action id) must NOT hard-fail the decode: in the batched ``OfferCandidates``
+  # message that would reject the WHOLE batch and stall the caller's entire
+  # build over one non-essential field — and it is asymmetric with ``label``,
+  # which carries no length cap. ``readBytes`` has already consumed the full
+  # field, so truncating to the cap here is frame-alignment-safe.
+  if commandStatsId.len > MaxCommandStatsIdBytes:
+    commandStatsId.setLen(MaxCommandStatsIdBytes)
   if not r.readResourceVector(resources): return false
   if not r.readDeadline(deadline): return false
   if not r.readU32(priorityRaw): return false
@@ -348,7 +356,15 @@ proc readLeaseCandidate(r: var BinaryReader;
   if not r.readU64(clientCandidateId): return false
   if not r.readString(label): return false
   if not r.readBytes(commandStatsId): return false
-  if commandStatsId.len > MaxCommandStatsIdBytes: return false
+  # ``commandStatsId`` is a best-effort stats-grouping hint, not a load-bearing
+  # field. An over-long value (e.g. a caller that defaults it to a long, unique
+  # action id) must NOT hard-fail the decode: in the batched ``OfferCandidates``
+  # message that would reject the WHOLE batch and stall the caller's entire
+  # build over one non-essential field — and it is asymmetric with ``label``,
+  # which carries no length cap. ``readBytes`` has already consumed the full
+  # field, so truncating to the cap here is frame-alignment-safe.
+  if commandStatsId.len > MaxCommandStatsIdBytes:
+    commandStatsId.setLen(MaxCommandStatsIdBytes)
   if not r.readResourceVector(resources): return false
   if not r.readDeadline(deadline): return false
   if not r.readU32(priorityRaw): return false

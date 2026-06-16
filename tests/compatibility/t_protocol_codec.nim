@@ -1,5 +1,6 @@
 import std/unittest
 
+import runquota_client
 import runquota_codec
 import runquota_core
 import runquota_protocol
@@ -100,3 +101,27 @@ suite "RQSP protocol and codec":
     check decoded.finishedLeases == 0'u32
     check inspectionStatusJson(decoded) ==
       "{\"active_sessions\":0,\"active_leases\":1,\"queued_leases\":0,\"supervisor_lost_leases\":1,\"finished_leases\":0,\"total_granted\":3,\"total_finished\":0}"
+
+  test "candidate offer truncates an over-long commandStatsId instead of rejecting":
+    # Regression: a caller that defaults ``commandStatsId`` to a long, unique
+    # action id (> MaxCommandStatsIdBytes) must NOT hard-fail the decode. For a
+    # batched ``OfferCandidates`` message that rejected the WHOLE batch — every
+    # staged launch failed and the caller's build scheduler stalled with "no
+    # progress" — and it was asymmetric with ``label`` (no length cap). The
+    # over-long stats hint is now truncated; the candidate still decodes.
+    let longId = "reprobuild.test_execute." &
+      "t_workspace_pre_push_passes_when_clean_and_published_and_locked"
+    check longId.len > MaxCommandStatsIdBytes
+    var request = resourceRequest(longId, milliCpu(1000), bytes(128))
+    request.commandStatsId = longId
+    let offer = CandidateOfferMessage(
+      sessionId: sessionId(1),
+      candidates: @[toCandidate(7'u64, request)])
+    var decoded: CandidateOfferMessage
+    check decodeCandidateOffer(encodeCandidateOffer(offer), decoded)
+    check decoded.candidates.len == 1
+    # ``label`` is preserved in full (it carries no cap); only the stats hint
+    # is truncated to the protocol maximum.
+    check decoded.candidates[0].label == longId
+    check decoded.candidates[0].commandStatsId.len == MaxCommandStatsIdBytes
+    check decoded.candidates[0].commandStatsId == longId[0 ..< MaxCommandStatsIdBytes]
