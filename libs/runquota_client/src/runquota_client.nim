@@ -1,4 +1,4 @@
-import std/[os, tables]
+import std/[os, tables, strutils]
 
 when defined(posix):
   import std/posix
@@ -12,6 +12,25 @@ import runquota_protocol
 export clientTypes
 
 const libraryName* = "runquota_client"
+
+proc handshakeTimeoutMs(): int =
+  ## Bound for the quick control handshakes (Hello / RegisterSession /
+  ## CloseSession). A runquota daemon that accepts the connection but never
+  ## answers — wedged, stale, or protocol-incompatible — must not block the
+  ## caller forever; the read fails so the caller can fall back (the engine's
+  ## documented ``fallbackToRunQuotaBypass`` path) instead of hanging. The
+  ## default is deliberately generous so a merely busy daemon under heavy
+  ## parallel load is never mistaken for an unresponsive one; operators can
+  ## tune it via ``RUNQUOTA_HANDSHAKE_TIMEOUT_MS`` (``0`` restores the old
+  ## unbounded blocking behaviour). The long-running grant stream is never
+  ## bounded by this — only the control handshakes are.
+  let override = getEnv("RUNQUOTA_HANDSHAKE_TIMEOUT_MS")
+  if override.len > 0:
+    try:
+      return max(0, parseInt(override))
+    except ValueError:
+      discard
+  30_000
 
 type
   RunQuotaClientError* = object of CatchableError
@@ -56,7 +75,11 @@ proc forgetInflight(client: var RunQuotaClient; requestId: uint64) =
       client.inflightRequestIds.delete(i)
       return
 
-proc readResponse(client: var RunQuotaClient; requestId: uint64): RqspFrame =
+proc readResponse(client: var RunQuotaClient; requestId: uint64;
+                  timeoutMs = 0): RqspFrame =
+  ## Read the response frame for ``requestId``. ``timeoutMs > 0`` bounds the
+  ## read so an unresponsive daemon raises ``RunQuotaClientError`` instead of
+  ## blocking forever; callers on the long-running grant stream pass ``0``.
   if client.responseBuffer.hasKey(requestId):
     result = client.responseBuffer[requestId]
     client.responseBuffer.del(requestId)
@@ -64,7 +87,7 @@ proc readResponse(client: var RunQuotaClient; requestId: uint64): RqspFrame =
   else:
     while true:
       var frame: RqspFrame
-      if not client.connection.receiveFrame(frame):
+      if not client.connection.receiveFrame(frame, timeoutMs):
         client.lastDiagnostic = diagnostic(diagProtocol, "daemon closed the RQSP connection")
         raise newException(RunQuotaClientError, client.lastDiagnostic.message)
       if frame.header.requestId == requestId:
@@ -115,7 +138,7 @@ proc connect*(endpoint: Endpoint; clientName = "runquota-nim";
     desiredCapabilities: "m1-lease"
   )
   let requestId = result.requestFrame(rqHello, encodeHello(hello))
-  let frame = result.readResponse(requestId)
+  let frame = result.readResponse(requestId, handshakeTimeoutMs())
   if frame.header.messageKind != rqHelloOk:
     result.lastDiagnostic = diagnostic(diagProtocol, "daemon did not answer Hello with HelloOk")
     raise newException(RunQuotaClientError, result.lastDiagnostic.message)
@@ -141,7 +164,7 @@ proc registerSession*(client: var RunQuotaClient; name,
   let msg = RegisterSessionMessage(name: name, version: version,
       metadata: metadataNone())
   let requestId = client.requestFrame(rqRegisterSession, encodeRegisterSession(msg))
-  let frame = client.readResponse(requestId)
+  let frame = client.readResponse(requestId, handshakeTimeoutMs())
   if frame.header.messageKind != rqSessionRegistered:
     client.lastDiagnostic = diagnostic(diagProtocol, "daemon did not register the session")
     raise newException(RunQuotaClientError, client.lastDiagnostic.message)
@@ -157,7 +180,7 @@ proc closeSession*(session: var RunQuotaSession) =
   let msg = CloseSessionMessage(sessionId: session.id)
   let requestId = session.client[].requestFrame(rqCloseSession,
       encodeCloseSession(msg))
-  let frame = session.client[].readResponse(requestId)
+  let frame = session.client[].readResponse(requestId, handshakeTimeoutMs())
   if frame.header.messageKind != rqSessionClosed:
     session.client[].lastDiagnostic = diagnostic(diagProtocol, "daemon did not close the session")
     raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)

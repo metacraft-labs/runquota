@@ -1,4 +1,4 @@
-import std/[net, nativesockets, os, strutils]
+import std/[net, nativesockets, os, strutils, times]
 
 when defined(posix):
   import std/posix
@@ -550,10 +550,48 @@ when defined(windows):
       offset += int(wrote)
     true
 
-proc readExactSocket(socket: Socket; size: int; data: var string): bool =
+proc readExactSocket(socket: Socket; size: int; data: var string;
+                     timeoutMs = 0): bool =
+  ## Read exactly ``size`` bytes from ``socket``. When ``timeoutMs > 0`` the
+  ## read is bounded by an absolute deadline: a blocking ``recv`` that would
+  ## have to hit the kernel is first gated behind a ``poll(POLLIN)`` for the
+  ## remaining budget, and the read fails (returns false) if the peer goes
+  ## quiet. This is used ONLY for the client connection handshakes (Hello /
+  ## RegisterSession / CloseSession): a runquota daemon that accepts the
+  ## connection but never returns a complete frame — a wedged, stale, or
+  ## protocol-incompatible daemon — would otherwise block the client forever
+  ## in ``recv``. (Observed on macOS in the reprobuild dev-env exec suite,
+  ## where a healthy-but-silent runquotad left ``repro exec`` wedged for hours
+  ## because the handshake had no timeout, so the engine's documented
+  ## ``fallbackToRunQuotaBypass`` degradation never engaged.) Long-running
+  ## reads — the session grant stream, which may legitimately block waiting
+  ## for capacity — pass ``timeoutMs == 0`` and keep the unbounded behaviour.
+  ##
+  ## CRITICAL: ``Socket`` is buffered (``newSocket`` defaults to
+  ## ``buffered = true``). A single kernel ``recv`` for the frame header pulls
+  ## the frame BODY into the socket's userspace buffer too, so the body read
+  ## must NOT poll the raw fd — ``poll`` reports the kernel socket as having no
+  ## data even though the bytes are already buffered in userspace, and the read
+  ## would spuriously time out. Gate the poll on ``hasDataBuffered`` so we only
+  ## wait on the kernel fd when Nim's userspace buffer is actually empty.
   data.setLen(0)
   var remaining = size
+  let deadline =
+    if timeoutMs > 0: epochTime() + timeoutMs.float / 1000.0
+    else: 0.0
   while remaining > 0:
+    when defined(posix):
+      if deadline > 0.0 and not socket.hasDataBuffered():
+        let remainingMs = int((deadline - epochTime()) * 1000.0)
+        if remainingMs <= 0:
+          return false
+        let fd = socket.getFd()
+        var fds = TPollfd(fd: cast[cint](fd), events: POLLIN, revents: 0)
+        let rc = poll(addr(fds), Tnfds(1), cint(remainingMs))
+        if rc <= 0:
+          # rc == 0: timed out; rc < 0: poll() error. Either way the
+          # handshake cannot make progress — fail rather than block.
+          return false
     let part = socket.recv(remaining)
     if part.len == 0:
       return false
@@ -574,10 +612,11 @@ proc sendFrame*(connection: var LocalConnection; frame: string) =
   else:
     raise newException(OSError, "unsupported RunQuota connection")
 
-proc readExact(connection: var LocalConnection; size: int; data: var string): bool =
+proc readExact(connection: var LocalConnection; size: int; data: var string;
+               timeoutMs = 0): bool =
   case connection.kind
   of endpointUnixSocket:
-    readExactSocket(connection.socket, size, data)
+    readExactSocket(connection.socket, size, data, timeoutMs)
   of endpointNamedPipe:
     when defined(windows):
       winReadExact(WinHandle(connection.pipeHandle), size, data)
@@ -587,10 +626,14 @@ proc readExact(connection: var LocalConnection; size: int; data: var string): bo
     false
 
 proc receiveFrame*(connection: var LocalConnection; frame: var RqspFrame;
-                   frameDiagnostic: var Diagnostic): bool =
+                   frameDiagnostic: var Diagnostic; timeoutMs = 0): bool =
+  ## Read one RQSP frame. ``timeoutMs > 0`` bounds each underlying read with an
+  ## absolute deadline (see ``readExactSocket``); used for the quick control
+  ## handshakes. ``timeoutMs == 0`` keeps the unbounded blocking behaviour for
+  ## long-running reads such as the grant stream.
   frameDiagnostic = okDiagnostic()
   var headerBytes: string
-  if not connection.readExact(int(RqspHeaderLen), headerBytes):
+  if not connection.readExact(int(RqspHeaderLen), headerBytes, timeoutMs):
     return false
   var header: FrameHeader
   if not decodeFrameHeader(headerBytes, header):
@@ -605,11 +648,12 @@ proc receiveFrame*(connection: var LocalConnection; frame: var RqspFrame;
     )
     return false
   var payload: string
-  if not connection.readExact(int(header.payloadLen), payload):
+  if not connection.readExact(int(header.payloadLen), payload, timeoutMs):
     return false
   frame = RqspFrame(header: header, payload: payload)
   true
 
-proc receiveFrame*(connection: var LocalConnection; frame: var RqspFrame): bool =
+proc receiveFrame*(connection: var LocalConnection; frame: var RqspFrame;
+                   timeoutMs = 0): bool =
   var frameDiagnostic = okDiagnostic()
-  connection.receiveFrame(frame, frameDiagnostic)
+  connection.receiveFrame(frame, frameDiagnostic, timeoutMs)
