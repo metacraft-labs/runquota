@@ -28,33 +28,63 @@ switch("styleCheck", "hint")
 # silently passing — this is intentional.
 let reprobuildSrc = getEnv("REPROBUILD_SRC")
 if reprobuildSrc.len > 0:
-  for dslLib in [
-    # Project DSL surface ``repro.nim`` imports directly.
-    "repro_project_dsl",
-    "repro_dsl_stdlib",
-    # Transitive deps reached by the ``package`` macro expansion.
-    "repro_core",
-    "repro_platform",
-    "repro_diagnostics",
-    "repro_domain_types",
-    "repro_hash",
-    "repro_solver",
-    "blake3",
-    "xxh3",
-    "gxhash",
-    "cbor",
-    "repro_infra",
-    "repro_interface_artifacts",
-    "repro_tool_profiles",
-    "repro_build_engine",
-    "repro_launch_plan",
-    "repro_local_store",
-    "repro_runquota",
-    "repro_workspace_manifests",
-  ]:
-    let candidate = reprobuildSrc / "libs" / dslLib / "src"
+  # The project-DSL ``package`` macro expansion reaches transitively
+  # into a large, *growing* set of reprobuild libs (currently the DSL
+  # surface, the build engine, the binary-cache cache-key + server
+  # types, the peer-cache auth layer, …). Rather than hand-maintain an
+  # allow-list that silently drifts every time the DSL grows a new
+  # dependency, put every ``libs/<name>/src`` directory in the
+  # reprobuild checkout on the ``--path:``. This block is gated on
+  # REPROBUILD_SRC and therefore only affects ``nim check repro.nim``
+  # from a workspace checkout — the regular runquota build (with
+  # REPROBUILD_SRC unset) stays hermetic to its own ``libs/`` tree.
+  for libDir in listDirs(reprobuildSrc / "libs"):
+    let candidate = libDir / "src"
     if dirExists(candidate):
       switch("path", candidate)
+
+  # Third-party Nim packages the DSL closure reaches into (nimcrypto
+  # for cache-key composition, bearssl via the peer-cache auth layer,
+  # the status-im serialization stack, …). reprobuild's own
+  # ``config.nims`` resolves each from an explicit ``*_SRC`` env var
+  # (exported by the dev shell) with sibling-checkout fallbacks; mirror
+  # that here against the reprobuild checkout root so the same packages
+  # resolve when ``nim check`` runs inside the dev shell.
+  proc addReprobuildPkgPath(envName: string; candidates: openArray[string];
+                            marker: string) =
+    let fromEnv = getEnv(envName)
+    if fromEnv.len > 0 and fileExists(fromEnv / marker):
+      switch("path", fromEnv)
+      return
+    for candidate in candidates:
+      if fileExists(candidate / marker):
+        switch("path", candidate)
+        return
+
+  addReprobuildPkgPath("NIMCRYPTO_SRC", [
+    reprobuildSrc / ".." / "codetracer" / "libs" / "nimcrypto",
+    reprobuildSrc / ".." / "nimcrypto",
+  ], "nimcrypto" / "hash.nim")
+  addReprobuildPkgPath("BEARSSL_SRC", [
+    reprobuildSrc / ".." / "nim-bearssl",
+    reprobuildSrc / "libs" / "nim-bearssl",
+  ], "bearssl.nim")
+  addReprobuildPkgPath("FASTSTREAMS_SRC", [
+    reprobuildSrc / "libs" / "nim-faststreams" / "src",
+    reprobuildSrc / ".." / "codetracer" / "libs" / "nim-faststreams",
+    reprobuildSrc / ".." / "nim-faststreams",
+  ], "faststreams" / "inputs.nim")
+  addReprobuildPkgPath("NIM_STEW_SRC", [
+    reprobuildSrc / "libs" / "nim-stew" / "src",
+    reprobuildSrc / ".." / "codetracer" / "libs" / "nim-stew",
+    reprobuildSrc / ".." / "nim-stew",
+  ], "stew" / "objects.nim")
+  addReprobuildPkgPath("RESULTS_SRC", [
+    reprobuildSrc / "libs" / "results" / "src",
+  ], "results.nim")
+  addReprobuildPkgPath("STINT_SRC", [
+    reprobuildSrc / "libs" / "stint" / "src",
+  ], "stint.nim")
 
 switch("path", "libs/runquota_core/src")
 switch("path", "libs/runquota_codec/src")
