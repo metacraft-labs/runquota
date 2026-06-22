@@ -588,18 +588,39 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
         child.doneFlag = true
         child.runningFlag = false
         child.waitStatus = int(status)
+        child.doneSeconds = epochTime()
       elif waited < 0:
         if errno != EINTR:
           child.doneFlag = true
           child.runningFlag = false
           child.waitStatus = 1 shl 8
+          child.doneSeconds = epochTime()
 
     if child.doneFlag:
       child.stdoutFd.drainFd(child.stdoutText, child.stdoutBytes,
                              child.stdoutLimit)
       child.stderrFd.drainFd(child.stderrText, child.stderrBytes,
                              child.stderrLimit)
+      # Completion is gated on the leased process itself being reaped (the
+      # waitpid above), NOT on every inherited pipe reaching EOF. A forking
+      # action's surviving descendants (e.g. cc spawning cc1/as, or a monitor
+      # shim's children) inherit the stdout/stderr write-ends and keep them
+      # open, so the pipes would never hit EOF and completion would never be
+      # declared — the supervisor would wait forever and never emit
+      # LeaseFinished. Once both write-ends are observed closed (the common,
+      # non-forking case) we report immediately; otherwise we keep draining
+      # whatever the descendants emit until a short bounded grace period
+      # elapses, then declare completion regardless.
       if child.stdoutFd < 0 and child.stderrFd < 0:
+        child.completion = child.buildCompletion(timedOut = false)
+        if child.completion.processCount == 0:
+          child.completion.processCount = 1
+        return true
+      const lingeringPipeDrainSeconds = 0.25
+      if child.doneSeconds > 0.0 and
+          epochTime() - child.doneSeconds >= lingeringPipeDrainSeconds:
+        closeFd(child.stdoutFd)
+        closeFd(child.stderrFd)
         child.completion = child.buildCompletion(timedOut = false)
         if child.completion.processCount == 0:
           child.completion.processCount = 1

@@ -57,6 +57,12 @@ type
     runningFlag*: bool
     cancelSent*: bool
     doneFlag*: bool
+    # Wall-clock time (epochTime seconds) at which the leased child itself was
+    # reaped. Used to bound the final output drain: once the direct child has
+    # exited we must declare completion even if forked descendants keep the
+    # inherited pipe write-ends open (so the pipes never reach EOF). 0.0 means
+    # "not yet reaped".
+    doneSeconds*: float
     waitStatus*: int
     stdoutText*: string
     stderrText*: string
