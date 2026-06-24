@@ -38,6 +38,16 @@ type
     client*: ptr RunQuotaClient
     id*: SessionId
     active*: bool
+    ## ``pendingGrantRequestId`` tracks an in-flight ``GrantNext`` whose
+    ## response has not yet been read.  It lets a bounded grant poll
+    ## (``pollNextGrantBounded``) wait for the *same* request across
+    ## several short reads — a daemon that legitimately keeps a candidate
+    ## queued answers with an empty batch and the id is cleared; a daemon
+    ## that is silent leaves the id set so the next bounded read continues
+    ## waiting on it instead of flooding the daemon with fresh GrantNext
+    ## frames (which would buffer unbounded late responses).  ``0`` means
+    ## "no GrantNext is currently outstanding".
+    pendingGrantRequestId*: uint64
 
   RunQuotaLease* = object
     session*: ptr RunQuotaSession

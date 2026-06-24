@@ -298,6 +298,93 @@ proc pollNextGrant*(session: var RunQuotaSession): seq[OfferedLease] =
   let requestId = session.client[].requestFrame(rqGrantNext, encodeGrantNext(msg))
   session.decodeDecisionBatch(session.client[].readResponse(requestId))
 
+type
+  GrantPollKind* = enum
+    ## Result of one bounded ``pollNextGrantBounded`` attempt.
+    ##
+    ## ``grantPollFrame`` — the daemon answered the outstanding GrantNext
+    ##   with a decision batch (which may be *empty* while the candidate is
+    ##   still legitimately queued).  A received frame — empty or not — is
+    ##   proof the daemon is alive (liveness), so callers treat it as a
+    ##   reason to reset any "unresponsive" deadline, NOT as silence.
+    ## ``grantPollTimeout`` — no complete frame arrived within the bounded
+    ##   read window.  The GrantNext stays outstanding (its request id is
+    ##   parked on the session) so the next bounded read continues waiting
+    ##   on the same request rather than emitting a fresh GrantNext.  A
+    ##   timeout is *ambiguous* on its own (a merely-slow daemon vs a
+    ##   wedged one); callers disambiguate with a ``daemonStatus`` liveness
+    ##   probe before concluding the daemon is unresponsive.
+    grantPollFrame
+    grantPollTimeout
+
+  GrantPollFrame* = object
+    kind*: GrantPollKind
+    decisions*: seq[OfferedLease]   ## valid when ``kind == grantPollFrame``.
+
+proc pollNextGrantBounded*(session: var RunQuotaSession;
+                           timeoutMs: int): GrantPollFrame =
+  ## Bounded variant of ``pollNextGrant`` used by long waits that must stay
+  ## observable and must distinguish a *queued-but-alive* daemon from a
+  ## *silent* one.
+  ##
+  ## A single GrantNext is kept outstanding across attempts: the first call
+  ## sends one and parks its request id on the session; while the daemon
+  ## stays silent each subsequent call re-reads that same request id with a
+  ## fresh bounded window (no new GrantNext is sent, so a wedged daemon can
+  ## never accumulate buffered late responses).  As soon as the daemon
+  ## answers, the parked id is cleared and the next call issues a new
+  ## GrantNext.
+  ##
+  ## ``timeoutMs <= 0`` falls back to a single blocking round-trip
+  ## (equivalent to ``pollNextGrant``) so callers that want the legacy
+  ## behaviour still work.
+  if not session.active:
+    session.client[].lastDiagnostic =
+      diagnostic(diagInvalidArgument, "session is not active")
+    raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+  if timeoutMs <= 0:
+    return GrantPollFrame(kind: grantPollFrame, decisions: session.pollNextGrant())
+  if session.pendingGrantRequestId == 0'u64:
+    let msg = GrantNextMessage(sessionId: session.id)
+    session.pendingGrantRequestId =
+      session.client[].requestFrame(rqGrantNext, encodeGrantNext(msg))
+  let requestId = session.pendingGrantRequestId
+  # If the response was already buffered by an earlier read, take it now.
+  if session.client[].responseBuffer.hasKey(requestId):
+    let frame = session.client[].readResponse(requestId)
+    session.pendingGrantRequestId = 0'u64
+    return GrantPollFrame(kind: grantPollFrame,
+      decisions: session.decodeDecisionBatch(frame))
+  # Bounded read for THIS request id.  Buffer any other frames we see so a
+  # later read can match them.  A read that returns no frame is reported as
+  # a timeout, leaving the GrantNext outstanding.
+  var frame: RqspFrame
+  if not session.client[].connection.receiveFrame(frame, timeoutMs):
+    # No complete frame within the window.  This is EITHER a clean timeout
+    # (the daemon is alive but the candidate is still queued and it sent
+    # nothing) OR a closed connection.  We do NOT decide that here: the
+    # caller runs a ``daemonStatus`` liveness probe to disambiguate.  The
+    # request id stays parked so we keep waiting on the same GrantNext.
+    return GrantPollFrame(kind: grantPollTimeout)
+  if frame.header.requestId != requestId:
+    session.client[].responseBuffer[frame.header.requestId] = frame
+    # We received *a* frame (liveness) but not the one we wanted; report it
+    # as a timeout for this request so the caller resets its clock on the
+    # next bounded read picking up the right id — but the parked id stays.
+    return GrantPollFrame(kind: grantPollTimeout)
+  session.client[].forgetInflight(requestId)
+  session.pendingGrantRequestId = 0'u64
+  if (frame.header.flags and FrameFlagError) != 0 or
+      frame.header.messageKind == rqError:
+    var errorMessage: ProtocolErrorMessage
+    if decodeProtocolError(frame.payload, errorMessage):
+      session.client[].lastDiagnostic = errorMessage.diagnostic
+      raise newException(RunQuotaClientError, errorMessage.diagnostic.message)
+    session.client[].lastDiagnostic =
+      diagnostic(diagProtocol, "invalid RQSP error payload")
+    raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+  GrantPollFrame(kind: grantPollFrame, decisions: session.decodeDecisionBatch(frame))
+
 proc requestLeaseWaiting*(session: var RunQuotaSession; request: ResourceRequest;
                           pollMillis = 50; maxPolls = 0): RunQuotaLease =
   if not session.active:
@@ -439,9 +526,17 @@ proc finish*(lease: var RunQuotaLease; outcome = leaseFinishSucceeded;
     raise newException(RunQuotaClientError, lease.session[].client[].lastDiagnostic.message)
   lease.state = leaseClientFinished
 
-proc daemonStatus*(client: var RunQuotaClient): DaemonStatusMessage =
+proc daemonStatus*(client: var RunQuotaClient;
+                   timeoutMs = 0): DaemonStatusMessage =
+  ## Round-trip a StatusRequest.  ``timeoutMs > 0`` bounds the read so a
+  ## wedged daemon (accepts the connection but never answers) raises
+  ## ``RunQuotaClientError`` instead of blocking forever — this is what
+  ## makes ``daemonStatus`` usable as a *liveness probe*: a bounded
+  ## successful round-trip proves the daemon is alive, while a timeout (or
+  ## a closed connection) is detectable as silence.  ``timeoutMs == 0``
+  ## keeps the legacy unbounded behaviour.
   let requestId = client.requestFrame(rqStatusRequest, "")
-  let frame = client.readResponse(requestId)
+  let frame = client.readResponse(requestId, timeoutMs)
   if frame.header.messageKind != rqStatusResponse:
     client.lastDiagnostic = diagnostic(diagProtocol, "daemon did not answer with status")
     raise newException(RunQuotaClientError, client.lastDiagnostic.message)
