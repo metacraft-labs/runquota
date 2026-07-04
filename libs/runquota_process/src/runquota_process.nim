@@ -28,6 +28,19 @@ const DefaultOutputLimit* = 1_048_576
 when defined(posix):
   proc childExit(status: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
 
+  proc closeInheritedChildFds() =
+    ## Keep leased commands from observing runquota's own control descriptors.
+    ## Reproducibility monitors classify reads from inherited pipes/sockets as
+    ## opaque external content because the producing endpoint is outside the
+    ## monitored action tree.
+    var maxFd = 1024
+    when declared(SC_OPEN_MAX):
+      let openMax = sysconf(SC_OPEN_MAX)
+      if openMax > 0 and openMax <= 1_048_576:
+        maxFd = int(openMax)
+    for fd in 3 ..< maxFd:
+      discard close(cint(fd))
+
 when defined(windows):
   # Windows: lightweight Job Object accounting wrappers. We pull in only the
   # symbols we use rather than depend on a Job Objects helper module that does
@@ -432,10 +445,16 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       if spec.cwd.len > 0 and chdir(cstring(spec.cwd)) != 0:
         childExit(126)
       applyChildEnv(spec.env)
+      let devNull = open(cstring("/dev/null"), O_RDONLY)
+      if devNull >= 0:
+        discard dup2(devNull, STDIN_FILENO)
+        if devNull != STDIN_FILENO:
+          discard close(devNull)
       discard dup2(stdoutPipe[1], STDOUT_FILENO)
       discard dup2(stderrPipe[1], STDERR_FILENO)
       discard close(stdoutPipe[1])
       discard close(stderrPipe[1])
+      closeInheritedChildFds()
       discard execvp(cstring(spec.argv[0]), argv)
       childExit(127)
     if pid < 0:

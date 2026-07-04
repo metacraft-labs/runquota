@@ -13,3 +13,4 @@ bench-results/
 
 .DS_Store
 .repro/
+.pre-commit-config.yaml
