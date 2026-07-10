@@ -17,6 +17,8 @@ case "${RUNQUOTA_BUILD_MODE:-${REPROBUILD_BUILD_MODE:-debug}}" in
 esac
 
 while read -r name path _; do
+  name="${name%$'\r'}"
+  path="${path%$'\r'}"
   case "${name}" in
     ""|\#*) continue ;;
   esac
