@@ -8,7 +8,11 @@ on:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [incus, tart-linux-arm, macos-tart]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Nix
@@ -23,13 +27,17 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: lint-logs
+          name: lint-logs-${{ matrix.runner }}
           path: test-logs/
           retention-days: 30
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [incus, tart-linux-arm, macos-tart]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Nix
@@ -44,13 +52,17 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs
+          name: test-logs-${{ matrix.runner }}
           path: test-logs/
           retention-days: 30
 
   nix-build:
     name: Nix Build
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [incus, tart-linux-arm, macos-tart]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Nix
@@ -65,6 +77,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
+          name: build-logs-${{ matrix.runner }}
           path: test-logs/
           retention-days: 30
