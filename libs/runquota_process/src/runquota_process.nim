@@ -168,7 +168,7 @@ proc backendProfile*(): ProcessBackendProfile =
       outputCapture: "nonblocking-pipes-poll-bounded",
       completionWait: "waitpid-wnohang",
       cancellation: "process-group-sigterm",
-      telemetry: "macos-ps-when-available",
+      telemetry: "macos-libproc-when-available",
       directArgv: true,
       implicitShell: false
     )
