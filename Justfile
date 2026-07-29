@@ -12,7 +12,7 @@ build:
 test:
     mkdir -p test-logs
     bash scripts/run_tests.sh 2>&1 | tee test-logs/test.log
-    bash scripts/check_static_helpers.sh 2>&1 | tee -a test-logs/test.log
+    runquota-static-helper-gate 2>&1 | tee -a test-logs/test.log
 
 t: test
 
@@ -58,4 +58,4 @@ check-repo-requirements:
     bash scripts/check_repo_requirements.sh
 
 check-static-helpers:
-    bash scripts/check_static_helpers.sh
+    runquota-static-helper-gate

@@ -1,0 +1,2 @@
+#[ This source must fail closed.
+   #[ Its nested comment is closed. ]#

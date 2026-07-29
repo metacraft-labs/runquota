@@ -44,6 +44,43 @@
               pass_filenames = false;
             };
           };
+          staticHelperGatePath = pkgs.lib.makeBinPath [
+            pkgs.bash
+            pkgs.coreutils
+            pkgs.findutils
+            pkgs.gawk
+            pkgs.gnugrep
+            pkgs.gnused
+            pkgs.nim2
+            pkgs.stdenv.cc
+          ];
+          staticHelperGate = pkgs.writeShellScriptBin "runquota-static-helper-gate" ''
+            set -euo pipefail
+
+            gate_self="$(${pkgs.coreutils}/bin/realpath -e -- "$0")"
+            if [ "$#" -eq 1 ] && [ "$1" = "--print-authority" ]; then
+              printf 'nim=%s\nsource=%s\npath=%s\ngate=%s\n' \
+                '${pkgs.nim2}/bin/nim' \
+                '${./.}' \
+                '${staticHelperGatePath}' \
+                "$gate_self"
+              exit 0
+            fi
+            if [ "$#" -ne 0 ]; then
+              echo "usage: runquota-static-helper-gate [--print-authority]" >&2
+              exit 2
+            fi
+
+            exec ${pkgs.coreutils}/bin/env -i \
+              PATH='${staticHelperGatePath}' \
+              LC_ALL=C \
+              LANG=C \
+              ${pkgs.bash}/bin/bash \
+              '${./.}/scripts/check_static_helpers.sh' \
+              '${pkgs.nim2}/bin/nim' \
+              '${./.}' \
+              "$gate_self"
+          '';
           runquota = pkgs.stdenv.mkDerivation {
             pname = "runquota";
             inherit version;
@@ -107,22 +144,31 @@
             static-helpers =
               pkgs.runCommand "runquota-static-helpers"
                 {
-                  nativeBuildInputs = [
-                    pkgs.nim2
-                    pkgs.stdenv.cc
-                  ];
+                  nativeBuildInputs = [ staticHelperGate ];
                 }
                 ''
-                  cp -R ${./.} source
-                  chmod -R u+w source
-                  cd source
-                  ${pkgs.bash}/bin/bash scripts/check_static_helpers.sh
+                  mkdir -p hostile-config
+                  ${pkgs.coreutils}/bin/env \
+                    RUNQUOTA_PINNED_NIM=/usr/bin/false \
+                    RUNQUOTA_SOURCE_ROOT="$PWD" \
+                    PATH=/runquota-hostile-path \
+                    HOME="$PWD/hostile-config" \
+                    XDG_CONFIG_HOME="$PWD/hostile-config" \
+                    XDG_CONFIG_DIRS="$PWD/hostile-config" \
+                    NIMBLE_DIR="$PWD/hostile-config" \
+                    NIM_LIB_PREFIX="$PWD/hostile-config" \
+                    NIM_CONFIG_DIR="$PWD/hostile-config" \
+                    REPROBUILD_SRC="$PWD/hostile-config" \
+                    CC=/usr/bin/false \
+                    CXX=/usr/bin/false \
+                    ${staticHelperGate}/bin/runquota-static-helper-gate
                   mkdir -p $out
                 '';
           };
 
           devShells.default = pkgs.mkShell {
             packages = [
+              staticHelperGate
               pkgs.just
               pkgs.nim2
               pkgs.nixfmt-rfc-style
