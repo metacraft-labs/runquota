@@ -367,13 +367,21 @@ when defined(windows):
       if sample.processCount > child.processCount:
         child.processCount = sample.processCount
 
-  proc windowsShellCommand(argv: openArray[string]): bool =
-    if argv.len < 3 or argv[1] != "-c":
+  proc isWindowsShellCommandAt(argv: openArray[string]; start: int): bool =
+    if start < 0 or start + 2 >= argv.len or argv[start + 1] != "-c":
       return false
-    var executable = argv[0].extractFilename.toLowerAscii()
+    var executable = argv[start].extractFilename.toLowerAscii()
     if executable.endsWith(".exe"):
       executable.setLen(executable.len - 4)
     executable in ["sh", "bash", "dash", "ksh", "zsh"]
+
+  proc windowsShellCommandStart(argv: openArray[string]): int =
+    if isWindowsShellCommandAt(argv, 0):
+      return 0
+    for i in countdown(argv.len - 4, 0):
+      if argv[i] == "--" and isWindowsShellCommandAt(argv, i + 1):
+        return i + 1
+    -1
 
   proc prepareWindowsArgv(argv: openArray[string]):
       tuple[argv: seq[string]; temporaryFiles: seq[string]] =
@@ -382,14 +390,15 @@ when defined(windows):
     ## and source it through a short wrapper while preserving ``$0`` and the
     ## caller's positional arguments.
     result.argv = @argv
-    if not windowsShellCommand(argv):
+    let shellStart = windowsShellCommandStart(argv)
+    if shellStart < 0:
       return
 
     let (scriptFile, scriptPath) = createTempFile(
       "runquota-shell-", ".sh", getTempDir())
     var scriptOpen = true
     try:
-      scriptFile.write(argv[2])
+      scriptFile.write(argv[shellStart + 2])
       scriptFile.close()
       scriptOpen = false
     except CatchableError:
@@ -404,16 +413,17 @@ when defined(windows):
         discard
       raise
 
-    let commandName = if argv.len >= 4: argv[3] else: argv[0]
-    result.argv = @[
-      argv[0],
-      "-c",
+    let commandName =
+      if argv.len > shellStart + 3: argv[shellStart + 3]
+      else: argv[shellStart]
+    result.argv = @argv[0 .. shellStart + 1]
+    result.argv.add(@[
       "script_path=$1; shift; . \"$script_path\"",
       commandName,
       scriptPath.replace('\\', '/'),
-    ]
-    if argv.len > 4:
-      result.argv.add(argv[4 .. ^1])
+    ])
+    if argv.len > shellStart + 4:
+      result.argv.add(argv[shellStart + 4 .. ^1])
     result.temporaryFiles = @[scriptPath]
 
   proc launchWindowsProcess(spec: CommandSpec): LaunchedProcess =
