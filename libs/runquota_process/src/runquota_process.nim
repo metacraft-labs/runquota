@@ -7,7 +7,7 @@ when defined(windows):
   # Windows: spawn child processes via std/osproc and assign them to a Job
   # Object so the whole tree can be tracked and (optionally) killed atomically.
   # The Job Object also gives us cheap accounting (CPU/IO/process count).
-  import std/[osproc, streams, strtabs]
+  import std/[osproc, streams, strtabs, tempfiles]
   import std/winlean
 
 import runquota_core
@@ -367,23 +367,82 @@ when defined(windows):
       if sample.processCount > child.processCount:
         child.processCount = sample.processCount
 
+  proc windowsShellCommand(argv: openArray[string]): bool =
+    if argv.len < 3 or argv[1] != "-c":
+      return false
+    var executable = argv[0].extractFilename.toLowerAscii()
+    if executable.endsWith(".exe"):
+      executable.setLen(executable.len - 4)
+    executable in ["sh", "bash", "dash", "ksh", "zsh"]
+
+  proc prepareWindowsArgv(argv: openArray[string]):
+      tuple[argv: seq[string]; temporaryFiles: seq[string]] =
+    ## MSYS2/Cygwin shells do not reliably round-trip long, nested ``-c``
+    ## programs through a Windows command-line string. Stage only that payload
+    ## and source it through a short wrapper while preserving ``$0`` and the
+    ## caller's positional arguments.
+    result.argv = @argv
+    if not windowsShellCommand(argv):
+      return
+
+    let (scriptFile, scriptPath) = createTempFile(
+      "runquota-shell-", ".sh", getTempDir())
+    var scriptOpen = true
+    try:
+      scriptFile.write(argv[2])
+      scriptFile.close()
+      scriptOpen = false
+    except CatchableError:
+      if scriptOpen:
+        try:
+          scriptFile.close()
+        except CatchableError:
+          discard
+      try:
+        removeFile(scriptPath)
+      except CatchableError:
+        discard
+      raise
+
+    let commandName = if argv.len >= 4: argv[3] else: argv[0]
+    result.argv = @[
+      argv[0],
+      "-c",
+      "script_path=$1; shift; . \"$script_path\"",
+      commandName,
+      scriptPath.replace('\\', '/'),
+    ]
+    if argv.len > 4:
+      result.argv.add(argv[4 .. ^1])
+    result.temporaryFiles = @[scriptPath]
+
   proc launchWindowsProcess(spec: CommandSpec): LaunchedProcess =
     if spec.argv.len == 0:
       raise newException(ValueError, "empty argv")
     let cwd = if spec.cwd.len > 0: spec.cwd else: getCurrentDir()
+    let prepared = prepareWindowsArgv(spec.argv)
     let args =
-      if spec.argv.len > 1: spec.argv[1 .. ^1]
+      if prepared.argv.len > 1: prepared.argv[1 .. ^1]
       else: @[]
     # Windows: poEvalCommand + poUsePath were tried in earlier prototypes but
     # cause quoting headaches; pass argv directly and let osproc CreateProcess
     # for us.
-    var process = startProcess(
-      spec.argv[0],
-      workingDir = cwd,
-      args = args,
-      env = windowsChildEnv(spec),
-      options = {poStdErrToStdOut, poUsePath}
-    )
+    var process: Process
+    try:
+      process = startProcess(
+        prepared.argv[0],
+        workingDir = cwd,
+        args = args,
+        env = windowsChildEnv(spec),
+        options = {poStdErrToStdOut, poUsePath}
+      )
+    except CatchableError:
+      for path in prepared.temporaryFiles:
+        try:
+          removeFile(path)
+        except CatchableError:
+          discard
+      raise
     let processHandle = winProcessHandle(process)
     let job = createJobObjectW(nil, nil)
     if job != 0:
@@ -418,7 +477,8 @@ when defined(windows):
         backend: backendProfile()
       ),
       winProcess: process,
-      winJobHandle: uint64(job)
+      winJobHandle: uint64(job),
+      temporaryLaunchFiles: prepared.temporaryFiles
     )
 
 proc launchProcess*(spec: CommandSpec): LaunchedProcess =
@@ -889,3 +949,9 @@ proc close*(child: var LaunchedProcess) =
     if child.winJobHandle != 0:
       discard closeHandle(Handle(child.winJobHandle))
       child.winJobHandle = 0
+    for path in child.temporaryLaunchFiles:
+      try:
+        removeFile(path)
+      except CatchableError:
+        discard
+    child.temporaryLaunchFiles.setLen(0)
