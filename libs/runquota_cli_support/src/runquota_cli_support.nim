@@ -71,11 +71,12 @@ proc printInspection(subject: string; sessionId = sessionId(0)): int =
   0
 
 proc daemonProgramPath*(): string =
-  let sibling = getAppDir() / "runquotad"
+  let programName = addFileExt("runquotad", ExeExt)
+  let sibling = getAppDir() / programName
   if fileExists(sibling):
     sibling
   else:
-    "runquotad"
+    programName
 
 proc runDaemonStart(): int =
   try:
