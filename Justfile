@@ -9,10 +9,15 @@ build:
     mkdir -p test-logs
     bash scripts/build_apps.sh 2>&1 | tee test-logs/build.log
 
+# Both steps always run; the recipe exits non-zero if either failed. Without
+# the `|| rc=$?` the failing test suite would abort before the static helper
+# gate was ever invoked, hiding that check behind an unrelated failure.
 test:
     mkdir -p test-logs
-    bash scripts/run_tests.sh 2>&1 | tee test-logs/test.log
-    runquota-static-helper-gate 2>&1 | tee -a test-logs/test.log
+    rc=0; \
+    bash scripts/run_tests.sh 2>&1 | tee test-logs/test.log || rc=$?; \
+    runquota-static-helper-gate 2>&1 | tee -a test-logs/test.log || rc=$?; \
+    exit $rc
 
 t: test
 
