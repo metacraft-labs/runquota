@@ -36,10 +36,22 @@ while IFS= read -r -d '' test_file; do
   test_files+=("${test_file}")
 done < <(
   {
-    find tests -type f -name 't*.nim' -print0
-    find libs -path '*/tests/t*.nim' -type f -print0
+    # `set -e` and `pipefail` cannot observe a process-substitution's exit
+    # status, so a `find` that failed here would silently yield a SMALLER set
+    # and the run would look clean. Fail loudly inside the substitution
+    # instead: the marker is read back as a normal entry and rejected below.
+    find tests -type f -name 't*.nim' -print0 || printf 'DISCOVERY_FAILED\0'
+    find libs -path '*/tests/t*.nim' -type f -print0 || printf 'DISCOVERY_FAILED\0'
   } | LC_ALL=C sort -z
 )
+
+for entry in ${test_files[@]+"${test_files[@]}"}; do
+  if [ "${entry}" = "DISCOVERY_FAILED" ]; then
+    echo "test discovery failed: a find invocation returned non-zero" >&2
+    echo "refusing to run a partial suite" >&2
+    exit 1
+  fi
+done
 
 discovered=${#test_files[@]}
 
@@ -76,8 +88,11 @@ for test_file in "${test_files[@]}"; do
   # Two test files sharing a basename would overwrite each other's binary, so
   # the second one would never really run. Surface it instead of hiding it.
   if [[ "${seen_names}" == *" ${test_name} "* ]]; then
-    skipped=$((skipped + 1))
-    skips+=("${test_file} (duplicate test binary name '${test_name}')")
+    # FATAL, not a skip. A skipped duplicate leaves the run GREEN with a test
+    # that never executed -- the same shape as the abort this runner replaced,
+    # just quieter. Counting it as a failure is what makes "exit 0" mean
+    # "every discovered test ran and passed".
+    failures+=("${test_name} (duplicate test binary name; would overwrite --out) [${test_file}]")
     continue
   fi
   seen_names="${seen_names}${test_name} "
