@@ -46,7 +46,7 @@ when isMainModule:
     quit 0
 
   var config = defaultDaemonConfig(defaultEndpoint())
-  let usage = "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH]"
+  let usage = "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH]"
   var i = 0
   while i < args.len:
     case args[i]
@@ -124,6 +124,11 @@ when isMainModule:
       if i + 1 >= args.len:
         quit 2
       config.estimateDbPath = args[i + 1]
+      i += 2
+    of "--observation-db":
+      if i + 1 >= args.len:
+        quit 2
+      config.observationDbPath = args[i + 1]
       i += 2
     of "--help", "-h":
       echo "runquotad " & versionString() & "\n" & usage

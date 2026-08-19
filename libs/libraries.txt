@@ -13,6 +13,7 @@ runquota_host_linux
 runquota_host_macos
 runquota_host_windows
 runquota_persistence
+runquota_observation_store
 runquota_daemon
 runquota_cli_support
 runquota_partition

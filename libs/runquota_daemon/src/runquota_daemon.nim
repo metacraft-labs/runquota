@@ -1,4 +1,4 @@
-import std/[algorithm, cpuinfo, locks, os, strutils, tables, times]
+import std/[algorithm, cpuinfo, locks, options, os, strutils, tables, times]
 
 import runquota_daemon/types as daemonTypes
 import runquota_codec
@@ -11,6 +11,7 @@ when defined(windows):
   # always returns "unavailable" off-macOS).
   import runquota_host_windows
 import runquota_ipc
+import runquota_observation_store
 import runquota_persistence
 import runquota_protocol
 
@@ -37,7 +38,9 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     pressureRequired: false,
     memoryPressureHeavyBytes: bytes(512'u64 * 1024'u64 * 1024'u64),
     estimateDbPath: "",
-    estimateQueueCapacity: 128
+    estimateQueueCapacity: 128,
+    observationDbPath: "",
+    observationQueueCapacity: 1024
   )
 
 proc machineCapacity*(id: string; cpuSlots: MilliCpu; memoryBytes: Bytes;
@@ -117,10 +120,22 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
     namedPoolUsage: initTable[string, uint32](),
     pressureFileCache: PressureFileCache(
       path: "", mtimeUnix: 0, sizeBytes: 0, raw: ""
-    )
+    ),
+    observationStore: openObservationStore(effectiveConfig.observationDbPath),
+    observationHostId: "",
+    observationBootId: opaqueId("boot-"),
+    observationRunIds: initTable[uint64, string]()
   )
   for row in loadLearnedEstimates(effectiveConfig.estimateDbPath):
     result.estimates[estimateTableKey(row.scope, row.commandStatsId)] = row
+  # OS-4: a store that will not open is reported and then ignored. The
+  # daemon keeps serving leases; only capture is lost.
+  if result.observationStore.captureEnabled:
+    result.observationHostId =
+      result.observationStore.ensureHostRow(result.observationBootId)
+    if result.observationHostId.len > 0:
+      startObservationWriter(result.observationStore.path,
+        effectiveConfig.observationQueueCapacity)
 
 proc countLeases(daemon: RunQuotaDaemon; state: LeaseLifecycleState): uint32 =
   for lease in daemon.leases.values:
@@ -767,6 +782,86 @@ proc updateEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
   daemon.estimates[key] = row
   discard enqueueEstimateWrite(daemon.estimateStore, row)
 
+proc observationCaptureEnabled(daemon: RunQuotaDaemon): bool =
+  daemon.observationStore.captureEnabled and daemon.observationHostId.len > 0
+
+proc openObservationRun(daemon: var RunQuotaDaemon; session: SessionRow) =
+  ## One ``runs`` row per registered session. The row is written once, at
+  ## registration, and never updated: ``finished_at`` and ``exit_status``
+  ## stay NULL until the protocol carries client-declared run boundaries
+  ## (M13). NULL says "not declared"; a zero would have claimed a
+  ## measurement nobody made.
+  if not daemon.observationCaptureEnabled:
+    return
+  let runId = opaqueId("run-")
+  daemon.observationRunIds[session.id.value] = runId
+  discard enqueueRunRow(RunRow(
+    runId: runId,
+    hostId: daemon.observationHostId,
+    tool: session.name,
+    toolVersion: session.version,
+    invocationKind: "lease-session",
+    startedAtUnixMillis: unixMillisNow(),
+    finishedAtUnixMillis: none(int64),
+    exitStatus: none(int64),
+    workspaceId: none(string),
+    profile: none(string),
+    gitCommit: none(string),
+    gitBranch: none(string),
+    captureCompleteness: ccComplete,
+    droppedObservations: 0
+  ))
+
+proc observationTermination(finish: LeaseFinishedMessage): Termination =
+  ## The protocol's finish outcome mapped onto the specification's
+  ## termination set. Provisional: the outcome enum was designed for
+  ## admission accounting, not for failure forensics, and M13 is where the
+  ## client reports termination directly.
+  if finish.hardLimitOrOom or finish.outcome == leaseFinishResourceLimit:
+    return tOomKilled
+  if finish.signal != 0'u32 or finish.outcome == leaseFinishCrashed:
+    return tSignalled
+  case finish.outcome
+  of leaseFinishCancelled, leaseFinishLaunchFailed: tRefused
+  else: tExited
+
+proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
+                        finish: LeaseFinishedMessage) =
+  ## Appends one immutable execution row. In-memory only: the enqueue takes
+  ## an uncontended lock and returns, and a background thread does the IO
+  ## (OS-1). A dropped row is counted, never an error to the client.
+  if not daemon.observationCaptureEnabled:
+    return
+  if not daemon.observationRunIds.hasKey(lease.sessionId.value):
+    return
+  let finishedAt = unixMillisNow()
+  let startedAt =
+    if lease.startedAtUnixMillis > 0: lease.startedAtUnixMillis else: finishedAt
+  discard enqueueExecutionRow(ExecutionRow(
+    executionId: opaqueId("exec-"),
+    hostId: daemon.observationHostId,
+    hostProfileId: none(string),
+    runId: daemon.observationRunIds[lease.sessionId.value],
+    commandStatsId: lease.commandStatsId,
+    leaseId: some(int64(lease.id.value)),
+    startedAtUnixMillis: startedAt,
+    finishedAtUnixMillis: finishedAt,
+    durationMillis: max(0'i64, finishedAt - startedAt),
+    exitStatus: int64(finish.exitCode),
+    termination: observationTermination(finish),
+    attempt: 1,
+    retryOf: none(string),
+    peakRssBytes: int64(finish.peakMemoryBytes),
+    cpuUserMillis: none(int64),
+    cpuSysMillis: none(int64),
+    maxProcesses: int64(finish.processCount),
+    majorPageFaults: int64(finish.majorPageFaults),
+    ioReadBytes: none(int64),
+    ioWriteBytes: none(int64),
+    captureCompleteness: ccComplete,
+    droppedObservations: 0
+  ))
+
 proc grantQueuedLease(daemon: var RunQuotaDaemon; id: uint64; delivered: bool) =
   var lease = daemon.leases[id]
   daemon.transitionLeaseState(lease, leaseStateGranted)
@@ -897,6 +992,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       peer: context.peer
     )
     context.sessionIds.add(id)
+    daemon.openObservationRun(daemon.sessions[id.value])
     connection.sendResponse(
       rqSessionRegistered,
       frame.header.requestId,
@@ -1094,6 +1190,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           diagInvalidArgument, "lease is not granted"))
       return
     daemon.transitionLeaseState(lease, leaseStateStarting)
+    lease.startedAtUnixMillis = unixMillisNow()
     daemon.leases[msg.leaseId.value] = lease
     connection.sendResponse(
       rqLeaseStartingAck,
@@ -1149,6 +1246,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     lease.pressureEvents = msg.pressureEvents
     lease.hardLimitOrOom = msg.hardLimitOrOom
     daemon.updateEstimateFromFinish(lease, msg)
+    daemon.captureObservation(lease, msg)
     inc daemon.totalFinished
     daemon.leases[msg.leaseId.value] = lease
     discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
@@ -1315,6 +1413,10 @@ proc serve*(config: DaemonConfig): int =
   var listener = bindEndpoint(config.endpoint)
   sharedDaemon.daemon.state = dsServing
   echo "runquotad listening " & config.endpoint.path
+  if config.observationDbPath.len > 0:
+    # The report is the "clear report" half of OS-4: a store that will not
+    # open says so on stdout and the daemon carries on serving leases.
+    echo sharedDaemon.daemon.observationStore.report
   flushFile(stdout)
   var threads: seq[Thread[void]] = @[]
   for _ in 0 ..< connectionWorkerCount():
@@ -1332,6 +1434,7 @@ proc serve*(config: DaemonConfig): int =
     try:
       sharedDaemon.daemon.state = dsStopping
       stopEstimateStore(sharedDaemon.daemon.estimateStore)
+      stopObservationWriter()
     finally:
       release(sharedDaemon.lock)
       listener.close()

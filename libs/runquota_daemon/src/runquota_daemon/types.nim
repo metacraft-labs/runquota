@@ -2,6 +2,7 @@ import std/tables
 
 import runquota_core
 import runquota_ipc
+import runquota_observation_store
 import runquota_persistence
 import runquota_protocol
 
@@ -54,6 +55,8 @@ type
     memoryPressureHeavyBytes*: Bytes
     estimateDbPath*: string
     estimateQueueCapacity*: int
+    observationDbPath*: string
+    observationQueueCapacity*: int
 
   SessionRow* = object
     id*: SessionId
@@ -89,6 +92,10 @@ type
     pressureEvents*: uint32
     hardLimitOrOom*: bool
     queueDiagnostic*: Diagnostic
+    startedAtUnixMillis*: int64
+      ## When the client reported the lease as starting. Observation only:
+      ## the daemon does not watch the process tree, so this is the lease
+      ## window it was told about, not a measurement it took.
 
   ConnectionContext* = object
     supervisorProcessId*: uint64
@@ -120,6 +127,11 @@ type
     leases*: Table[uint64, LeaseRow]
     estimates*: Table[string, LearnedEstimateRow]
     estimateStore*: EstimateStore
+    observationStore*: ObservationStore
+    observationHostId*: string
+    observationBootId*: string
+    observationRunIds*: Table[uint64, string]
+      ## Session id to the ``runs`` row it opened.
     activeLeaseCount*: uint32
     activeBenchmarkCount*: uint32
     machineUsage*: Table[string, MachineUsage]
