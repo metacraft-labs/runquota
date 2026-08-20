@@ -230,6 +230,12 @@ proc connectEndpoint*(endpoint: Endpoint): LocalConnection =
       raise newException(OSError, "Unix-socket endpoints are not supported on Windows")
     else:
       var socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE)
+      # A session holds this socket open across `runWithLease`, i.e. across the
+      # fork+exec of the leased command. Close-on-exec keeps the daemon
+      # connection out of the child, where a reproducibility monitor would read
+      # it as opaque external input. `std/net` offers no way to pass
+      # SOCK_CLOEXEC to `socket(2)`, so this is the earliest point available.
+      setCloseOnExec(cint(socket.getFd()))
       socket.connectUnix(endpoint.path)
       LocalConnection(kind: endpointUnixSocket, socket: socket, endpoint: endpoint)
   of endpointNamedPipe:
@@ -277,6 +283,7 @@ proc bindEndpoint*(endpoint: Endpoint): LocalListener =
       if fileExists(endpoint.path):
         removeFile(endpoint.path)
       var socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE)
+      setCloseOnExec(cint(socket.getFd()))
       socket.bindUnix(endpoint.path)
       socket.listen()
       LocalListener(kind: endpointUnixSocket, socket: socket, endpoint: endpoint)
@@ -303,6 +310,9 @@ proc acceptConnection*(listener: var LocalListener): LocalConnection =
     else:
       var client: owned(Socket)
       listener.socket.accept(client)
+      # `accept(2)` never inherits the listener's CLOEXEC flag, so the accepted
+      # descriptor has to be marked separately.
+      setCloseOnExec(cint(client.getFd()))
       LocalConnection(kind: endpointUnixSocket, socket: client, endpoint: listener.endpoint)
   of endpointNamedPipe:
     when defined(windows):
@@ -332,6 +342,7 @@ proc acceptNativeConnection*(listener: var LocalListener): AcceptedConnection =
       let accepted = nativesockets.accept(listener.socket.getFd())
       if accepted[0] == osInvalidSocket:
         raiseOSError(osLastError())
+      setCloseOnExec(cint(accepted[0]))
       AcceptedConnection(kind: endpointUnixSocket, handle: accepted[0])
   of endpointNamedPipe:
     when defined(windows):

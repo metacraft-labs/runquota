@@ -28,18 +28,171 @@ const DefaultOutputLimit* = 1_048_576
 when defined(posix):
   proc childExit(status: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
 
-  proc closeInheritedChildFds() =
-    ## Keep leased commands from observing runquota's own control descriptors.
-    ## Reproducibility monitors classify reads from inherited pipes/sockets as
-    ## opaque external content because the producing endpoint is outside the
-    ## monitored action tree.
+  # ---------------------------------------------------------------------------
+  # Descriptor hygiene
+  # ---------------------------------------------------------------------------
+  #
+  # Leased commands must not observe runquota's own control descriptors:
+  # reproducibility monitors classify reads from inherited pipes/sockets as
+  # opaque external content, because the producing endpoint is outside the
+  # monitored action tree.
+  #
+  # The primary mechanism is CLOEXEC at birth (see `runquota_core/fd_hygiene`
+  # and the pipe creation in `launchProcess` below): descriptors runquota opens
+  # are created close-on-exec, so the kernel drops them at `execve` for free.
+  #
+  # `closeInheritedChildFds` is only the backstop for descriptors runquota did
+  # NOT open -- whatever the process that invoked runquota happened to be
+  # holding. It runs between fork and exec, so it may only use
+  # async-signal-safe calls: no allocation, no locks, no `opendir`/`readdir`.
+  #
+  # It must never again be bounded by `sysconf(_SC_OPEN_MAX)`. That is the
+  # limit on descriptor *numbers*, not a count of open ones; on hosts where it
+  # is raised to 1048576 (this is the default `RLIMIT_NOFILE` on several
+  # configurations, macOS included) the old numeric loop issued 1048573
+  # `close()` calls and ~90ms of syscalls before *every* leased exec. Bounding
+  # by `RLIMIT_NOFILE.rlim_cur` instead fixes nothing, because that is the very
+  # same number. Enumerating what is actually open -- or handing the whole
+  # range to the kernel in one call -- is the only approach whose cost tracks
+  # reality, so the numeric scan survives solely as a hard-capped last resort.
+
+  const MaxNumericFdScan = 4096
+    ## Hard cap on the last-resort numeric scan. Generous next to any plausible
+    ## descriptor table, and bounded whatever the host's rlimit says.
+
+  when defined(linux):
+    # `close_range(2)` (Linux 5.9) closes the whole range in one syscall, but
+    # glibc only wraps it from 2.34. Issue the syscall directly so the build
+    # does not depend on the libc version.
+    const SYS_close_range = clong(436)
+
+    proc rawSyscall(number: clong): clong {.
+      importc: "syscall", header: "<sys/syscall.h>", varargs, discardable.}
+
+    proc linuxPipe2(fds: array[0..1, cint]; flags: cint): cint {.
+      importc: "pipe2", header: "<unistd.h>".}
+
+    proc closeInheritedRange(): bool =
+      ## One syscall for every descriptor from 3 upwards. Fails with ENOSYS on
+      ## kernels older than 5.9, in which case the caller falls back.
+      rawSyscall(SYS_close_range, cuint(3), cuint(0xFFFF_FFFF'u32), cint(0)) == 0
+
+  elif defined(macosx):
+    # Darwin has neither `close_range` nor `closefrom`, so the open descriptors
+    # have to be enumerated from `/dev/fd`. `opendir`/`readdir` are not an
+    # option here: they allocate, and this code runs between fork and exec.
+    # `__getdirentries64` is libSystem's raw directory-read stub -- one syscall,
+    # no allocation, no locking -- reading into a caller-supplied buffer, which
+    # for us is the forked child's stack.
+    proc getdirentries64(fd: cint; buf: pointer; bufSize: csize_t;
+                         basep: ptr Off): int {.importc: "__getdirentries64".}
+
+    type
+      DarwinDirent {.importc: "struct dirent", header: "<dirent.h>",
+                     final, pure.} = object
+        d_reclen {.importc: "d_reclen".}: uint16
+        d_namlen {.importc: "d_namlen".}: uint16
+        d_name {.importc: "d_name".}: array[1024, char]
+
+    let O_DIRECTORY_C {.importc: "O_DIRECTORY", header: "<fcntl.h>".}: cint
+
+    proc closeInheritedByEnumeration(): bool =
+      ## Close every descriptor `/dev/fd` reports except 0, 1, 2 and the
+      ## directory handle used to do the reading. Returns false if `/dev/fd`
+      ## could not be opened at all, so the caller can fall back.
+      let dirFd = posix.open(cstring("/dev/fd"),
+                             O_RDONLY or O_DIRECTORY_C or O_CLOEXEC)
+      if dirFd < 0:
+        return false
+      # Stack buffer: no allocation between fork and exec. 8 KiB holds ~250
+      # entries per syscall, and `/dev/fd` entries are read in fd order, so
+      # closing an already-visited descriptor cannot perturb the walk.
+      var buffer: array[8192, char]
+      var base: Off = 0
+      while true:
+        let readBytes = getdirentries64(dirFd, addr buffer[0],
+                                        csize_t(buffer.len), addr base)
+        if readBytes <= 0:
+          break
+        var offset = 0
+        while offset < readBytes:
+          let entry = cast[ptr DarwinDirent](addr buffer[offset])
+          let recordLen = int(entry.d_reclen)
+          if recordLen <= 0:
+            # Malformed record: stop rather than spin forever on offset 0.
+            offset = readBytes
+            break
+          # Entry names under `/dev/fd` are decimal descriptor numbers. Parse
+          # by hand; `parseInt` and friends allocate.
+          var value = 0
+          var digits = 0
+          var index = 0
+          let nameLen = min(int(entry.d_namlen), entry.d_name.len)
+          while index < nameLen:
+            let ch = entry.d_name[index]
+            if ch < '0' or ch > '9':
+              digits = 0
+              break
+            value = value * 10 + (ord(ch) - ord('0'))
+            inc digits
+            inc index
+          if digits > 0 and value > STDERR_FILENO and cint(value) != dirFd:
+            discard close(cint(value))
+          offset += recordLen
+      discard close(dirFd)
+      true
+
+  elif defined(freebsd) or defined(netbsd) or defined(openbsd) or
+       defined(dragonfly) or defined(solaris):
+    # `closefrom(2)` is the BSD/Solaris equivalent of `close_range`. It returns
+    # void on FreeBSD and int elsewhere; declared with a header so the platform
+    # prototype is the one that is used, and treated as total either way.
+    proc closefrom(lowfd: cint) {.importc: "closefrom", header: "<unistd.h>".}
+
+    proc closeInheritedRange(): bool =
+      closefrom(cint(3))
+      true
+
+  proc closeInheritedByNumber() =
+    ## Last resort when no enumeration primitive is available. Bounded by
+    ## `RLIMIT_NOFILE.rlim_cur` AND by a hard cap, never by `_SC_OPEN_MAX`.
     var maxFd = 1024
-    when declared(SC_OPEN_MAX):
-      let openMax = sysconf(SC_OPEN_MAX)
-      if openMax > 0 and openMax <= 1_048_576:
-        maxFd = int(openMax)
+    var limit: RLimit
+    if getrlimit(RLIMIT_NOFILE, limit) == 0 and limit.rlim_cur > 0:
+      maxFd = int(limit.rlim_cur)
+    if maxFd > MaxNumericFdScan:
+      maxFd = MaxNumericFdScan
     for fd in 3 ..< maxFd:
       discard close(cint(fd))
+
+  proc closeInheritedChildFds() =
+    ## Backstop, between fork and exec: async-signal-safe calls only.
+    when defined(linux) or defined(freebsd) or defined(netbsd) or
+         defined(openbsd) or defined(dragonfly) or defined(solaris):
+      if closeInheritedRange():
+        return
+    elif defined(macosx):
+      if closeInheritedByEnumeration():
+        return
+    closeInheritedByNumber()
+
+  proc createControlPipe(fds: var array[0..1, cint]): bool =
+    ## Create a pipe whose ends are close-on-exec from birth, so neither end
+    ## can leak into an unrelated lease's child. The write end is `dup2`'d onto
+    ## the child's stdout/stderr, and `dup2` clears CLOEXEC on the new
+    ## descriptor, so the child still gets a working stream.
+    when defined(linux):
+      # `pipe2` sets the flag atomically, which matters because runquota is
+      # built with threads and another thread may fork between the two calls.
+      if linuxPipe2(fds, O_CLOEXEC) == 0:
+        return true
+    if pipe(fds) != 0:
+      return false
+    # Darwin has no `pipe2`; this two-step is the best available there and
+    # leaves a narrow window that the backstop above still covers.
+    setCloseOnExec(fds[0])
+    setCloseOnExec(fds[1])
+    true
 
 when defined(windows):
   # Windows: lightweight Job Object accounting wrappers. We pull in only the
@@ -497,9 +650,12 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       raise newException(ValueError, "empty argv")
     var stdoutPipe: array[0..1, cint]
     var stderrPipe: array[0..1, cint]
-    if pipe(stdoutPipe) != 0:
+    # Close-on-exec from birth: these are runquota's own control descriptors,
+    # and a concurrent lease's child must never inherit them. The kernel drops
+    # them at `execve` at no per-launch cost.
+    if not createControlPipe(stdoutPipe):
       raise newException(OSError, "stdout pipe failed")
-    if pipe(stderrPipe) != 0:
+    if not createControlPipe(stderrPipe):
       discard close(stdoutPipe[0])
       discard close(stdoutPipe[1])
       raise newException(OSError, "stderr pipe failed")
