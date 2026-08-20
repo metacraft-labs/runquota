@@ -79,6 +79,13 @@ when defined(posix):
     let O_DIRECTORY_C {.importc: "O_DIRECTORY", header: "<fcntl.h>".}: cint
 
   when defined(linux):
+    # NOT EXECUTED ANYWHERE YET. Everything below this line is verified by
+    # CODEGEN ONLY: it compiles for amd64/arm64/i386/arm, the `offsetOf` assert
+    # on the dirent layout fires when perturbed, the child-path allocation
+    # checker reports it clean, and the parse loop was transcribed to C and run
+    # against synthetic `linux_dirent64` records. No Linux host has ever run it.
+    # Treat a failure here as a first observation, not a regression.
+    #
     # `close_range(2)` (Linux 5.9) closes the whole range in one syscall, but
     # glibc only wraps it from 2.34. Issue the syscall directly so the build
     # does not depend on the libc version.
