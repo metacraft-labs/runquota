@@ -18,11 +18,13 @@
 ##   trigger that aborts. There is deliberately no update entry point, and
 ##   the trigger holds even for a client using ``sqlite3`` directly.
 
-import std/[options, os, strutils, sysrand, times]
+import std/[options, os, strutils]
 
-import ./schema, ./sqlite_cli, ./types
+import ./hardware, ./ids, ./schema, ./sqlite_cli, ./types
 
 export types
+export ids
+export hardware
 export schema.spineSchemaVersion, schema.spineTableNames
 
 const libraryName* = "runquota_observation_store"
@@ -39,23 +41,6 @@ type
 
 proc libraryInfo*(): LibraryInfo =
   LibraryInfo(name: libraryName)
-
-proc unixMillisNow*(): int64 =
-  int64(epochTime() * 1000.0)
-
-proc opaqueId*(prefix: string): string =
-  ## An identifier with no meaning outside this store. ``host_id`` in
-  ## particular MUST NOT be derived from the hostname: hostnames are
-  ## renamed and reused, which silently merges the histories of unrelated
-  ## machines.
-  var raw = newSeq[byte](16)
-  if not urandom(raw):
-    let fallback = unixMillisNow() * 1_000_003 + int64(getCurrentProcessId())
-    for i in 0 ..< raw.len:
-      raw[i] = byte((fallback shr (i mod 8 * 8)) and 0xff)
-  result = prefix
-  for value in raw:
-    result.add(toHex(int(value), 2).toLowerAscii)
 
 proc captureEnabled*(store: ObservationStore): bool =
   not store.isNil and store.status == ssOpen
@@ -555,24 +540,119 @@ proc readExtensionRegistry*(store: ObservationStore):
       tableName: decodeText(row[3]),
       registeredAtUnixMillis: parseBiggestInt(row[4])))
 
-proc ensureHostRow*(store: ObservationStore; lastBootId: string): string =
-  ## Returns this store's ``host_id``, creating one on first use.
+# ---------------------------------------------------------------------------
+# Host identity and versioned hardware profiles (M10)
+# ---------------------------------------------------------------------------
+
+proc ensureHostRow*(store: ObservationStore; hostId, lastBootId: string): bool =
+  ## Records ``hostId`` as a host of this store, refreshing its boot id.
   ##
-  ## M9 scope: a store holds one host until M10 lands real host identity
-  ## and hardware profiling, so an existing row is reused rather than a
-  ## second one invented on every restart. A merged database holds several
-  ## hosts, and M10 replaces this with identity the machine owns rather
-  ## than identity the store happens to hold.
-  if not store.captureEnabled:
+  ## The id comes from the machine (``identity.resolveHostIdentity``), not
+  ## from the store: a database is a file that gets copied, merged and
+  ## thrown away, and a machine that took its identity from whichever
+  ## database it happened to open would answer to a different name in each
+  ## one. This is the M9 placeholder's replacement, and the reason the
+  ## placeholder was wrong for a merged database.
+  ##
+  ## ``last_boot_id`` is updated in place rather than appended, because
+  ## ``hosts`` records the machine and not its restarts; ``executions`` is
+  ## the immutable table (OS-3), and this is not it.
+  if not store.captureEnabled or hostId.len == 0:
+    return false
+  store.execute(
+    "insert into hosts (host_id, created_at_unix_millis, last_boot_id) " &
+    "values (" & encodeText(hostId) & ", " & encodeInt(unixMillisNow()) &
+      ", " & encodeText(lastBootId) & ") " &
+    "on conflict(host_id) do update set last_boot_id = excluded.last_boot_id;")
+
+proc currentHostProfile*(store: ObservationStore;
+                         hostId: string): Option[HostProfileRow] =
+  ## The profile that is current for ``hostId`` — the one row whose
+  ## ``valid_to`` is still open. Schema version 3 makes "one" a constraint
+  ## rather than a hope (``host_profiles_current``).
+  for row in store.readHostProfiles():
+    if row.hostId == hostId and row.validToUnixMillis.isNone:
+      return some(row)
+  none(HostProfileRow)
+
+proc hostProfileRow(hostId, profileId: string; hardware: HardwareProfile;
+                    validFrom: int64): HostProfileRow =
+  HostProfileRow(
+    hostId: hostId,
+    profileId: profileId,
+    profileHash: profileHash(hardware),
+    validFromUnixMillis: validFrom,
+    validToUnixMillis: none(int64),
+    cpuModel: hardware.cpuModel,
+    physicalCores: hardware.physicalCores,
+    logicalCores: hardware.logicalCores,
+    ramBytes: hardware.ramBytes,
+    swapBytes: hardware.swapBytes,
+    diskClass: hardware.diskClass,
+    fsType: hardware.fsType,
+    arch: hardware.arch,
+    os: hardware.os,
+    osVersion: hardware.osVersion,
+    kernelVersion: hardware.kernelVersion,
+    virtualization: hardware.virtualization,
+    cpuShareGroup: hardware.cpuShareGroup)
+
+proc ensureHostProfile*(store: ObservationStore; hostId: string;
+                        hardware: HardwareProfile;
+                        atUnixMillis = 0'i64): string =
+  ## Returns the ``profile_id`` of the profile current for ``hostId``,
+  ## opening a new one only if the hardware really changed.
+  ##
+  ## Unchanged hardware reuses the existing row: the descriptive columns
+  ## are hashed and the hash compared, so a restart, a hundred restarts,
+  ## or a second daemon on the same store all land on the same row. A
+  ## table that grew a row per start would have to be disambiguated by
+  ## every join that reads it.
+  ##
+  ## A change closes the old row at ``now`` and opens the new one at the
+  ## same instant, so the two intervals are contiguous and neither
+  ## overlaps: an execution has exactly one profile at any time it could
+  ## have run. **Existing ``executions`` rows are not touched and MUST NOT
+  ## be** — they reference the profile that was current when they ran, and
+  ## a machine that gained RAM must not retroactively turn every past
+  ## duration into a measurement of hardware that did not exist yet.
+  ##
+  ## Returns the empty string if the profile could not be established, in
+  ## which case the caller writes NULL and says so; capture stays on.
+  if not store.captureEnabled or hostId.len == 0:
     return ""
-  let outcome = runSqlite(store.path,
-    "select " & selectText("host_id") &
-      " from hosts order by created_at_unix_millis limit 1;")
-  if outcome.ok:
-    let text = outcome.output.strip()
-    if text.len > 0:
-      return decodeText(text)
-  result = opaqueId("host-")
-  if not store.insertHost(HostRow(hostId: result,
-      createdAtUnixMillis: unixMillisNow(), lastBootId: lastBootId)):
+  let now = if atUnixMillis > 0: atUnixMillis else: unixMillisNow()
+  let hash = profileHash(hardware)
+
+  let current = store.currentHostProfile(hostId)
+  if current.isSome:
+    if current.get.profileHash == hash:
+      return current.get.profileId
+    # `valid_to` may not precede `valid_from`: two daemon starts inside one
+    # millisecond would otherwise write an interval that runs backwards.
+    let closedAt = max(now, current.get.validFromUnixMillis)
+    let successor = hostProfileRow(hostId, opaqueId("profile-"), hardware,
+      closedAt)
+    # One transaction: a closed profile with no successor would leave the
+    # host with no current hardware at all, and an open successor beside an
+    # open predecessor is refused by `host_profiles_current` anyway.
+    if not store.execute(
+        "begin immediate;\n" &
+        "update host_profiles set valid_to_unix_millis = " &
+          encodeInt(closedAt) & " where host_id = " & encodeText(hostId) &
+          " and valid_to_unix_millis is null;\n" &
+        insertStatement("host_profiles", hostProfileColumns,
+          hostProfileValues(successor)) & "\n" &
+        "commit;"):
+      # No rollback is issued: every `runSqlite` is its own process and its
+      # own connection, so an aborted transaction dies with it. Issuing one
+      # would fail with "no transaction is active" and that failure, not
+      # being a constraint rejection, would disable capture for a write
+      # that already did nothing.
+      return ""
+    return successor.profileId
+
+  let first = hostProfileRow(hostId, opaqueId("profile-"), hardware, now)
+  if not store.insertHostProfile(first):
     return ""
+  first.profileId

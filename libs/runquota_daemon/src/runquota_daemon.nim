@@ -40,7 +40,8 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     estimateDbPath: "",
     estimateQueueCapacity: 128,
     observationDbPath: "",
-    observationQueueCapacity: 1024
+    observationQueueCapacity: 1024,
+    hostIdentityFilePath: ""
   )
 
 proc machineCapacity*(id: string; cpuSlots: MilliCpu; memoryBytes: Bytes;
@@ -90,6 +91,17 @@ proc normalizeTopology(config: var DaemonConfig) =
     config.memoryBytes = local.memoryBytes
     config.ioSlots = local.ioSlots
 
+proc localCpuShareGroup(config: DaemonConfig): string =
+  ## The share group of the machine this daemon *is*, for the hardware
+  ## profile. ``cpu_share_group`` is not detectable — it is RunQuota's own
+  ## machine-model grouping, and carrying it into the profile is what lets
+  ## a merged database tell a pinned VM from a co-tenant guest.
+  if config.machines.hasKey(DefaultMachineId):
+    let group = config.machines[DefaultMachineId].cpuShareGroup
+    if group.len > 0:
+      return group
+  DefaultMachineId
+
 proc estimateTableKey(scope, commandStatsId: string): string =
   scope & "\0" & commandStatsId
 
@@ -123,6 +135,8 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
     ),
     observationStore: openObservationStore(effectiveConfig.observationDbPath),
     observationHostId: "",
+    observationProfileId: "",
+    observationIdentityReport: "",
     observationBootId: opaqueId("boot-"),
     observationRunIds: initTable[uint64, string]()
   )
@@ -131,11 +145,36 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
   # OS-4: a store that will not open is reported and then ignored. The
   # daemon keeps serving leases; only capture is lost.
   if result.observationStore.captureEnabled:
-    result.observationHostId =
-      result.observationStore.ensureHostRow(result.observationBootId)
-    if result.observationHostId.len > 0:
+    # Identity first, and from the machine rather than from the database:
+    # `host_id` is not derived from the hostname, the address, or anything
+    # else that two machines can share (M10, OS-6).
+    let identity = resolveHostIdentity(effectiveConfig.hostIdentityFilePath)
+    result.observationHostId = identity.hostId
+    if result.observationStore.ensureHostRow(identity.hostId,
+        result.observationBootId):
+      # The disk that matters to a build's duration is the one the work
+      # happens on, and the store lives beside it.
+      let hardware = detectHardwareProfile(
+        result.observationStore.path.parentDir,
+        localCpuShareGroup(effectiveConfig))
+      result.observationProfileId =
+        result.observationStore.ensureHostProfile(identity.hostId, hardware)
       startObservationWriter(result.observationStore.path,
         effectiveConfig.observationQueueCapacity)
+      result.observationIdentityReport =
+        "runquota observation store " & result.observationStore.path &
+          ": host " & identity.hostId & "; hardware profile " &
+          (if result.observationProfileId.len > 0: result.observationProfileId
+           else: "unavailable") & "; " & identity.report
+    else:
+      result.observationHostId = ""
+      result.observationIdentityReport =
+        "runquota observation store " & result.observationStore.path &
+          ": the host row could not be written; executions are not recorded"
+  else:
+    result.observationIdentityReport =
+      "runquota observation store " & effectiveConfig.observationDbPath &
+        ": host identity and hardware profile not recorded; capture disabled"
 
 proc countLeases(daemon: RunQuotaDaemon; state: LeaseLifecycleState): uint32 =
   for lease in daemon.leases.values:
@@ -840,7 +879,15 @@ proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
   discard enqueueExecutionRow(ExecutionRow(
     executionId: opaqueId("exec-"),
     hostId: daemon.observationHostId,
-    hostProfileId: none(string),
+    # The profile current when this ran (OS-6). NULL only when detection
+    # could not establish one: a wrong profile id would be worse than an
+    # absent one, because an aggregate would then be reported against
+    # hardware that was never measured.
+    hostProfileId:
+      if daemon.observationProfileId.len > 0:
+        some(daemon.observationProfileId)
+      else:
+        none(string),
     runId: daemon.observationRunIds[lease.sessionId.value],
     commandStatsId: lease.commandStatsId,
     leaseId: some(int64(lease.id.value)),
@@ -1416,7 +1463,11 @@ proc serve*(config: DaemonConfig): int =
   if config.observationDbPath.len > 0:
     # The report is the "clear report" half of OS-4: a store that will not
     # open says so on stdout and the daemon carries on serving leases.
+    # Exactly two lines, always, whenever a store path was given: a reader
+    # that has to guess how many lines it will get is a reader that
+    # deadlocks on a daemon which then goes quiet.
     echo sharedDaemon.daemon.observationStore.report
+    echo sharedDaemon.daemon.observationIdentityReport
   flushFile(stdout)
   var threads: seq[Thread[void]] = @[]
   for _ in 0 ..< connectionWorkerCount():

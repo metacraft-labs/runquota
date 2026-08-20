@@ -57,6 +57,10 @@ type
     estimateQueueCapacity*: int
     observationDbPath*: string
     observationQueueCapacity*: int
+    hostIdentityFilePath*: string
+      ## Where this machine's ``host_id`` is kept. Empty means the
+      ## per-user default; tests point it at a scratch directory so they
+      ## neither read nor write the operator's real machine identity.
 
   SessionRow* = object
     id*: SessionId
@@ -129,6 +133,12 @@ type
     estimateStore*: EstimateStore
     observationStore*: ObservationStore
     observationHostId*: string
+    observationProfileId*: string
+      ## The hardware profile current for this daemon's host. Every
+      ## ``executions`` row it writes references this and nothing else, so
+      ## a profile transition mid-life would need a restart to be picked
+      ## up — see M10's deferrals.
+    observationIdentityReport*: string
     observationBootId*: string
     observationRunIds*: Table[uint64, string]
       ## Session id to the ``runs`` row it opened.

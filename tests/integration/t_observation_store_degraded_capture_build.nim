@@ -60,18 +60,24 @@ type DaemonHandle = object
   process: Process
   startupLines: seq[string]
 
-proc startDaemon(socketPath, observationDb: string): DaemonHandle =
+proc startDaemon(socketPath, observationDb, identityFile: string):
+    DaemonHandle =
+  # `--host-identity-file` keeps the test off the operator's real machine
+  # identity: without it this test would read, or create, the `host_id`
+  # the developer's own daemon uses.
   let process = startProcess(
     daemonPath(),
-    args = ["--socket", socketPath, "--observation-db", observationDb],
+    args = ["--socket", socketPath, "--observation-db", observationDb,
+            "--host-identity-file", identityFile],
     options = {poStdErrToStdOut}
   )
   waitForSocket(socketPath)
   var lines: seq[string] = @[]
-  # The daemon prints exactly two startup lines and then goes quiet: the
-  # endpoint, and the observation-store report. Reading precisely those two
-  # cannot deadlock against a daemon that never writes again.
-  for _ in 0 ..< 2:
+  # The daemon prints exactly three startup lines whenever a store path was
+  # given, and then goes quiet: the endpoint, the observation-store report,
+  # and the host-identity/hardware-profile report. Reading precisely those
+  # three cannot deadlock against a daemon that never writes again.
+  for _ in 0 ..< 3:
     lines.add(process.outputStream.readLine())
   DaemonHandle(process: process, startupLines: lines)
 
@@ -96,15 +102,19 @@ suite "observation_store_degraded_capture_build":
     defer: removeDir(dir)
     let socketPath = dir / "runquotad.sock"
     let dbPath = dir / "observations.sqlite"
+    let identityFile = dir / "host-id"
     let source = writeBuildInput(dir)
     let binary = dir / "hello.bin"
     check fileExists(daemonPath())
     check fileExists(cliPath())
     putEnv("RUNQUOTA_SOCKET", socketPath)
 
-    var daemon = startDaemon(socketPath, dbPath)
+    var hostId = ""
+    var profileId = ""
+    var daemon = startDaemon(socketPath, dbPath, identityFile)
     try:
       check daemon.startupLines[1].contains("capture enabled")
+      check daemon.startupLines[2].contains("hardware profile")
 
       let build = runBuildUnderLease(dir, source, binary)
       check build.exitCode == 0
@@ -119,6 +129,16 @@ suite "observation_store_degraded_capture_build":
       check runs[0].tool == "runquota acquire"
       check runs[0].hostId.len > 0
       check not runs[0].hostId.contains(getHostName())
+      # Opaque and fixed-shape, which is the assertion the containment
+      # check above cannot make on a host whose name is short.
+      check isOpaqueId(runs[0].hostId, "host-")
+      # Guarded so a daemon that wrote its identity somewhere else fails
+      # the restart assertions below too, rather than taking the test out
+      # with an IO exception before they are ever reached.
+      check fileExists(identityFile)
+      if fileExists(identityFile):
+        check readFile(identityFile).strip() == runs[0].hostId
+
       let executions = store.readExecutions()
       check executions.len >= 1
       check executions[0].runId == runs[0].runId
@@ -127,8 +147,56 @@ suite "observation_store_degraded_capture_build":
       check executions[0].termination == tExited
       check executions[0].exitStatus == 0
       check executions[0].durationMillis >= 0
+
+      # M10: the execution carries the hardware dimension OS-6 needs, and
+      # it is the profile that was current when it ran.
+      let profiles = store.readHostProfiles()
+      check profiles.len == 1
+      check profiles[0].hostId == runs[0].hostId
+      check executions[0].hostProfileId == some(profiles[0].profileId)
+      check profiles[0].validToUnixMillis.isNone
+      check profiles[0].validFromUnixMillis <= executions[0].startedAtUnixMillis
+      check profiles[0].profileHash.startsWith("sha256:")
+      # A real machine was described, not a row of placeholders.
+      check profiles[0].cpuModel != unknownField
+      check profiles[0].ramBytes > 0
+      check profiles[0].logicalCores >= 1
+      check profiles[0].diskClass != dcUnknown
+      check profiles[0].profileHash ==
+        profileHash(hardwareProfile(profiles[0]))
+      check daemon.startupLines[2].contains(profiles[0].profileId)
+      check daemon.startupLines[2].contains(runs[0].hostId)
+
+      hostId = runs[0].hostId
+      profileId = profiles[0].profileId
     finally:
       daemon.stop()
+
+    # Re-running with unchanged hardware must not accumulate. This is the
+    # gate's "re-running" clause against a real daemon rather than against
+    # a library call: a second process, a second store open, a second
+    # detection, and the same two rows.
+    check hostId.len > 0
+    let secondSocket = dir / "second.sock"
+    putEnv("RUNQUOTA_SOCKET", secondSocket)
+    var restarted = startDaemon(secondSocket, dbPath, identityFile)
+    try:
+      check restarted.startupLines[1].contains("capture enabled")
+      let store = openObservationStore(dbPath)
+      check store.captureEnabled
+      let hosts = store.readHosts()
+      check hosts.len == 1
+      check hosts[0].hostId == hostId
+      let profiles = store.readHostProfiles()
+      check profiles.len == 1
+      check profiles[0].profileId == profileId
+      check profiles[0].validToUnixMillis.isNone
+      # And the restarted daemon agrees it is the same machine on the same
+      # hardware, rather than merely having failed to write.
+      check restarted.startupLines[2].contains(hostId)
+      check restarted.startupLines[2].contains(profileId)
+    finally:
+      restarted.stop()
 
   test "a build over a corrupt store still succeeds, and capture is off":
     let dir = scratchDir("c")
@@ -152,12 +220,16 @@ suite "observation_store_degraded_capture_build":
     let binary = dir / "hello.bin"
     putEnv("RUNQUOTA_SOCKET", socketPath)
 
-    var daemon = startDaemon(socketPath, dbPath)
+    var daemon = startDaemon(socketPath, dbPath, dir / "host-id")
     try:
       # The report is clear, and it is on stdout where an operator sees it.
       check daemon.startupLines[1].contains("corrupt")
       check daemon.startupLines[1].contains("capture disabled")
       check daemon.startupLines[1].contains(dbPath)
+      # And the identity line says the host and the profile were not
+      # recorded, rather than claiming a profile nothing was written to.
+      check daemon.startupLines[2].contains("not recorded")
+      check not fileExists(dir / "host-id")
 
       let build = runBuildUnderLease(dir, source, binary)
       check build.exitCode == 0

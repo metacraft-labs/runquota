@@ -11,7 +11,7 @@
 ## registered in ``extension_registry`` (M12).
 
 const
-  spineSchemaVersion* = 2'i64
+  spineSchemaVersion* = 3'i64
     ## The schema version this build understands. A database whose
     ## ``user_version`` exceeds it is REFUSED, never degraded (see
     ## ``openObservationStore``).
@@ -145,7 +145,18 @@ alter table executions
   add column dropped_observations integer not null default 0;
 """
 
-  migrations* = [migrationV1, migrationV2]
+  # Version 3 makes "unchanged hardware MUST NOT accumulate profile rows"
+  # structural instead of merely tested. A host has at most one *current*
+  # profile -- one row whose ``valid_to`` is still open -- so a second one
+  # cannot be inserted even by a client reaching past this library into
+  # ``sqlite3``. Superseded rows are unconstrained: a machine may have as
+  # many closed profiles as it has had hardware.
+  migrationV3 = """
+create unique index host_profiles_current
+  on host_profiles(host_id) where valid_to_unix_millis is null;
+"""
+
+  migrations* = [migrationV1, migrationV2, migrationV3]
     ## Index ``i`` migrates ``user_version`` ``i`` to ``i + 1``.
 
 static:

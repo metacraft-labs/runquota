@@ -43,11 +43,29 @@ read. The daemon opens the store at startup, writes one `runs` row per
 registered session and one immutable `executions` row per finished lease, and
 reports on stdout whether capture is on.
 
+Host identity and the hardware dimension are live. The machine's `host_id` is
+128 random bits kept in a per-user state file (`--host-identity-file PATH`,
+defaulting under `XDG_STATE_HOME`); it is not derived from the hostname, the
+address, or anything else two machines can share, because a derived identity
+silently merges the histories of unrelated machines. At startup the daemon
+detects its hardware, hashes the descriptive columns, and reuses the current
+`host_profiles` row when the hash is unchanged. A change closes the old row at
+that instant and opens the new one at the same instant, so the intervals are
+contiguous and non-overlapping; already-written `executions` keep pointing at
+the profile that was current when they ran. Schema version 3 enforces at most
+one open profile per host.
+
+Two detection notes. `swap_bytes` is recorded at whole-GiB granularity because
+macOS has no configured swap size — the dynamic pager grows swap files on
+demand, and a byte-exact figure would mint a fresh hardware profile every time
+it did. Only macOS/arm64 has ever run the detector; the Linux branch is written
+from `/proc` and `/sys` and has never executed, and there is no Windows branch
+beyond what the Nim runtime already knows.
+
 Columns the RQSP protocol does not yet carry — CPU user and system time, IO
-byte counts, the host profile reference, and a run's finish status — are stored
-as SQL `NULL`, which reads as "not declared". They are deliberately not stored
-as zero: a zero is a measurement, and nobody made it. M10 supplies the host
-profile, M13 the client-reported figures.
+byte counts, and a run's finish status — are stored as SQL `NULL`, which reads
+as "not declared". They are deliberately not stored as zero: a zero is a
+measurement, and nobody made it. M13 supplies the client-reported figures.
 
 ## State-boundary requirements
 

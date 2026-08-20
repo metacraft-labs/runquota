@@ -50,6 +50,27 @@ type
     createdAtUnixMillis*: int64
     lastBootId*: string
 
+  HardwareProfile* = object
+    ## The descriptive half of a ``host_profiles`` row: what the machine
+    ## is, with nothing about which row records it or when that row was
+    ## current. ``profileHash`` digests exactly these fields, which is why
+    ## they are a separate type rather than a comment on ``HostProfileRow``
+    ## — a field added to the row that must not change the hash cannot be
+    ## added here by accident.
+    cpuModel*: string
+    physicalCores*: int64
+    logicalCores*: int64
+    ramBytes*: int64
+    swapBytes*: int64
+    diskClass*: DiskClass
+    fsType*: string
+    arch*: string
+    os*: string
+    osVersion*: string
+    kernelVersion*: string
+    virtualization*: string
+    cpuShareGroup*: string
+
   HostProfileRow* = object
     hostId*: string
     profileId*: string
