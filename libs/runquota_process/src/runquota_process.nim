@@ -1,4 +1,4 @@
-import std/[envvars, os, strutils, times]
+import std/[os, strutils, times]
 
 when defined(posix):
   import std/posix
@@ -46,6 +46,16 @@ when defined(posix):
   # holding. It runs between fork and exec, so it may only use
   # async-signal-safe calls: no allocation, no locks, no `opendir`/`readdir`.
   #
+  # That restriction is not stylistic. runquota is built `--threads:on`, and
+  # `fork()` in a threaded process gives the child a single thread plus a copy
+  # of every lock the other threads held at the instant of the fork. A child
+  # that then touches the allocator can block forever on a mutex whose owner
+  # does not exist in it, never reaching `execve`. For a lease coordinator that
+  # is worse than a crash: the lease is never finished, its capacity is never
+  # returned, and nothing reports an error. Everything the child needs is
+  # therefore built in the parent (see `childEnvEntries` / `resolveProgram`
+  # below) and handed over as memory the child only reads.
+  #
   # It must never again be bounded by `sysconf(_SC_OPEN_MAX)`. That is the
   # limit on descriptor *numbers*, not a count of open ones; on hosts where it
   # is raised to 1048576 (this is the default `RLIMIT_NOFILE` on several
@@ -57,8 +67,16 @@ when defined(posix):
   # reality, so the numeric scan survives solely as a hard-capped last resort.
 
   const MaxNumericFdScan = 4096
-    ## Hard cap on the last-resort numeric scan. Generous next to any plausible
-    ## descriptor table, and bounded whatever the host's rlimit says.
+    ## Hard cap on the last-resort numeric scan. It is reached only when the
+    ## host offers neither a range-close primitive nor a way to enumerate the
+    ## descriptor table (on Linux: a pre-5.9 kernel with no `/proc` mounted).
+    ## A launcher holding descriptors above this number on such a host would
+    ## leak them into the child, so enumeration is preferred wherever it is
+    ## possible -- the cap exists to bound a scan that cannot be made correct,
+    ## not to stand in for one that can.
+
+  when defined(linux) or defined(macosx):
+    let O_DIRECTORY_C {.importc: "O_DIRECTORY", header: "<fcntl.h>".}: cint
 
   when defined(linux):
     # `close_range(2)` (Linux 5.9) closes the whole range in one syscall, but
@@ -77,6 +95,94 @@ when defined(posix):
       ## kernels older than 5.9, in which case the caller falls back.
       rawSyscall(SYS_close_range, cuint(3), cuint(0xFFFF_FFFF'u32), cint(0)) == 0
 
+    # Pre-5.9 kernels need the descriptors enumerated instead, and the numeric
+    # scan cannot do that: it is capped, so a launcher holding a descriptor
+    # above the cap would leak it into the monitored child silently. Linux
+    # publishes the real table as `/proc/self/fd`, so read that with the same
+    # discipline the Darwin path uses -- raw directory syscall into a stack
+    # buffer, digits parsed by hand, nothing allocated.
+    #
+    # `getdents64`'s syscall number is architecture-specific (217 on x86-64, 61
+    # on aarch64) and glibc only wraps the function from 2.30, so take the
+    # number from `<sys/syscall.h>` rather than hard-coding either.
+    let SYS_getdents64_C {.importc: "SYS_getdents64",
+                           header: "<sys/syscall.h>".}: clong
+
+    type
+      LinuxDirent64 {.final, pure.} = object
+        ## `struct linux_dirent64` exactly as the kernel writes it. Declared
+        ## here rather than imported because glibc only exposes an equivalent
+        ## `struct dirent64` under `_LARGEFILE64_SOURCE`.
+        inode: uint64
+        offset: int64
+        recordLen: uint16
+        kind: uint8
+        name: array[256, char]
+
+    const LinuxDirentNameOffset = 19
+      ## Byte offset of `d_name` within the record: 8 + 8 + 2 + 1. The name is
+      ## not length-prefixed, so this offset is the only thing bounding the
+      ## digit scan below -- get it wrong and the walk reads past the record.
+
+    static:
+      # Pinned to the layout the compiler actually produces, on whatever
+      # architecture this is being built for, rather than assumed.
+      doAssert offsetOf(LinuxDirent64, name) == LinuxDirentNameOffset
+
+    proc closeInheritedByEnumeration(): bool =
+      ## Close every descriptor `/proc/self/fd` reports except 0, 1, 2 and the
+      ## directory handle used to do the reading. Returns false when `/proc` is
+      ## not mounted, so the caller can fall back to the capped numeric scan.
+      let dirFd = posix.open(cstring("/proc/self/fd"),
+                             O_RDONLY or O_DIRECTORY_C or O_CLOEXEC)
+      if dirFd < 0:
+        return false
+      # Stack buffer: no allocation between fork and exec. One `getdents64`
+      # rarely fills it, but a launcher holding hundreds of descriptors needs
+      # the loop below to keep asking until the kernel reports 0 -- stopping
+      # after the first buffer is exactly the truncation this routine exists to
+      # avoid. Entries come back in descriptor order, so closing an
+      # already-visited descriptor cannot perturb the walk.
+      var buffer {.align: 8.}: array[8192, char]
+      while true:
+        let readBytes = int(rawSyscall(SYS_getdents64_C, dirFd, addr buffer[0],
+                                       cuint(buffer.len)))
+        if readBytes <= 0:
+          break
+        var offset = 0
+        while offset < readBytes:
+          let entry = cast[ptr LinuxDirent64](addr buffer[offset])
+          let recordLen = int(entry.recordLen)
+          if recordLen <= LinuxDirentNameOffset or
+              offset + recordLen > readBytes:
+            # Malformed record: stop rather than spin forever on offset 0.
+            offset = readBytes
+            break
+          # Entry names under `/proc/self/fd` are decimal descriptor numbers.
+          # Parse by hand; `parseInt` and friends allocate. Unlike the Darwin
+          # dirent there is no name length, so the name is NUL-terminated
+          # inside the record: the terminator ends the number, it does not
+          # invalidate it.
+          var value = 0
+          var digits = 0
+          var index = 0
+          let nameLen = min(recordLen - LinuxDirentNameOffset, entry.name.len)
+          while index < nameLen:
+            let ch = entry.name[index]
+            if ch == '\0':
+              break
+            if ch < '0' or ch > '9':
+              digits = 0
+              break
+            value = value * 10 + (ord(ch) - ord('0'))
+            inc digits
+            inc index
+          if digits > 0 and value > STDERR_FILENO and cint(value) != dirFd:
+            discard close(cint(value))
+          offset += recordLen
+      discard close(dirFd)
+      true
+
   elif defined(macosx):
     # Darwin has neither `close_range` nor `closefrom`, so the open descriptors
     # have to be enumerated from `/dev/fd`. `opendir`/`readdir` are not an
@@ -93,8 +199,6 @@ when defined(posix):
         d_reclen {.importc: "d_reclen".}: uint16
         d_namlen {.importc: "d_namlen".}: uint16
         d_name {.importc: "d_name".}: array[1024, char]
-
-    let O_DIRECTORY_C {.importc: "O_DIRECTORY", header: "<fcntl.h>".}: cint
 
     proc closeInheritedByEnumeration(): bool =
       ## Close every descriptor `/dev/fd` reports except 0, 1, 2 and the
@@ -167,8 +271,17 @@ when defined(posix):
 
   proc closeInheritedChildFds() =
     ## Backstop, between fork and exec: async-signal-safe calls only.
-    when defined(linux) or defined(freebsd) or defined(netbsd) or
-         defined(openbsd) or defined(dragonfly) or defined(solaris):
+    when defined(linux):
+      # One syscall on 5.9 and newer; `/proc/self/fd` on anything older. The
+      # capped numeric scan below is reached only when neither is available --
+      # a pre-5.9 kernel with no `/proc` mounted -- because it is the only one
+      # of the three that can silently miss a descriptor.
+      if closeInheritedRange():
+        return
+      if closeInheritedByEnumeration():
+        return
+    elif defined(freebsd) or defined(netbsd) or defined(openbsd) or
+         defined(dragonfly) or defined(solaris):
       if closeInheritedRange():
         return
     elif defined(macosx):
@@ -317,7 +430,7 @@ proc backendProfile*(): ProcessBackendProfile =
   when defined(posix):
     ProcessBackendProfile(
       name: "posix-fork-exec-poll",
-      launchPrimitive: "fork+execvp",
+      launchPrimitive: "fork+execve",
       outputCapture: "nonblocking-pipes-poll-bounded",
       completionWait: "waitpid-wnohang",
       cancellation: "process-group-sigterm",
@@ -410,11 +523,117 @@ when defined(posix):
         closeFd(fd)
         break
 
-  proc applyChildEnv(values: openArray[string]) =
-    for item in values:
+  # ---------------------------------------------------------------------------
+  # Child environment and program resolution -- all of it in the parent
+  # ---------------------------------------------------------------------------
+  #
+  # The child used to reach `putEnv` for every entry in `spec.env`, i.e. two
+  # string slices, a `deallocShared` and a `setenv` between fork and exec (that
+  # is what the generated C showed, not what the Nim reads like). None of that
+  # is async-signal-safe. Composing the environment in the parent and handing
+  # the child a finished `char *[]` for `execve` removes the whole class of
+  # problem rather than narrowing it: the child's path from fork to exec now
+  # only reads memory the parent already populated.
+
+  when defined(macosx) or defined(ios):
+    # Darwin's loader only links `environ` into complete programs; everything
+    # else has to go through `_NSGetEnviron()`. `runquota_process` ships as a
+    # static helper that other binaries link, so use the supported accessor.
+    proc nsGetEnviron(): ptr cstringArray {.
+      importc: "_NSGetEnviron", header: "<crt_externs.h>".}
+
+    proc currentEnviron(): cstringArray =
+      nsGetEnviron()[]
+  else:
+    var globalEnviron {.importc: "environ", header: "<unistd.h>".}: cstringArray
+
+    proc currentEnviron(): cstringArray =
+      globalEnviron
+
+  const
+    DefaultExecSearchPath = "/usr/bin:/bin"
+      ## What `execvp` falls back to when PATH is unset (`_PATH_DEFPATH`).
+    ExecShellPath = "/bin/sh"
+      ## Interpreter `execvp` retries with when the kernel rejects a file as
+      ## ENOEXEC -- a script with no shebang.
+
+  proc envEntryHasKey(entry, key: string): bool =
+    ## `entry` is a `NAME=VALUE` string; does its NAME equal `key`? Compared in
+    ## place so no slice is materialised per comparison.
+    entry.len > key.len and entry[key.len] == '=' and entry.startsWith(key)
+
+  proc childEnvEntries(overrides: openArray[string]): seq[string] =
+    ## The environment the child should exec with: the launcher's own
+    ## environment with `overrides` layered on top. This reproduces what the
+    ## in-child `putEnv` loop produced -- including that an entry with no name
+    ## (`=value`) or no separator at all is not an assignment and is ignored --
+    ## except that it is computed before the fork.
+    let inherited = currentEnviron()
+    if inherited != nil:
+      var index = 0
+      while inherited[index] != nil:
+        result.add($inherited[index])
+        inc index
+    for item in overrides:
       let split = item.find('=')
-      if split > 0:
-        putEnv(item[0 ..< split], item[split + 1 .. ^1])
+      if split <= 0:
+        continue
+      let key = item[0 ..< split]
+      var replaced = false
+      for existing in result.mitems:
+        if existing.envEntryHasKey(key):
+          existing = item
+          replaced = true
+          break
+      if not replaced:
+        result.add(item)
+
+  proc execSearchPath(entries: openArray[string]): string =
+    ## The PATH `execvp` would have searched, distinguishing "PATH is unset"
+    ## (fall back to `_PATH_DEFPATH`) from "PATH is set to the empty string"
+    ## (a single empty element, i.e. the current directory).
+    for entry in entries:
+      if entry.envEntryHasKey("PATH"):
+        return entry["PATH".len + 1 .. ^1]
+    DefaultExecSearchPath
+
+  proc isExecutableFile(path: string): bool =
+    var info: Stat
+    if stat(cstring(path), info) != 0:
+      return false
+    S_ISREG(info.st_mode) and access(cstring(path), X_OK) == 0
+
+  proc resolveProgram(program: string; searchPath: string): string =
+    ## `execvp`'s PATH search, performed in the parent because `execve` does not
+    ## perform one and the search cannot move into the child: building candidate
+    ## paths allocates. `execvpe` would have kept it in libc, but Darwin does not
+    ## have it, and this repo builds for Darwin and Linux alike.
+    ##
+    ## `searchPath` is the PATH the *child* will see, so a caller that overrides
+    ## PATH in `spec.env` still resolves against the value it asked for -- which
+    ## is what `execvp` did once the old in-child `putEnv` had run.
+    if program.len == 0 or program.contains('/'):
+      return program
+    for directory in searchPath.split(':'):
+      # An empty PATH element means the current directory, as in `execvp`.
+      let candidate =
+        if directory.len == 0: program
+        else: directory & "/" & program
+      if isExecutableFile(candidate):
+        return candidate
+    # Nothing matched. Hand the bare name to `execve` anyway so an unresolvable
+    # program still fails the way it always did (child exits 127) rather than
+    # acquiring a new, differently-shaped error path in the parent.
+    program
+
+  proc shellFallbackArgv(program: string;
+                         argv: openArray[string]): seq[string] =
+    ## `execvp` re-executes a file the kernel rejects with ENOEXEC through
+    ## `/bin/sh`; `execve` reports the error instead. Build the replacement argv
+    ## here so the child can still do it without allocating.
+    result = @[ExecShellPath, program]
+    for index in 1 ..< argv.len:
+      result.add(argv[index])
 
   proc buildCompletion(child: LaunchedProcess; status: cint; elapsedMillis: uint64;
                        stdoutText, stderrText: string; stdoutBytes, stderrBytes: uint64;
@@ -648,6 +867,14 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
   when defined(posix):
     if spec.argv.len == 0:
       raise newException(ValueError, "empty argv")
+
+    # Everything the child needs between fork and exec is composed here, while
+    # there is still a whole process to compose it in. After the fork the child
+    # may only read what is already built.
+    let childEnv = childEnvEntries(spec.env)
+    let program = resolveProgram(spec.argv[0], execSearchPath(childEnv))
+    let shellArgv = shellFallbackArgv(program, spec.argv)
+
     var stdoutPipe: array[0..1, cint]
     var stderrPipe: array[0..1, cint]
     # Close-on-exec from birth: these are runquota's own control descriptors,
@@ -660,8 +887,14 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       discard close(stdoutPipe[1])
       raise newException(OSError, "stderr pipe failed")
 
+    # `argv[0]` stays whatever the caller passed, exactly as `execvp` leaves it;
+    # only the path handed to the kernel is the resolved one.
     let argv = allocCStringArray(spec.argv)
     defer: deallocCStringArray(argv)
+    let envp = allocCStringArray(childEnv)
+    defer: deallocCStringArray(envp)
+    let shellArgvC = allocCStringArray(shellArgv)
+    defer: deallocCStringArray(shellArgvC)
     let pid = fork()
     if pid == 0:
       discard close(stdoutPipe[0])
@@ -670,7 +903,6 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         discard setpgid(0, 0)
       if spec.cwd.len > 0 and chdir(cstring(spec.cwd)) != 0:
         childExit(126)
-      applyChildEnv(spec.env)
       let devNull = open(cstring("/dev/null"), O_RDONLY)
       if devNull >= 0:
         discard dup2(devNull, STDIN_FILENO)
@@ -681,7 +913,9 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       discard close(stdoutPipe[1])
       discard close(stderrPipe[1])
       closeInheritedChildFds()
-      discard execvp(cstring(spec.argv[0]), argv)
+      discard execve(cstring(program), argv, envp)
+      if errno == ENOEXEC:
+        discard execve(cstring(ExecShellPath), shellArgvC, envp)
       childExit(127)
     if pid < 0:
       discard close(stdoutPipe[0])

@@ -14,6 +14,37 @@ const FixtureSleep = "--m5-fixture-sleep"
 const FixtureExit7 = "--m5-fixture-exit7"
 const FixtureEnvName = "RUNQUOTA_M5_CHILD_ENV"
 const FixtureRecord = "runquota-m5-cwd-env.txt"
+const FixtureEnvDump = "--m5-fixture-env-dump"
+const FixtureArgv0 = "--m5-fixture-argv0"
+
+if commandLineParams().len >= 1 and commandLineParams()[0] == FixtureEnvDump:
+  # Report exactly the variables the caller asked about, reading the child's
+  # environment block rather than asking `getEnv`. `getEnv` cannot answer
+  # either question this fixture exists to answer: it returns "" both for a
+  # variable that is absent and for one that is present but empty, and when a
+  # name appears twice it reports only the first. The composed environment
+  # must neither drop an entry nor carry two entries for the same name, so
+  # both the absent/empty split and the occurrence count are printed.
+  for name in commandLineParams()[1 .. ^1]:
+    var occurrences = 0
+    var firstValue = ""
+    for key, value in envPairs():
+      if key == name:
+        if occurrences == 0:
+          firstValue = value
+        inc occurrences
+    if occurrences == 0:
+      stdout.write(name & "=<absent>\n")
+    else:
+      stdout.write(name & "=[" & firstValue & "]\n")
+    stdout.write(name & " occurrences=" & $occurrences & "\n")
+  quit 0
+
+if commandLineParams().len == 1 and commandLineParams()[0] == FixtureArgv0:
+  # `paramStr(0)` is `argv[0]` as the kernel received it, which is not the same
+  # as `getAppFilename()`: the latter resolves the running image.
+  stdout.write("argv0=[" & paramStr(0) & "]\n")
+  quit 0
 
 if commandLineParams().len == 1 and commandLineParams()[0] == FixtureOutput:
   stdout.write("m5 stdout\n")
@@ -135,6 +166,139 @@ suite "m5_process_exec_bench_contract":
     finally:
       if dirExists(cwdDir):
         removeDir(cwdDir)
+
+  # The three tests below cover what moved out of the child when the
+  # between-fork-and-exec `putEnv` loop was replaced by a `char *[]` built in
+  # the parent and handed to `execve`. `execve` takes the environment whole and
+  # performs no PATH search of its own, so "overrides reach the child" is no
+  # longer the only property that has to hold: the launcher's *own*
+  # environment has to survive, an override has to replace rather than
+  # duplicate, and the PATH lookup `execvp` used to do inside the child has to
+  # still happen -- against the PATH the child was given, not the parent's.
+
+  test "the child's environment is the launcher's, with overrides layered on top":
+    putEnv("RUNQUOTA_M5_INHERITED", "from-launcher")
+    putEnv("RUNQUOTA_M5_REPLACED", "parent-value")
+    var child = launchProcess(commandSpec(
+      [getAppFilename(), FixtureEnvDump,
+       "RUNQUOTA_M5_INHERITED", "RUNQUOTA_M5_REPLACED", "RUNQUOTA_M5_ADDED",
+       "RUNQUOTA_M5_UNSET"],
+      env = [
+        "RUNQUOTA_M5_REPLACED=child-value",
+        "RUNQUOTA_M5_ADDED=added-by-caller"
+      ]))
+    let completion = child.waitForCompletion(10_000)
+    child.close()
+
+    check completion.exited
+    check completion.exitCode == 0
+    # Inherited, untouched by the override list.
+    check completion.stdout.contains("RUNQUOTA_M5_INHERITED=[from-launcher]")
+    check completion.stdout.contains("RUNQUOTA_M5_INHERITED occurrences=1")
+    # Overridden, not shadowed: the parent value must not survive alongside it.
+    # The occurrence count is what makes "replaced" distinguishable from
+    # "appended" -- `getenv` would report the first of a duplicated pair and
+    # hide the second, so the entry is counted in the child's environment
+    # block instead.
+    check completion.stdout.contains("RUNQUOTA_M5_REPLACED=[child-value]")
+    check not completion.stdout.contains("RUNQUOTA_M5_REPLACED=[parent-value]")
+    check completion.stdout.contains("RUNQUOTA_M5_REPLACED occurrences=1")
+    # Added, with no inherited entry to replace.
+    check completion.stdout.contains("RUNQUOTA_M5_ADDED=[added-by-caller]")
+    check completion.stdout.contains("RUNQUOTA_M5_ADDED occurrences=1")
+    # A name the caller never mentioned is absent from the child, not present
+    # and empty -- the two the fixture can now tell apart.
+    check completion.stdout.contains("RUNQUOTA_M5_UNSET=<absent>")
+    # The launcher's own environment is not disturbed by having composed the
+    # child's: the old implementation mutated it via `putEnv` in the child, so
+    # this asserts the replacement did not move that mutation into the parent.
+    check getEnv("RUNQUOTA_M5_REPLACED") == "parent-value"
+    check getEnv("RUNQUOTA_M5_ADDED") == ""
+
+  test "a bare program name is resolved through the PATH the child is given":
+    when defined(posix):
+      let binDir = getTempDir() / ("runquota-m5-path-" & $getCurrentProcessId())
+      prepareDir(binDir)
+      try:
+        let probe = binDir / "runquota-m5-path-probe"
+        writeFile(probe, "#!/bin/sh\necho \"probe=$RUNQUOTA_M5_PATH_MARK\"\n")
+        setFilePermissions(probe, {fpUserRead, fpUserExec})
+
+        # The directory is on the *child's* PATH only; the launcher's PATH does
+        # not contain it. `execvp` resolved against the environment the child
+        # had after its own `putEnv` calls, so the replacement has to resolve
+        # against the composed environment too, not against the parent's.
+        check findExe("runquota-m5-path-probe").len == 0
+        var child = launchProcess(commandSpec(
+          ["runquota-m5-path-probe"],
+          env = [
+            "PATH=" & binDir,
+            "RUNQUOTA_M5_PATH_MARK=resolved-via-child-path"
+          ]))
+        let completion = child.waitForCompletion(10_000)
+        child.close()
+
+        check completion.exited
+        check completion.exitCode == 0
+        check completion.stdout.contains("probe=resolved-via-child-path")
+      finally:
+        if dirExists(binDir):
+          removeDir(binDir)
+    else:
+      skip()
+
+  test "argv[0] reaches the child as the caller wrote it, not as it resolved":
+    when defined(posix):
+      # `execve` needs a resolved path where `execvp` took a bare name, and the
+      # obvious way to give it one is to write the resolved path into `argv[0]`
+      # on the way past. `execvp` never did that, and callers can see the
+      # difference: `$0`, `ps` output, and multi-call binaries that dispatch on
+      # their own name. Invoke by a bare name that only resolves through the
+      # child's PATH, so resolution has something to rewrite, and check that it
+      # left `argv[0]` alone.
+      let binDir = getTempDir() / ("runquota-m5-argv0-" & $getCurrentProcessId())
+      prepareDir(binDir)
+      try:
+        let probeName = "runquota-m5-argv0-probe"
+        createSymlink(getAppFilename(), binDir / probeName)
+        var child = launchProcess(commandSpec(
+          [probeName, FixtureArgv0], env = ["PATH=" & binDir]))
+        let completion = child.waitForCompletion(10_000)
+        child.close()
+
+        check completion.exited
+        check completion.exitCode == 0
+        check completion.stdout.contains("argv0=[" & probeName & "]")
+      finally:
+        if dirExists(binDir):
+          removeDir(binDir)
+    else:
+      skip()
+
+  test "a program the kernel cannot exec directly still runs through the shell":
+    when defined(posix):
+      # No shebang: the kernel answers ENOEXEC. `execvp` retried such a file
+      # through `/bin/sh`, and dropping that when moving to `execve` would have
+      # silently broken every caller that relies on it.
+      let scriptDir = getTempDir() / ("runquota-m5-noexec-" & $getCurrentProcessId())
+      prepareDir(scriptDir)
+      try:
+        let script = scriptDir / "runquota-m5-shebangless"
+        writeFile(script, "echo \"shebangless=$1\"\n")
+        setFilePermissions(script, {fpUserRead, fpUserExec})
+
+        var child = launchProcess(commandSpec([script, "ran-anyway"]))
+        let completion = child.waitForCompletion(10_000)
+        child.close()
+
+        check completion.exited
+        check completion.exitCode == 0
+        check completion.stdout.contains("shebangless=ran-anyway")
+      finally:
+        if dirExists(scriptDir):
+          removeDir(scriptDir)
+    else:
+      skip()
 
   test "process running predicate does not consume completion status":
     var child = launchProcess(commandSpec([getAppFilename(), FixtureExit7]))
