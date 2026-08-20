@@ -10,8 +10,24 @@ import runquota_protocol
 
 const FixtureArg = "--pressure-fixture"
 
+const FixtureBallastBytes = 8 * 1024 * 1024
+  ## The fixture child touches this much anonymous memory so the telemetry
+  ## sampler has a resident footprint worth learning from. The daemon turns
+  ## the reported peak into a conservative estimate, and the estimate has to
+  ## come out larger than the memory budget still free further down, or the
+  ## admission decision this suite checks cannot happen.
+
+const MinObservedBallastBytes = FixtureBallastBytes div 2
+  ## Acceptance floor for a telemetry sample: proof that the child is past
+  ## its own startup and has faulted in the ballast. A child that has merely
+  ## been forked reports around 1 MiB, and accepting that (the previous
+  ## ``> 1 MiB`` floor did) teaches the daemon an estimate far too small to
+  ## exceed the free budget below. Half the ballast keeps a wide margin over
+  ## the startup footprint without demanding that every last page stayed
+  ## resident.
+
 if commandLineParams().len == 1 and commandLineParams()[0] == FixtureArg:
-  var ballast = newSeq[byte](8 * 1024 * 1024)
+  var ballast = newSeq[byte](FixtureBallastBytes)
   for i in countup(0, ballast.high, 4096):
     ballast[i] = byte(i and 0xff)
   sleep(30_000)
@@ -39,6 +55,17 @@ proc writePressure(path, level: string) =
 
 proc mib(value: uint64): uint64 =
   value * 1024'u64 * 1024'u64
+
+const
+  DaemonMemoryBudgetMiB = 1000'u64
+  HeavyLeaseMemoryMiB = 998'u64
+  FreeBudgetAfterHeavyLeaseBytes =
+    mib(DaemonMemoryBudgetMiB) - mib(HeavyLeaseMemoryMiB)
+    ## What the daemon still has to give once the heavy lease holds its
+    ## reservation. The learned-estimate candidate near the end of the test
+    ## asks for less than this and is expected to be queued anyway, so the
+    ## learned estimate must come out larger than this remainder — see the
+    ## check that asserts exactly that before the candidate is offered.
 
 proc conservativeEstimate(observedPeakMemoryBytes: uint64): uint64 =
   max(observedPeakMemoryBytes, (observedPeakMemoryBytes * 125'u64) div 100'u64)
@@ -70,14 +97,19 @@ proc launchForLease(lease: var RunQuotaLease): LaunchedProcess =
   lease.markRunning(childProcessId = result.info.processId, cleanupRegistered = true)
 
 proc waitForProcessTelemetry(processId: uint64): HostProcessTreeTelemetrySample =
-  for _ in 0 ..< 100:
+  ## Polls until the fixture child's ballast is resident. Sampling is much
+  ## cheaper than starting a process, so the first sample routinely lands
+  ## while the child is still between fork and its own first instruction;
+  ## returning that sample reports a startup footprint as the child's peak.
+  for _ in 0 ..< 200:
     result =
       when defined(linux):
         sampleLinuxProcessTreeTelemetry(processId)
       else:
         sampleMacosProcessTreeTelemetry(processId)
     if result.diagnostic.code == diagOk and result.rootAlive and
-        result.processCount > 0 and result.residentMemoryBytes > mib(1):
+        result.processCount > 0 and
+        result.residentMemoryBytes >= MinObservedBallastBytes:
       return
     sleep(50)
   raise newException(OSError, "process telemetry was not observed")
@@ -132,7 +164,7 @@ suite "integration_runquota_memory_pressure_gate":
       args = [
         "--socket", socketPath,
         "--cpu-milli", "2000",
-        "--memory-bytes", $mib(1000),
+        "--memory-bytes", $mib(DaemonMemoryBudgetMiB),
         "--memory-pressure-source", "deterministic-file",
         "--memory-pressure-file", pressurePath,
         "--memory-pressure-required",
@@ -158,7 +190,7 @@ suite "integration_runquota_memory_pressure_gate":
 
       writePressure(pressurePath, "warning")
       let warning = session.offerCandidates([
-        candidate(102, req("warning-heavy", 998))
+        candidate(102, req("warning-heavy", HeavyLeaseMemoryMiB))
       ])
       let warningDecision = warning.findDecision(102)
       check warningDecision.queued
@@ -192,11 +224,21 @@ suite "integration_runquota_memory_pressure_gate":
         learnedTelemetry.processCount
       )
 
+      # Candidate 106 asks for 1 MiB, which fits the budget the heavy lease
+      # leaves free. Queueing it is therefore only possible if the learned
+      # estimate inflates it past that remainder; without this the check
+      # below would pass or fail on how much memory the child happened to
+      # have faulted in when it was sampled.
+      check learnedConservative > FreeBudgetAfterHeavyLeaseBytes
+
       let repeated = session.offerCandidates([
         candidate(106, req("learned-repeat", 1, "learned-stat"))
       ])
       let repeatedDecision = repeated.findDecision(106)
       check repeatedDecision.queued
+      # Queued for the budget the learned estimate consumed, not because
+      # host pressure or benchmark isolation happened to hold it back.
+      check repeatedDecision.diagnostic.message.contains("resource budget")
       check repeatedDecision.lease.resources.memory.value >= learnedConservative
       check client.inspectionJson("estimates").contains("learned-stat")
 
