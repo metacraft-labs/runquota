@@ -25,9 +25,11 @@
 ##
 ## No mocks: the production helper spawns the production ``sqlite3``.
 
-import std/[atomics, os, osproc, strutils, tempfiles, times, unittest]
+import std/[atomics, os, osproc, strutils, tempfiles, unittest]
 
 import runquota_observation_store/sqlite_cli
+
+import ./child_watchdog
 
 const
   ChildFlag = "--concurrent-spawn-child"
@@ -40,6 +42,10 @@ const
   IterationsPerThread = 50
 
   ChildDeadlineSeconds = 60
+
+  ## How long to allow a signalled process group to actually disappear before
+  ## calling it a leak.
+  SurvivorGraceSeconds = 10
 
 type
   SpawnPlan = object
@@ -86,16 +92,6 @@ proc reportField(report: string; key: string): string =
       return line[separator + 1 .. ^1]
   ""
 
-proc waitBounded(process: Process; seconds: int): int =
-  ## The child's exit code, or -1 if it was still running at the deadline.
-  let deadline = epochTime() + float(seconds)
-  while epochTime() < deadline:
-    let code = process.peekExitCode()
-    if code != -1:
-      return code
-    sleep(25)
-  -1
-
 # The child role must be dispatched before `unittest` takes over the process.
 if paramCount() >= 3 and paramStr(1) == ChildFlag:
   runConcurrentChild(paramStr(2), paramStr(3))
@@ -107,15 +103,13 @@ suite "sqlite_cli concurrent spawn":
     defer: removeDir(work)
     let resultPath = work / "result.txt"
 
-    let child = startProcess(
-      getAppFilename(),
-      args = [ChildFlag, work, resultPath],
-      options = {poParentStreams}
-    )
+    let child = startSupervisedChild(
+      getAppFilename(), [ChildFlag, work, resultPath])
     let code = waitBounded(child, ChildDeadlineSeconds)
     if code == -1:
-      kill(child)
-      discard child.waitForExit()
+      # The wedged processes are grandchildren holding each other's pipes:
+      # killing only `child` strands them on pid 1 forever.
+      killProcessTree(child)
       child.close()
       checkpoint(
         $SpawnThreads & " threads x " & $IterationsPerThread &
@@ -135,3 +129,11 @@ suite "sqlite_cli concurrent spawn":
       check report.reportField("completed").parseInt() ==
         SpawnThreads * IterationsPerThread
       check report.reportField("failures").parseInt() == 0
+
+    # Asserted on both paths. A run that wedges `sqlite3` and then walks away
+    # leaves processes that outlive the suite entirely, and the campaign rule
+    # is that a milestone leaves nothing running.
+    let survivors = awaitNoSurvivors(work, SurvivorGraceSeconds)
+    if survivors.len > 0:
+      checkpoint("processes still alive after the test: " & survivors.join("; "))
+    check survivors.len == 0

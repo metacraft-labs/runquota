@@ -26,9 +26,11 @@
 ## through the production helper; only the *scheduling* of the call is
 ## test-owned.
 
-import std/[os, osproc, strutils, tempfiles, times, unittest]
+import std/[os, osproc, strutils, tempfiles, unittest]
 
 import runquota_observation_store/sqlite_cli
+
+import ./child_watchdog
 
 const
   ChildFlag = "--stderr-flood-child"
@@ -47,6 +49,10 @@ const
   ## point of the bound is to convert a hang into a red result, not to police
   ## latency.
   ChildDeadlineSeconds = 60
+
+  ## How long to allow a signalled process group to actually disappear before
+  ## calling it a leak.
+  SurvivorGraceSeconds = 10
 
 proc floodSql(): string =
   ## stdout, then a flood on stderr, then stdout again. The trailing stdout
@@ -82,16 +88,6 @@ proc reportField(report: string; key: string): string =
       return line[separator + 1 .. ^1]
   ""
 
-proc waitBounded(process: Process; seconds: int): int =
-  ## The child's exit code, or -1 if it was still running at the deadline.
-  let deadline = epochTime() + float(seconds)
-  while epochTime() < deadline:
-    let code = process.peekExitCode()
-    if code != -1:
-      return code
-    sleep(25)
-  -1
-
 # The child role must be dispatched before `unittest` takes over the process.
 if paramCount() >= 3 and paramStr(1) == ChildFlag:
   runFloodChild(paramStr(2), paramStr(3))
@@ -107,15 +103,13 @@ suite "sqlite_cli stream backpressure":
       let dbPath = work / "store.db"
       let resultPath = work / "result.txt"
 
-      let child = startProcess(
-        getAppFilename(),
-        args = [ChildFlag, dbPath, resultPath],
-        options = {poParentStreams}
-      )
+      let child = startSupervisedChild(
+        getAppFilename(), [ChildFlag, dbPath, resultPath])
       let code = waitBounded(child, ChildDeadlineSeconds)
       if code == -1:
-        kill(child)
-        discard child.waitForExit()
+        # The blocked `sqlite3` is a grandchild; signalling only `child`
+        # can strand it.
+        killProcessTree(child)
         child.close()
         checkpoint(
           "runSqlite did not return within " & $ChildDeadlineSeconds &
@@ -152,3 +146,11 @@ suite "sqlite_cli stream backpressure":
         # stderr must not have been merged into stdout.
         check report.reportField("outputBytes").parseInt() <
           MeasuredPipeCapacityBytes
+
+      # Asserted on both paths: a run that wedges `sqlite3` and then walks
+      # away leaves processes that outlive the suite entirely.
+      let survivors = awaitNoSurvivors(work, SurvivorGraceSeconds)
+      if survivors.len > 0:
+        checkpoint("processes still alive after the test: " &
+          survivors.join("; "))
+      check survivors.len == 0
