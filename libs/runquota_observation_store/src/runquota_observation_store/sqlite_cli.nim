@@ -21,6 +21,26 @@ const
   nullMarker* = "~"
 
 type
+  StreamDrain = object
+    ## One end of a child pipe plus the text read from it. Passed to a drain
+    ## thread by ``ptr``, so the thread argument itself carries no managed
+    ## memory.
+    stream: Stream
+    text: string
+    failure: string
+
+proc drainStream(drain: ptr StreamDrain) {.thread.} =
+  ## Read one stream to EOF. Never propagates: a thread that let an exception
+  ## escape would terminate the process, and this runs inside a daemon whose
+  ## whole contract is to degrade rather than fail.
+  try:
+    drain.text = drain.stream.readAll()
+  except CatchableError as error:
+    drain.failure = error.msg
+  except Defect as error:
+    drain.failure = error.msg
+
+type
   SqliteOutcome* = object
     ok*: bool
     exitCode*: int
@@ -61,6 +81,22 @@ proc runSqlite*(dbPath, sql: string): SqliteOutcome =
   ## argument limit, and passing it as `argv` made a large batch fail as a
   ## whole while a small one succeeded — a size-dependent failure with no
   ## natural test to catch it.
+  ##
+  ## All three pipes are serviced CONCURRENTLY, one drain thread per output
+  ## stream while this thread feeds stdin. Each pipe holds a bounded amount
+  ## before a write to it blocks — 65_536 bytes as measured on the
+  ## development host — so any implementation that finishes with one stream
+  ## before it starts on another has a deadlock in it: the child blocks
+  ## writing to the pipe nobody is reading, and so stops reading the pipe
+  ## this side is blocked writing to, or stops producing the stream this side
+  ## is blocked reading. Draining stdout to EOF and only then reading stderr
+  ## was exactly that shape, and a `sqlite3` that put more than 64 KiB on
+  ## stderr wedged the daemon for as long as anyone was willing to wait.
+  ##
+  ## Threads rather than `poll`/`select` because this is one code path on
+  ## every platform: a POSIX-only readiness loop would leave Windows on a
+  ## second implementation that the suite never exercises. The cost is two
+  ## thread creations against a process spawn that already costs milliseconds.
   result = SqliteOutcome(ok: false, exitCode: -1, output: "", error: "")
   var process: Process
   try:
@@ -75,17 +111,59 @@ proc runSqlite*(dbPath, sql: string): SqliteOutcome =
   except Defect as error:
     result.error = "cannot run " & sqliteTool & ": " & error.msg
     return
+
+  var outputDrain = StreamDrain(stream: nil, text: "", failure: "")
+  var errorDrain = StreamDrain(stream: nil, text: "", failure: "")
+  var outputThread: Thread[ptr StreamDrain]
+  var errorThread: Thread[ptr StreamDrain]
+  var drainsStarted = 0
+  var failure = ""
+
   try:
+    outputDrain.stream = process.outputStream
+    errorDrain.stream = process.errorStream
+    createThread(outputThread, drainStream, addr outputDrain)
+    drainsStarted = 1
+    createThread(errorThread, drainStream, addr errorDrain)
+    drainsStarted = 2
     let input = process.inputStream
     input.write(sqlitePreamble)
     input.write(sql)
     input.write("\n")
     input.flush()
-    input.close()
-    result.output = process.outputStream.readAll()
-    result.error = process.errorStream.readAll()
-    result.exitCode = process.waitForExit()
-    result.ok = result.exitCode == 0
+  except CatchableError as error:
+    failure = error.msg
+  except Defect as error:
+    failure = error.msg
+  finally:
+    # Closing stdin before joining is what guarantees the joins terminate:
+    # `sqlite3 -batch` runs until end of input, so a drain thread waiting for
+    # EOF on stdout would otherwise wait on a child that is itself waiting on
+    # us. This runs on the failure path too, where stdin may not have been
+    # written at all.
+    try:
+      process.inputStream.close()
+    except CatchableError:
+      discard
+    except Defect:
+      discard
+    if drainsStarted >= 1:
+      joinThread(outputThread)
+    if drainsStarted >= 2:
+      joinThread(errorThread)
+
+  try:
+    if failure.len == 0 and outputDrain.failure.len > 0:
+      failure = outputDrain.failure
+    if failure.len == 0 and errorDrain.failure.len > 0:
+      failure = errorDrain.failure
+    if failure.len > 0:
+      result.error = "running " & sqliteTool & " failed: " & failure
+    else:
+      result.output = outputDrain.text
+      result.error = errorDrain.text
+      result.exitCode = process.waitForExit()
+      result.ok = result.exitCode == 0
   except CatchableError as error:
     result.error = "running " & sqliteTool & " failed: " & error.msg
   finally:
