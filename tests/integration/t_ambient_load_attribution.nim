@@ -445,11 +445,19 @@ suite "ambient_load_attribution":
     check ambientReadingsUnavailable() == 0
     # Every tick of the fixed cadence is accounted for: it produced a row,
     # or it saw a snapshot the kernel had not updated, or it saw a counter
-    # go backwards. The `+ 1` is the very first reading, which establishes
-    # the baseline a rate is measured against and can be nothing else.
+    # go backwards, or its millisecond was already taken by a written
+    # sample. The `+ 1` is the very first reading, which establishes the
+    # baseline a rate is measured against and can be nothing else.
+    #
+    # The collision term is normally zero -- a 200 ms cadence does not put
+    # two samples in one millisecond -- but it is a BUCKET and not an
+    # exception: a colliding sample is dropped and counted rather than
+    # re-timed, so it has to appear here or the identity would call an
+    # honest drop a missing tick.
     check ambientSamplerTicks() ==
       ambientSamplesTaken() + ambientReadingsStale() +
-      ambientReadingsDiscontinuous() + ambientReadingsUnavailable() + 1
+      ambientReadingsDiscontinuous() + ambientReadingsUnavailable() +
+      ambientSamplesCollided() + 1
 
     let onRows = inWindows(rows, onWindows)
     let offRows = inWindows(rows, offWindows)

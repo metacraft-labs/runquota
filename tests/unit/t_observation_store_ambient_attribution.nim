@@ -104,6 +104,31 @@ proc scannedFor(path: string; tokens: openArray[string]): seq[string] =
     if token in text:
       result.add(token)
 
+proc assignmentsTo(text, field: string): int =
+  ## How many times ``field`` appears on the LEFT of an assignment.
+  ##
+  ## Written as a scan rather than as a substring test because
+  ## ``x.field ==`` contains ``x.field =`` and a naive test would call a
+  ## comparison an assignment. ``=``, ``+=`` and ``-=`` all count; ``==``
+  ## does not.
+  var index = 0
+  while true:
+    let hit = text.find(field, index)
+    if hit < 0:
+      break
+    var cursor = hit + field.len
+    index = cursor
+    while cursor < text.len and text[cursor] == ' ':
+      cursor += 1
+    if cursor >= text.len:
+      break
+    if text[cursor] in {'+', '-'} and cursor + 1 < text.len and
+        text[cursor + 1] == '=':
+      result += 1
+    elif text[cursor] == '=' and
+        (cursor + 1 >= text.len or text[cursor + 1] != '='):
+      result += 1
+
 suite "observation_store_ambient_attribution":
 
   test "a rate needs two readings that actually moved":
@@ -300,6 +325,51 @@ suite "observation_store_ambient_attribution":
     endSelfReportedExecution("exec-b")
     check liveSelfReports().len == 0
     check sumSelfCpuPct(liveSelfReports()) == 0.0
+
+  test "a sample whose millisecond is taken is DROPPED, never re-timed":
+    # `(host_id, sampled_at_unix_millis)` is the primary key. Two samples
+    # inside one millisecond collide, and the only two things an
+    # implementation can do with the loser are to drop it or to move its
+    # timestamp. Moving it writes an instant at which no reading was taken
+    # -- a fabricated value presented as an observation, which OS-2
+    # forbids -- so it is dropped and counted, exactly as this module
+    # already treats a stale pair and a discontinuous one.
+    check ambientSampleFollows(1_700_000_000_000'i64, 1_700_000_000_001'i64)
+    check not ambientSampleFollows(1_700_000_000_000'i64,
+      1_700_000_000_000'i64)
+    check not ambientSampleFollows(1_700_000_000_000'i64,
+      1_699_999_999_999'i64)
+
+    # The counter is on the same surface as the other two refusals, and a
+    # sampler that has taken no colliding sample reads zero rather than
+    # not being readable at all.
+    stopAmbientSampler()
+    startAmbientSampler("", "host-x")
+    check ambientSamplesCollided() == 0
+    stopAmbientSampler()
+
+    # THE ASSERTION THAT FAILS AGAINST A RE-TIMING SAMPLER, and the reason
+    # it is an inspection gate: the collision path is unreachable at any
+    # sane cadence, so no run of the sampler can distinguish "drops" from
+    # "re-times" -- which is exactly how a fabricated timestamp got shipped
+    # as a deferral. What CAN be checked is that no code path in the
+    # sampler assigns a sample's instant at all: every `sampled_at` in the
+    # store is the `atUnixMillis` of a reading that was actually taken.
+    check fileExists(ambientSource)
+    let ambientText = readFile(ambientSource)
+    check assignmentsTo(ambientText, "sampledAtUnixMillis") == 0
+    # And `sampled_at` is populated ONLY by construction from a reading,
+    # so the zero above is not zero because the field went missing.
+    check "sampledAtUnixMillis: current.atUnixMillis" in ambientText
+
+    # THE POSITIVE CONTROL. The same scanner, over a file that really does
+    # assign the field -- this one: the clamp test moves a row's instant on
+    # purpose to get a second primary key -- must find it. A scanner that
+    # finds nothing anywhere agrees with every implementation.
+    let selfText = readFile(currentSourcePath())
+    check assignmentsTo(selfText, "sampledAtUnixMillis") >= 1
+    # ... and it does not mistake this file's comparisons for assignments.
+    check "check row.sampledAtUnixMillis == current.atUnixMillis" in selfText
 
   test "an unusable store or host leaves the sampler inactive":
     # OS-4 on this path too: ambient sampling is capture, and capture that

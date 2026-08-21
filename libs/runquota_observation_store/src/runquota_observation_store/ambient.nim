@@ -359,6 +359,21 @@ proc classifyReadings*(previous, current: HostLoadReading): ReadingPair =
     return rpStale
   rpAdvanced
 
+proc ambientSampleFollows*(lastSampledAtUnixMillis,
+                           sampledAtUnixMillis: int64): bool =
+  ## Whether a sample taken at ``sampledAtUnixMillis`` can be stored after
+  ## one already written at ``lastSampledAtUnixMillis``.
+  ##
+  ## ``(host_id, sampled_at_unix_millis)`` is the primary key, so two
+  ## samples landing inside one millisecond COLLIDE. There are exactly two
+  ## things an implementation can do with the loser, and only one of them
+  ## is honest: drop it, or move its timestamp. Moving it writes an instant
+  ## at which nothing was read — a measurement nobody made, presented in
+  ## the store as an observation, which OS-2 forbids. It is dropped and
+  ## counted instead, exactly as a stale or discontinuous pair is, and the
+  ## count is readable through ``ambientSamplesCollided``.
+  sampledAtUnixMillis > lastSampledAtUnixMillis
+
 proc attributeAmbientSample*(hostId: string;
                              previous, current: HostLoadReading;
                              reports: openArray[SelfReport]):
@@ -451,6 +466,7 @@ var
   samplerUnavailable = 0'i64
   samplerStale = 0'i64
   samplerDiscontinuous = 0'i64
+  samplerCollided = 0'i64
   samplerLastSampledAt = 0'i64
   samplerStop = false
   samplerActive = false
@@ -587,24 +603,36 @@ proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
     of rpAdvanced:
       discard
     var row: AmbientSampleRow
+    var collided = false
     acquire(samplerLock)
     try:
       row = attributeAmbientSample(samplerHostId, previous, current,
         samplerReports)
       # `(host_id, sampled_at_unix_millis)` is the primary key, so two
-      # samples inside one millisecond would collide and the second would
-      # be lost silently. Advance instead: the cadence is what carries the
-      # timing, and a sample displaced by a millisecond is still a sample.
-      if row.sampledAtUnixMillis <= samplerLastSampledAt:
-        row.sampledAtUnixMillis = samplerLastSampledAt + 1
-      samplerLastSampledAt = row.sampledAtUnixMillis
-      samplerTaken += 1
-      if samplerQueue.len >= samplerCapacity:
-        samplerDropped += 1
+      # samples inside one millisecond collide. The loser is DROPPED and
+      # COUNTED, which is how this module already handles a stale pair and
+      # a discontinuous one. Re-timing it to the next free millisecond
+      # would put an instant in `sampled_at` at which no reading was taken
+      # -- a fabricated value presented as an observation, which is what
+      # OS-2 forbids and what this store exists to refuse.
+      if not ambientSampleFollows(samplerLastSampledAt,
+          row.sampledAtUnixMillis):
+        samplerCollided += 1
+        collided = true
       else:
-        samplerQueue.add(row)
+        samplerLastSampledAt = row.sampledAtUnixMillis
+        samplerTaken += 1
+        if samplerQueue.len >= samplerCapacity:
+          samplerDropped += 1
+        else:
+          samplerQueue.add(row)
     finally:
       release(samplerLock)
+    if collided:
+      # The baseline is deliberately NOT advanced, for the same reason a
+      # stale pair does not advance it: the interval this reading covered
+      # is folded into the next sample rather than thrown away.
+      return
     previous = current
 
 proc samplerMain() {.thread.} =
@@ -659,6 +687,7 @@ proc startAmbientSampler*(path, hostId: string;
     samplerUnavailable = 0
     samplerStale = 0
     samplerDiscontinuous = 0
+    samplerCollided = 0
     samplerLastSampledAt = 0
     samplerStop = false
     if path.len == 0 or hostId.len == 0:
@@ -710,6 +739,18 @@ proc ambientReadingsDiscontinuous*(): int64 =
   acquire(samplerLock)
   try:
     samplerDiscontinuous
+  finally:
+    release(samplerLock)
+
+proc ambientSamplesCollided*(): int64 =
+  ## Samples dropped because their millisecond was already taken by a
+  ## written sample. Nonzero here means the cadence outran the primary
+  ## key's resolution; it never means a timestamp was invented, because
+  ## this counter exists precisely so that none is.
+  ensureSamplerLock()
+  acquire(samplerLock)
+  try:
+    samplerCollided
   finally:
     release(samplerLock)
 
