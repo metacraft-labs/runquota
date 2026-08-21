@@ -31,17 +31,51 @@ not monitor client process trees. Per-execution resource figures are therefore
 only host-wide totals and derives foreign load by difference.
 
 The implementation lives in `libs/runquota_observation_store`. Capture is off
-unless `runquotad --observation-db PATH` names a store; making it on by default
-is M13, together with the client-declared run boundaries the `runs` row is still
-missing.
+unless `runquotad --observation-db PATH` names a store. Turning it on by default
+is M22, whose committed per-execution overhead figure over the ring is what
+justifies it; M13 measures the socket path's overhead as the fallback's cost and
+supplies the client-declared run boundaries the `runs` row is still missing.
 
 ### What exists today
 
 The execution spine (`runs`, `executions`), `hosts`, `host_profiles`,
 `ambient_samples` and `extension_registry` are created, migrated, written and
-read. The daemon opens the store at startup, writes one `runs` row per
-registered session and one immutable `executions` row per finished lease, and
-reports on stdout whether capture is on.
+read. The daemon opens the store at startup and reports on stdout whether
+capture is on.
+
+**Two writers run against that one store, not one.** Both are background
+threads, and both exist so that nothing on the lease path waits for IO:
+
+- The **observation writer** takes the execution spine. Recording is an
+  in-memory append under an uncontended lock — one `runs` row per registered
+  session, one immutable `executions` row per finished lease — and a drain
+  thread batches them to SQLite. A full queue drops the row and counts it;
+  losing an observation always beats perturbing the work being observed.
+- The **ambient sampler** takes `ambient_samples`, on a fixed cadence rather
+  than on an event. It is the writer that is unbounded in *time*: everything
+  else costs rows per unit of work. `--ambient-sample-interval-millis N` sets
+  the cadence and `0` turns it off; the default of one second is about 86k rows
+  per host per day, which is why bounded retention (M15) is a prerequisite for
+  leaving it on rather than an afterthought.
+
+Because there are two of them, `sqlite3` is given a busy timeout — through the
+`.timeout` dot-command rather than `pragma busy_timeout`, since the pragma
+returns a row and would prepend its value to the output of every statement
+after it, starting with `pragma user_version`.
+
+The sampler reads **host-wide totals only**: `runquotad` is a lease authority
+and does not inspect client process trees, so `self_*` is the arithmetic sum of
+what clients report about their own live executions and `foreign_*` is the
+residual, clamped at zero. Nothing feeds `self_*` in production yet — RQSP
+carries no in-flight figures from a running client — so a live daemon currently
+records everything it admitted as foreign, and M13 is where that is wired up.
+
+A tick that cannot support a measurement writes **no row** and is counted
+instead: an unavailable reading, a pair of kernel counters that did not move, a
+counter that went backwards, and a sample whose millisecond was already taken.
+A row of zeros would not read as "not measured", it would read as an idle
+machine. Only macOS/arm64 has ever sampled; the Linux branch is written from
+`/proc` and has never executed, and every other platform reports unavailable.
 
 Host identity and the hardware dimension are live. The machine's `host_id` is
 128 random bits kept in a per-user state file (`--host-identity-file PATH`,
@@ -91,9 +125,10 @@ As implemented:
 - **Benchmarks.** Recording on the lease-finish path is an in-memory append:
   157–381 ns per row across seven repetitions on an aarch64 macOS host whose
   load average was 66–90 at the time. Nothing on that path opens a file, and
-  the database write happens on a drain thread in batches. The per-execution
-  overhead figure that the default-on decision is conditional on belongs to
-  M13 and does not exist yet.
+  the database write happens on a drain thread in batches. Neither
+  per-execution overhead figure exists yet: M13 measures the socket path and
+  M22 measures the ring, and it is M22's number that the default-on decision
+  rests on.
 
 Two rules apply to every persistent store here:
 
