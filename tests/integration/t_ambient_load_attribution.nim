@@ -374,6 +374,8 @@ suite "ambient_load_attribution":
     var onWindows: seq[Window] = @[]
     var offWindows: seq[Window] = @[]
     var inRange = false
+    var pairsSufficient = false
+    var pairedSoFar = 0
     var load = LoadGenerator()
     try:
       # INSTRUMENT RANGE, CHECKED AGAINST THE MEASUREMENT'S OWN BASELINE
@@ -416,18 +418,57 @@ suite "ambient_load_attribution":
         let offSoFar = median(foreignCpu(inWindows(soFar, offWindows)))
         let knownSoFar = ownCpuPct(onWindows) - ownCpuPct(offWindows)
         inRange = offSoFar + knownSoFar <= fullScaleCeiling
-        if inRange:
+
+        # THE SECOND WAY A BLOCK CAN BE UNUSABLE, AND IT IS NOT THE SAME
+        # WAY AS THE FIRST. The paired estimator needs BOTH windows of a
+        # cycle to have caught a sample; a cycle that caught none in one of
+        # them contributes no pair. That is a property of where the
+        # sampler's ticks happened to fall -- the kernel's counters update
+        # on their own schedule, and a stale tick inside a 700 ms window
+        # takes the whole cycle out -- and it says nothing whatever about
+        # whether `foreign_cpu_pct` tracks the load. Verification watched
+        # this go red at a paired ratio of 0.997 on a host at 67-73% busy,
+        # where the property under test was in perfect health; the run that
+        # verified the fix below landed on exactly 12 pairs, the boundary.
+        #
+        # It is RE-RUN rather than merely reported, because it is the same
+        # class of thing as the out-of-range path directly above it: the
+        # machine did not offer a measurable window this time round. If it
+        # persists across every attempt the block FAILS on its own
+        # assertion below, which names the pair count and not the ratio.
+        pairedSoFar = 0
+        for i in 0 ..< cpuCycles:
+          if inWindows(soFar, [onWindows[i]]).len > 0 and
+              inWindows(soFar, [offWindows[i]]).len > 0:
+            pairedSoFar += 1
+        pairsSufficient = pairedSoFar >= cpuCycles - 2
+
+        if inRange and pairsSufficient:
           break
-        echo "  m11 cpu: block ", attempt, " OUT OF RANGE (off=",
-          offSoFar.formatFloat(ffDecimal, 1), "% + known=",
-          knownSoFar.formatFloat(ffDecimal, 1), "pp exceeds ",
-          fullScaleCeiling.formatFloat(ffDecimal, 0), "%); re-running"
+        if not inRange:
+          echo "  m11 cpu: block ", attempt, " OUT OF RANGE (off=",
+            offSoFar.formatFloat(ffDecimal, 1), "% + known=",
+            knownSoFar.formatFloat(ffDecimal, 1), "pp exceeds ",
+            fullScaleCeiling.formatFloat(ffDecimal, 0), "%); re-running"
+        if not pairsSufficient:
+          echo "  m11 cpu: block ", attempt, " PAIRING SHORTFALL (only ",
+            pairedSoFar, " of ", cpuCycles,
+            " cycles caught a sample in BOTH windows, need ", cpuCycles - 2,
+            "); this is a SAMPLE-COUNT shortfall, NOT a tracking failure; ",
+            "re-running"
     finally:
       load.stopLoad()
     # Nothing below this line may run while a spinner is alive.
     check not load.running
     check busyBefore <= maxBusyForMeasurement
     check inRange
+    # A SEPARATE, SELF-DESCRIBING FAILURE from the two above and from the
+    # ratio assertions below. This one going red says "the sampler's ticks
+    # did not land inside enough of the windows", which is a statement
+    # about sample coverage; a red `pairedRatio` says "foreign_cpu_pct did
+    # not follow the load", which is a statement about the property. One
+    # red reported for both would be read as flakiness in the property.
+    check pairsSufficient
     check onWindows.len == cpuCycles
     check offWindows.len == cpuCycles
 
