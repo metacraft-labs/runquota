@@ -372,6 +372,23 @@ proc appendBatchAt*(path: string; runs: openArray[RunRow];
     return SqliteOutcome(ok: true, exitCode: 0, output: "", error: "")
   runSqlite(path, batchStatement(runs, executions))
 
+proc ambientBatchStatement*(rows: openArray[AmbientSampleRow]): string =
+  ## One transaction for a drained run of ambient samples.
+  result = "begin immediate;\n"
+  for row in rows:
+    result.add(insertStatement("ambient_samples", ambientColumns,
+      ambientValues(row)) & "\n")
+  result.add("commit;\n")
+
+proc appendAmbientSamplesAt*(path: string;
+                             rows: openArray[AmbientSampleRow]): SqliteOutcome =
+  ## Path-addressed batch append, for the ambient sampler thread: like the
+  ## observation writer, it must not touch the ``ObservationStore`` ref
+  ## owned by the daemon thread.
+  if rows.len == 0:
+    return SqliteOutcome(ok: true, exitCode: 0, output: "", error: "")
+  runSqlite(path, ambientBatchStatement(rows))
+
 proc appendBatch*(store: ObservationStore; runs: openArray[RunRow];
                   executions: openArray[ExecutionRow]): bool =
   if not store.captureEnabled:

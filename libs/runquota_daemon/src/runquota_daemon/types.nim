@@ -61,6 +61,10 @@ type
       ## Where this machine's ``host_id`` is kept. Empty means the
       ## per-user default; tests point it at a scratch directory so they
       ## neither read nor write the operator's real machine identity.
+    ambientSampleIntervalMillis*: int
+      ## The FIXED cadence of ambient load sampling (M11), independent of
+      ## execution boundaries. Zero or negative turns ambient sampling off
+      ## while leaving execution capture on.
 
   SessionRow* = object
     id*: SessionId

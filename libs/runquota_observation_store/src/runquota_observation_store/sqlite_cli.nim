@@ -35,8 +35,22 @@ proc sqliteToolAvailable*(): bool =
 # batch. Both are per-connection settings and so must be repeated on every
 # invocation. Losing the last few observations to a power cut is precisely
 # the trade OS-1 already makes on the hot path.
+#
+# A busy timeout exists because the daemon now has TWO writers against one
+# store: the observation writer draining executions and the ambient sampler
+# flushing samples. Under WAL a second writer is refused immediately rather
+# than queued, and that refusal is not a constraint rejection -- `execute`
+# would read it as a store that has stopped working and turn capture off
+# for everyone. Waiting is the correct response to a lock somebody else
+# holds for the length of one batch.
+#
+# It is set with the `.timeout` DOT-COMMAND and not with `pragma
+# busy_timeout`, because the pragma RETURNS A ROW: it would prepend "5000"
+# to the output of every statement that followed it, and the first casualty
+# was `pragma user_version`, which then read back as `5000\n0` and made
+# every store on the machine look like it had an unreadable schema version.
 const sqlitePreamble =
-  "pragma foreign_keys = on;\npragma synchronous = normal;\n"
+  ".timeout 5000\npragma foreign_keys = on;\npragma synchronous = normal;\n"
 
 proc runSqlite*(dbPath, sql: string): SqliteOutcome =
   ## Runs ``sql`` against ``dbPath``. Never raises: a failure to even start

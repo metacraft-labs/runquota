@@ -7,6 +7,8 @@
 ## Repository posture and state-boundary requirements: ``docs/database.md``.
 
 import runquota_observation_store/[
-  hardware, identity, ids, schema, sha256, sqlite_cli, store, types, writer]
+  ambient, hardware, identity, ids, schema, sha256, sqlite_cli, store, types,
+  writer]
 
-export hardware, identity, ids, schema, sha256, sqlite_cli, store, types, writer
+export ambient, hardware, identity, ids, schema, sha256, sqlite_cli, store,
+  types, writer

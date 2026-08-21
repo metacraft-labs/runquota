@@ -41,7 +41,8 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     estimateQueueCapacity: 128,
     observationDbPath: "",
     observationQueueCapacity: 1024,
-    hostIdentityFilePath: ""
+    hostIdentityFilePath: "",
+    ambientSampleIntervalMillis: defaultAmbientCadenceMillis
   )
 
 proc machineCapacity*(id: string; cpuSlots: MilliCpu; memoryBytes: Bytes;
@@ -154,6 +155,20 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
         result.observationBootId):
       # The disk that matters to a build's duration is the one the work
       # happens on, and the store lives beside it.
+      #
+      # DETECTION HAPPENS HERE AND NOWHERE ELSE. M10 left "the profile is
+      # detected once at startup and never again" for M11's sampler to
+      # revisit, and M11's answer is that it stays that way ON PURPOSE.
+      # Re-detecting on the sampler's cadence would buy almost nothing --
+      # adding RAM, swapping a disk, or upgrading the kernel all restart
+      # the machine and therefore this daemon -- and it would cost a
+      # `diskutil` process spawn per tick plus a standing invitation to
+      # the one residual M10 recorded: `swap_bytes` is quantized, not
+      # stable, so a macOS host whose dynamic pager crosses a GiB boundary
+      # forks its hardware profile, and periodic re-detection is precisely
+      # what would make that happen repeatedly. What this leaves uncovered
+      # is a daemon that outlives a hardware change without a restart --
+      # a live-migrated guest, in practice.
       let hardware = detectHardwareProfile(
         result.observationStore.path.parentDir,
         localCpuShareGroup(effectiveConfig))
@@ -161,11 +176,22 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
         result.observationStore.ensureHostProfile(identity.hostId, hardware)
       startObservationWriter(result.observationStore.path,
         effectiveConfig.observationQueueCapacity)
+      # Ambient load sampling (M11, OS-6). Host-wide totals only: the
+      # daemon is a lease authority and does not inspect client process
+      # trees, so `self_*` comes from what clients report about themselves
+      # and `foreign_*` is the residual.
+      var ambientReport = "ambient sampling off"
+      if effectiveConfig.ambientSampleIntervalMillis > 0:
+        startAmbientSampler(result.observationStore.path, identity.hostId,
+          effectiveConfig.ambientSampleIntervalMillis)
+        if ambientSamplerActive():
+          ambientReport = "ambient sampling every " &
+            $effectiveConfig.ambientSampleIntervalMillis & "ms"
       result.observationIdentityReport =
         "runquota observation store " & result.observationStore.path &
           ": host " & identity.hostId & "; hardware profile " &
           (if result.observationProfileId.len > 0: result.observationProfileId
-           else: "unavailable") & "; " & identity.report
+            else: "unavailable") & "; " & ambientReport & "; " & identity.report
     else:
       result.observationHostId = ""
       result.observationIdentityReport =
@@ -289,8 +315,10 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
       inc daemon.activeBenchmarkCount
   else:
     usage.cpu = (if usage.cpu >= cpuDelta: usage.cpu - cpuDelta else: 0'u32)
-    usage.memory = (if usage.memory >= memDelta: usage.memory - memDelta else: 0'u64)
-    usage.ioSlots = (if usage.ioSlots >= ioDelta: usage.ioSlots - ioDelta else: 0'u32)
+    usage.memory = (if usage.memory >= memDelta: usage.memory -
+        memDelta else: 0'u64)
+    usage.ioSlots = (if usage.ioSlots >= ioDelta: usage.ioSlots -
+        ioDelta else: 0'u32)
     daemon.machineUsage[machine.id] = usage
     let prevGroup = daemon.cpuShareGroupUsage.getOrDefault(groupId, 0'u32)
     daemon.cpuShareGroupUsage[groupId] =
@@ -523,7 +551,8 @@ proc benchmarkGateAllows(daemon: RunQuotaDaemon; lease: LeaseRow): bool =
     return false
   benchmarkId == 0'u64
 
-proc waitingDiagnostic(daemon: var RunQuotaDaemon; lease: LeaseRow): Diagnostic =
+proc waitingDiagnostic(daemon: var RunQuotaDaemon;
+    lease: LeaseRow): Diagnostic =
   if not daemon.benchmarkGateAllows(lease):
     if lease.purpose == leasePurposeBenchmark:
       return diagnostic(
@@ -1485,6 +1514,7 @@ proc serve*(config: DaemonConfig): int =
     try:
       sharedDaemon.daemon.state = dsStopping
       stopEstimateStore(sharedDaemon.daemon.estimateStore)
+      stopAmbientSampler()
       stopObservationWriter()
     finally:
       release(sharedDaemon.lock)
