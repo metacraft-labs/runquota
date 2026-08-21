@@ -27,7 +27,7 @@
 ## it there. A scanner that finds nothing anywhere agrees with every
 ## implementation.
 
-import std/[options, os, strutils, unittest]
+import std/[algorithm, options, os, strutils, unittest]
 
 import runquota_observation_store
 
@@ -97,6 +97,90 @@ proc pair(busyDeltaMillis, totalDeltaMillis: int64;
     previous.cpuTotalMillis + totalDeltaMillis, memTotal, memAvailable,
     previous.swapInPages + swapDelta)
   (previous, current)
+
+# ---------------------------------------------------------------------------
+# The measured arm's ESTIMATOR, over readings that are scripted
+# ---------------------------------------------------------------------------
+#
+# `t_ambient_load_attribution` burns real CPU, touches real pages, and asks
+# whether `foreign_*` followed. What it can never say is BY HOW MUCH: the
+# machine's own background moves while it measures, so its answer comes back
+# as a ratio inside a band, and the band has to stay wide enough for a host
+# somebody else is also using.
+#
+# Everything that arm asserts about TRACKING is asserted here instead,
+# against constructed readings, and every answer below is an EQUALITY. What
+# is left over there is the one claim no constructed reading can make: that
+# a real kernel counter moves when a real load runs.
+
+const
+  capacityMillis = 8_000_000'i64
+    ## Elapsed CPU capacity across the sampled interval, summed over every
+    ## logical core. It divides by 100 exactly, so "n percent busy" is a
+    ## whole number of milliseconds and `100 * busy / total` comes back as
+    ## exactly `n` in IEEE arithmetic rather than near it -- which is what
+    ## lets the assertions be equalities instead of tolerances.
+  onePercentMillis = capacityMillis div 100
+
+proc rowAtBusy(busyPct: int; reports: openArray[SelfReport] = []):
+    AmbientSampleRow =
+  ## One written sample from a machine that was exactly ``busyPct`` percent
+  ## busy over the interval it covers.
+  let (previous, current) = pair(int64(busyPct) * onePercentMillis,
+    capacityMillis)
+  attributeAmbientSample("host-a", previous, current, reports)
+
+proc rowAtAvailable(availableBytes: int64;
+                    reports: openArray[SelfReport] = []): AmbientSampleRow =
+  ## One written sample from a machine with exactly ``availableBytes`` free.
+  let previous = reading(1_700_000_000_000'i64, 900_000, 8_000_000, memTotal,
+    availableBytes, 4242)
+  let current = reading(previous.atUnixMillis + 1000,
+    previous.cpuBusyMillis + 40 * onePercentMillis,
+    previous.cpuTotalMillis + capacityMillis, memTotal, availableBytes,
+    previous.swapInPages)
+  attributeAmbientSample("host-a", previous, current, reports)
+
+proc median(values: seq[float]): float =
+  ## The same statistic the measured arm forms, so what is pinned here is
+  ## that estimator and not a different one that happens to agree.
+  var sorted = values
+  sorted.sort()
+  if sorted.len == 0: 0.0
+  elif sorted.len mod 2 == 1: sorted[sorted.len div 2]
+  else: (sorted[sorted.len div 2 - 1] + sorted[sorted.len div 2]) / 2.0
+
+proc foreignCpu(rows: seq[AmbientSampleRow]): seq[float] =
+  for row in rows:
+    result.add(row.foreignCpuPct)
+
+type Estimate = object
+  ## What the measured arm computes from a run of ON/OFF cycles.
+  paired: float
+    ## The median over cycles of that cycle's own (ON median - OFF median).
+  pooled: float
+    ## Every ON sample against every OFF sample, ignoring which cycle each
+    ## came from.
+  carrying: int
+    ## Cycles whose own pair carried more than 0.3x the known load.
+  cycles: int
+
+proc estimate(offWindows, onWindows: seq[seq[AmbientSampleRow]];
+              known: float): Estimate =
+  var deltas: seq[float] = @[]
+  var pooledOff: seq[float] = @[]
+  var pooledOn: seq[float] = @[]
+  for cycle in 0 ..< offWindows.len:
+    let delta = median(foreignCpu(onWindows[cycle])) -
+      median(foreignCpu(offWindows[cycle]))
+    deltas.add(delta)
+    if delta > known * 0.3:
+      result.carrying += 1
+    pooledOff.add(foreignCpu(offWindows[cycle]))
+    pooledOn.add(foreignCpu(onWindows[cycle]))
+  result.paired = median(deltas)
+  result.pooled = median(pooledOn) - median(pooledOff)
+  result.cycles = deltas.len
 
 proc scannedFor(path: string; tokens: openArray[string]): seq[string] =
   let text = readFile(path)
@@ -297,6 +381,146 @@ suite "observation_store_ambient_attribution":
     negative.foreignRssBytes = -1
     check not store.insertAmbientSample(negative)
     check store.readAmbientSamples().len == 1
+
+  test "a known load lands in foreign_cpu_pct point for point":
+    # THE MEASURED ARM'S TRACKING CLAIM, STATED AS ARITHMETIC. Over there
+    # the load is real CPU and the answer is a ratio inside a band, because
+    # the background wanders underneath the measurement. Here the
+    # background is held still and the answer is an equality: a load of
+    # exactly twenty-five points moves the column by exactly twenty-five
+    # points, and the ratio is exactly one.
+    const known = 25
+    for background in [0, 12, 40, 60, 74]:
+      let off = rowAtBusy(background)
+      let on = rowAtBusy(background + known)
+      check off.cpuBusyPct == float(background)
+      check on.cpuBusyPct == float(background + known)
+      check off.foreignCpuPct == float(background)
+      check on.foreignCpuPct == float(background + known)
+      # The quantity the measured arm actually reads, and its ratio.
+      check on.foreignCpuPct - off.foreignCpuPct == float(known)
+      check (on.foreignCpuPct - off.foreignCpuPct) / float(known) == 1.0
+
+    # AND IT SURVIVES A CLIENT REPORTING ITS OWN EXECUTION. `self_*` is
+    # subtracted from both sides of the difference, so what a client said
+    # about itself changes the level and cannot change the tracking. A
+    # sampler that let a report leak into only one side would fail here.
+    let reports = [SelfReport(executionId: "exec-a", cpuPct: 5.0, rssBytes: 0)]
+    check rowAtBusy(40, reports).foreignCpuPct == 35.0
+    check rowAtBusy(40 + known, reports).foreignCpuPct == 60.0
+    check rowAtBusy(40 + known, reports).foreignCpuPct -
+      rowAtBusy(40, reports).foreignCpuPct == float(known)
+
+  test "the ON/OFF estimator recovers a known load from a drifting host":
+    # THE ESTIMATOR ITSELF, on scripted samples. The measured arm toggles a
+    # load fourteen times and reduces the rows to one number; that
+    # reduction is asserted here against a machine whose own background
+    # RAMPS a point a cycle underneath it -- thirteen points end to end,
+    # which is the order of drift that arm's header records on a real
+    # workstation. Both the paired estimator and the pooled one come back
+    # with the load exactly, and every cycle carries it.
+    const
+      cycles = 14
+      samplesPerWindow = 3
+      known = 25
+      baseBackground = 20
+
+    proc script(loadPoints: int): tuple[off, on: seq[seq[AmbientSampleRow]]] =
+      for cycle in 0 ..< cycles:
+        let background = baseBackground + cycle
+        var offWindow: seq[AmbientSampleRow] = @[]
+        var onWindow: seq[AmbientSampleRow] = @[]
+        for _ in 0 ..< samplesPerWindow:
+          offWindow.add(rowAtBusy(background))
+          onWindow.add(rowAtBusy(background + loadPoints))
+        result.off.add(offWindow)
+        result.on.add(onWindow)
+
+    let tracked = script(known)
+    let measured = estimate(tracked.off, tracked.on, float(known))
+    check measured.cycles == cycles
+    check measured.paired == float(known)
+    check measured.paired / float(known) == 1.0
+    check measured.pooled == float(known)
+    check measured.pooled / float(known) == 1.0
+    check measured.carrying == cycles
+
+    # A SAMPLER THAT REPORTS A CONSTANT. This is the shape a real
+    # regression takes -- a column that no longer moves with the machine --
+    # and it is the reason the measured arm's assertion is a DIFFERENCE
+    # rather than a level: every estimator reads zero, not "about right".
+    var flatOff: seq[seq[AmbientSampleRow]] = @[]
+    var flatOn: seq[seq[AmbientSampleRow]] = @[]
+    for cycle in 0 ..< cycles:
+      var window: seq[AmbientSampleRow] = @[]
+      for _ in 0 ..< samplesPerWindow:
+        window.add(rowAtBusy(50))
+      flatOff.add(window)
+      flatOn.add(window)
+    let flat = estimate(flatOff, flatOn, float(known))
+    check flat.paired == 0.0
+    check flat.paired / float(known) == 0.0
+    check flat.pooled == 0.0
+    check flat.carrying == 0
+
+    # AND A SAMPLER THAT UNDER-REPORTS BY A FIFTH. It tracks, so it is not
+    # caught by "the column moved"; it lands at 0.80, which is inside every
+    # band the measured arm can afford to state and inside the ratio
+    # majority as well. Only an equality catches it, and only a
+    # deterministic test can assert an equality.
+    let short = script(known * 4 div 5)
+    let shortMeasured = estimate(short.off, short.on, float(known))
+    check shortMeasured.paired / float(known) == 0.8
+    check shortMeasured.carrying == cycles
+    check shortMeasured.paired != float(known)
+
+  test "a known allocation lands in foreign_rss_bytes byte for byte":
+    # The memory arm's tracking claim, as arithmetic. `foreign_rss_bytes`
+    # is `mem_total - mem_available - self_rss`, so an allocation of
+    # exactly four gibibytes shows up as exactly four gibibytes whatever
+    # else the machine is holding.
+    const known = 4'i64 * gib
+    for available in [40'i64 * gib, 32'i64 * gib, 8'i64 * gib]:
+      let empty = rowAtAvailable(available)
+      let full = rowAtAvailable(available - known)
+      check empty.foreignRssBytes == memTotal - available
+      check full.foreignRssBytes == memTotal - available + known
+      check full.foreignRssBytes - empty.foreignRssBytes == known
+
+    # What a client reported about itself moves the level and not the
+    # tracking, exactly as on the CPU side.
+    let reports = [SelfReport(executionId: "exec-a", cpuPct: 0.0,
+      rssBytes: 6 * gib)]
+    let empty = rowAtAvailable(40 * gib, reports)
+    let full = rowAtAvailable(40 * gib - known, reports)
+    check empty.foreignRssBytes == memTotal - 40 * gib - 6 * gib
+    check full.foreignRssBytes - empty.foreignRssBytes == known
+
+    # AND UNDER DRIFT. The memory arm's own header records a Time Machine
+    # pass releasing 3.4 GB inside one measurement; here the machine's
+    # resident set walks a gibibyte a cycle underneath nine cycles and the
+    # paired median is still the allocation, to the byte.
+    var paired: seq[float] = @[]
+    var carrying = 0
+    for cycle in 0 ..< 9:
+      let base = 40'i64 * gib - int64(cycle) * gib
+      let delta = float(rowAtAvailable(base - known).foreignRssBytes) -
+        float(rowAtAvailable(base).foreignRssBytes)
+      paired.add(delta)
+      if delta > float(known) * 0.3:
+        carrying += 1
+    check paired.len == 9
+    check median(paired) == float(known)
+    check median(paired) / float(known) == 1.0
+    check carrying == 9
+
+    # The constant sampler again, on this column. A `mem_available` that
+    # never moves reads as an allocation nobody made.
+    var flat: seq[float] = @[]
+    for _ in 0 ..< 9:
+      flat.add(float(rowAtAvailable(40 * gib).foreignRssBytes) -
+        float(rowAtAvailable(40 * gib).foreignRssBytes))
+    check median(flat) == 0.0
 
   test "the live self-report set is a set, and it empties":
     # `self_*` is the sum over CONCURRENTLY LIVE executions. A client
