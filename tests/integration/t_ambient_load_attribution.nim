@@ -365,6 +365,41 @@ const
     ## in both the CPU and the memory arm. Under no effect it would be at
     ## most 0.5, and for a sampler reporting a constant it is 0.0.
 
+  cadenceWindowTicks = 3 * defaultAmbientFlushSamples
+    ## The daemon-cadence window, SIZED IN FLUSH BATCHES rather than in
+    ## seconds, because it is the flush and not the wall clock that decides
+    ## how many rows a reader can see while the daemon is still running.
+    ##
+    ## The sampler batches: ``sinceFlush`` counts TICKS and a batch reaches
+    ## SQLite every ``defaultAmbientFlushSamples`` of them. A window quoted
+    ## in seconds therefore says nothing about how many rows are on disk
+    ## halfway through it. The window this replaced was 3.2 s, reasoned
+    ## about as "twelve to sixteen ticks", and was in fact ONE closed batch
+    ## -- a real ceiling of nine rows, since the first tick of all is a
+    ## baseline that writes nothing -- against a floor of five, while this
+    ## very module documents roughly one reading in eight going stale. The
+    ## floor was a fraction of a number nobody had computed.
+    ##
+    ## Three batches wide leaves two of them CLOSED for certain by the time
+    ## the window ends, whatever the third one is doing when the store is
+    ## read.
+  cadenceWindowMillis = cadenceWindowTicks * cadenceMillis
+  cadenceFlushedTicks = 2 * defaultAmbientFlushSamples
+    ## The ticks whose batch has certainly closed by the end of the window:
+    ## the KNOWN budget the floor below is a fraction of. One of them is the
+    ## baseline tick, so at most ``cadenceFlushedTicks - 1`` of them can
+    ## have produced a row.
+  cadenceRowFloor = defaultAmbientFlushSamples + 1
+    ## MORE THAN ONE BATCH. This is what makes the count say "the cadence is
+    ## a cadence", because any floor at or below ``defaultAmbientFlushSamples``
+    ## is satisfied by a single flush -- including the single flush a
+    ## shutdown performs.
+    ##
+    ## As a fraction of the known budget it allows nine of the nineteen
+    ## eligible ticks above to produce no row at all: the stale ones, the
+    ## discontinuous ones, and the ones whose interval preceded the lease.
+    ## The measured loss on this platform is about one reading in eight.
+
 suite "ambient_load_attribution":
 
   test "foreign_cpu_pct tracks a known synthetic foreign load":
@@ -868,6 +903,11 @@ suite "ambient_load_attribution":
 
     putEnv("RUNQUOTA_SOCKET", socketPath)
 
+    # Taken BEFORE the process exists, so the sampler inside it cannot have
+    # ticked before this instant. It is what the row ceiling below is
+    # derived from: a sampler cannot have ticked more often than its
+    # configured cadence allows in the time it has been alive.
+    let daemonStartedAt = epochTime()
     let daemon = startProcess(daemonBinary,
       args = ["--socket", socketPath, "--observation-db", dbPath,
               "--host-identity-file", dir / "host-id",
@@ -875,6 +915,7 @@ suite "ambient_load_attribution":
       options = {poStdErrToStdOut})
     var startupLines: seq[string] = @[]
     var rowsWhileRunning: seq[AmbientSampleRow] = @[]
+    var ticksPossible = 0
     try:
       # Exactly the three lines the daemon prints when a store path was
       # given, and then it goes quiet.
@@ -890,8 +931,8 @@ suite "ambient_load_attribution":
       # BOUNDARIES, and it is asserted below against a window in which not
       # one execution begins or ends -- `executions` stays empty because
       # the lease is never released, and the daemon is asked for nothing
-      # else for 3.2 seconds. The gate itself, in both directions, is the
-      # test after this one.
+      # else for the whole of `cadenceWindowMillis`. The gate itself, in
+      # both directions, is the test after this one.
       var client = connectDefault()
       var session = client.registerSession("m11-cadence", "0.1.0")
       var lease = session.requestLease(resourceRequest(
@@ -899,10 +940,17 @@ suite "ambient_load_attribution":
         bytes(256'u64 * 1024'u64 * 1024'u64)))
       check lease.active
 
-      sleep(3200)
+      sleep(cadenceWindowMillis)
       let store = openObservationStore(dbPath)
       check store.captureEnabled
       rowsWhileRunning = store.readAmbientSamples()
+      # How many times the fixed cadence COULD have fired since the process
+      # was created. Each iteration of the sampler loop sleeps a whole
+      # cadence before it reads anything, so this is an upper bound and not
+      # an estimate; it is read after the rows so that it can only be
+      # generous.
+      ticksPossible = int((epochTime() - daemonStartedAt) * 1000.0 /
+        float(cadenceMillis))
       check store.readExecutions().len == 0
       # One `runs` row, written at session registration. It is the only
       # thing the spine learned in this window.
@@ -917,11 +965,25 @@ suite "ambient_load_attribution":
         discard daemon.waitForExit(5000)
       daemon.close()
 
-    # Enough rows that the cadence is the cadence and not one flush at
-    # shutdown: 2.5 s at 200 ms is twelve ticks, and macOS turns roughly
-    # one tick in ten into a stale reading that writes nothing.
-    check rowsWhileRunning.len >= 5
-    check rowsWhileRunning.len <= 20
+    # BOTH BOUNDS ARE DERIVED, neither is a guess about the wall clock.
+    #
+    # The floor is more rows than one batch holds, so what it says is "at
+    # least two batches closed while the daemon was running" -- which is
+    # the property, since a single flush is exactly what a shutdown does.
+    # It is a fraction of `cadenceFlushedTicks`, the tick budget whose
+    # batches had certainly closed, and it leaves room for nine of those
+    # nineteen eligible ticks to have written nothing.
+    #
+    # The ceiling is the number of times the configured cadence could have
+    # fired at all. A sampler that ignored its interval and spun would
+    # exceed it; the previous ceiling of twenty was a wall-clock guess that
+    # a sampler running at four times its cadence could still satisfy,
+    # because the flush was quantising the count anyway.
+    echo "  m11 cadence: rows=", rowsWhileRunning.len, " floor=",
+      cadenceRowFloor, " ticksPossible=", ticksPossible,
+      " window=", cadenceWindowMillis, "ms"
+    check rowsWhileRunning.len >= cadenceRowFloor
+    check rowsWhileRunning.len <= ticksPossible
     let hostIds = block:
       var ids: seq[string] = @[]
       for row in rowsWhileRunning:
@@ -950,7 +1012,17 @@ suite "ambient_load_attribution":
     # A FIXED cadence: the median gap is the configured interval, not a
     # burst at shutdown and not a function of anything the daemon was asked
     # to do.
-    check gaps.len >= 4
+    #
+    # The gap count is an INVARIANT of the walk above -- one gap between
+    # each adjacent pair -- and not a second opinion about how many rows
+    # there were. It used to read `>= 4`, which restates
+    # `rowsWhileRunning.len >= 5` in different units and made one shortfall
+    # report itself as two independent failures. Stated as the invariant it
+    # instead catches a row whose instant is not a real one: `previousAt`
+    # only starts a gap once it has seen a positive timestamp, so a zero or
+    # negative `sampled_at` anywhere in the run drops a gap and shows up
+    # here.
+    check gaps.len == rowsWhileRunning.len - 1
     let medianGap = median(gaps)
     check medianGap >= float(cadenceMillis) * 0.8
     check medianGap <= float(cadenceMillis) * 2.5
