@@ -48,6 +48,13 @@ const
     repoRoot / "libs" / "runquota_host_linux" / "src" / "runquota_host_linux.nim"
   boundaryFile = repoRoot / "CLAUDE.md"
 
+  readerStamp = "result.atUnixMillis = unixMillisNow()"
+    ## The ONLY way a reading's instant may be set: a platform reader
+    ## stamping the moment it read the kernel. Pinned as an exact line
+    ## rather than as a pattern, because the check that uses it counts
+    ## occurrences of this spelling against assignments of the field, and
+    ## a looser pattern would let a second spelling in.
+
   perProcessInterfaces = [
     # Every documented way of asking an operating system about a PROCESS
     # rather than about the MACHINE. None of these may appear anywhere in
@@ -585,6 +592,30 @@ suite "observation_store_ambient_attribution":
     # And `sampled_at` is populated ONLY by construction from a reading,
     # so the zero above is not zero because the field went missing.
     check "sampledAtUnixMillis: current.atUnixMillis" in ambientText
+
+    # THE HOLE THE TWO CHECKS ABOVE LEAVE, CLOSED. Between them they say
+    # the SAMPLE's instant is never assigned and is built from a reading's
+    # own `atUnixMillis`. An implementation that wanted a fabricated
+    # timestamp anyway has an obvious route left: move the READING's
+    # instant instead -- `current.atUnixMillis = <anything>` before the row
+    # is constructed -- and both checks above stay green while every
+    # `sampled_at` in the store becomes a moment at which nothing was read.
+    #
+    # It closes with the same shape of statement one level up. There is
+    # exactly one thing in this module allowed to set a reading's instant:
+    # a reader, stamping the moment it read, on the line below. So the
+    # number of assignments to `atUnixMillis` anywhere in the file must be
+    # the number of times that exact line appears, and no other spelling
+    # can be added without the counts diverging.
+    check assignmentsTo(ambientText, "atUnixMillis") ==
+      ambientText.count(readerStamp)
+    # ... and the equality is not satisfied by there being none of either:
+    # the macOS reader carries one and the Linux reader carries one.
+    check ambientText.count(readerStamp) >= 2
+    # `atUnixMillis` is not a substring of `sampledAtUnixMillis` -- the
+    # capital A sees to that -- so the count above is about readings and
+    # the count above that is about rows, and neither absorbs the other.
+    check "atUnixMillis" notin "sampledAtUnixMillis"
 
     # THE POSITIVE CONTROL. The same scanner, over a file that really does
     # assign the field -- this one: the clamp test moves a row's instant on
