@@ -186,7 +186,8 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
           effectiveConfig.ambientSampleIntervalMillis)
         if ambientSamplerActive():
           ambientReport = "ambient sampling every " &
-            $effectiveConfig.ambientSampleIntervalMillis & "ms"
+            $effectiveConfig.ambientSampleIntervalMillis &
+            "ms while a lease is live"
       result.observationIdentityReport =
         "runquota observation store " & result.observationStore.path &
           ": host " & identity.hostId & "; hardware profile " &
@@ -331,6 +332,12 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
       dec daemon.activeLeaseCount
     if lease.purpose == leasePurposeBenchmark and daemon.activeBenchmarkCount > 0'u32:
       dec daemon.activeBenchmarkCount
+  # AMBIENT SAMPLING IS GATED ON THIS. The sampler writes no row over an
+  # interval in which no lease was live, so the count has to be published
+  # from the one place that maintains it -- here, where every add and every
+  # release passes -- rather than sampled from the lease table on a
+  # cadence, which would be the same walk this aggregate exists to avoid.
+  setAmbientLiveLeaseCount(int(daemon.activeLeaseCount))
 
 proc transitionLeaseState(daemon: var RunQuotaDaemon; lease: var LeaseRow;
                           newState: LeaseLifecycleState) =

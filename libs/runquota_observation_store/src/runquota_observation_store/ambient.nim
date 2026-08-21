@@ -28,6 +28,15 @@
 ## rather than allowed to go negative — a negative "everything else" is not
 ## a small error, it is a category error, and the schema rejects it.
 ##
+## SAMPLING IS GATED ON AT LEAST ONE LIVE LEASE. Fixed cadence means
+## independent of execution *boundaries*, not independent of whether any
+## work exists. This is the only writer in the store unbounded in TIME --
+## an execution costs one row per execution -- and a sample taken while no
+## lease is live can never be joined to an execution, so it is a row no
+## query can reach. The gate therefore costs no information and bounds
+## ambient growth by build activity. ``setAmbientLiveLeaseCount`` is how
+## the lease authority publishes it.
+##
 ## PLATFORM STATUS. macOS/arm64 is the only platform this has been run on.
 ## The Linux branch is written from ``/proc`` semantics and HAS NEVER
 ## EXECUTED. Every other platform reports unavailable, and an unavailable
@@ -467,7 +476,10 @@ var
   samplerStale = 0'i64
   samplerDiscontinuous = 0'i64
   samplerCollided = 0'i64
+  samplerNoLease = 0'i64
   samplerLastSampledAt = 0'i64
+  samplerLiveLeases = 0
+  samplerLeaseCovered = false
   samplerStop = false
   samplerActive = false
 
@@ -475,6 +487,35 @@ proc ensureSamplerLock() =
   if not samplerLockReady:
     initLock(samplerLock)
     samplerLockReady = true
+
+proc setAmbientLiveLeaseCount*(count: int) =
+  ## How many leases the daemon currently holds live. SAMPLING IS GATED ON
+  ## THIS: with none, a tick writes no row.
+  ##
+  ## Called by the lease authority, which is the only component that knows.
+  ## It is a COUNT rather than a flag so that the caller can publish the
+  ## number it already maintains instead of deriving a boolean it would
+  ## then have to keep consistent.
+  ##
+  ## Raising it above zero also arms the coverage flag the sampler reads,
+  ## which is what makes the tick straddling a lease's START a written
+  ## sample rather than a lost one.
+  ensureSamplerLock()
+  acquire(samplerLock)
+  try:
+    samplerLiveLeases = max(0, count)
+    if samplerLiveLeases > 0:
+      samplerLeaseCovered = true
+  finally:
+    release(samplerLock)
+
+proc ambientLiveLeaseCount*(): int =
+  ensureSamplerLock()
+  acquire(samplerLock)
+  try:
+    samplerLiveLeases
+  finally:
+    release(samplerLock)
 
 proc reportSelfExecution*(executionId: string; cpuPct: float64;
                           rssBytes: int64) =
@@ -602,6 +643,38 @@ proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
       return
     of rpAdvanced:
       discard
+
+    # THE LIVE-LEASE GATE. A sample taken while no lease is live can never
+    # be joined to an execution -- there is no execution for it to be
+    # joined to -- so it is a row no query can reach, and this is the only
+    # writer in the store unbounded in TIME rather than by work done. The
+    # reading itself is still taken and still becomes the baseline: it
+    # costs two kernel calls, it writes nothing, and it is what keeps the
+    # first WRITTEN sample after work resumes an interval of one cadence
+    # rather than an average over the whole idle night.
+    #
+    # BOTH TRANSITION EDGES ARE COVERED, and covered the same way. A tick
+    # measures the interval since the previous one, so the question is
+    # whether a lease was live at any point INSIDE that interval, not
+    # whether one is live at the instant the tick fires. `samplerLeaseCovered`
+    # answers it: raised the moment a lease appears, and cleared at the end
+    # of a tick only when none is live any more. The tick straddling the
+    # first lease's start is therefore written, and so is the one
+    # straddling the last lease's end -- each of those intervals really did
+    # contain work -- and the tick after that is the first one dropped.
+    var covered = false
+    acquire(samplerLock)
+    try:
+      covered = samplerLeaseCovered or samplerLiveLeases > 0
+      samplerLeaseCovered = samplerLiveLeases > 0
+      if not covered:
+        samplerNoLease += 1
+    finally:
+      release(samplerLock)
+    if not covered:
+      previous = current
+      return
+
     var row: AmbientSampleRow
     var collided = false
     acquire(samplerLock)
@@ -688,7 +761,14 @@ proc startAmbientSampler*(path, hostId: string;
     samplerStale = 0
     samplerDiscontinuous = 0
     samplerCollided = 0
+    samplerNoLease = 0
     samplerLastSampledAt = 0
+    # A sampler starts with NOTHING LIVE, and therefore writing nothing.
+    # The lease authority publishes the count as leases come and go; there
+    # can be no live lease before the daemon that grants them is serving,
+    # so starting from zero cannot lose one.
+    samplerLiveLeases = 0
+    samplerLeaseCovered = false
     samplerStop = false
     if path.len == 0 or hostId.len == 0:
       return
@@ -739,6 +819,19 @@ proc ambientReadingsDiscontinuous*(): int64 =
   acquire(samplerLock)
   try:
     samplerDiscontinuous
+  finally:
+    release(samplerLock)
+
+proc ambientTicksWithoutLease*(): int64 =
+  ## Ticks that read the host, kept the reading as a baseline, and wrote no
+  ## row because no lease was live over the interval they measured. On an
+  ## idle host this is every tick, which is the point: ambient growth is
+  ## bounded by build activity, the same bound every other table in the
+  ## store already obeys.
+  ensureSamplerLock()
+  acquire(samplerLock)
+  try:
+    samplerNoLease
   finally:
     release(samplerLock)
 
@@ -805,5 +898,7 @@ proc stopAmbientSampler*() =
     samplerPath = ""
     samplerHostId = ""
     samplerReports = @[]
+    samplerLiveLeases = 0
+    samplerLeaseCovered = false
   finally:
     release(samplerLock)

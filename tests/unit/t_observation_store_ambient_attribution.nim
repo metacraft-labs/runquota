@@ -371,6 +371,30 @@ suite "observation_store_ambient_attribution":
     # ... and it does not mistake this file's comparisons for assignments.
     check "check row.sampledAtUnixMillis == current.atUnixMillis" in selfText
 
+  test "the live-lease count the sampler is gated on starts at zero":
+    # The daemon publishes this from the aggregate it already maintains.
+    # It starts at zero and a sampler that has never been told about a
+    # lease writes nothing, which is what bounds ambient growth by build
+    # activity instead of by wall-clock time. The two-directional
+    # behavioural gate is `t_ambient_load_attribution`; what is pinned
+    # here is that the default is "no work is live" rather than "assume
+    # some is".
+    stopAmbientSampler()
+    startAmbientSampler("", "host-x")
+    check ambientLiveLeaseCount() == 0
+    check ambientTicksWithoutLease() == 0
+
+    setAmbientLiveLeaseCount(3)
+    check ambientLiveLeaseCount() == 3
+    setAmbientLiveLeaseCount(0)
+    check ambientLiveLeaseCount() == 0
+    # A count can never go negative: the daemon decrements a `uint32` it
+    # guards, but a gate that could be armed by an arithmetic slip is not
+    # a gate.
+    setAmbientLiveLeaseCount(-4)
+    check ambientLiveLeaseCount() == 0
+    stopAmbientSampler()
+
   test "an unusable store or host leaves the sampler inactive":
     # OS-4 on this path too: ambient sampling is capture, and capture that
     # cannot run must not fail anything.

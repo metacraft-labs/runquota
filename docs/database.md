@@ -52,11 +52,15 @@ threads, and both exist so that nothing on the lease path waits for IO:
   thread batches them to SQLite. A full queue drops the row and counts it;
   losing an observation always beats perturbing the work being observed.
 - The **ambient sampler** takes `ambient_samples`, on a fixed cadence rather
-  than on an event. It is the writer that is unbounded in *time*: everything
-  else costs rows per unit of work. `--ambient-sample-interval-millis N` sets
-  the cadence and `0` turns it off; the default of one second is about 86k rows
-  per host per day, which is why bounded retention (M15) is a prerequisite for
-  leaving it on rather than an afterthought.
+  than on an event. `--ambient-sample-interval-millis N` sets the cadence and
+  `0` turns it off. **It writes only while at least one lease is live.** Fixed
+  cadence means independent of execution *boundaries*, not independent of
+  whether any work exists: a sample taken while nothing is leased can never be
+  joined to an execution, so it is a row no query can reach, and without the
+  gate a one-second cadence would write about 86k such rows per host per day
+  through an idle night. Gating costs no information and bounds ambient growth
+  by build activity, the same bound the spine already obeys. Bounded retention
+  (M15) is still wanted; it is no longer a precondition for turning capture on.
 
 Because there are two of them, `sqlite3` is given a busy timeout — through the
 `.timeout` dot-command rather than `pragma busy_timeout`, since the pragma
@@ -72,7 +76,9 @@ records everything it admitted as foreign, and M13 is where that is wired up.
 
 A tick that cannot support a measurement writes **no row** and is counted
 instead: an unavailable reading, a pair of kernel counters that did not move, a
-counter that went backwards, and a sample whose millisecond was already taken.
+counter that went backwards, a sample whose millisecond was already taken, and
+an interval over which no lease was live. Every tick lands in exactly one of
+those buckets or produces a row, which the suite asserts as an identity.
 A row of zeros would not read as "not measured", it would read as an idle
 machine. Only macOS/arm64 has ever sampled; the Linux branch is written from
 `/proc` and has never executed, and every other platform reports unavailable.

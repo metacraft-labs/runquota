@@ -314,6 +314,13 @@ proc openSampledStore(dir: string; cadenceMillis: int):
   let hostId = resolveHostIdentity(dir / "host-id").hostId
   doAssert store.ensureHostRow(hostId, "boot-m11")
   startAmbientSampler(path, hostId, cadenceMillis, flushSamples = 4)
+  # SAMPLING IS GATED ON A LIVE LEASE, so the blocks below have to declare
+  # one before they can measure anything -- exactly as the daemon does from
+  # its own lease table. It is declared once and held for the whole block:
+  # what these tests are about is what the sampler WRITES while work is
+  # live, and the gate itself is asserted in both directions by the
+  # idle-daemon test at the end of this file.
+  setAmbientLiveLeaseCount(1)
   (store, hostId)
 
 const
@@ -367,6 +374,11 @@ suite "ambient_load_attribution":
     clearSelfReportedExecutions()
     let (store, _) = openSampledStore(dir, cadenceMillis)
     check ambientSamplerActive()
+    # Sampling is gated on a live lease, and this block declared one. Every
+    # row asserted below therefore describes an interval in which work was
+    # live -- which is the only kind of interval this table is allowed to
+    # hold a row for.
+    check ambientLiveLeaseCount() == 1
 
     let cores = max(1, cpuinfo.countProcessors())
     var busyBefore = -1.0
@@ -498,7 +510,11 @@ suite "ambient_load_attribution":
     check ambientSamplerTicks() ==
       ambientSamplesTaken() + ambientReadingsStale() +
       ambientReadingsDiscontinuous() + ambientReadingsUnavailable() +
-      ambientSamplesCollided() + 1
+      ambientSamplesCollided() + ambientTicksWithoutLease() + 1
+    # And the lease was live for the whole block, so the gate's own bucket
+    # is empty here rather than absorbing ticks the identity above would
+    # otherwise have to account for.
+    check ambientTicksWithoutLease() == 0
 
     let onRows = inWindows(rows, onWindows)
     let offRows = inWindows(rows, offWindows)
@@ -850,6 +866,8 @@ suite "ambient_load_attribution":
     check fileExists(daemonBinary)
     stopAmbientSampler()
 
+    putEnv("RUNQUOTA_SOCKET", socketPath)
+
     let daemon = startProcess(daemonBinary,
       args = ["--socket", socketPath, "--observation-db", dbPath,
               "--host-identity-file", dir / "host-id",
@@ -866,15 +884,33 @@ suite "ambient_load_attribution":
       check startupLines[2].contains(
         "ambient sampling every " & $cadenceMillis & "ms")
 
-      # NOT ONE CLIENT CONNECTS. The cadence is independent of execution
-      # boundaries, so an idle daemon that has never admitted anything must
-      # still be describing the machine.
+      # ONE LEASE IS HELD FOR THE WHOLE WINDOW, AND NOTHING ELSE HAPPENS.
+      # Sampling is gated on a live lease, so a lease has to exist; the
+      # property under test is that the cadence is independent of execution
+      # BOUNDARIES, and it is asserted below against a window in which not
+      # one execution begins or ends -- `executions` stays empty because
+      # the lease is never released, and the daemon is asked for nothing
+      # else for 3.2 seconds. The gate itself, in both directions, is the
+      # test after this one.
+      var client = connectDefault()
+      var session = client.registerSession("m11-cadence", "0.1.0")
+      var lease = session.requestLease(resourceRequest(
+        "m11-cadence-exec", milliCpu(1000),
+        bytes(256'u64 * 1024'u64 * 1024'u64)))
+      check lease.active
+
       sleep(3200)
       let store = openObservationStore(dbPath)
       check store.captureEnabled
       rowsWhileRunning = store.readAmbientSamples()
       check store.readExecutions().len == 0
-      check store.readRuns().len == 0
+      # One `runs` row, written at session registration. It is the only
+      # thing the spine learned in this window.
+      check store.readRuns().len == 1
+
+      lease.release()
+      session.closeSession()
+      client.close()
     finally:
       if daemon.running:
         daemon.terminate()
@@ -903,7 +939,10 @@ suite "ambient_load_attribution":
       if previousAt > 0:
         gaps.add(float(row.sampledAtUnixMillis - previousAt))
       previousAt = row.sampledAtUnixMillis
-      # No client ever reported, so everything the machine did is foreign.
+      # The lease was admitted but the protocol carries no in-flight
+      # figures, so nothing ever reached the self columns and everything
+      # the machine did is foreign. A lease RESERVATION is not a
+      # measurement and must not become one.
       check row.selfCpuPct == 0.0
       check row.selfRssBytes == 0
       check row.foreignCpuPct == row.cpuBusyPct
@@ -920,3 +959,138 @@ suite "ambient_load_attribution":
     let settled = openObservationStore(dbPath).readAmbientSamples()
     sleep(cadenceMillis * 4)
     check openObservationStore(dbPath).readAmbientSamples().len == settled.len
+
+  test "an idle daemon writes NO ambient rows, a leased one writes rows":
+    # THE GATE, BOTH DIRECTIONS, AS AN A/B WITH ONE DIFFERENCE BETWEEN THE
+    # ARMS. Two real daemons, same binary, same cadence, same wall-clock
+    # window, same store shape. One is never asked for anything; the other
+    # holds a single lease. If the idle arm writes nothing because of some
+    # accident of flushing or timing rather than because of the gate, the
+    # leased arm writes nothing either and the pair fails together --
+    # which is what stops "no rows" from being satisfied by a sampler that
+    # was simply never running.
+    #
+    # WHY THE GATE EXISTS: this is the only writer in the store unbounded
+    # in TIME. A sample taken while no lease is live cannot be joined to
+    # an execution, because there is no execution to join it to, so it is
+    # a row no query can reach -- and at the default cadence there are
+    # about 86,000 of them per host per day whether the machine is
+    # building or asleep.
+    let dir = scratchDir("gate")
+    defer: removeDir(dir)
+    stopAmbientSampler()
+
+    let daemonBinary = getCurrentDir() / "build" / "bin" / "runquotad"
+    check fileExists(daemonBinary)
+
+    proc startGateDaemon(binary, root, tag: string):
+        tuple[process: Process; db: string] =
+      let socketPath = root / (tag & ".sock")
+      let dbPath = root / (tag & ".sqlite")
+      putEnv("RUNQUOTA_SOCKET", socketPath)
+      let process = startProcess(binary,
+        args = ["--socket", socketPath, "--observation-db", dbPath,
+                "--host-identity-file", root / "host-id",
+                "--ambient-sample-interval-millis", $cadenceMillis],
+        options = {poStdErrToStdOut})
+      # The three startup lines, so the daemon is past initialisation and
+      # the sampler has been started before the window opens.
+      for _ in 0 ..< 3:
+        discard process.outputStream.readLine()
+      (process, dbPath)
+
+    # -- ARM ONE: nothing is ever leased. -----------------------------------
+    #
+    # Long enough that an UNGATED sampler would have flushed at least once:
+    # 4.5 s at a 200 ms cadence is 22 ticks and the sampler flushes every
+    # ten, so a sampler writing unconditionally puts twenty rows on disk
+    # inside this window. Measured against the ungated implementation it
+    # put 20 there, and this assertion read "20 rows were written while no
+    # lease was live".
+    let (idleDaemon, idleDb) = startGateDaemon(daemonBinary, dir, "idle")
+    var idleRows: seq[AmbientSampleRow] = @[]
+    var idleRuns = 0
+    try:
+      sleep(4500)
+      let store = openObservationStore(idleDb)
+      check store.captureEnabled
+      idleRows = store.readAmbientSamples()
+      idleRuns = store.readRuns().len
+    finally:
+      if idleDaemon.running:
+        idleDaemon.terminate()
+        discard idleDaemon.waitForExit(5000)
+      idleDaemon.close()
+
+    # THE ASSERTION THAT MATTERS. Not "few rows", not "fewer rows": none.
+    check idleRows.len == 0
+    check idleRuns == 0
+    # And nothing arrives after the daemon is gone either, so the zero is
+    # not a queue that had yet to be flushed.
+    sleep(cadenceMillis * 4)
+    check openObservationStore(idleDb).readAmbientSamples().len == 0
+
+    # -- ARM TWO: one live lease, and only that. ----------------------------
+    let (leasedDaemon, leasedDb) = startGateDaemon(daemonBinary, dir, "leased")
+    var leasedRows: seq[AmbientSampleRow] = @[]
+    var afterRelease = 0
+    var settledAfterRelease = 0
+    try:
+      var ready = false
+      for _ in 0 ..< 200:
+        try:
+          var probe = connectDefault()
+          probe.close()
+          ready = true
+          break
+        except CatchableError:
+          sleep(25)
+      check ready
+
+      var client = connectDefault()
+      var session = client.registerSession("m11-gate", "0.1.0")
+      var lease = session.requestLease(resourceRequest(
+        "m11-gate-exec", milliCpu(1000),
+        bytes(256'u64 * 1024'u64 * 1024'u64)))
+      check lease.active
+
+      sleep(4500)
+      leasedRows = openObservationStore(leasedDb).readAmbientSamples()
+
+      # THE OTHER EDGE. The lease goes away; sampling must stop again
+      # rather than merely have started once. At most ONE further row may
+      # appear -- the tick whose interval straddles the release, which did
+      # contain live work -- and then nothing.
+      lease.release()
+      session.closeSession()
+      client.close()
+      sleep(4000)
+      afterRelease = openObservationStore(leasedDb).readAmbientSamples().len
+      sleep(4000)
+      settledAfterRelease =
+        openObservationStore(leasedDb).readAmbientSamples().len
+    finally:
+      if leasedDaemon.running:
+        leasedDaemon.terminate()
+        discard leasedDaemon.waitForExit(5000)
+      leasedDaemon.close()
+
+    # THE CONTROL FOR ARM ONE. Same daemon, same cadence, same window; the
+    # only difference is that a lease was live, and rows appear.
+    check leasedRows.len >= 5
+
+    # AND IT STOPPED AGAIN WITH THE LEASE. Eight further seconds is forty
+    # more ticks; what may still appear is only what had already been
+    # taken while the lease was live and not yet batched to disk (the
+    # sampler writes every ten samples), plus at most the one tick whose
+    # interval straddled the release. An ungated sampler adds a row for
+    # nearly every one of those forty.
+    check settledAfterRelease - leasedRows.len <= defaultAmbientFlushSamples
+    check settledAfterRelease == afterRelease
+
+    # The rows really are ambient rows about this machine, so "rows
+    # appeared" is not satisfied by anything else landing in the table.
+    for row in leasedRows:
+      check isOpaqueId(row.hostId, "host-")
+      check row.memAvailableBytes > 0
+      check row.foreignCpuPct == row.cpuBusyPct
