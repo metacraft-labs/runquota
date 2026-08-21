@@ -381,6 +381,43 @@ const
     ## of the load — is caught exactly, and only, by the scripted estimator
     ## in ``t_observation_store_ambient_attribution``.
 
+  memoryLivenessFloor = 0.25
+    ## THE MEMORY ARM'S FLOOR, and — since the tracking claim moved — a
+    ## LIVENESS floor rather than a tracking tolerance. What it asserts is
+    ## that a REAL KERNEL COUNTER MOVED when four real gibibytes were
+    ## touched, in the same sense the CPU arm's pooled band does.
+    ##
+    ## It used to read ``0.5``, and that was a tracking claim wearing a
+    ## band: over nine observed runs the paired ratio came back 0.517,
+    ## 0.574, 0.655, 0.662, 0.672, 0.769, 0.834, 0.907 and 0.988, so the
+    ## worst of them cleared the floor by 3.4% — an assertion that cannot
+    ## afford its own noise, and the tightest thing left in the file after
+    ## the CPU arm stopped making tracking claims it could not support.
+    ## The spread is not a defect: the host-wide "available memory" figure
+    ## counts the page cache and every other process's pages, and this
+    ## module's own header records a Time Machine pass releasing 3.4 GB
+    ## inside one measurement.
+    ##
+    ## BY HOW MUCH the column moves is asserted BYTE FOR BYTE, over
+    ## scripted readings and under a gibibyte-a-cycle drift, in
+    ## ``t_observation_store_ambient_attribution``. That is where a column
+    ## under-reporting an allocation by a fifth is caught — at 0.800, a
+    ## figure no band a real machine can support could ever reject — so
+    ## this floor is not the thing standing between that defect and a
+    ## green run, and does not need to be tight enough to pretend it is.
+    ##
+    ## A quarter clears the worst observed run by a factor of two, against
+    ## the 1.5 the CPU arm's pooled floor leaves, and still rejects every
+    ## way the column can stop being a measurement: a constant reads
+    ## 0.000, a unit confusion between pages and bytes reads 0.0002, an
+    ## order-of-magnitude slip reads 0.100, and an inverted difference is
+    ## negative.
+  memoryCeilingFactor = 1.8
+    ## Deliberately NOT moved. The observed maximum over the same nine runs
+    ## was 1.077, so this end already carries 67% of headroom and nothing
+    ## about the restatement above put it at risk. Widening a bound that
+    ## was never close is how a band stops meaning anything.
+
   cadenceWindowTicks = 5 * defaultAmbientFlushSamples
     ## The daemon-cadence window, SIZED IN FLUSH BATCHES rather than in
     ## seconds, because it is the flush and not the wall clock that decides
@@ -700,6 +737,17 @@ suite "ambient_load_attribution":
     # than the CPU arm's was -- the windows here are 800 ms against 700,
     # there are nine cycles against fourteen, and a cycle is only lost if
     # an entire window caught no sample at all.
+    #
+    # STATED AS WHAT THE MEDIAN NEEDS, WHICH IS A MAJORITY. It used to read
+    # `>= memoryCycles - 2`: seven of nine, against an observed minimum of
+    # eight, so it sat one cycle above what the machine delivers. Seven is
+    # not a property of a median -- nothing about the statistic changes
+    # between six pairs and seven -- it was a coverage assertion in a
+    # precondition's clothing, and it would have gone red for the same
+    # reason the CPU arm's pair count did: where a tick happened to fall.
+    # A MAJORITY of the cycles is the real requirement, because it is what
+    # stops the median being taken over a handful of survivors, and it
+    # leaves three cycles of room instead of one.
     var paired: seq[float] = @[]
     var positive = 0
     for i in 0 ..< memoryCycles:
@@ -711,7 +759,7 @@ suite "ambient_load_attribution":
       paired.add(delta)
       if delta > float(knownBytes) * 0.3:
         positive += 1
-    check paired.len >= memoryCycles - 2
+    check paired.len * 2 > memoryCycles
 
     let measured = median(paired)
     let pooled = median(foreignRss(fullRows)) - median(foreignRss(emptyRows))
@@ -721,11 +769,12 @@ suite "ambient_load_attribution":
       " pooledRatio=", (pooled / float(knownBytes)).formatFloat(ffDecimal, 3),
       " cycles=", positive, "/", paired.len, " above 0.3x (reported, not gated)",
       " samples=", emptyRows.len, "/", fullRows.len
-    # THE ONE HOST-MEASURED ASSERTION IN THIS ARM. Wider than the CPU arm
-    # on purpose: the host-wide figure counts the page cache and every
-    # other process's pages in the same number, so this is a claim that a
-    # real kernel counter moved when four real gibibytes were touched, and
-    # not a measurement of the allocation.
+    # THE ONE HOST-MEASURED ASSERTION IN THIS ARM, and -- like the CPU
+    # arm's -- a claim about LIVENESS and not about tracking: a real kernel
+    # counter MOVED when four real gibibytes were touched. Wider than the
+    # CPU arm on purpose, because the host-wide figure counts the page
+    # cache and every other process's pages in the same number, so it is
+    # not a measurement of the allocation and must not be read as one.
     #
     # By how much it moved is asserted BYTE FOR BYTE over scripted
     # readings in `t_observation_store_ambient_attribution`, which is also
@@ -733,8 +782,14 @@ suite "ambient_load_attribution":
     # printed above; it is no longer a gate, for the same reason the CPU
     # arm's is not -- it can be destroyed by where a tick fell rather than
     # by anything about attribution.
-    check measured > float(knownBytes) * 0.5
-    check measured < float(knownBytes) * 1.8
+    #
+    # The floor moved from a half to a quarter when the tracking claim did.
+    # Both ends carry their measurements in their own declarations above;
+    # the short version is that the half was clearing the worst observed
+    # run by 3.4%, and a column that under-reports by a fifth reads 0.800
+    # and was never going to be caught here in any case.
+    check measured > float(knownBytes) * memoryLivenessFloor
+    check measured < float(knownBytes) * memoryCeilingFactor
 
     # Nothing was attributed to RunQuota: no client reported anything, so
     # the whole of the machine's resident memory is foreign.
