@@ -381,7 +381,7 @@ const
     ## of the load — is caught exactly, and only, by the scripted estimator
     ## in ``t_observation_store_ambient_attribution``.
 
-  cadenceWindowTicks = 3 * defaultAmbientFlushSamples
+  cadenceWindowTicks = 5 * defaultAmbientFlushSamples
     ## The daemon-cadence window, SIZED IN FLUSH BATCHES rather than in
     ## seconds, because it is the flush and not the wall clock that decides
     ## how many rows a reader can see while the daemon is still running.
@@ -396,26 +396,26 @@ const
     ## very module documents roughly one reading in eight going stale. The
     ## floor was a fraction of a number nobody had computed.
     ##
-    ## Three batches wide leaves two of them CLOSED for certain by the time
-    ## the window ends, whatever the third one is doing when the store is
-    ## read.
+    ## Five batches wide leaves four of them CLOSED for certain by the time
+    ## the window ends, whatever the fifth is doing when the store is read.
+    ## Three was tried first and is not enough: the budget it leaves is two
+    ## batches, the fixed cost of getting a lease granted eats several ticks
+    ## of it, and a floor stated as "more than one batch" then sits within
+    ## one row of what the machine actually delivers. Measured during a full
+    ## suite run it landed on exactly the floor.
   cadenceWindowMillis = cadenceWindowTicks * cadenceMillis
-  cadenceFlushedTicks = 2 * defaultAmbientFlushSamples
-    ## The ticks whose batch has certainly closed by the end of the window:
-    ## the KNOWN budget the floor below is a fraction of. One of them is the
-    ## baseline tick, so at most ``cadenceFlushedTicks - 1`` of them can
-    ## have produced a row.
-  cadenceRowFloor = cadenceFlushedTicks div 2 + 1
-    ## A FRACTION OF THE KNOWN BUDGET ABOVE, and -- the same number read the
-    ## other way round -- MORE THAN ONE BATCH. The second reading is what
-    ## makes the count say "the cadence is a cadence", because any floor at
-    ## or below ``defaultAmbientFlushSamples`` is satisfied by a single
-    ## flush, including the single flush a shutdown performs.
-    ##
-    ## As a fraction it allows nine of the nineteen eligible ticks to
-    ## produce no row at all: the stale ones, the discontinuous ones, and
-    ## the ones whose interval preceded the lease. The measured loss on
-    ## this platform is about one reading in eight.
+  cadenceFlushedTicks = 4 * defaultAmbientFlushSamples
+    ## The ticks whose batch has certainly closed by the end of the window.
+    ## Not yet the budget: what a tick was ELIGIBLE to write is measured
+    ## inside the test, because sampling is gated on a lease and the ticks
+    ## before one was granted could never have written anything.
+  cadenceLossAllowance = 2
+    ## One in ``cadenceLossAllowance`` of the eligible ticks may write no
+    ## row. Ticks are lost to a stale kernel snapshot, to a counter going
+    ## backwards, and to the interval that straddles the lease grant; the
+    ## measured loss on this platform is between one in eight on a quiet
+    ## host and a little over one in four while the rest of this suite is
+    ## running. The allowance is roughly twice the worse of those.
 
 suite "ambient_load_attribution":
 
@@ -917,6 +917,7 @@ suite "ambient_load_attribution":
     var startupLines: seq[string] = @[]
     var rowsWhileRunning: seq[AmbientSampleRow] = @[]
     var ticksPossible = 0
+    var eligibleTicks = 0
     try:
       # Exactly the three lines the daemon prints when a store path was
       # given, and then it goes quiet.
@@ -940,6 +941,15 @@ suite "ambient_load_attribution":
         "m11-cadence-exec", milliCpu(1000),
         bytes(256'u64 * 1024'u64 * 1024'u64)))
       check lease.active
+      # THE BUDGET, MEASURED. Of the ticks whose batch has certainly
+      # closed, the ones that fired before this instant could never have
+      # written a row -- sampling is gated on a live lease and there was
+      # none -- and the very first tick of all is a baseline whatever else
+      # is true. What is left is what the window really offered, and it is
+      # a measurement of this run rather than an assumption about how
+      # quickly a daemon starts and grants.
+      eligibleTicks = cadenceFlushedTicks - 1 -
+        int((epochTime() - daemonStartedAt) * 1000.0 / float(cadenceMillis))
 
       sleep(cadenceWindowMillis)
       let store = openObservationStore(dbPath)
@@ -966,24 +976,31 @@ suite "ambient_load_attribution":
         discard daemon.waitForExit(5000)
       daemon.close()
 
-    # BOTH BOUNDS ARE DERIVED, neither is a guess about the wall clock.
+    # EVERY BOUND HERE IS DERIVED, none is a guess about the wall clock.
     #
-    # The floor is more rows than one batch holds, so what it says is "at
-    # least two batches closed while the daemon was running" -- which is
-    # the property, since a single flush is exactly what a shutdown does.
-    # It is a fraction of `cadenceFlushedTicks`, the tick budget whose
-    # batches had certainly closed, and it leaves room for nine of those
-    # nineteen eligible ticks to have written nothing.
+    # The floor is a fraction of `eligibleTicks` -- the ticks whose batch
+    # had certainly closed and which a live lease could have let write --
+    # and that budget is MEASURED on this run rather than assumed. Half of
+    # it may go missing.
+    #
+    # Beside it, and not the same statement: more rows than one batch
+    # holds. That is what makes the count say "the cadence is a cadence",
+    # because a single flush is exactly what a shutdown does and any floor
+    # at or below `defaultAmbientFlushSamples` is satisfied by one.
     #
     # The ceiling is the number of times the configured cadence could have
-    # fired at all. A sampler that ignored its interval and spun would
-    # exceed it; the previous ceiling of twenty was a wall-clock guess that
-    # a sampler running at four times its cadence could still satisfy,
-    # because the flush was quantising the count anyway.
-    echo "  m11 cadence: rows=", rowsWhileRunning.len, " floor=",
-      cadenceRowFloor, " ticksPossible=", ticksPossible,
+    # fired at all. A sampler that ignored its interval and spun exceeds
+    # it; the previous ceiling of twenty was a wall-clock guess that would
+    # simply have been wrong at this window length.
+    echo "  m11 cadence: rows=", rowsWhileRunning.len,
+      " eligible=", eligibleTicks,
+      " floor=", max(eligibleTicks div cadenceLossAllowance,
+        defaultAmbientFlushSamples + 1),
+      " ticksPossible=", ticksPossible,
       " window=", cadenceWindowMillis, "ms"
-    check rowsWhileRunning.len >= cadenceRowFloor
+    check eligibleTicks > defaultAmbientFlushSamples
+    check rowsWhileRunning.len >= eligibleTicks div cadenceLossAllowance
+    check rowsWhileRunning.len > defaultAmbientFlushSamples
     check rowsWhileRunning.len <= ticksPossible
     let hostIds = block:
       var ids: seq[string] = @[]
