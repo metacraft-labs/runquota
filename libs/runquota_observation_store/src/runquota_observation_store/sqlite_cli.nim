@@ -155,6 +155,14 @@ proc runSqlite*(dbPath, sql: string): SqliteOutcome =
       discard
     except Defect:
       discard
+    # If the stderr drain never started -- `createThread` is the only thing
+    # here that can fail after the stdout drain is running -- then nothing
+    # would ever read that pipe, the child would block once it filled, and
+    # the stdout drain would wait on EOF from a child that can no longer
+    # reach it. Read stderr on this thread instead, so both streams are still
+    # serviced at the same time and the join below is guaranteed to return.
+    if drainsStarted == 1:
+      drainStream(addr errorDrain)
     if drainsStarted >= 1:
       joinThread(outputThread)
     if drainsStarted >= 2:
