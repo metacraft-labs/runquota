@@ -600,12 +600,33 @@ proc flushAmbientQueue() {.gcsafe.} =
 
 proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
   {.cast(gcsafe).}:
+    # THE READING AND THE SELF FIGURES ARE ONE OBSERVATION, so they are
+    # taken under one lock hold.
+    #
+    # `foreign_* = host total - sum(self_*)` is a subtraction of two
+    # measurements, and it only means anything if both describe the SAME
+    # instant. Taking the host reading here and reading `samplerReports`
+    # later let a `reportSelfExecution` land between them: the row then
+    # carried a timestamp from before the report and a `self_*` from after
+    # it. Where the late figures exceeded the earlier host total -- a burst
+    # of lease starts does this, and so does one lagging report -- the
+    # clamp fired and `foreign_*` was written as zero. That row describes
+    # no moment that ever existed.
+    #
+    # A row's `sampled_at_unix_millis` therefore now denotes the instant at
+    # which BOTH the kernel counters and the live self-reports were read.
+    # `readHostLoad` is syscalls only (mach counters on macOS, `/proc` on
+    # Linux); it spawns nothing and takes no lock of its own, so holding
+    # `samplerLock` across it costs a few microseconds and cannot deadlock.
+    var current: HostLoadReading
+    var reports: seq[SelfReport]
     acquire(samplerLock)
     try:
       samplerTicks += 1
+      current = readHostLoad()
+      reports = samplerReports
     finally:
       release(samplerLock)
-    let current = readHostLoad()
     if not current.available:
       acquire(samplerLock)
       try:
@@ -679,8 +700,10 @@ proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
     var collided = false
     acquire(samplerLock)
     try:
-      row = attributeAmbientSample(samplerHostId, previous, current,
-        samplerReports)
+      # `reports` is the snapshot taken WITH the reading above, not
+      # `samplerReports` as it stands now: re-reading it here is precisely
+      # the skew this proc exists to avoid.
+      row = attributeAmbientSample(samplerHostId, previous, current, reports)
       # `(host_id, sampled_at_unix_millis)` is the primary key, so two
       # samples inside one millisecond collide. The loser is DROPPED and
       # COUNTED, which is how this module already handles a stale pair and
