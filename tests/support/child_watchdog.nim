@@ -1,8 +1,14 @@
 ## Supervising a test child that is *expected* to be able to wedge.
 ##
-## Both deadlock regression tests in this directory run the call under test in
-## a re-executed child, because a hung call cannot report its own failure. That
-## makes the child's own children this test's responsibility.
+## Every deadlock regression test in this repository runs the call under test
+## in a re-executed child, because a hung call cannot report its own failure.
+## That makes the child's own children the test's responsibility.
+##
+## It lives here, and not next to any one of them, because the spawn defects it
+## supervises are not the property of a single library: the observation store,
+## the estimate store and the macOS host backend all reach a child process, and
+## the tests for all three need the same supervision. Three copies of a
+## process-group kill is three chances for one of them to drift.
 ##
 ## Killing the direct child is not enough. The processes a deadlock test wedges
 ## are its GRANDchildren, and the interesting ones are wedged precisely because

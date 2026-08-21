@@ -1,5 +1,7 @@
 import std/[locks, os, osproc, strutils, times]
 
+import runquota_core/child_process
+
 import runquota_persistence/types
 
 export types
@@ -29,11 +31,40 @@ proc nowUnixMillis*(): uint64 =
 proc sqlQuote(value: string): string =
   "'" & value.replace("'", "''") & "'"
 
-proc runSqlite(path, sqlText: string): string =
+proc runSqlite*(path, sqlText: string): string =
+  ## Run ``sqlText`` against the estimate store and return what ``sqlite3``
+  ## put on stdout.
+  ##
+  ## This used to be `execProcess(..., options = {poUsePath})`, and the
+  ## explicit `options` is the whole defect. `execProcess`'s body loops on
+  ## `outputStream` and reads no other stream; its *default* options include
+  ## `poStdErrToStdOut`, which folds stderr into the stream it does read, so
+  ## in the default shape the omission is invisible. Passing `options`
+  ## explicitly replaces that default wholesale, and stderr gets a pipe of its
+  ## own that nobody will ever read.
+  ##
+  ## `writeBatch` hands a whole batch of `insert`s over as a single argv
+  ## argument, which is ~800 bytes per queued row. `sqlite3` echoes the
+  ## statement text back when it cannot prepare it, so the size of the
+  ## diagnostic tracks the size of the batch: a batch a few hundred rows long
+  ## produces more than the 65_536 bytes a pipe holds, `sqlite3` blocks in
+  ## write(2), never exits, and `execProcess`'s loop -- which only breaks when
+  ## the child stops running -- spins forever. That runs on the estimate
+  ## store's WRITER THREAD, and `stopEstimateStore` joins it.
+  ##
+  ## `runCapturedProcess` services both output streams at once, closes stdin,
+  ## and takes the spawn guard so this thread and the observation store's
+  ## writer cannot hand each other's pipes to their children.
+  ##
+  ## Exported so the regression test can drive it in its production shape.
+  ## stderr is deliberately still discarded rather than returned: every caller
+  ## here parses stdout as rows, and a diagnostic mixed into that stream would
+  ## be read as an estimate.
   let parent = parentDir(path)
   if parent.len > 0 and not dirExists(parent):
     createDir(parent)
-  execProcess("sqlite3", args = [path, sqlText], options = {poUsePath})
+  runCapturedProcess(
+    "sqlite3", args = [path, sqlText], options = {poUsePath}).output
 
 proc initEstimateSchema(path: string) =
   discard runSqlite(path, """

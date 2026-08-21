@@ -30,7 +30,7 @@ import std/[os, osproc, strutils, tempfiles, unittest]
 
 import runquota_observation_store/sqlite_cli
 
-import ./child_watchdog
+import ../../../tests/support/child_watchdog
 
 const
   ChildFlag = "--stderr-flood-child"

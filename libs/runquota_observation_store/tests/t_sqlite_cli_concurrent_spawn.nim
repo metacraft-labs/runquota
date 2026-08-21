@@ -29,7 +29,7 @@ import std/[atomics, os, osproc, strutils, tempfiles, unittest]
 
 import runquota_observation_store/sqlite_cli
 
-import ./child_watchdog
+import ../../../tests/support/child_watchdog
 
 const
   ChildFlag = "--concurrent-spawn-child"
