@@ -34,10 +34,19 @@
 ##
 ## The guard is held across process creation only, never while a child runs,
 ## so a slow child cannot keep another thread from spawning.
+##
+## WHY THIS LIVES IN ``runquota_core``. The lock only works if it is *one*
+## lock for the whole process. Every RunQuota spawner has to be able to reach
+## it, and the spawners sit in libraries that do not depend on one another --
+## the observation store, the estimate store, the macOS host backend. Only the
+## base library is below all of them. It is deliberately not re-exported from
+## the ``runquota_core`` umbrella: that module is a static-helper entry point
+## and has no business pulling ``osproc`` and a global lock into every consumer
+## that only wanted the shared types.
 
 import std/[locks, osproc]
 
-import runquota_core
+import ./fd_hygiene
 
 var spawnLock: Lock
 spawnLock.initLock()
