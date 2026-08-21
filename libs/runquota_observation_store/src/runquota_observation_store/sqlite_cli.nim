@@ -16,6 +16,8 @@
 
 import std/[os, osproc, streams, strutils]
 
+import ./spawn_guard
+
 const
   sqliteTool* = "sqlite3"
   nullMarker* = "~"
@@ -100,11 +102,17 @@ proc runSqlite*(dbPath, sql: string): SqliteOutcome =
   result = SqliteOutcome(ok: false, exitCode: -1, output: "", error: "")
   var process: Process
   try:
-    process = startProcess(
-      sqliteTool,
-      args = ["-batch", "-noheader", "-bail", dbPath],
-      options = {poUsePath}
-    )
+    # Guarded because osproc's pipes are inheritable for the length of this
+    # call: a concurrent spawn would hand them to its own child and neither
+    # side would ever see EOF again. See `spawn_guard`. The guard covers
+    # process creation only, not the child's lifetime.
+    withSpawnGuard:
+      process = startProcess(
+        sqliteTool,
+        args = ["-batch", "-noheader", "-bail", dbPath],
+        options = {poUsePath}
+      )
+      process.protectSpawnedPipes()
   except CatchableError as error:
     result.error = "cannot run " & sqliteTool & ": " & error.msg
     return
