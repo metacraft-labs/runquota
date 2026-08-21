@@ -27,7 +27,9 @@
 ## rest. Treat a failure on either as a first observation, not a
 ## regression.
 
-import std/[os, osproc, streams, strutils]
+import std/[os, strutils]
+
+import runquota_core/child_process
 
 import ./sha256, ./types
 
@@ -121,22 +123,28 @@ proc networkFsType(fsType: string): bool =
     "nfs", "nfs4", "smbfs", "cifs", "smb3", "afpfs", "webdav", "ftp",
     "fuse.sshfs", "9p", "afs"]
 
-proc runTool(command: string; args: openArray[string]): string =
+proc runTool*(command: string; args: openArray[string]): string =
   ## A detection tool's stdout, or the empty string if it would not run.
   ## Never raises: a machine without the tool answers "unknown", it does
   ## not take the daemon down.
+  ##
+  ## This ran on the daemon's startup path while reading stdout and *nothing
+  ## else*: stderr had a pipe of its own that no one ever read, and stdin was
+  ## never closed. A detection tool that writes more than a pipe holds --
+  ## 65_536 bytes as measured on the development host -- to stderr blocks in
+  ## `write(2)` forever, so it never exits, never closes stdout, and the
+  ## `readAll` above never returns. Nothing here was waiting on a timer, so
+  ## the daemon simply never finished starting. `runCapturedProcess` services
+  ## every stream at once and closes stdin, and takes the spawn guard so a
+  ## concurrent spawn elsewhere in the daemon cannot inherit these pipes.
+  ##
+  ## Exported for the regression test, which has to drive this in its
+  ## production shape -- the public detection entry points can only invoke the
+  ## fixed set of tools this machine happens to have.
   if not fileExists(command):
     return ""
-  try:
-    let process = startProcess(command, args = @args, options = {})
-    let output = process.outputStream.readAll()
-    let code = process.waitForExit()
-    process.close()
-    if code != 0: "" else: output
-  except CatchableError:
-    ""
-  except Defect:
-    ""
+  let captured = runCapturedProcess(command, args = args, options = {})
+  if not captured.ok: "" else: captured.output
 
 # ---------------------------------------------------------------------------
 # macOS
