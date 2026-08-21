@@ -45,14 +45,6 @@ import std/[osproc, streams, strtabs]
 import ./spawn_guard
 
 type
-  StreamDrain = object
-    ## One end of a child pipe plus the text read from it. Passed to a drain
-    ## thread by ``ptr``, so the thread argument itself carries no managed
-    ## memory.
-    stream: Stream
-    text: string
-    failure: string
-
   CapturedProcess* = object
     ## What a finished child left behind.
     ##
@@ -67,16 +59,26 @@ type
       ## Why the command could not be run or could not be drained. Empty when
       ## the child ran, whatever it exited with.
 
-proc drainStream(drain: ptr StreamDrain) {.thread.} =
-  ## Read one stream to EOF. Never propagates: a thread that let an exception
-  ## escape would terminate the process, and this runs inside a daemon whose
-  ## whole contract is to degrade rather than fail.
-  try:
-    drain.text = drain.stream.readAll()
-  except CatchableError as error:
-    drain.failure = error.msg
-  except Defect as error:
-    drain.failure = error.msg
+when compileOption("threads"):
+  type
+    StreamDrain = object
+      ## One end of a child pipe plus the text read from it. Passed to a drain
+      ## thread by ``ptr``, so the thread argument itself carries no managed
+      ## memory.
+      stream: Stream
+      text: string
+      failure: string
+
+  proc drainStream(drain: ptr StreamDrain) {.thread.} =
+    ## Read one stream to EOF. Never propagates: a thread that let an exception
+    ## escape would terminate the process, and this runs inside a daemon whose
+    ## whole contract is to degrade rather than fail.
+    try:
+      drain.text = drain.stream.readAll()
+    except CatchableError as error:
+      drain.failure = error.msg
+    except Defect as error:
+      drain.failure = error.msg
 
 proc runCapturedProcess*(
     command: string;
@@ -104,6 +106,14 @@ proc runCapturedProcess*(
       ": poParentStreams leaves no pipes to read"
     return
 
+  # `poStdErrToStdOut` is forced on a build without threads, because there is
+  # then only one reader and two pipes cannot be serviced at once. Merging is
+  # the only deadlock-free single-reader shape; see the note above the
+  # `compileOption` branch below.
+  var spawnOptions = options
+  when not compileOption("threads"):
+    spawnOptions.incl(poStdErrToStdOut)
+
   var process: Process
   try:
     # Guarded because osproc's pipes are inheritable for the length of this
@@ -117,7 +127,7 @@ proc runCapturedProcess*(
         workingDir = workingDir,
         args = args,
         env = env,
-        options = options
+        options = spawnOptions
       )
       process.protectSpawnedPipes()
   except CatchableError as error:
@@ -127,64 +137,109 @@ proc runCapturedProcess*(
     result.failure = "cannot run " & command & ": " & error.msg
     return
 
-  var outputDrain = StreamDrain(stream: nil, text: "", failure: "")
-  var errorDrain = StreamDrain(stream: nil, text: "", failure: "")
-  var outputThread: Thread[ptr StreamDrain]
-  var errorThread: Thread[ptr StreamDrain]
-  var drainsStarted = 0
   var failure = ""
+  var capturedOutput = ""
+  var capturedError = ""
 
-  try:
-    outputDrain.stream = process.outputStream
-    errorDrain.stream = process.errorStream
-    createThread(outputThread, drainStream, addr outputDrain)
-    drainsStarted = 1
-    createThread(errorThread, drainStream, addr errorDrain)
-    drainsStarted = 2
-    if input.len > 0:
-      let stdinStream = process.inputStream
-      stdinStream.write(input)
-      stdinStream.flush()
-  except CatchableError as error:
-    failure = error.msg
-  except Defect as error:
-    failure = error.msg
-  finally:
-    # Closing stdin before joining is what guarantees the joins terminate: a
-    # tool that reads to end of input runs until it gets one, so a drain
-    # thread waiting for EOF on stdout would otherwise wait on a child that is
-    # itself waiting on us. It runs even when `input` was empty -- an unread,
-    # unclosed stdin is exactly the hang -- and on the failure path, where
-    # stdin may not have been written at all.
+  when compileOption("threads"):
+    var outputDrain = StreamDrain(stream: nil, text: "", failure: "")
+    var errorDrain = StreamDrain(stream: nil, text: "", failure: "")
+    var outputThread: Thread[ptr StreamDrain]
+    var errorThread: Thread[ptr StreamDrain]
+    var drainsStarted = 0
+
     try:
-      process.inputStream.close()
-    except CatchableError:
-      discard
-    except Defect:
-      discard
-    # If the stderr drain never started -- `createThread` is the only thing
-    # here that can fail after the stdout drain is running -- then nothing
-    # would ever read that pipe, the child would block once it filled, and the
-    # stdout drain would wait on EOF from a child that can no longer reach it.
-    # Read stderr on this thread instead, so both streams are still serviced
-    # at the same time and the join below is guaranteed to return.
-    if drainsStarted == 1:
-      drainStream(addr errorDrain)
-    if drainsStarted >= 1:
-      joinThread(outputThread)
-    if drainsStarted >= 2:
-      joinThread(errorThread)
+      outputDrain.stream = process.outputStream
+      errorDrain.stream = process.errorStream
+      createThread(outputThread, drainStream, addr outputDrain)
+      drainsStarted = 1
+      createThread(errorThread, drainStream, addr errorDrain)
+      drainsStarted = 2
+      if input.len > 0:
+        let stdinStream = process.inputStream
+        stdinStream.write(input)
+        stdinStream.flush()
+    except CatchableError as error:
+      failure = error.msg
+    except Defect as error:
+      failure = error.msg
+    finally:
+      # Closing stdin before joining is what guarantees the joins terminate: a
+      # tool that reads to end of input runs until it gets one, so a drain
+      # thread waiting for EOF on stdout would otherwise wait on a child that
+      # is itself waiting on us. It runs even when `input` was empty -- an
+      # unread, unclosed stdin is exactly the hang -- and on the failure path,
+      # where stdin may not have been written at all.
+      try:
+        process.inputStream.close()
+      except CatchableError:
+        discard
+      except Defect:
+        discard
+      # If the stderr drain never started -- `createThread` is the only thing
+      # here that can fail after the stdout drain is running -- then nothing
+      # would ever read that pipe, the child would block once it filled, and
+      # the stdout drain would wait on EOF from a child that can no longer
+      # reach it. Read stderr on this thread instead, so both streams are still
+      # serviced at the same time and the join below is guaranteed to return.
+      if drainsStarted == 1:
+        drainStream(addr errorDrain)
+      if drainsStarted >= 1:
+        joinThread(outputThread)
+      if drainsStarted >= 2:
+        joinThread(errorThread)
 
-  try:
     if failure.len == 0 and outputDrain.failure.len > 0:
       failure = outputDrain.failure
     if failure.len == 0 and errorDrain.failure.len > 0:
       failure = errorDrain.failure
+    capturedOutput = outputDrain.text
+    capturedError = errorDrain.text
+  else:
+    # NO THREADS -- the static-helper gate builds `runquota_core`,
+    # `runquota_host_macos` and their closure with `--mm:arc --app:staticlib`
+    # and no thread support, so this branch is what those archives contain.
+    #
+    # With one reader and two pipes there is no way to service both at once,
+    # and servicing them in sequence is precisely the deadlock this module
+    # exists to remove. So stderr is MERGED into stdout above: one pipe, one
+    # reader, nothing to fill behind our back. `error` is therefore always
+    # empty here and the diagnostic arrives in `output` -- stated rather than
+    # hidden, because a caller that distinguishes the two would be wrong on
+    # this build. Every RunQuota caller that does distinguish them
+    # (`runquota_observation_store`, `runquota_persistence`) is outside the
+    # static-helper set and always compiles with threads.
+    try:
+      if input.len > 0:
+        let stdinStream = process.inputStream
+        stdinStream.write(input)
+        stdinStream.flush()
+    except CatchableError as error:
+      failure = error.msg
+    except Defect as error:
+      failure = error.msg
+    finally:
+      try:
+        process.inputStream.close()
+      except CatchableError:
+        discard
+      except Defect:
+        discard
+
+    if failure.len == 0:
+      try:
+        capturedOutput = process.outputStream.readAll()
+      except CatchableError as error:
+        failure = error.msg
+      except Defect as error:
+        failure = error.msg
+
+  try:
     if failure.len > 0:
       result.failure = "running " & command & " failed: " & failure
     else:
-      result.output = outputDrain.text
-      result.error = errorDrain.text
+      result.output = capturedOutput
+      result.error = capturedError
       result.exitCode = process.waitForExit()
       result.ok = result.exitCode == 0
   except CatchableError as error:
