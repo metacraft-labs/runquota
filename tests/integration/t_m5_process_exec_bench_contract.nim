@@ -5,6 +5,7 @@ when defined(posix):
 
 import runquota_client
 import runquota_core
+import runquota_core/child_process
 import runquota_exec
 import runquota_process
 
@@ -385,7 +386,11 @@ suite "m5_process_exec_bench_contract":
       checkCwdEnvRecord(leaseCwdDir, "lease-cwd-env")
 
       let beforeCli = client.daemonStatus().totalFinished
-      let cliOutput = execProcess(
+      # `runCapturedProcess`, not `execProcess`: the latter reads stdout and
+      # no other stream, and the explicit `options` here replaces its
+      # `poStdErrToStdOut` default, so stderr sat on a pipe nobody read. The
+      # fixture's own diagnostics go there, and a pipe holds only 65_536 bytes.
+      let cliCaptured = runCapturedProcess(
         cliPath(),
         args = [
           "acquire",
@@ -399,7 +404,10 @@ suite "m5_process_exec_bench_contract":
         env = nil,
         options = {poUsePath}
       )
-      check cliOutput.contains("m5 stdout")
+      if not cliCaptured.ok:
+        checkpoint("runquota acquire stderr: " & cliCaptured.error)
+      check cliCaptured.failure.len == 0
+      check cliCaptured.output.contains("m5 stdout")
       check client.daemonStatus().totalFinished > beforeCli
 
       session.closeSession()
@@ -413,11 +421,27 @@ suite "m5_process_exec_bench_contract":
         removeDir(socketDir)
 
   test "process benchmark quick path emits cwd env workload evidence":
-    let output = execProcess(
+    # This runs a BUILD SCRIPT -- `nim c` of the benchmark, then the benchmark
+    # itself -- through a helper that used to read stdout and nothing else.
+    # The script routes the compiler's own stdout to /dev/null but not its
+    # stderr, so every compiler diagnostic lands on a pipe that `execProcess`
+    # would never have read. A clean run measures 6_177 bytes there, which is
+    # a tenth of the 65_536 a pipe holds -- but the amount is a function of how
+    # much the compiler has to say, so the first genuinely noisy build would
+    # not have failed this test, it would have HUNG it, and hung it with the
+    # compiler's explanation still sitting unread in the pipe.
+    let captured = runCapturedProcess(
       "scripts/run-m5-benchmark.sh",
       args = ["process", "--quick"],
       options = {poUsePath}
     )
+    # The script's diagnostics are now readable, so a failed build says why
+    # instead of failing three opaque metric assertions below.
+    if not captured.ok:
+      checkpoint("run-m5-benchmark.sh stderr: " & captured.error)
+    check captured.failure.len == 0
+    check captured.exitCode == 0
+    let output = captured.output
     check hasMetricWithExtra(output, "raw-cwd-env fixture", "cwd_env=verified")
     check hasMetricWithExtra(output, "lease-cwd-env fixture", "cwd_env=verified")
     check hasMetricWithExtra(output, "lease-output-capture bytes", "LeaseFinished=true")

@@ -2,6 +2,7 @@ import std/[os, osproc, strutils, unittest]
 
 import runquota_client
 import runquota_core
+import runquota_core/child_process
 when defined(linux):
   import runquota_host_linux
 import runquota_host_macos
@@ -123,8 +124,13 @@ proc finishLaunched(lease: var RunQuotaLease; child: var LaunchedProcess;
   lease.finish(peakMemoryBytes = peakMemoryBytes, processCount = processCount)
 
 proc persistedEstimate(dbPath, commandStatsId: string): uint64 =
+  ## The same defect `runquota_persistence.runSqlite` had, in the test that
+  ## checks its output: `execProcess` reads stdout and no other stream, and the
+  ## explicit `options` replaces its `poStdErrToStdOut` default, so `sqlite3`'s
+  ## diagnostics sat on a pipe nobody read. Past the 65_536 bytes a pipe holds
+  ## that is a hang, not a failure.
   try:
-    let output = execProcess(
+    let output = runCapturedProcess(
       "sqlite3",
       args = [
         dbPath,
@@ -132,7 +138,7 @@ proc persistedEstimate(dbPath, commandStatsId: string): uint64 =
           "where command_stats_id = '" & commandStatsId & "' limit 1;"
       ],
       options = {poUsePath}
-    ).strip()
+    ).output.strip()
     if output.len == 0:
       return 0'u64
     parseUInt(output.splitLines()[0])

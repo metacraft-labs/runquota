@@ -3,6 +3,7 @@ import std/[os, osproc, strutils, unittest]
 import runquota_client
 import runquota_codec
 import runquota_core
+import runquota_core/child_process
 import runquota_ipc except connectDefault
 import runquota_protocol
 
@@ -119,7 +120,20 @@ proc waitForNoActiveSessions() =
   raise newException(OSError, "daemon did not clean up active sessions")
 
 proc runCli(args: openArray[string]): string =
-  execProcess(cliPath(), args = @args, options = {poUsePath})
+  ## The CLI's stdout.
+  ##
+  ## Not `execProcess`: its body reads `outputStream` and no other stream, and
+  ## the explicit `options` here replaces its `poStdErrToStdOut` default, so
+  ## stderr had a pipe nobody would read. The CLI is quiet today, but the pipe
+  ## holds only 65_536 bytes and the day it is not quiet this test would hang
+  ## rather than fail -- and it runs alongside a live daemon and several
+  ## concurrent sessions, which is also exactly the window in which two
+  ## `startProcess` calls hand each other's pipes to their children.
+  let captured = runCapturedProcess(cliPath(), args = args,
+                                    options = {poUsePath})
+  # stdout only, as before: every caller here matches JSON against it, so a
+  # diagnostic merged into the result would be matched as data.
+  captured.output
 
 template finishLease(lease: var RunQuotaLease; progress: var int) =
   lease.finish()
