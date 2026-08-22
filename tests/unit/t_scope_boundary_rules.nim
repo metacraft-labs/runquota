@@ -34,7 +34,17 @@ import runquota_ipc
 import runquota_observation_store
 
 proc scratchDir(name: string): string =
-  result = getTempDir() / ("rq-m13c-" & name & "-" & $getCurrentProcessId())
+  # SHORT ON PURPOSE, and the arithmetic is the reason rather than taste.
+  # Nim's `Sockaddr_un_path_length` is 92 on macOS and `toSockAddr` refuses
+  # `path.len >= 92`, so 91 characters is the whole budget -- NOT the ~104
+  # this used to say, which is the raw BSD `sun_path` size and 12 bytes
+  # more than Nim will actually accept. A plain macOS `TMPDIR` is 49
+  # characters before anything is appended; inside `nix develop` it is 21.
+  # That gap is why a fixture can be over budget and still be green in the
+  # sanctioned shell and in CI, which is exactly what happened here.
+  #
+  #   49 (TMPDIR) + 13 (this dir) + 3 (/ep) + 15 (/runquotad.sock) = 80
+  result = getTempDir() / ("rq" & $getCurrentProcessId() & name)
   removeDir(result)
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
@@ -82,7 +92,7 @@ suite "scope_boundary_rules_endpoint_directory":
     # directory, which is the whole defect, in one line.
     let root = scratchDir("create")
     defer: removeDir(root)
-    let dir = root / "endpoint"
+    let dir = root / "ep"
     let saved = umask(Mode(0))
     try:
       ensureEndpointDir(unixEndpoint(dir / "runquotad.sock"))
@@ -98,7 +108,7 @@ suite "scope_boundary_rules_endpoint_directory":
   test "a pre-created world-writable endpoint directory is REFUSED, and named":
     let root = scratchDir("world")
     defer: removeDir(root)
-    let dir = root / "endpoint"
+    let dir = root / "ep"
     createDir(dir)
     setFilePermissions(dir, {
       fpUserRead, fpUserWrite, fpUserExec,
@@ -125,7 +135,7 @@ suite "scope_boundary_rules_endpoint_directory":
     # that group can plant a socket in.
     let root = scratchDir("group")
     defer: removeDir(root)
-    let dir = root / "endpoint"
+    let dir = root / "ep"
     createDir(dir)
     setFilePermissions(dir, {
       fpUserRead, fpUserWrite, fpUserExec,
@@ -145,7 +155,7 @@ suite "scope_boundary_rules_endpoint_directory":
     # assumed.
     let root = scratchDir("loose")
     defer: removeDir(root)
-    let dir = root / "endpoint"
+    let dir = root / "ep"
     createDir(dir)
     setFilePermissions(dir, {
       fpUserRead, fpUserWrite, fpUserExec,
@@ -189,7 +199,7 @@ suite "scope_boundary_rules_endpoint_directory":
     let real = root / "real"
     createDir(real)
     setFilePermissions(real, {fpUserRead, fpUserWrite, fpUserExec})
-    let link = root / "endpoint"
+    let link = root / "ep"
     createSymlink(real, link)
     let trust = endpointDirectoryTrust(unixEndpoint(link / "runquotad.sock"))
     check trust.reason == trustWrongType
@@ -213,7 +223,7 @@ suite "scope_boundary_rules_endpoint_directory":
     # open.
     let root = scratchDir("attach")
     defer: removeDir(root)
-    let dir = root / "endpoint"
+    let dir = root / "ep"
     let socketPath = dir / "runquotad.sock"
     var listener = bindEndpoint(unixEndpoint(socketPath))
     try:

@@ -201,10 +201,17 @@ suite "inherited_fd_isolation":
       # that is a world-writable `/tmp` owned by root, and `bindEndpoint`
       # refuses a rendezvous directory it cannot vouch for -- correctly, so
       # the fixture has to be one it can. `bindEndpoint` creates it 0700.
-      let socketDir = getTempDir() / ("rq-fd-isolation-" &
-        $getCurrentProcessId())
+      #
+      # BOTH NAMES ARE TERSE ON PURPOSE. Nim's `Sockaddr_un_path_length` is
+      # 92 on macOS and `toSockAddr` refuses `path.len >= 92`, so the whole
+      # budget is 91 characters. Adding a directory here cost 21 of them
+      # (76 -> 97), which fits inside `nix develop` -- a 21-character
+      # `TMPDIR` -- and fails outside it, where a normal macOS `TMPDIR` is
+      # 49. The sanctioned shell and CI would both have stayed green. This
+      # spends 18 characters instead of 39 and leaves the margin visible.
+      let socketDir = getTempDir() / ("rq-fd-" & $getCurrentProcessId())
       removeDir(socketDir)
-      let socketPath = socketDir / "runquota-fd-isolation.sock"
+      let socketPath = socketDir / "fd.sock"
       defer: removeDir(socketDir)
       var listener = bindEndpoint(unixEndpoint(socketPath))
       check isCloseOnExec(cint(listener.socket.getFd()))

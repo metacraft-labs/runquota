@@ -10,6 +10,7 @@
 
   outputs =
     inputs@{
+      self,
       flake-parts,
       git-hooks,
       ...
@@ -21,6 +22,24 @@
         "x86_64-darwin"
         "aarch64-darwin"
       ];
+
+      # THE INSTALL STEP. `runquotad` keeps this machine's `host_id` in a
+      # host-wide, daemon-owned directory (`/var/lib/runquota` on Linux,
+      # `/var/db/runquota` on macOS) and REFUSES -- capture off, path and
+      # reason named -- when that directory is missing. It never creates
+      # it: a path any caller can create is a path any caller can create
+      # differently. These modules are what creates it, with the owner and
+      # mode fixed in `nix/host-state.nix`.
+      #
+      # Hosts not managed by Nix provision it from the runbook in
+      # `docs/database.md`, which carries the same owner and mode.
+      flake = {
+        nixosModules.runquotad = import ./nix/modules/runquotad-nixos.nix { inherit self; };
+        nixosModules.default = self.nixosModules.runquotad;
+        darwinModules.runquotad = import ./nix/modules/runquotad-darwin.nix { inherit self; };
+        darwinModules.default = self.darwinModules.runquotad;
+        hostState = import ./nix/host-state.nix;
+      };
 
       perSystem =
         { pkgs, system, ... }:

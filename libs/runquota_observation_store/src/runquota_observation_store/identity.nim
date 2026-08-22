@@ -22,20 +22,46 @@
 ## attached to it. That is the correct failure — a lost identity splits a
 ## history, where a hostname-derived one merges two, and a split is
 ## visible in the data while a merge is not.
+##
+## AN IDENTITY THAT CANNOT BE PERSISTED IS A REFUSAL, NEVER AN EPHEMERAL
+## ONE. This is the other half of "minted *once*", and it is the rule that
+## closes a whole class of silent degradation. Minting an id that is not
+## written down satisfies every type in the system and has no symptom at
+## the point of use: each invocation becomes a new machine, no two rows
+## ever pool, and the aggregates still carry *a* hardware dimension, so
+## nothing looks wrong. That is strictly worse than the per-user file this
+## replaced, which at least persisted. So every failure below returns an
+## EMPTY ``hostId`` with a report naming the path and the reason, and the
+## daemon turns capture off rather than recording against a fiction.
+##
+## Specified in ``reprobuild-specs/RunQuota-Observation-Store.md``
+## §"The Execution Spine": "**A `host_id` that cannot be persisted MUST be
+## a refusal, never an ephemeral one.**"
 
 import std/[os, strutils]
+
+when not defined(windows):
+  import std/posix
 
 import ./ids
 
 type
   HostIdentity* = object
     hostId*: string
-      ## Empty only if no identity could be produced at all.
+      ## The machine's identity, or EMPTY. Non-empty IF AND ONLY IF
+      ## ``persisted`` is true — an id nothing wrote down is not an
+      ## identity, because the next process would mint a different one.
+      ## Callers key capture off this being non-empty.
     path*: string
     persisted*: bool
-      ## False when the id could not be written down, and so will not
-      ## survive this process. The caller reports it; capture continues.
+      ## True only when ``hostId`` was read back from ``path`` or written
+      ## to it. False means REFUSED: there is no id, and ``report`` says
+      ## which path and why.
     report*: string
+      ## ONE LINE, always. The daemon prints this as one of a fixed number
+      ## of startup lines, and a reader that has to guess how many lines it
+      ## will get is a reader that deadlocks. ``OSError.msg`` embeds a
+      ## newline on macOS ("Additional info: ..."), so it is folded.
 
 const hostIdPrefix* = "host-"
 
@@ -56,6 +82,12 @@ const
   # Nothing per-user may appear in this path. `HOME`, `XDG_STATE_HOME` and
   # `LOCALAPPDATA` all differ between two users on one machine, which is
   # exactly the property that must not be here.
+  #
+  # THESE THREE PATHS ARE ALSO WRITTEN DOWN IN `nix/host-state.nix`, which
+  # is what the install step provisions from. The two must agree, and
+  # `tests/integration/t_host_identity_refusal.nim` asserts that they do:
+  # a directory provisioned somewhere the daemon does not look is the same
+  # unprovisioned host with more moving parts.
   hostWideStateDir* =
     when defined(windows):
       r"C:\ProgramData\runquota"
@@ -63,6 +95,35 @@ const
       "/var/db/runquota"
     else:
       "/var/lib/runquota"
+
+proc oneLine(text: string): string =
+  ## Folds an embedded newline. `OSError.msg` on macOS is two lines --
+  ## the message and an "Additional info:" line -- and the daemon's
+  ## startup output is a FIXED number of lines that a test reads by
+  ## count. An unfolded message silently adds a fourth line and every
+  ## reader of the third one deadlocks or misreads.
+  var parts: seq[string] = @[]
+  for line in text.splitLines:
+    let trimmed = line.strip()
+    if trimmed.len > 0:
+      parts.add(trimmed)
+  parts.join("; ")
+
+proc provisionHostStateDirCommand*(directory: string): string =
+  ## The exact command an operator runs on a host the install step has not
+  ## reached. Named in the refusal itself: a refusal that says only "cannot
+  ## persist" leaves the operator to guess, and the guess -- creating the
+  ## directory as whoever happens to be logged in -- is the failure this
+  ## whole rule exists to prevent.
+  ##
+  ## Ownership is the DAEMON's, not root's: the daemon has to write the
+  ## identity file inside it on first start. The mode is 0755 rather than
+  ## 0700 because the directory is host-wide by design.
+  when defined(windows):
+    "mkdir " & directory
+  else:
+    "sudo mkdir -p " & directory & " && sudo chown " & $getuid() & " " &
+      directory & " && sudo chmod 0755 " & directory
 
 proc defaultHostIdentityFile*(): string =
   ## The machine's identity file. Host-wide, daemon-owned, and outside any
@@ -78,8 +139,19 @@ proc defaultHostIdentityFile*(): string =
 
 proc resolveHostIdentity*(path = ""): HostIdentity =
   ## Reads the machine's ``host_id``, minting and persisting one on first
-  ## use. Never raises.
+  ## use inside an ALREADY-PROVISIONED directory. Never raises.
+  ##
+  ## EVERY FAILURE IS A REFUSAL: ``hostId`` comes back empty, ``persisted``
+  ## false, and ``report`` names the path and the reason. Nothing here ever
+  ## returns an id that is not on disk. The result satisfies, on every
+  ## path, ``(hostId.len > 0) == persisted``.
+  ##
+  ## The result is also a FUNCTION OF THE FILESYSTEM AND NOTHING ELSE, so
+  ## two consecutive calls agree. That is the only property that separates
+  ## a real identity from a fresh one that looks fine, and it is what the
+  ## suite's repetition control asserts.
   let file = if path.len > 0: path else: defaultHostIdentityFile()
+  let directory = file.parentDir
   result = HostIdentity(hostId: "", path: file, persisted: false, report: "")
 
   if fileExists(file):
@@ -87,9 +159,10 @@ proc resolveHostIdentity*(path = ""): HostIdentity =
     try:
       existing = readFile(file).strip()
     except CatchableError as error:
-      existing = ""
-      result.report = "runquota host identity " & file & ": unreadable (" &
-        error.msg & ")"
+      result.report = "runquota host identity " & file &
+        ": cannot persist -- unreadable (" & oneLine(error.msg) &
+        "); no identity was minted and capture stays off"
+      return
     if isOpaqueId(existing, hostIdPrefix):
       result.hostId = existing
       result.persisted = true
@@ -99,27 +172,55 @@ proc resolveHostIdentity*(path = ""): HostIdentity =
       # A file that is not an identity is not overwritten. Whatever it is,
       # something else owns it, and clobbering it to make this start tidy
       # would be the daemon deciding it knows better.
-      result.hostId = opaqueId(hostIdPrefix)
       result.report = "runquota host identity " & file &
-        ": file does not hold a RunQuota host id and was left alone; " &
-        "using a temporary identity that will not survive a restart"
+        ": cannot persist -- the file does not hold a RunQuota host id and " &
+        "was left alone; no identity was minted and capture stays off"
       return
 
-  result.hostId = opaqueId(hostIdPrefix)
+  # THE DIRECTORY IS PROVISIONED BY THE INSTALL STEP AND IS NOT CREATED
+  # HERE. `createDir` used to be on this line, and it is the reason the
+  # host-wide move made things worse rather than better: `/var/db` and
+  # `/var/lib` are root-owned 0755, so an unprivileged daemon's `createDir`
+  # always failed and the old code answered by minting an id per process.
+  # Creating it when the daemon *can* is not the fix either -- a path any
+  # caller can create is a path any caller can create DIFFERENTLY, with
+  # whatever owner and mode the first starter happened to have. So the
+  # directory's owner and mode are decided once, by installation, and a
+  # missing one is reported with the command that creates it.
+  if directory.len > 0 and not dirExists(directory):
+    result.report = "runquota host identity " & file &
+      ": cannot persist -- the host-wide state directory " & directory &
+      " does not exist. It is created by the RunQuota install step, never " &
+      "by the daemon; provision it with: " &
+      provisionHostStateDirCommand(directory) &
+      " -- no identity was minted and capture stays off"
+    return
+
+  # Write-then-rename: a torn write would leave a file that fails
+  # `isOpaqueId` and mint a second identity for one machine on the next
+  # start, which is exactly the accumulation this is here to prevent.
+  #
+  # The id is assigned to `result` only after the rename lands. An id that
+  # exists in this process and nowhere else is precisely what must not
+  # escape from here.
+  let minted = opaqueId(hostIdPrefix)
+  let temporary = file & ".new." & $getCurrentProcessId()
   try:
-    let parent = file.parentDir
-    if parent.len > 0 and not dirExists(parent):
-      createDir(parent)
-    # Write-then-rename: a torn write would leave a file that fails
-    # `isOpaqueId` and mint a second identity for one machine on the next
-    # start, which is exactly the accumulation this is here to prevent.
-    let temporary = file & ".new." & $getCurrentProcessId()
-    writeFile(temporary, result.hostId & "\n")
+    writeFile(temporary, minted & "\n")
     moveFile(temporary, file)
+    result.hostId = minted
     result.persisted = true
-    result.report = "runquota host identity " & file & ": created " &
-      result.hostId
+    result.report = "runquota host identity " & file & ": created " & minted
   except CatchableError as error:
-    result.report = "runquota host identity " & file & ": cannot persist (" &
-      error.msg & "); using a temporary identity that will not survive a " &
-      "restart"
+    # A write that landed but did not get renamed leaves a stray file in a
+    # host-wide directory, and the next start would leave another. Removed
+    # best-effort: failing to clean up must not turn a refusal into a
+    # raise, since callers are promised this never raises.
+    try:
+      if fileExists(temporary):
+        removeFile(temporary)
+    except CatchableError:
+      discard
+    result.report = "runquota host identity " & file &
+      ": cannot persist -- " & oneLine(error.msg) & " (state directory " &
+      directory & "); no identity was minted and capture stays off"

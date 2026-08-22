@@ -321,7 +321,13 @@ proc spinnersForHeadroom(busyPct: float; cores: int): int =
   clamp(int(headroom * 0.45 / 100.0 * float(cores)), 2, max(2, cores div 2))
 
 proc scratchDir(name: string): string =
-  # Short on purpose: a Unix-domain socket path is capped at ~104 bytes.
+  # Short on purpose. Nim's `Sockaddr_un_path_length` is 92 on macOS, and
+  # `toSockAddr` refuses `path.len >= 92`, so 91 characters is the whole
+  # budget -- NOT the ~104 this used to say, which is the raw BSD
+  # `sun_path` size and 12 bytes more than Nim will actually accept.
+  # A plain macOS `TMPDIR` is 49 characters on its own; inside `nix
+  # develop` it is 21, which is why an over-long fixture passes in the
+  # sanctioned shell and in CI and fails nowhere anyone looks.
   result = getTempDir() / ("rq-m11-" & $getCurrentProcessId() & "-" & name)
   removeDir(result)
   # 0700, not whatever the umask leaves: `runquotad` and every client refuse a

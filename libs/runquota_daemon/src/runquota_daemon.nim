@@ -151,7 +151,27 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
     # else that two machines can share (M10, OS-6).
     let identity = resolveHostIdentity(effectiveConfig.hostIdentityFilePath)
     result.observationHostId = identity.hostId
-    if result.observationStore.ensureHostRow(identity.hostId,
+    if not identity.persisted:
+      # OS-6. AN IDENTITY THAT CANNOT BE PERSISTED IS A REFUSAL. The daemon
+      # says which path and why, and records nothing; `resolveHostIdentity`
+      # has already declined to invent an id, so `observationHostId` is
+      # empty and `observationCaptureEnabled` is false for the process's
+      # whole life.
+      #
+      # CAPTURE OFF RATHER THAN REFUSING TO START, and the reason is what
+      # RunQuota is FOR. Admission is the mission: a daemon that cannot
+      # record history can still keep a machine from thrashing itself to
+      # death, and refusing to admit anything because a statistics
+      # directory is missing would let an advisory subsystem take out the
+      # host's whole build capacity. It is also the response OS-4 already
+      # gives to the neighbouring failure -- a store that will not open
+      # degrades to no capture and the daemon carries on -- and two
+      # different answers to two indistinguishable operator-visible
+      # failures would be the surprising design, not this one.
+      result.observationIdentityReport =
+        "runquota observation store " & result.observationStore.path &
+          ": capture disabled, no host identity; " & identity.report
+    elif result.observationStore.ensureHostRow(identity.hostId,
         result.observationBootId):
       # The disk that matters to a build's duration is the one the work
       # happens on, and the store lives beside it.

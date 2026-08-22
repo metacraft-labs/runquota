@@ -32,8 +32,17 @@ import runquota_observation_store
 import runquota_protocol
 
 proc scratchDir(name: string): string =
-  # Short on purpose: a Unix-domain socket path is capped at ~104 bytes.
-  result = getTempDir() / ("rq-m13ce-" & name & "-" & $getCurrentProcessId())
+  # SHORT ON PURPOSE, and the arithmetic is the reason rather than taste.
+  # Nim's `Sockaddr_un_path_length` is 92 on macOS and `toSockAddr` refuses
+  # `path.len >= 92`, so 91 characters is the whole budget -- NOT the ~104
+  # this used to say, which is the raw BSD `sun_path` size and 12 bytes
+  # more than Nim will actually accept. A plain macOS `TMPDIR` is 49
+  # characters before anything is appended; inside `nix develop` it is 21.
+  # That gap is why a fixture can be over budget and still be green in the
+  # sanctioned shell and in CI, which is exactly what happened here.
+  #
+  #   49 (TMPDIR) + 13 (this dir) + 3 (/ep) + 15 (/runquotad.sock) = 80
+  result = getTempDir() / ("rq" & $getCurrentProcessId() & name)
   removeDir(result)
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
@@ -208,7 +217,7 @@ suite "scope_boundary_enforcement_daemon_start":
   test "a real daemon REFUSES a pre-created world-writable endpoint directory":
     let root = scratchDir("wide")
     defer: removeDir(root)
-    let dir = root / "endpoint"
+    let dir = root / "ep"
     createDir(dir)
     setFilePermissions(dir, {
       fpUserRead, fpUserWrite, fpUserExec,
@@ -252,7 +261,7 @@ suite "scope_boundary_enforcement_daemon_start":
     # would satisfy both refusals above.
     let root = scratchDir("good")
     defer: removeDir(root)
-    let dir = root / "endpoint"
+    let dir = root / "ep"
     let socketPath = dir / "runquotad.sock"
     let dbPath = root / "observations.sqlite"
     let identityFile = root / "host-id"
@@ -271,7 +280,7 @@ suite "scope_boundary_enforcement_owner_uid":
   test "a client declaring somebody else's uid is REFUSED, and one declaring its own is not":
     let root = scratchDir("owner")
     defer: removeDir(root)
-    let dir = root / "endpoint"
+    let dir = root / "ep"
     let socketPath = dir / "runquotad.sock"
     let dbPath = root / "observations.sqlite"
     let identityFile = root / "host-id"
@@ -302,7 +311,7 @@ suite "scope_boundary_enforcement_owner_uid":
   test "owner_uid on an execution comes from peer credentials":
     let root = scratchDir("exec")
     defer: removeDir(root)
-    let dir = root / "endpoint"
+    let dir = root / "ep"
     let socketPath = dir / "runquotad.sock"
     let dbPath = root / "observations.sqlite"
     let identityFile = root / "host-id"

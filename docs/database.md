@@ -86,7 +86,11 @@ machine. Only macOS/arm64 has ever sampled; the Linux branch is written from
 Host identity and the hardware dimension are live. The machine's `host_id` is
 128 random bits kept in a **host-wide, daemon-owned** state file
 (`--host-identity-file PATH`, defaulting to `/var/db/runquota/host-id` on macOS
-and `/var/lib/runquota/host-id` elsewhere). `runquotad` is one daemon per host,
+and `/var/lib/runquota/host-id` elsewhere).
+**That directory must already exist**: see "Provisioning the host-wide state
+directory" below. The daemon never creates it, and where it is missing capture
+is off.
+`runquotad` is one daemon per host,
 so the file that names the machine has to be as host-wide as the daemon that
 owns it: a per-user file — which is what this was before, under
 `XDG_STATE_HOME` — makes one machine present as several, and that is the
@@ -122,6 +126,67 @@ attributed to another user — and a Hello whose declared uid disagrees with the
 peer credentials is refused rather than corrected. It is `NULL`, not `0`, where
 the transport cannot report credentials: `0` is root, and a wrong owner is
 worse than an absent one.
+
+## Provisioning the host-wide state directory
+
+`runquotad` keeps this machine's `host_id` in a directory that **the install
+step creates and the daemon never does**:
+
+| Platform | Directory | Owner | Mode |
+|----------|-----------|-------|------|
+| macOS | `/var/db/runquota` | the account `runquotad` runs as | `0755` |
+| Linux | `/var/lib/runquota` | the account `runquotad` runs as | `0755` |
+| Windows | `C:\ProgramData\runquota` | the account `runquotad` runs as | — |
+
+The paths are also written down once, machine-readably, in `nix/host-state.nix`,
+and `tests/integration/t_host_identity_refusal.nim` asserts that file agrees
+with `hostWideStateDir` in the daemon's source.
+
+**On a host where the directory is missing, capture is off.** The daemon still
+starts and still serves leases — admission is the mission, and an advisory
+subsystem must not take out a machine's build capacity — but it prints the path
+and the reason on stdout and records nothing. It does **not** mint an identity
+for the current process: an id nothing wrote down would be a different machine
+on every invocation, no two rows would ever pool, and the aggregates would still
+carry a hardware dimension, so nothing would look wrong. That failure has no
+symptom at the point of use, which is why it is a refusal.
+
+### Under Nix
+
+The flake ships the install step:
+
+- `nixosModules.runquotad` — a systemd unit plus `StateDirectory=runquota` and a
+  `systemd.tmpfiles` rule, so `/var/lib/runquota` exists with the right owner
+  and mode from activation onwards.
+- `darwinModules.runquotad` — a launchd daemon plus an activation script that
+  `install -d`s `/var/db/runquota`.
+
+```nix
+{
+  imports = [ runquota.nixosModules.runquotad ];   # or darwinModules
+  services.runquotad.enable = true;
+}
+```
+
+### By hand
+
+On a host not managed by Nix, run once, as the account `runquotad` will run as
+(`$(id -u)` below is that account's uid — run this while logged in as it):
+
+```sh
+# macOS
+sudo mkdir -p /var/db/runquota && sudo chown "$(id -u)" /var/db/runquota && sudo chmod 0755 /var/db/runquota
+
+# Linux
+sudo mkdir -p /var/lib/runquota && sudo chown "$(id -u)" /var/lib/runquota && sudo chmod 0755 /var/lib/runquota
+```
+
+The daemon's own refusal message prints this command with the uid already
+filled in, so an operator who hits it does not have to come back here.
+
+`--host-identity-file PATH` overrides the location for a test or an unusual
+host. It does not change the rule: the directory containing `PATH` must exist
+before the daemon starts.
 
 ## State-boundary requirements
 

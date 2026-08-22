@@ -405,6 +405,10 @@ suite "observation_store_host_profile":
     let dir = scratchDir("identity")
     defer: removeDir(dir)
 
+    # Each simulated machine gets a PROVISIONED state directory, because
+    # that is now the precondition: `resolveHostIdentity` mints into a
+    # directory the install step made and never creates one itself.
+    createDir(dir / "machine-a")
     let first = resolveHostIdentity(dir / "machine-a" / "host-id")
     check first.persisted
     check first.hostId.len > 0
@@ -428,6 +432,7 @@ suite "observation_store_host_profile":
     # of those.
     var minted: seq[string] = @[]
     for i in 0 ..< 64:
+      createDir(dir / ("machine-" & $i))
       let identity = resolveHostIdentity(dir / ("machine-" & $i) / "host-id")
       check identity.persisted
       check isOpaqueId(identity.hostId, "host-")
@@ -453,16 +458,24 @@ suite "observation_store_host_profile":
           check candidate notin id
 
   test "an identity that cannot be persisted is reported, not invented":
+    ## THE TWO `hostId.len == 0` ASSERTIONS BELOW WERE INVERTED IN M13c-fix.
+    ## They previously read `check isOpaqueId(<x>.hostId, "host-")` -- that
+    ## is, they asserted the defect: an id minted for this process and
+    ## nothing else. The test's own name says what it should have asserted.
+    ## The rule is now normative in
+    ## `reprobuild-specs/RunQuota-Observation-Store.md` §"The Execution
+    ## Spine": an identity that cannot be persisted is a REFUSAL.
     let dir = scratchDir("nopersist")
     defer: removeDir(dir)
 
-    # A file where a directory would have to be: `createDir` fails, and
-    # OS-4 says the daemon carries on.
+    # A file where a directory would have to be. The state directory is
+    # provisioned by installation and never created here, so this is a
+    # refusal; OS-4 says the daemon carries on serving leases regardless.
     let blocker = dir / "blocked"
     writeFile(blocker, "not a directory\n")
     let identity = resolveHostIdentity(blocker / "runquota" / "host-id")
     check not identity.persisted
-    check isOpaqueId(identity.hostId, "host-")
+    check identity.hostId.len == 0
     check "cannot persist" in identity.report
     check readFile(blocker) == "not a directory\n"
 
@@ -472,7 +485,7 @@ suite "observation_store_host_profile":
     writeFile(foreign, "important\n")
     let second = resolveHostIdentity(foreign)
     check not second.persisted
-    check isOpaqueId(second.hostId, "host-")
+    check second.hostId.len == 0
     check readFile(foreign) == "important\n"
     check "left alone" in second.report
 
