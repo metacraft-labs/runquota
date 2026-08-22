@@ -740,6 +740,21 @@ proc handleHello(daemon: var RunQuotaDaemon; connection: var LocalConnection;
   if not compatibility.compatible:
     connection.sendError(frame.header.requestId, compatibility.diagnostic)
     return false
+  # A CLIENT MAY NOT NAME AN OWNER OTHER THAN ITSELF. The daemon is
+  # host-wide, so `hello.userId` -- which the client writes -- would
+  # otherwise be a way to attribute one user's executions, estimates and
+  # reports to another. Peer credentials are the only acceptable source,
+  # and where the kernel supplies them a Hello that disagrees is refused
+  # rather than corrected: a client that declares somebody else's uid is
+  # either broken or lying, and neither is a connection to keep serving.
+  let peer = connection.peerIdentity()
+  if peer.kind != peerIdentityUnavailable and hello.userId != peer.userId:
+    connection.sendError(frame.header.requestId, diagnostic(diagDenied,
+      "client declared uid " & $hello.userId &
+        " but its peer credentials say uid " & $peer.userId,
+      "owner_uid is recorded from peer credentials and MUST NOT be " &
+        "declared by the client"))
+    return false
   let platformName =
     when defined(macosx): "macos"
     elif defined(linux): "linux"
@@ -770,7 +785,7 @@ proc handleHello(daemon: var RunQuotaDaemon; connection: var LocalConnection;
   connection.sendResponse(rqHelloOk, frame.header.requestId, encodeHelloOk(helloOk))
   context.supervisorProcessId = hello.processId
   context.supervisorUserId = hello.userId
-  context.peer = connection.peerIdentity()
+  context.peer = peer
   true
 
 proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
@@ -942,7 +957,21 @@ proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
     ioReadBytes: none(int64),
     ioWriteBytes: none(int64),
     captureCompleteness: ccComplete,
-    droppedObservations: 0
+    droppedObservations: 0,
+    # FROM PEER CREDENTIALS, never from the client. `lease.peer` was filled
+    # in by `getpeereid`/`SO_PEERCRED` on the accepted connection;
+    # `supervisorUserId` beside it is whatever the client put in its Hello
+    # and is NOT usable here. One host-wide daemon holds every user's rows,
+    # so a client-declared owner would let any participant write rows
+    # attributed to another user -- the exact failure the per-user boundary
+    # exists to prevent.
+    #
+    # NULL, not 0, when the transport cannot report credentials: 0 is root.
+    ownerUid:
+      if lease.peer.kind == peerIdentityUnavailable:
+        none(int64)
+      else:
+        some(int64(lease.peer.userId))
   ))
 
 proc grantQueuedLease(daemon: var RunQuotaDaemon; id: uint64; delivered: bool) =
@@ -1489,11 +1518,41 @@ proc connectionWorker() {.thread, gcsafe.} =
       break
     handleSharedConnection(accepted)
 
+const endpointRefusedExitCode* = 3
+  ## `serve` returns this when the rendezvous directory is not trustworthy.
+  ## Distinct from a usage error (2) so a supervisor can tell "you asked for
+  ## something impossible" from "the path you asked for belongs to someone
+  ## else".
+
 proc serve*(config: DaemonConfig): int =
+  # THE RENDEZVOUS PATH IS CHECKED BEFORE ANYTHING ELSE STARTS. A daemon
+  # that has already opened its observation store, minted a boot id and
+  # spawned its writer thread has done work on behalf of a directory it is
+  # about to refuse. `bindEndpoint` verifies again after creating the
+  # directory; this one is about not getting that far.
+  let refusal = endpointDirectoryRefusal(config.endpoint)
+  if refusal.len > 0:
+    echo refusal
+    flushFile(stdout)
+    return endpointRefusedExitCode
   initLock(sharedDaemon.lock)
   initConnectionQueue()
   sharedDaemon.daemon = initDaemon(config)
-  var listener = bindEndpoint(config.endpoint)
+  var listener: LocalListener
+  try:
+    listener = bindEndpoint(config.endpoint)
+  except EndpointTrustError as error:
+    # Only reachable if the directory changed underneath the pre-check
+    # above. Still a refusal rather than a fallback, and the background
+    # threads `initDaemon` started are stopped rather than stranded.
+    echo error.msg
+    flushFile(stdout)
+    stopEstimateStore(sharedDaemon.daemon.estimateStore)
+    stopAmbientSampler()
+    stopObservationWriter()
+    deinitLock(sharedDaemon.lock)
+    deinitConnectionQueue()
+    return endpointRefusedExitCode
   sharedDaemon.daemon.state = dsServing
   echo "runquotad listening " & config.endpoint.path
   if config.observationDbPath.len > 0:

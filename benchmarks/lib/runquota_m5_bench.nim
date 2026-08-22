@@ -149,7 +149,10 @@ proc req(label: string): ResourceRequest =
 proc prepareDir(path: string) =
   if dirExists(path):
     removeDir(path)
+  # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
+  # rendezvous directory whose mode or owner they cannot vouch for.
   createDir(path)
+  setFilePermissions(path, {fpUserRead, fpUserWrite, fpUserExec})
 
 proc checkCwdEnvRecord(path, expectedEnv: string) =
   let recordPath = path / FixtureRecord
@@ -206,7 +209,10 @@ proc runProcessSuite(quick: bool): seq[BenchMetric] =
   let socketPath = socketDir / "runquotad.sock"
   if dirExists(socketDir):
     removeDir(socketDir)
+  # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
+  # rendezvous directory whose mode or owner they cannot vouch for.
   createDir(socketDir)
+  setFilePermissions(socketDir, {fpUserRead, fpUserWrite, fpUserExec})
   var daemon = startDaemon(socketPath)
   try:
     result.addBackend("process-execution")
@@ -352,7 +358,10 @@ proc runIpcSuite(quick: bool): seq[BenchMetric] =
   let socketPath = socketDir / "runquotad.sock"
   if dirExists(socketDir):
     removeDir(socketDir)
+  # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
+  # rendezvous directory whose mode or owner they cannot vouch for.
   createDir(socketDir)
+  setFilePermissions(socketDir, {fpUserRead, fpUserWrite, fpUserExec})
   var daemon = startDaemon(socketPath)
   try:
     result.addBackend("ipc-latency")

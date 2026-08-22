@@ -14,7 +14,12 @@
 - `libs/` contains importable Nim libraries. Static helper libraries are listed
   in `libs/static_helpers.txt`.
 - `apps/runquota/` is the CLI.
-- `apps/runquotad/` is the per-user lease authority daemon.
+- `apps/runquotad/` is the host-wide lease authority daemon: ONE PER HOST,
+  serving every user. Bounding load on a machine requires a single authority
+  over that machine's resources, and per-user daemons would each admit against
+  their own view of a budget they in fact share. Everything scope-related
+  follows from this — the rendezvous directory is verified rather than assumed,
+  `host_id` is host-wide state, and `owner_uid` comes from peer credentials.
 - `tests/` contains repository-level tests.
 - `benchmarks/` contains repeatable benchmark suites.
 

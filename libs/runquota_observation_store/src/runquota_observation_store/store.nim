@@ -238,7 +238,7 @@ const
     "termination", "attempt", "retry_of", "peak_rss_bytes",
     "cpu_user_millis", "cpu_sys_millis", "max_processes",
     "major_page_faults", "io_read_bytes", "io_write_bytes",
-    "capture_completeness", "dropped_observations"]
+    "capture_completeness", "dropped_observations", "owner_uid"]
 
   ambientColumns = [
     "host_id", "sampled_at_unix_millis", "cpu_busy_pct",
@@ -289,7 +289,8 @@ proc executionValues(row: ExecutionRow): seq[string] =
     encodeOptInt(row.cpuUserMillis), encodeOptInt(row.cpuSysMillis),
     encodeInt(row.maxProcesses), encodeInt(row.majorPageFaults),
     encodeOptInt(row.ioReadBytes), encodeOptInt(row.ioWriteBytes),
-    encodeText($row.captureCompleteness), encodeInt(row.droppedObservations)]
+    encodeText($row.captureCompleteness), encodeInt(row.droppedObservations),
+    encodeOptInt(row.ownerUid)]
 
 proc ambientValues(row: AmbientSampleRow): seq[string] =
   @[encodeText(row.hostId), encodeInt(row.sampledAtUnixMillis),
@@ -491,7 +492,7 @@ proc readExecutions*(store: ObservationStore): seq[ExecutionRow] =
     selectInt("cpu_sys_millis"), selectInt("max_processes"),
     selectInt("major_page_faults"), selectInt("io_read_bytes"),
     selectInt("io_write_bytes"), selectText("capture_completeness"),
-    selectInt("dropped_observations")
+    selectInt("dropped_observations"), selectInt("owner_uid")
   ].join(" || '|' || ") & " from executions order by host_id, execution_id;"
   for row in store.query(sql):
     result.add(ExecutionRow(
@@ -516,7 +517,8 @@ proc readExecutions*(store: ObservationStore): seq[ExecutionRow] =
       ioReadBytes: decodeOptInt(row[18]),
       ioWriteBytes: decodeOptInt(row[19]),
       captureCompleteness: parseEnum[CaptureCompleteness](decodeText(row[20])),
-      droppedObservations: parseBiggestInt(row[21])))
+      droppedObservations: parseBiggestInt(row[21]),
+      ownerUid: decodeOptInt(row[22])))
 
 proc readAmbientSamples*(store: ObservationStore): seq[AmbientSampleRow] =
   let sql = "select " & [

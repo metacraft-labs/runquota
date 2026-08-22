@@ -161,7 +161,10 @@ suite "integration_runquota_memory_pressure_gate":
     let estimateDb = socketDir / "estimates.sqlite"
     if dirExists(socketDir):
       removeDir(socketDir)
+    # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
+    # rendezvous directory whose mode or owner they cannot vouch for.
     createDir(socketDir)
+    setFilePermissions(socketDir, {fpUserRead, fpUserWrite, fpUserExec})
     writePressure(pressurePath, "low")
     check fileExists(daemonPath())
 

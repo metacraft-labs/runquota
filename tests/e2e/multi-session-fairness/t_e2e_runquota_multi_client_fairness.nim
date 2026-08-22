@@ -145,7 +145,10 @@ suite "e2e_runquota_multi_client_fairness":
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeDir(socketDir)
+    # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
+    # rendezvous directory whose mode or owner they cannot vouch for.
     createDir(socketDir)
+    setFilePermissions(socketDir, {fpUserRead, fpUserWrite, fpUserExec})
     check fileExists(daemonPath())
     check fileExists(cliPath())
 
@@ -277,7 +280,10 @@ suite "e2e_runquota_multi_client_fairness":
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeDir(socketDir)
+    # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
+    # rendezvous directory whose mode or owner they cannot vouch for.
     createDir(socketDir)
+    setFilePermissions(socketDir, {fpUserRead, fpUserWrite, fpUserExec})
     check fileExists(daemonPath())
     check fileExists(cliPath())
 
@@ -383,7 +389,10 @@ suite "e2e_runquota_multi_client_fairness":
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeDir(socketDir)
+    # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
+    # rendezvous directory whose mode or owner they cannot vouch for.
     createDir(socketDir)
+    setFilePermissions(socketDir, {fpUserRead, fpUserWrite, fpUserExec})
     check fileExists(daemonPath())
     check fileExists(cliPath())
     var cliBenchmark: Process
@@ -509,7 +518,10 @@ suite "e2e_runquota_multi_client_fairness":
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeDir(socketDir)
+    # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
+    # rendezvous directory whose mode or owner they cannot vouch for.
     createDir(socketDir)
+    setFilePermissions(socketDir, {fpUserRead, fpUserWrite, fpUserExec})
     check fileExists(daemonPath())
     check fileExists(cliPath())
 
@@ -604,7 +616,10 @@ suite "e2e_runquota_multi_client_fairness":
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeDir(socketDir)
+    # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
+    # rendezvous directory whose mode or owner they cannot vouch for.
     createDir(socketDir)
+    setFilePermissions(socketDir, {fpUserRead, fpUserWrite, fpUserExec})
     check fileExists(daemonPath())
 
     let process = startProcess(

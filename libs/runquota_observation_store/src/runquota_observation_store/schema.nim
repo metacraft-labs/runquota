@@ -11,7 +11,7 @@
 ## registered in ``extension_registry`` (M12).
 
 const
-  spineSchemaVersion* = 3'i64
+  spineSchemaVersion* = 4'i64
     ## The schema version this build understands. A database whose
     ## ``user_version`` exceeds it is REFUSED, never degraded (see
     ## ``openObservationStore``).
@@ -156,7 +156,27 @@ create unique index host_profiles_current
   on host_profiles(host_id) where valid_to_unix_millis is null;
 """
 
-  migrations* = [migrationV1, migrationV2, migrationV3]
+  # Version 4 adds the owner of an execution. One host-wide daemon means
+  # one store holding every user's executions, so a row has to say whose
+  # it is -- otherwise a uid-scoped query cannot be written at all and
+  # "queries are scoped to the calling uid by default" is unimplementable.
+  #
+  # NULLABLE ON PURPOSE, twice over. Rows written before this column
+  # existed have no owner to backfill, and inventing one would attribute
+  # somebody's history to whoever happens to be reading. And a transport
+  # that cannot report peer credentials (Windows named pipes today) must
+  # write NULL rather than 0, because 0 is root and a wrong owner is worse
+  # than an absent one.
+  #
+  # The value comes from the peer credentials of the connection, never
+  # from anything the client declares: a client-declared owner would let
+  # any participant write rows attributed to another user, which is the
+  # failure the per-user boundary exists to prevent.
+  migrationV4 = """
+alter table executions add column owner_uid integer;
+"""
+
+  migrations* = [migrationV1, migrationV2, migrationV3, migrationV4]
     ## Index ``i`` migrates ``user_version`` ``i`` to ``i + 1``.
 
 static:

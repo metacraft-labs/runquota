@@ -324,7 +324,10 @@ proc scratchDir(name: string): string =
   # Short on purpose: a Unix-domain socket path is capped at ~104 bytes.
   result = getTempDir() / ("rq-m11-" & $getCurrentProcessId() & "-" & name)
   removeDir(result)
+  # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
+  # rendezvous directory whose mode or owner they cannot vouch for.
   createDir(result)
+  setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
 
 proc openSampledStore(dir: string; cadenceMillis: int):
     tuple[store: ObservationStore; hostId: string] =

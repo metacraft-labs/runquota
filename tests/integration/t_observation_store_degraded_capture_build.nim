@@ -22,7 +22,10 @@ proc scratchDir(name: string): string =
   # its endpoint.
   result = getTempDir() / ("rq-obs-" & $getCurrentProcessId() & "-" & name)
   removeDir(result)
+  # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
+  # rendezvous directory whose mode or owner they cannot vouch for.
   createDir(result)
+  setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
 
 proc daemonPath(): string =
   getCurrentDir() / "build" / "bin" / "runquotad"

@@ -93,7 +93,10 @@ proc req(label: string): ResourceRequest =
 proc prepareDir(path: string) =
   if dirExists(path):
     removeDir(path)
+  # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
+  # rendezvous directory whose mode or owner they cannot vouch for.
   createDir(path)
+  setFilePermissions(path, {fpUserRead, fpUserWrite, fpUserExec})
 
 proc checkCwdEnvRecord(path, expectedEnv: string) =
   let recordPath = path / FixtureRecord
@@ -338,7 +341,10 @@ suite "m5_process_exec_bench_contract":
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeDir(socketDir)
+    # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
+    # rendezvous directory whose mode or owner they cannot vouch for.
     createDir(socketDir)
+    setFilePermissions(socketDir, {fpUserRead, fpUserWrite, fpUserExec})
     check fileExists(daemonPath())
     check fileExists(cliPath())
 

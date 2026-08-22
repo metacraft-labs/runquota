@@ -130,6 +130,11 @@ type
     ioWriteBytes*: Option[int64]
     captureCompleteness*: CaptureCompleteness
     droppedObservations*: int64
+    ownerUid*: Option[int64]
+      ## The uid whose lease this execution ran under, taken by the daemon
+      ## from the connection's peer credentials and NEVER from anything the
+      ## client declares. ``none`` means the transport could not report
+      ## them; it does not mean root.
 
   AmbientSampleRow* = object
     hostId*: string

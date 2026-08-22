@@ -197,8 +197,15 @@ suite "inherited_fd_isolation":
       # A RunQuotaSession keeps its daemon connection open across the fork+exec
       # of the leased command, so this socket is the single most likely thing
       # to leak into a monitored action tree.
-      let socketPath = getTempDir() / "runquota-fd-isolation.sock"
-      removeFile(socketPath)
+      # A directory of its own rather than `getTempDir()` itself. On Linux
+      # that is a world-writable `/tmp` owned by root, and `bindEndpoint`
+      # refuses a rendezvous directory it cannot vouch for -- correctly, so
+      # the fixture has to be one it can. `bindEndpoint` creates it 0700.
+      let socketDir = getTempDir() / ("rq-fd-isolation-" &
+        $getCurrentProcessId())
+      removeDir(socketDir)
+      let socketPath = socketDir / "runquota-fd-isolation.sock"
+      defer: removeDir(socketDir)
       var listener = bindEndpoint(unixEndpoint(socketPath))
       check isCloseOnExec(cint(listener.socket.getFd()))
       var client = connectEndpoint(unixEndpoint(socketPath))

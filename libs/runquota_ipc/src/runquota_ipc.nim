@@ -161,11 +161,238 @@ proc endpointForPath*(path: string): Endpoint =
   else:
     unixEndpoint(path)
 
+# ---------------------------------------------------------------------------
+# The rendezvous path, and the trust that has to be verified rather than
+# assumed.
+#
+# Normative specification:
+# ``reprobuild-specs/RunQuota-Shared-Memory-Transport.md`` §"Trust and the
+# privilege boundary", §"Mechanism".
+#
+# ``runquotad`` is ONE DAEMON PER HOST, not one per user: bounding load on a
+# machine requires a single authority over that machine's resources, and
+# per-user daemons would each admit against their own view of a budget they
+# in fact share. Everything below follows from that.
+#
+# The attack this defends against is on the PATH, not on the connection.
+# ``<tmp>/runquota-$UID`` is a predictable name, and where
+# ``XDG_RUNTIME_DIR`` is absent -- bare Linux, containers, any session
+# without ``pam_systemd`` -- its parent is a world-writable ``/tmp``. Another
+# user can create that directory BEFORE the daemon starts and thereby own the
+# rendezvous point. Checking the credentials of whoever connects
+# (``peerIdentity`` below, and it is still required) cannot detect this,
+# because by then the socket is already sitting in a directory somebody else
+# controls.
+#
+# Relying on ``umask`` is equally insufficient, and worse because it is
+# quiet: ``createDir`` with no mode asks for ``0o777`` and gets whatever the
+# umask leaves, typically ``0755``, and the happy path works either way. So
+# the mode is explicit on creation AND verified on every daemon start and
+# every client attach, and wrong ownership or mode is a refusal rather than a
+# fallback.
+# ---------------------------------------------------------------------------
+
+type
+  PathTrustReason* = enum
+    ## Why a rendezvous path was accepted or refused.
+    ##
+    ## The reason is part of the API rather than only part of the message:
+    ## "was refused" and "was refused FOR THE RIGHT REASON" are different
+    ## assertions, and a caller that can only see a message cannot tell an
+    ## ownership check that fired from one that was skipped while the mode
+    ## check happened to refuse the same path anyway.
+    trustOk
+    trustMissing
+      ## Nothing at that path. Not an error by itself: the daemon is about
+      ## to create it, and a client gets a plain connect failure.
+    trustUnreadable
+    trustWrongType
+      ## Checked with ``lstat``, so a symlink planted at the rendezvous
+      ## path lands here rather than being followed to a target whose mode
+      ## says nothing about the link.
+    trustForeignOwner
+    trustBadMode
+
+  PathTrust* = object
+    reason*: PathTrustReason
+    path*: string
+    mode*: int
+      ## The mode found on disk, or -1 when it could not be read.
+    ownerUid*: int64
+      ## The owning uid found on disk, or -1 when it could not be read.
+    message*: string
+      ## Empty exactly when ``reason`` is ``trustOk``. Always names the
+      ## offending path, and names the mode whenever one was read.
+
+  EndpointTrustError* = object of OSError
+    ## Raised instead of falling back. A rendezvous directory that fails
+    ## these checks is not a degraded mode to carry on in.
+
+  SegmentScope* = enum
+    ## THE PER-USER RULE IS NOT UNIFORM, and code that assumes it is will
+    ## break the design rather than enforce it.
+    ##
+    ## The budget and the observation ring are written by clients, so they
+    ## are one per user and ``0600``. The aggregate stats table is written
+    ## only by ``runquotad`` and read by every client: a page no client can
+    ## write cannot be used by one user to perturb another, so it needs no
+    ## isolation at all, and every client MUST be able to read it or the
+    ## zero-IPC estimate becomes one account's privilege. Group-readable
+    ## rather than world-readable because the keys are opaque but the table
+    ## still exposes the shape of another user's work.
+    ##
+    ## Applying ``0600`` uniformly here would make the host-wide table
+    ## unreadable by every user but one.
+    segmentPerUser
+    segmentHostWide
+
+const
+  endpointDirectoryMode* = 0o700
+    ## The rendezvous directory: ``0700`` and owned by the user, per
+    ## §"Mechanism".
+  perUserSegmentMode* = 0o600
+    ## Budget and observation-ring segments.
+  hostWideSegmentMode* = 0o640
+    ## The aggregate stats table: daemon-written, group-readable, and
+    ## deliberately NOT ``0600``.
+
+proc requiredSegmentMode*(scope: SegmentScope): int =
+  ## The mode a segment of ``scope`` must be created with and verified at.
+  ## Segment files themselves arrive with the shared-memory transport; this
+  ## is the rule they adopt, kept beside the directory rule because the two
+  ## are the same requirement applied to different objects.
+  case scope
+  of segmentPerUser: perUserSegmentMode
+  of segmentHostWide: hostWideSegmentMode
+
+proc segmentIsGroupReadable*(scope: SegmentScope): bool =
+  (requiredSegmentMode(scope) and 0o040) != 0
+
+proc modeText*(mode: int): string =
+  if mode < 0: "unknown" else: toOct(mode, 4)
+
+when defined(posix):
+  proc inspectPath(path: string; wantDirectory: bool; requiredMode: int;
+                   expectedOwnerUid: int64; label: string): PathTrust =
+    ## The single implementation of "is this path trustworthy", shared by
+    ## the rendezvous directory and by segment files.
+    ##
+    ## CHECK ORDER IS LOAD-BEARING. Ownership is checked before mode, so a
+    ## directory owned by another user is reported as an ownership problem
+    ## even when its mode is also wrong. Were the mode checked first, a
+    ## build with the ownership check removed would still refuse most
+    ## foreign directories -- for the wrong reason -- and the ownership
+    ## check would be untestable.
+    result = PathTrust(reason: trustOk, path: path, mode: -1, ownerUid: -1,
+                       message: "")
+    if path.len == 0:
+      result.reason = trustMissing
+      result.message = "runquota " & label & ": no path was given"
+      return
+    var info: Stat
+    # `lstat`, not `stat`: following a symlink would check the mode of
+    # whatever it points at while the daemon binds through the link.
+    if lstat(path.cstring, info) != 0:
+      let code = errno
+      if code == ENOENT or code == ENOTDIR:
+        result.reason = trustMissing
+        result.message = "runquota " & label & " " & path & ": does not exist"
+      else:
+        result.reason = trustUnreadable
+        result.message = "runquota " & label & " " & path &
+          ": cannot be inspected (errno " & $code & ")"
+      return
+    result.mode = int(info.st_mode) and 0o7777
+    result.ownerUid = int64(info.st_uid)
+    let isDirectory = S_ISDIR(info.st_mode)
+    let isRegular = S_ISREG(info.st_mode)
+    if (wantDirectory and not isDirectory) or
+        ((not wantDirectory) and not isRegular):
+      result.reason = trustWrongType
+      result.message = "runquota " & label & " " & path & ": mode " &
+        modeText(result.mode) & " is not a " &
+        (if wantDirectory: "directory" else: "regular file") &
+        "; refusing to use it as a rendezvous path"
+      return
+    if result.ownerUid != expectedOwnerUid:
+      result.reason = trustForeignOwner
+      result.message = "runquota " & label & " " & path &
+        ": refusing a path owned by uid " & $result.ownerUid &
+        " with mode " & modeText(result.mode) &
+        "; this process runs as uid " & $expectedOwnerUid &
+        ", and a rendezvous point another user owns is a rendezvous point " &
+        "another user controls"
+      return
+    if result.mode != requiredMode:
+      let writable = (result.mode and 0o022) != 0
+      result.reason = trustBadMode
+      result.message = "runquota " & label & " " & path &
+        ": refusing mode " & modeText(result.mode) & ", required " &
+        modeText(requiredMode) &
+        (if writable:
+          "; it is group- or world-writable, so another user can replace " &
+            "what lives there"
+        else:
+          "; the mode was not verified as created and MUST NOT be assumed")
+      return
+
+proc endpointDirectoryTrust*(endpoint: Endpoint): PathTrust =
+  ## Whether the directory the endpoint's socket lives in may be used.
+  ## ``trustMissing`` is reported rather than refused: the daemon is about
+  ## to create it with an explicit mode, and a client gets an ordinary
+  ## connect failure.
+  case endpoint.kind
+  of endpointUnixSocket:
+    when defined(posix):
+      inspectPath(parentDir(endpoint.path), wantDirectory = true,
+        requiredMode = endpointDirectoryMode,
+        expectedOwnerUid = int64(getuid()),
+        label = "endpoint directory")
+    else:
+      PathTrust(reason: trustOk, path: "", mode: -1, ownerUid: -1, message: "")
+  of endpointNamedPipe, endpointUnsupported:
+    # Windows: named pipes live in the kernel object namespace, so there is
+    # no directory to own and no mode to widen.
+    PathTrust(reason: trustOk, path: "", mode: -1, ownerUid: -1, message: "")
+
+proc segmentTrust*(path: string; scope: SegmentScope;
+                   expectedOwnerUid = -1'i64): PathTrust =
+  ## Whether a shared-memory segment file may be mapped. Exposed now, and
+  ## deliberately not called from anywhere yet, so the segments the
+  ## shared-memory transport introduces adopt this rule instead of growing
+  ## a second one.
+  when defined(posix):
+    let owner =
+      if expectedOwnerUid >= 0: expectedOwnerUid else: int64(getuid())
+    inspectPath(path, wantDirectory = false,
+      requiredMode = requiredSegmentMode(scope),
+      expectedOwnerUid = owner,
+      label = "segment")
+  else:
+    PathTrust(reason: trustOk, path: path, mode: -1, ownerUid: -1, message: "")
+
+proc endpointDirectoryRefusal*(endpoint: Endpoint): string =
+  ## The refusal message, or the empty string when the directory is
+  ## trustworthy or simply not there yet.
+  let trust = endpointDirectoryTrust(endpoint)
+  if trust.reason in {trustOk, trustMissing}: "" else: trust.message
+
+proc requireTrustedEndpointDir*(endpoint: Endpoint) =
+  let refusal = endpointDirectoryRefusal(endpoint)
+  if refusal.len > 0:
+    raise newException(EndpointTrustError, refusal)
+
 proc defaultEndpoint*(): Endpoint =
   let overridePath = getEnv("RUNQUOTA_SOCKET")
   if overridePath.len > 0:
     return endpointForPath(overridePath)
   when defined(posix):
+    # `XDG_RUNTIME_DIR` is already a private per-user directory the session
+    # manager made; the fallbacks are not, and `<tmp>/runquota-$UID` on a
+    # shared `/tmp` is exactly the predictable name on a world-writable
+    # parent §"Mechanism" names. The fallback stays -- a session without
+    # `pam_systemd` still needs a socket -- but the directory it points at
+    # is created with an explicit mode and verified, never assumed.
     let base = getEnv("XDG_RUNTIME_DIR", getEnv("TMPDIR", getTempDir()))
     let dir = base / ("runquota-" & $getuid())
     unixEndpoint(dir / "runquotad.sock")
@@ -176,11 +403,48 @@ proc defaultEndpoint*(): Endpoint =
   else:
     Endpoint(kind: endpointUnsupported, path: "")
 
+when defined(posix):
+  proc createPrivateDirTree(path: string) =
+    ## Creates every missing component with an EXPLICIT ``0700``.
+    ##
+    ## ``mkdir(2)``'s mode argument is still masked by the umask, so a
+    ## component this call created is chmod'ed to exactly ``0700``
+    ## afterwards. A component that already existed is left alone and left
+    ## to the verification that follows: silently tightening a directory
+    ## somebody else made would turn the refusal this whole section is
+    ## about into a repair.
+    if path.len == 0 or path == "/":
+      return
+    var missing: seq[string] = @[]
+    var walk = path
+    while walk.len > 0 and walk != "/" and not dirExists(walk):
+      missing.add(walk)
+      let parent = parentDir(walk)
+      if parent == walk:
+        break
+      walk = parent
+    for i in countdown(missing.high, 0):
+      let component = missing[i]
+      if mkdir(component.cstring, Mode(endpointDirectoryMode)) != 0:
+        if errno != EEXIST:
+          raise newException(OSError,
+            "runquota endpoint directory " & component &
+              ": cannot create (errno " & $errno & ")")
+      else:
+        discard chmod(component.cstring, Mode(endpointDirectoryMode))
+
 proc ensureEndpointDir*(endpoint: Endpoint) =
+  ## Creates the rendezvous directory with an explicit ``0700`` and then
+  ## VERIFIES it. Both halves are required: creating it correctly says
+  ## nothing about a directory that was already there when we arrived.
   case endpoint.kind
   of endpointUnixSocket:
     if endpoint.path.len > 0:
-      createDir(parentDir(endpoint.path))
+      when defined(posix):
+        createPrivateDirTree(parentDir(endpoint.path))
+      else:
+        createDir(parentDir(endpoint.path))
+      requireTrustedEndpointDir(endpoint)
   of endpointNamedPipe, endpointUnsupported:
     # Windows: named pipes live in the kernel object namespace; no fs dir.
     discard
@@ -229,6 +493,11 @@ proc connectEndpoint*(endpoint: Endpoint): LocalConnection =
     when defined(windows):
       raise newException(OSError, "Unix-socket endpoints are not supported on Windows")
     else:
+      # EVERY CLIENT ATTACH, not only every daemon start. `getpeereid` below
+      # validates who CONNECTS; this validates the path they connect
+      # through, and a client that skipped it would happily hand its
+      # requests to a socket another user planted.
+      requireTrustedEndpointDir(endpoint)
       var socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE)
       # A session holds this socket open across `runWithLease`, i.e. across the
       # fork+exec of the leased command. Close-on-exec keeps the daemon

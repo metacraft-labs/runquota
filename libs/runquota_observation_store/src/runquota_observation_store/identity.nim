@@ -39,18 +39,42 @@ type
 
 const hostIdPrefix* = "host-"
 
+const
+  hostIdentityFileName = "host-id"
+  # HOST-WIDE AND DAEMON-OWNED, not per-user.
+  #
+  # `runquotad` is one daemon per host, so `host_id` identifies the MACHINE
+  # and its state file has to be as host-wide as the daemon that owns it.
+  # Minting it per user -- under `XDG_STATE_HOME`, as this did before --
+  # makes one machine present as several, and that defeats OS-6 in the
+  # direction hardest to notice: the aggregates still carry *a* hardware
+  # dimension, so nothing looks wrong, but the durations from one host are
+  # split across several identities and never pool. A CI box where a dozen
+  # accounts build the same tree -- the machine with the most history to
+  # pool -- is where it costs the most.
+  #
+  # Nothing per-user may appear in this path. `HOME`, `XDG_STATE_HOME` and
+  # `LOCALAPPDATA` all differ between two users on one machine, which is
+  # exactly the property that must not be here.
+  hostWideStateDir* =
+    when defined(windows):
+      r"C:\ProgramData\runquota"
+    elif defined(macosx):
+      "/var/db/runquota"
+    else:
+      "/var/lib/runquota"
+
 proc defaultHostIdentityFile*(): string =
-  ## Per-user, per-machine, outside any database directory. A store is a
-  ## file that gets copied, merged and thrown away; the machine's identity
-  ## must not travel with one.
-  when defined(windows):
-    let base = getEnv("LOCALAPPDATA")
-    let root = if base.len > 0: base else: getHomeDir()
-    root / "runquota" / "host-id"
-  else:
-    let xdg = getEnv("XDG_STATE_HOME")
-    let root = if xdg.len > 0: xdg else: getHomeDir() / ".local" / "state"
-    root / "runquota" / "host-id"
+  ## The machine's identity file. Host-wide, daemon-owned, and outside any
+  ## database directory: a store is a file that gets copied, merged and
+  ## thrown away, and the machine's identity must not travel with one.
+  ##
+  ## Deliberately reads no environment at all. An env-var override would
+  ## reintroduce, per user, precisely the divergence this constant exists
+  ## to remove; an operator who needs a different path passes one
+  ## explicitly (``--host-identity-file``), which is a decision the host
+  ## makes once rather than one each session inherits.
+  hostWideStateDir / hostIdentityFileName
 
 proc resolveHostIdentity*(path = ""): HostIdentity =
   ## Reads the machine's ``host_id``, minting and persisting one on first

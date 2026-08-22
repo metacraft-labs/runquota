@@ -84,8 +84,14 @@ machine. Only macOS/arm64 has ever sampled; the Linux branch is written from
 `/proc` and has never executed, and every other platform reports unavailable.
 
 Host identity and the hardware dimension are live. The machine's `host_id` is
-128 random bits kept in a per-user state file (`--host-identity-file PATH`,
-defaulting under `XDG_STATE_HOME`); it is not derived from the hostname, the
+128 random bits kept in a **host-wide, daemon-owned** state file
+(`--host-identity-file PATH`, defaulting to `/var/db/runquota/host-id` on macOS
+and `/var/lib/runquota/host-id` elsewhere). `runquotad` is one daemon per host,
+so the file that names the machine has to be as host-wide as the daemon that
+owns it: a per-user file — which is what this was before, under
+`XDG_STATE_HOME` — makes one machine present as several, and that is the
+failure mode hardest to notice, because the aggregates still carry *a* hardware
+dimension and simply never pool. `host_id` is not derived from the hostname, the
 address, or anything else two machines can share, because a derived identity
 silently merges the histories of unrelated machines. At startup the daemon
 detects its hardware, hashes the descriptive columns, and reuses the current
@@ -106,6 +112,16 @@ Columns the RQSP protocol does not yet carry — CPU user and system time, IO
 byte counts, and a run's finish status — are stored as SQL `NULL`, which reads
 as "not declared". They are deliberately not stored as zero: a zero is a
 measurement, and nobody made it. M13 supplies the client-reported figures.
+
+`executions.owner_uid` (schema version 4) says whose lease a row records. One
+host-wide daemon means one store holding every user's executions, so a query
+has to be able to say whose rows it is about. The value is taken by the daemon
+from the connection's **peer credentials** and never from anything the client
+declares — a client-declared owner would let any participant write rows
+attributed to another user — and a Hello whose declared uid disagrees with the
+peer credentials is refused rather than corrected. It is `NULL`, not `0`, where
+the transport cannot report credentials: `0` is root, and a wrong owner is
+worse than an absent one.
 
 ## State-boundary requirements
 
