@@ -1,5 +1,6 @@
 import std/[algorithm, math, os, osproc, strutils, times]
 
+from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
 import runquota_core
 import runquota_exec
@@ -149,10 +150,14 @@ proc req(label: string): ResourceRequest =
 proc prepareDir(path: string) =
   if dirExists(path):
     removeDir(path)
-  # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
-  # rendezvous directory whose mode or owner they cannot vouch for.
   createDir(path)
-  setFilePermissions(path, {fpUserRead, fpUserWrite, fpUserExec})
+  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
+  # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
+  # where a `runquota` group exists and 0700 (owner-only, single-user mode)
+  # where it does not -- so a fixture hardcoding either one is green on one
+  # kind of host and red on the other. Fixture only; the modes themselves
+  # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+  setFilePermissions(path, endpointDirectoryPermissions())
 
 proc checkCwdEnvRecord(path, expectedEnv: string) =
   let recordPath = path / FixtureRecord
@@ -209,10 +214,14 @@ proc runProcessSuite(quick: bool): seq[BenchMetric] =
   let socketPath = socketDir / "runquotad.sock"
   if dirExists(socketDir):
     removeDir(socketDir)
-  # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
-  # rendezvous directory whose mode or owner they cannot vouch for.
   createDir(socketDir)
-  setFilePermissions(socketDir, {fpUserRead, fpUserWrite, fpUserExec})
+  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
+  # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
+  # where a `runquota` group exists and 0700 (owner-only, single-user mode)
+  # where it does not -- so a fixture hardcoding either one is green on one
+  # kind of host and red on the other. Fixture only; the modes themselves
+  # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+  setFilePermissions(socketDir, endpointDirectoryPermissions())
   var daemon = startDaemon(socketPath)
   try:
     result.addBackend("process-execution")
@@ -358,10 +367,14 @@ proc runIpcSuite(quick: bool): seq[BenchMetric] =
   let socketPath = socketDir / "runquotad.sock"
   if dirExists(socketDir):
     removeDir(socketDir)
-  # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
-  # rendezvous directory whose mode or owner they cannot vouch for.
   createDir(socketDir)
-  setFilePermissions(socketDir, {fpUserRead, fpUserWrite, fpUserExec})
+  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
+  # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
+  # where a `runquota` group exists and 0700 (owner-only, single-user mode)
+  # where it does not -- so a fixture hardcoding either one is green on one
+  # kind of host and red on the other. Fixture only; the modes themselves
+  # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+  setFilePermissions(socketDir, endpointDirectoryPermissions())
   var daemon = startDaemon(socketPath)
   try:
     result.addBackend("ipc-latency")

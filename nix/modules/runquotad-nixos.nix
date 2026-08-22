@@ -22,6 +22,10 @@ let
   # agree. Deriving it rather than writing "runquota" twice keeps a change
   # to `nix/host-state.nix` from silently provisioning the wrong path.
   stateDirName = lib.removePrefix "/var/lib/" stateDir;
+  endpointDir = hostState.endpointDirectories.linux;
+  # `RuntimeDirectory=` names a path RELATIVE to /run, so the two have to
+  # agree. Derived rather than written twice.
+  endpointDirName = lib.removePrefix "/run/" endpointDir;
 in
 {
   options.services.runquotad = {
@@ -48,7 +52,17 @@ in
     group = lib.mkOption {
       type = lib.types.str;
       default = hostState.group;
-      description = "The group owning the host-wide state directory.";
+      description = ''
+        The group owning the host-wide state directory AND the rendezvous
+        directory. Membership in it is the admission control for "may you
+        participate in the managed-resource system on this host": the
+        rendezvous directory is `${hostState.endpointDirectoryMode}` and
+        the socket is `${hostState.endpointSocketMode}`, so a non-member
+        is refused by the KERNEL rather than by anything the daemon runs.
+
+        Add a user to this group to let them use RunQuota:
+        `users.users.<name>.extraGroups = [ "${hostState.group}" ];`
+      '';
     };
 
     observationDb = lib.mkOption {
@@ -90,8 +104,15 @@ in
     # must not happen: whichever of the two runs first, the owner and the
     # mode are the ones written down here rather than the ones whoever
     # started the daemon happened to have.
+    #
+    # THE RENDEZVOUS DIRECTORY IS PROVISIONED THE SAME WAY, and for a
+    # sharper reason: its GROUP is the admission list. A directory created
+    # by whichever process started first carries whatever group that
+    # process had, which is either nobody (the daemon is unreachable) or
+    # the wrong population (anyone may participate).
     systemd.tmpfiles.rules = [
       "d ${stateDir} ${hostState.mode} ${cfg.user} ${cfg.group} -"
+      "d ${endpointDir} ${hostState.endpointDirectoryMode} ${cfg.user} ${cfg.group} -"
     ];
 
     systemd.services.runquotad = {
@@ -104,6 +125,15 @@ in
         Group = cfg.group;
         StateDirectory = stateDirName;
         StateDirectoryMode = hostState.mode;
+        RuntimeDirectory = endpointDirName;
+        RuntimeDirectoryMode = hostState.endpointDirectoryMode;
+        # The rendezvous must survive a restart of the unit; recreating it
+        # on every start is the "created by whoever started first" defect
+        # with extra steps.
+        RuntimeDirectoryPreserve = true;
+        # The daemon binds the socket at 0660 itself; this keeps a lax
+        # inherited umask from being what decides it.
+        UMask = "0007";
         ExecStart = lib.escapeShellArgs (
           [ "${cfg.package}/bin/runquotad" ]
           ++ lib.optionals (cfg.observationDb != null) [

@@ -87,9 +87,10 @@ Host identity and the hardware dimension are live. The machine's `host_id` is
 128 random bits kept in a **host-wide, daemon-owned** state file
 (`--host-identity-file PATH`, defaulting to `/var/db/runquota/host-id` on macOS
 and `/var/lib/runquota/host-id` elsewhere).
-**That directory must already exist**: see "Provisioning the host-wide state
-directory" below. The daemon never creates it, and where it is missing capture
-is off.
+**That directory must already exist**, with the right owner and a mode nobody
+else can write: see "Provisioning the host-wide state directory and the rendezvous" below. The daemon
+never creates it, verifies its ownership and mode on every start, and where it
+is missing or untrustworthy capture is off — path and reason named.
 `runquotad` is one daemon per host,
 so the file that names the machine has to be as host-wide as the daemon that
 owns it: a per-user file — which is what this was before, under
@@ -127,20 +128,81 @@ peer credentials is refused rather than corrected. It is `NULL`, not `0`, where
 the transport cannot report credentials: `0` is root, and a wrong owner is
 worse than an absent one.
 
-## Provisioning the host-wide state directory
+## Provisioning the host-wide state directory and the rendezvous
 
-`runquotad` keeps this machine's `host_id` in a directory that **the install
-step creates and the daemon never does**:
+`runquotad` needs two directories that **the install step creates and the
+daemon never does**. It keeps this machine's `host_id` in the first and binds
+its socket in the second:
 
-| Platform | Directory | Owner | Mode |
-|----------|-----------|-------|------|
+| Platform | State directory | Owner | Mode |
+|----------|-----------------|-------|------|
 | macOS | `/var/db/runquota` | the account `runquotad` runs as | `0755` |
 | Linux | `/var/lib/runquota` | the account `runquotad` runs as | `0755` |
 | Windows | `C:\ProgramData\runquota` | the account `runquotad` runs as | — |
 
+| Platform | Rendezvous directory | Owner | Group | Mode |
+|----------|----------------------|-------|-------|------|
+| macOS | `/var/run/runquota` | the account `runquotad` runs as | `runquota` | `0750` |
+| Linux | `/run/runquota` | the account `runquotad` runs as | `runquota` | `0750` |
+| Windows | — (named pipes) | — | — | — |
+
+The socket inside it is `runquotad.sock`, mode `0660`, group `runquota`.
+
+**The rendezvous path contains nothing derived from the caller.** It is not
+under `XDG_RUNTIME_DIR`, not `<tmp>/runquota-$UID`, and not anywhere else a
+second user would compute differently — because a second user who computes a
+different path does not fail to reach the daemon, they start a daemon of their
+own, and two daemons then admit against their own view of one machine's budget.
+
+**Membership in the `runquota` group is the admission control.** A user who is
+in it can traverse the directory and connect to the socket; a user who is not
+is refused by the kernel, before any RunQuota code runs — the directory's
+missing search bit and the socket's own mode both bite, and on macOS the socket
+mode alone is enough. Adding a user to the group is how an operator says "you
+may participate in the managed-resource system on this host":
+
+```sh
+# Linux
+sudo usermod -aG runquota alice
+# macOS
+sudo dseditgroup -o edit -a alice -t user runquota
+```
+
+### When the group does not exist: single-user mode
+
+**A `runquota` group that cannot be resolved does not switch the group check
+off.** The group *is* the admission boundary, so a daemon that merely skipped
+the comparison would keep a `0750` directory reachable by whatever group it
+happened to inherit — a boundary nobody chose and nothing verified.
+
+Instead the endpoint degrades, visibly and to something smaller:
+
+| | Group resolves | Group does not resolve |
+|---|---|---|
+| Rendezvous directory | `0750`, group `runquota` | `0700`, owner-only |
+| Socket | `0660`, group `runquota` | `0600`, owner-only |
+| Who may connect | the owner and every group member | the owner only |
+| `runquotad` says | nothing extra | `single-user mode: …` on its listening line |
+
+So a host-wide daemon on an unprovisioned host degrades **visibly to a per-user
+one** rather than invisibly to no boundary at all. It still starts and still
+serves leases: admission is the mission, and a missing group entry must not take
+out a machine's build-capacity governor. Create the group and restart to serve
+every member of it.
+
+`RUNQUOTA_ENDPOINT_GROUP` overrides the group name, and accepts a numeric gid
+for hosts whose group is real but not resolvable by name.
+
+Both directories' **ownership and mode are verified on every daemon start and
+every client attach**, and a squatted or wrong-moded one is refused rather than
+used — path and mode named. Existence is not trust: a state directory owned by
+the wrong uid lets any local user replace `host-id` and thereby fork this
+machine's history or merge it with another machine's, and a rendezvous
+directory owned by the wrong uid is a rendezvous point somebody else controls.
+
 The paths are also written down once, machine-readably, in `nix/host-state.nix`,
 and `tests/integration/t_host_identity_refusal.nim` asserts that file agrees
-with `hostWideStateDir` in the daemon's source.
+with `hostWideStateDir` and `hostWideEndpointDir` in the daemon's source.
 
 **On a host where the directory is missing, capture is off.** The daemon still
 starts and still serves leases — admission is the mission, and an advisory
@@ -155,11 +217,20 @@ symptom at the point of use, which is why it is a refusal.
 
 The flake ships the install step:
 
-- `nixosModules.runquotad` — a systemd unit plus `StateDirectory=runquota` and a
-  `systemd.tmpfiles` rule, so `/var/lib/runquota` exists with the right owner
-  and mode from activation onwards.
+- `nixosModules.runquotad` — a systemd unit plus `StateDirectory=runquota`,
+  `RuntimeDirectory=runquota` and two `systemd.tmpfiles` rules, so
+  `/var/lib/runquota` and `/run/runquota` both exist with the right owner,
+  group and mode from activation onwards.
 - `darwinModules.runquotad` — a launchd daemon plus an activation script that
-  `install -d`s `/var/db/runquota`.
+  `install -d`s `/var/db/runquota` and `/var/run/runquota`.
+
+Both modules are **evaluated** by `checks.module-eval` in `flake.nix`, which
+puts each through its real module system — nix-darwin is reached transitively
+via `inputs.nixos-modules.inputs.nix-darwin` — and asserts on the resulting
+activation script, launchd `serviceConfig`, tmpfiles rules and unit
+`serviceConfig`. Run it with `nix build .#checks.<system>.module-eval`. Neither
+module has been *activated* on a real host by this repository's tests;
+evaluation is what is claimed, and it is claimed equally for both.
 
 ```nix
 {
@@ -176,10 +247,17 @@ On a host not managed by Nix, run once, as the account `runquotad` will run as
 ```sh
 # macOS
 sudo mkdir -p /var/db/runquota && sudo chown "$(id -u)" /var/db/runquota && sudo chmod 0755 /var/db/runquota
+sudo mkdir -p /var/run/runquota && sudo chown "$(id -u)":runquota /var/run/runquota && sudo chmod 0750 /var/run/runquota
 
 # Linux
 sudo mkdir -p /var/lib/runquota && sudo chown "$(id -u)" /var/lib/runquota && sudo chmod 0755 /var/lib/runquota
+sudo mkdir -p /run/runquota && sudo chown "$(id -u)":runquota /run/runquota && sudo chmod 0750 /run/runquota
 ```
+
+`/run` (and `/var/run` on macOS) is cleared on boot, so the rendezvous
+directory has to be re-created at every boot — which is what
+`RuntimeDirectory=` and the activation script do on a Nix-managed host, and
+what an init script or a `tmpfiles.d` drop-in has to do elsewhere.
 
 The daemon's own refusal message prints this command with the uid already
 filled in, so an operator who hits it does not have to come back here.

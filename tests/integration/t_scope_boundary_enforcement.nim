@@ -31,6 +31,28 @@ import runquota_ipc
 import runquota_observation_store
 import runquota_protocol
 
+proc groupOf(path: string): int64 =
+  var info: Stat
+  if lstat(path.cstring, info) != 0:
+    return -1
+  int64(info.st_gid)
+
+proc pinRendezvousGroup(dir: string) =
+  ## THE RENDEZVOUS SCOPE IS PINNED, and it has to be. The shipped policy
+  ## is `0750`/`0660` group-gated where a `runquota` group exists and
+  ## `0700`/`0600` owner-only where it does not, so a file asserting either
+  ## mode as a literal would mean two different things on two machines --
+  ## green on the sanctioned host and red nowhere anyone looks.
+  ##
+  ## It is pinned to the group the FIXTURE ACTUALLY HAS rather than to a
+  ## constant, because that group differs by host and by shell: a scratch
+  ## directory under `/private/tmp` is born group-`wheel` by BSD
+  ## inheritance, one under a private `/var/folders` `TMPDIR` is born with
+  ## the caller's gid, and Linux has no inheritance at all. Pinning to the
+  ## inherited gid is what keeps these clauses about the MODE, which is
+  ## what they assert.
+  putEnv("RUNQUOTA_ENDPOINT_GROUP", $groupOf(dir))
+
 proc scratchDir(name: string): string =
   # SHORT ON PURPOSE, and the arithmetic is the reason rather than taste.
   # Nim's `Sockaddr_un_path_length` is 92 on macOS and `toSockAddr` refuses
@@ -46,6 +68,7 @@ proc scratchDir(name: string): string =
   removeDir(result)
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
+  pinRendezvousGroup(result)
 
 proc daemonPath(): string =
   getCurrentDir() / "build" / "bin" / "runquotad"
@@ -235,7 +258,7 @@ suite "scope_boundary_enforcement_daemon_start":
     # Named, not opaque.
     check dir in refused.output
     check "0777" in refused.output
-    check "0700" in refused.output
+    check "0750" in refused.output
     # A refusal, not a fallback: nothing was bound and nothing was left
     # behind in a directory the daemon does not trust.
     check not pathPresent(socketPath)
@@ -256,7 +279,7 @@ suite "scope_boundary_enforcement_daemon_start":
       # It refused before touching a path it has no business writing to.
       check not pathPresent(socketPath)
 
-  test "a real daemon accepts a directory it created itself, at 0700":
+  test "a real daemon accepts a directory it created itself, at 0750":
     # The acceptance half. Without it, a build that refused every start
     # would satisfy both refusals above.
     let root = scratchDir("good")
@@ -270,9 +293,13 @@ suite "scope_boundary_enforcement_daemon_start":
     try:
       check daemon.startupLines[0].contains(socketPath)
       check dirExists(dir)
-      check modeOf(dir) == 0o700
+      check modeOf(dir) == 0o750
+      check (modeOf(dir) and 0o022) == 0
       check ownerOf(dir) == int64(getuid())
       check socketExists(socketPath)
+      # M13d: the socket the daemon bound is 0660, so a group member may
+      # connect through it and a non-member is refused by the filesystem.
+      check modeOf(socketPath) == 0o660
     finally:
       daemon.stop()
 

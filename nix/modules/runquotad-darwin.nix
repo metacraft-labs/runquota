@@ -22,6 +22,7 @@ let
   cfg = config.services.runquotad;
   hostState = import ../host-state.nix;
   stateDir = hostState.directories.darwin;
+  endpointDir = hostState.endpointDirectories.darwin;
 in
 {
   options.services.runquotad = {
@@ -52,7 +53,22 @@ in
     group = lib.mkOption {
       type = lib.types.str;
       default = "wheel";
-      description = "The group owning the host-wide state directory.";
+      description = ''
+        The group owning the host-wide state directory AND the rendezvous
+        directory. Membership in it is the admission control for "may you
+        participate in the managed-resource system on this host": the
+        rendezvous directory is `${hostState.endpointDirectoryMode}` and
+        the socket is `${hostState.endpointSocketMode}`, so a non-member is
+        refused by the KERNEL rather than by anything the daemon runs.
+
+        Defaults to `wheel` for the same reason `user` defaults to `root`
+        — nix-darwin has no system-group abstraction comparable to
+        NixOS's. A host that wants a real admission list should create a
+        `${hostState.group}` group with `dscl` and set this to it;
+        leaving it at `wheel` makes the admission list "the
+        administrators", which is a decision rather than a default worth
+        inheriting silently.
+      '';
     };
 
     observationDb = lib.mkOption {
@@ -79,10 +95,26 @@ in
     # started first happened to have. `install -d` is idempotent and also
     # corrects the mode and owner of a directory that already exists,
     # which matters on a host where somebody once created it by hand.
+    #
+    # THE RENDEZVOUS DIRECTORY IS PROVISIONED HERE TOO, and for a sharper
+    # reason: its GROUP is the admission list for the whole
+    # managed-resource system. A directory created by whichever process
+    # started first carries whatever group that process had -- either
+    # nobody, so the daemon is unreachable, or the wrong population, so
+    # anyone may participate.
+    #
+    # `/var/run` is cleared on boot on macOS, so this rule has to run at
+    # every activation AND the directory has to be re-created after a
+    # reboot. `launchd.daemons` below runs as root and `RunAtLoad` fires
+    # after activation on a booted system; on a fresh boot the daemon's
+    # own refusal names the provisioning command.
     system.activationScripts.runquotadStateDir.text = ''
       printf 'provisioning RunQuota host-wide state directory %s\n' '${stateDir}'
       /usr/bin/install -d -m ${hostState.mode} \
         -o '${cfg.user}' -g '${cfg.group}' '${stateDir}'
+      printf 'provisioning RunQuota rendezvous directory %s\n' '${endpointDir}'
+      /usr/bin/install -d -m ${hostState.endpointDirectoryMode} \
+        -o '${cfg.user}' -g '${cfg.group}' '${endpointDir}'
     '';
 
     launchd.daemons.runquotad = {

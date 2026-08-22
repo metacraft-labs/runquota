@@ -44,6 +44,46 @@
       perSystem =
         { pkgs, system, ... }:
         let
+          hostState = import ./nix/host-state.nix;
+          # THE DARWIN MODULE IS EVALUATED, NOT MERELY PARSED.
+          #
+          # It used to be described in `nix/README.md` and `docs/database.md`
+          # exactly as the NixOS one is, while only the NixOS one had ever
+          # been through a real module system -- so an operator reading
+          # either document could not tell the verified module from the
+          # unverified one. `nix-darwin` is not a direct input of this
+          # flake, but it is reachable transitively through
+          # `nixos-modules`, and a full `darwinSystem` evaluation succeeds
+          # through that path. `checks.module-eval` below is that
+          # evaluation, and it forces the activation script and the launchd
+          # job rather than stopping at the option declarations.
+          nix-darwin = inputs.nixos-modules.inputs.nix-darwin;
+          darwinEval = nix-darwin.lib.darwinSystem {
+            modules = [
+              self.darwinModules.runquotad
+              {
+                nixpkgs.hostPlatform = "aarch64-darwin";
+                system.stateVersion = 5;
+                system.primaryUser = hostState.user;
+                services.runquotad.enable = true;
+              }
+            ];
+          };
+          nixosEval = inputs.nixos-modules.inputs.nixpkgs.lib.nixosSystem {
+            modules = [
+              self.nixosModules.runquotad
+              {
+                nixpkgs.hostPlatform = "x86_64-linux";
+                boot.loader.grub.devices = [ "/dev/sda" ];
+                fileSystems."/" = {
+                  device = "/dev/sda1";
+                  fsType = "ext4";
+                };
+                system.stateVersion = "24.05";
+                services.runquotad.enable = true;
+              }
+            ];
+          };
           version =
             let
               versionMatches = builtins.filter (match: match != null) (
@@ -151,6 +191,64 @@
           checks = {
             inherit pre-commit-check;
             package-build = runquota;
+
+            # Both install steps, put through their real module systems and
+            # asserted on their OUTPUT. The strings compared here are the
+            # two host-wide directories, their modes and their group -- the
+            # facts the daemon refuses to start without.
+            module-eval =
+              pkgs.runCommand "runquota-module-eval"
+                {
+                  darwinActivation =
+                    darwinEval.config.system.activationScripts.runquotadStateDir.text;
+                  # The VALUES, not the attribute names: nix-darwin
+                  # declares every launchd key whether or not it was set,
+                  # so a grep over the names would pass against a module
+                  # that configured nothing at all.
+                  darwinLaunchd = builtins.toJSON {
+                    inherit (darwinEval.config.launchd.daemons.runquotad.serviceConfig)
+                      Label
+                      UserName
+                      GroupName
+                      RunAtLoad
+                      ;
+                  };
+                  nixosTmpfiles = builtins.toJSON nixosEval.config.systemd.tmpfiles.rules;
+                  # `ExecStart` is dropped deliberately: it carries the
+                  # x86_64-linux package's store path, and keeping it here
+                  # would make this EVALUATION check demand a Linux BUILD.
+                  # The point is the module system's output, not the
+                  # binary's.
+                  nixosService = builtins.toJSON (
+                    removeAttrs nixosEval.config.systemd.services.runquotad.serviceConfig [
+                      "ExecStart"
+                    ]
+                  );
+                }
+                ''
+                  printf '%s' "$darwinActivation" > darwin-activation
+                  grep -F '${hostState.directories.darwin}' darwin-activation
+                  grep -F '${hostState.endpointDirectories.darwin}' darwin-activation
+                  grep -F '${hostState.mode}' darwin-activation
+                  grep -F '${hostState.endpointDirectoryMode}' darwin-activation
+                  printf '%s' "$darwinLaunchd" > darwin-launchd
+                  grep -F '"GroupName":"wheel"' darwin-launchd
+                  grep -F '"UserName":"root"' darwin-launchd
+                  grep -F 'org.metacraft-labs.runquotad' darwin-launchd
+
+                  printf '%s' "$nixosTmpfiles" > nixos-tmpfiles
+                  grep -F '${hostState.directories.linux}' nixos-tmpfiles
+                  grep -F '${hostState.endpointDirectories.linux}' nixos-tmpfiles
+                  grep -F '${hostState.endpointDirectoryMode}' nixos-tmpfiles
+                  grep -F '${hostState.group}' nixos-tmpfiles
+
+                  printf '%s' "$nixosService" > nixos-service
+                  grep -F 'RuntimeDirectory' nixos-service
+                  grep -F 'StateDirectory' nixos-service
+
+                  mkdir -p $out
+                '';
+
             repo-requirements =
               pkgs.runCommand "runquota-repo-requirements" { nativeBuildInputs = [ pkgs.just ]; }
                 ''

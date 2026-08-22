@@ -29,6 +29,7 @@
 
 import std/[os, osproc, streams, strutils, unittest]
 
+import runquota_ipc
 import runquota_observation_store
 
 proc scratchDir(name: string): string =
@@ -41,7 +42,13 @@ proc scratchDir(name: string): string =
   result = getTempDir() / ("rq-hi-" & $getCurrentProcessId() & name)
   removeDir(result)
   createDir(result)
-  setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
+  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal: some of these
+  # fixtures ARE the rendezvous directory the daemon binds in, and the
+  # rendezvous mode is 0750 where a `runquota` group exists and 0700
+  # (owner-only, single-user mode) where it does not. Nothing in this file
+  # asserts the fixture's own mode; the modes themselves are asserted in
+  # `tests/unit/t_shared_endpoint_rules.nim`.
+  setFilePermissions(result, endpointDirectoryPermissions())
 
 proc contents(path: string): string =
   ## Deliberately not `readFile`. A missing artifact must fail its own
@@ -324,21 +331,53 @@ suite "host_identity_provisioning":
     check defaultHostIdentityFile() == hostWideStateDir / "host-id"
     check "identityFileName = \"host-id\"" in hostState
 
+    # M13d: THE RENDEZVOUS DIRECTORY IS THE SECOND HOST-WIDE PATH, and it
+    # is duplicated the same way, so it can drift the same way. Its group
+    # is checked too: the group is the admission list, and a rendezvous
+    # provisioned without one is either unreachable or open to everybody.
+    check "\"/var/run/runquota\"" in hostState
+    check "\"/run/runquota\"" in hostState
+    check ("\"" & hostWideEndpointDir & "\"") in hostState
+    check ("endpointSocketName = \"" & endpointSocketName & "\"") in hostState
+    check ("endpointDirectoryMode = \"" & modeText(endpointDirectoryMode) &
+      "\"") in hostState
+    check ("endpointSocketMode = \"" & modeText(endpointSocketMode) &
+      "\"") in hostState
+    check ("group = \"" & defaultRendezvousGroup & "\"") in hostState
+
     # The modules provision it rather than merely mentioning it.
     let nixos = contents(nixosModule)
     check "systemd.tmpfiles.rules" in nixos
     check "StateDirectory" in nixos
     check "host-state.nix" in nixos
+    check "endpointDirectories.linux" in nixos
+    check "RuntimeDirectory" in nixos
+    # The RULE, not just the reference: a module that mentioned the path
+    # in a `let` and never provisioned it would satisfy the line above.
+    check "\"d ${endpointDir} ${hostState.endpointDirectoryMode}" in nixos
 
     let darwin = contents(darwinModule)
     check "system.activationScripts" in darwin
     check "install -d" in darwin
     check "host-state.nix" in darwin
+    check "endpointDirectories.darwin" in darwin
+    # The INSTALL, not just the reference.
+    check "rendezvous directory" in darwin
+    check "-m ${hostState.endpointDirectoryMode}" in darwin
+
 
     # The flake exposes them, so `imports = [ ... ]` can reach them.
     let flakeText = contents(flake)
     check "nixosModules.runquotad" in flakeText
     check "darwinModules.runquotad" in flakeText
+    # BOTH modules are EVALUATED, not merely parsed. The darwin one used
+    # to be described exactly as the NixOS one while only the NixOS one
+    # had been through a module system, which left an operator unable to
+    # tell the verified module from the unverified one.
+    check "module-eval" in flakeText
+    check "darwinSystem" in flakeText
+    check "nixosSystem" in flakeText
+    check "inputs.nixos-modules.inputs.nix-darwin" in flakeText
 
     # And a host not managed by Nix has a runbook that says the directory
     # must pre-exist -- the omission that let this defect ship.
@@ -347,3 +386,6 @@ suite "host_identity_provisioning":
     check "must already exist" in runbookText
     check hostWideStateDir in runbookText
     check "sudo mkdir -p " & hostWideStateDir in runbookText
+    check hostWideEndpointDir in runbookText
+    check "sudo mkdir -p " & hostWideEndpointDir in runbookText
+    check defaultRendezvousGroup in runbookText

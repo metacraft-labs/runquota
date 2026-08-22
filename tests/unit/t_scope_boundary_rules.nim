@@ -33,6 +33,28 @@ import std/[os, posix, strutils, unittest]
 import runquota_ipc
 import runquota_observation_store
 
+proc groupOf(path: string): int64 =
+  var info: Stat
+  if lstat(path.cstring, info) != 0:
+    return -1
+  int64(info.st_gid)
+
+proc pinRendezvousGroup(dir: string) =
+  ## THE RENDEZVOUS SCOPE IS PINNED, and it has to be. The shipped policy
+  ## is `0750`/`0660` group-gated where a `runquota` group exists and
+  ## `0700`/`0600` owner-only where it does not, so a file asserting either
+  ## mode as a literal would mean two different things on two machines --
+  ## green on the sanctioned host and red nowhere anyone looks.
+  ##
+  ## It is pinned to the group the FIXTURE ACTUALLY HAS rather than to a
+  ## constant, because that group differs by host and by shell: a scratch
+  ## directory under `/private/tmp` is born group-`wheel` by BSD
+  ## inheritance, one under a private `/var/folders` `TMPDIR` is born with
+  ## the caller's gid, and Linux has no inheritance at all. Pinning to the
+  ## inherited gid is what keeps these clauses about the MODE, which is
+  ## what they assert.
+  putEnv("RUNQUOTA_ENDPOINT_GROUP", $groupOf(dir))
+
 proc scratchDir(name: string): string =
   # SHORT ON PURPOSE, and the arithmetic is the reason rather than taste.
   # Nim's `Sockaddr_un_path_length` is 92 on macOS and `toSockAddr` refuses
@@ -48,6 +70,7 @@ proc scratchDir(name: string): string =
   removeDir(result)
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
+  pinRendezvousGroup(result)
 
 proc modeOf(path: string): int =
   var info: Stat
@@ -84,12 +107,18 @@ proc foreignOwnedDirectory(): string =
   ""
 
 suite "scope_boundary_rules_endpoint_directory":
-  test "the endpoint directory is created 0700 by an explicit mode, not by the umask":
+  test "the endpoint directory is created 0750 by an explicit mode, not by the umask":
     # THE UMASK IS SET WIDE OPEN ON PURPOSE. `createDir` with no mode asks
     # for 0777 and gets whatever the umask leaves, so on a developer box
     # with umask 022 it lands on 0755 and the defect is invisible. Under
     # umask 0 an unfixed creation path produces a 0777 rendezvous
     # directory, which is the whole defect, in one line.
+    #
+    # M13d: 0750 and not 0700. The rendezvous is SHARED -- a private mode
+    # on it locks out every user but one, which is the same defect as
+    # running a daemon per user. What must never happen is group- or
+    # other-WRITABLE, and that is asserted separately below so a future
+    # widening cannot pass by changing one number.
     let root = scratchDir("create")
     defer: removeDir(root)
     let dir = root / "ep"
@@ -99,7 +128,8 @@ suite "scope_boundary_rules_endpoint_directory":
     finally:
       discard umask(saved)
     check dirExists(dir)
-    check modeOf(dir) == 0o700
+    check modeOf(dir) == 0o750
+    check (modeOf(dir) and 0o022) == 0
     check ownerOf(dir) == int64(getuid())
     # And the directory it just made is one it will accept again, which is
     # what makes creation and verification one contract rather than two.
@@ -124,7 +154,7 @@ suite "scope_boundary_rules_endpoint_directory":
     # in the message, and so is the mode that was required.
     check dir in trust.message
     check "0777" in trust.message
-    check "0700" in trust.message
+    check "0750" in trust.message
     check "group- or world-writable" in trust.message
     check endpointDirectoryRefusal(unixEndpoint(dir / "runquotad.sock")) ==
       trust.message
@@ -164,7 +194,7 @@ suite "scope_boundary_rules_endpoint_directory":
     let trust = endpointDirectoryTrust(unixEndpoint(dir / "runquotad.sock"))
     check trust.reason == trustBadMode
     check "0755" in trust.message
-    check "0700" in trust.message
+    check "0750" in trust.message
 
   test "an endpoint directory owned by another uid is REFUSED, as an OWNERSHIP problem":
     # THE ATTACK IS ON THE PATH, NOT ON THE CONNECTION. `getpeereid`
@@ -227,7 +257,7 @@ suite "scope_boundary_rules_endpoint_directory":
     let socketPath = dir / "runquotad.sock"
     var listener = bindEndpoint(unixEndpoint(socketPath))
     try:
-      check modeOf(dir) == 0o700
+      check modeOf(dir) == 0o750
       # A client attaches happily while the directory is still private.
       var ok = connectEndpoint(unixEndpoint(socketPath))
       ok.close()

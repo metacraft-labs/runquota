@@ -1,5 +1,9 @@
 import std/[algorithm, cpuinfo, locks, options, os, strutils, tables, times]
 
+when defined(posix):
+  # `getuid` for the host-state-directory ownership check below.
+  import std/posix
+
 import runquota_daemon/types as daemonTypes
 import runquota_codec
 import runquota_core
@@ -103,6 +107,51 @@ proc localCpuShareGroup(config: DaemonConfig): string =
       return group
   DefaultMachineId
 
+proc hostStateDirectoryRefusal(config: DaemonConfig): string =
+  ## M13d: the host-wide state directory's OWNER AND MODE, verified on
+  ## every daemon start.
+  ##
+  ## Its EXISTENCE was already checked, in `resolveHostIdentity`, and
+  ## existence alone is the same half-check M13c closed for the rendezvous
+  ## and left open here: a `/var/db/runquota` owned by the wrong uid is
+  ## accepted for as long as the daemon can still write in it. Exploiting
+  ## that needs root, since `/var/db` is root-owned `0755` -- but the
+  ## realistic failure needs nobody at all. An operator runs `sudo mkdir
+  ## -p` and forgets the `chown`, or leaves the directory `0777`, and then
+  ## any local user can replace `host-id` and thereby fork this machine's
+  ## history into two or merge it with another machine's. Both are
+  ## invisible at the point of use, which is why they are refused rather
+  ## than logged.
+  ##
+  ## HERE RATHER THAN IN `identity.nim`: `runquota_daemon` already imports
+  ## both libraries, so this needs no new library edge and no new export,
+  ## and "verified on every daemon start" is a statement about the daemon.
+  ##
+  ## The required mode is `0755` for the DEFAULT host-wide directory --
+  ## what `nix/host-state.nix`, the NixOS module and the by-hand runbook
+  ## all write -- and, for a directory an operator named explicitly with
+  ## `--host-identity-file`, only the invariant: owned by this daemon and
+  ## never group- or other-writable. The exact mode of a path an operator
+  ## chose is their decision; who can replace what lives in it is not.
+  when defined(posix):
+    let identityPath =
+      if config.hostIdentityFilePath.len > 0: config.hostIdentityFilePath
+      else: defaultHostIdentityFile()
+    let directory = identityPath.parentDir
+    if directory.len == 0:
+      return ""
+    let trust = inspectPath(directory, wantDirectory = true,
+      requiredMode =
+        (if directory == hostWideStateDir: hostStateDirectoryMode else: -1),
+      expectedOwnerUid = int64(getuid()),
+      label = "host state directory")
+    # `trustMissing` is NOT refused here: `resolveHostIdentity` already
+    # reports an unprovisioned host, with the command that provisions it,
+    # and two reports for one condition would be one report too many.
+    if trust.reason in {trustOk, trustMissing}: "" else: trust.message
+  else:
+    ""
+
 proc estimateTableKey(scope, commandStatsId: string): string =
   scope & "\0" & commandStatsId
 
@@ -149,7 +198,21 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
     # Identity first, and from the machine rather than from the database:
     # `host_id` is not derived from the hostname, the address, or anything
     # else that two machines can share (M10, OS-6).
-    let identity = resolveHostIdentity(effectiveConfig.hostIdentityFilePath)
+    #
+    # The directory is verified BEFORE the identity is read out of it. An
+    # id minted into, or read from, a directory somebody else can write is
+    # an id somebody else chose.
+    let stateRefusal = hostStateDirectoryRefusal(effectiveConfig)
+    let identity =
+      if stateRefusal.len > 0:
+        HostIdentity(hostId: "", persisted: false, report: stateRefusal,
+          path:
+            if effectiveConfig.hostIdentityFilePath.len > 0:
+              effectiveConfig.hostIdentityFilePath
+            else:
+              defaultHostIdentityFile())
+      else:
+        resolveHostIdentity(effectiveConfig.hostIdentityFilePath)
     result.observationHostId = identity.hostId
     if not identity.persisted:
       # OS-6. AN IDENTITY THAT CANNOT BE PERSISTED IS A REFUSAL. The daemon
@@ -1574,7 +1637,14 @@ proc serve*(config: DaemonConfig): int =
     deinitConnectionQueue()
     return endpointRefusedExitCode
   sharedDaemon.daemon.state = dsServing
-  echo "runquotad listening " & config.endpoint.path
+  # THE DEGRADATION IS SAID OUT LOUD, and it is appended to the listening
+  # line rather than printed on one of its own: the startup output is a
+  # FIXED number of lines that readers consume by count, and a fourth line
+  # would leave every reader of the third one misreading or blocked. An
+  # operator sees, on the line they already read, whether this host's
+  # endpoint is group-gated or owner-only.
+  echo "runquotad listening " & config.endpoint.path &
+    rendezvousDegradationReport()
   if config.observationDbPath.len > 0:
     # The report is the "clear report" half of OS-4: a store that will not
     # open says so on stdout and the daemon carries on serving leases.

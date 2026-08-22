@@ -2,6 +2,7 @@ import std/[os, osproc, unittest]
 
 import runquota_client
 import runquota_core
+from runquota_ipc import endpointDirectoryPermissions
 
 proc daemonPath(): string =
   getCurrentDir() / "build" / "bin" / "runquotad"
@@ -25,10 +26,14 @@ suite "e2e_runquota_single_client_lease":
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeDir(socketDir)
-    # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
-    # rendezvous directory whose mode or owner they cannot vouch for.
     createDir(socketDir)
-    setFilePermissions(socketDir, {fpUserRead, fpUserWrite, fpUserExec})
+    # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
+    # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
+    # where a `runquota` group exists and 0700 (owner-only, single-user mode)
+    # where it does not -- so a fixture hardcoding either one is green on one
+    # kind of host and red on the other. Fixture only; the modes themselves
+    # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+    setFilePermissions(socketDir, endpointDirectoryPermissions())
     check fileExists(daemonPath())
 
     let process = startProcess(

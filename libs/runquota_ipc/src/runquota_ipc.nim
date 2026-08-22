@@ -174,6 +174,18 @@ proc endpointForPath*(path: string): Endpoint =
 # per-user daemons would each admit against their own view of a budget they
 # in fact share. Everything below follows from that.
 #
+# THE RENDEZVOUS IS SHARED, NOT PER-USER, AND THAT FOLLOWS FROM THE DAEMON
+# BEING HOST-WIDE. The endpoint used to be ``<runtime>/runquota-$UID/…``,
+# and the failure that produced is worse than unreachability: the path was
+# DERIVED FROM THE CALLER'S IDENTITY, so a second user did not get
+# ``EACCES`` -- they computed a DIFFERENT path, found nothing there, and
+# started a daemon of their own. The deployment degraded silently to one
+# daemon per user, which is exactly what the host-wide decision exists to
+# prevent, and every scope check in this file then guarded a boundary
+# nothing could cross. So the endpoint now lives at a FIXED system path
+# with nothing caller-derived anywhere in it, and reaching it is gated by
+# GROUP MEMBERSHIP rather than by uid.
+#
 # The attack this defends against is on the PATH, not on the connection.
 # ``<tmp>/runquota-$UID`` is a predictable name, and where
 # ``XDG_RUNTIME_DIR`` is absent -- bare Linux, containers, any session
@@ -190,6 +202,22 @@ proc endpointForPath*(path: string): Endpoint =
 # the mode is explicit on creation AND verified on every daemon start and
 # every client attach, and wrong ownership or mode is a refusal rather than a
 # fallback.
+#
+# THE TWO REQUIREMENTS PULL AGAINST EACH OTHER AND THAT IS THE DESIGN.
+# Shared access is why the mode cannot be ``0700``; squatting is why the
+# mode cannot be assumed. They reconcile because the directory is
+# DAEMON-OWNED at a FIXED path: group members traverse and connect, nobody
+# but the daemon creates or replaces, and both facts are checked rather
+# than trusted.
+#
+# WHICH LAYER REFUSES A NON-MEMBER MATTERS. The refusal that counts is the
+# KERNEL's -- no search permission on a ``0750`` directory whose group the
+# caller is not in -- and the predicate below is deliberately written so it
+# does NOT fire for a legitimate non-member: a non-member sees the correct
+# owner, the correct group and the correct mode, so ``trustOk`` comes back
+# and the ``connect(2)`` that follows is refused by the filesystem. An
+# application-level check that fired first would leave the real boundary
+# untested.
 # ---------------------------------------------------------------------------
 
 type
@@ -211,6 +239,13 @@ type
       ## path lands here rather than being followed to a target whose mode
       ## says nothing about the link.
     trustForeignOwner
+    trustForeignGroup
+      ## The directory is owned by the right uid but carries the wrong
+      ## GROUP. Distinct from ``trustForeignOwner`` because it is a
+      ## different deployment mistake with a different repair: the group is
+      ## what the kernel admits callers by, so a rendezvous in the wrong
+      ## group is one no client can reach, or -- worse -- one the wrong
+      ## population can.
     trustBadMode
 
   PathTrust* = object
@@ -220,6 +255,8 @@ type
       ## The mode found on disk, or -1 when it could not be read.
     ownerUid*: int64
       ## The owning uid found on disk, or -1 when it could not be read.
+    groupGid*: int64
+      ## The owning gid found on disk, or -1 when it could not be read.
     message*: string
       ## Empty exactly when ``reason`` is ``trustOk``. Always names the
       ## offending path, and names the mode whenever one was read.
@@ -247,14 +284,122 @@ type
     segmentHostWide
 
 const
-  endpointDirectoryMode* = 0o700
-    ## The rendezvous directory: ``0700`` and owned by the user, per
-    ## §"Mechanism".
+  endpointDirectoryMode* = 0o750
+    ## The rendezvous directory. NOT ``0700``: a private mode on a SHARED
+    ## rendezvous locks out every user but one, which is the same defect as
+    ## running a daemon per user. Daemon-owned, traversable by the
+    ## ``runquota`` group, and never group- or other-WRITABLE -- that last
+    ## is the invariant, and the exact mode is how it is enforced.
+  endpointSocketMode* = 0o660
+    ## The socket itself: group ``runquota``, so a member may connect and a
+    ## non-member is refused by the filesystem. NOT decoration: Darwin
+    ## enforces a Unix socket's own mode on ``connect(2)``, verified by a
+    ## paired control from a second uid through one traversable ``0755``
+    ## directory -- ``0660`` refused, ``0666`` connected, ``0600``
+    ## refused.
+  singleUserEndpointDirectoryMode* = 0o700
+    ## THE DEGRADED RENDEZVOUS, used when the ``runquota`` group cannot be
+    ## resolved on this host. See ``RendezvousScope``.
+  singleUserEndpointSocketMode* = 0o600
   perUserSegmentMode* = 0o600
-    ## Budget and observation-ring segments.
+    ## Budget and observation-ring segments. PER-USER STATE DOES NOT FOLLOW
+    ## THE RENDEZVOUS. The rendezvous became group-accessible because it is
+    ## where a client FINDS the daemon; the budget word and the observation
+    ## ring are where a client's own work is written, and widening those to
+    ## match would satisfy every other rule here while destroying the
+    ## boundary the rules exist for.
   hostWideSegmentMode* = 0o640
     ## The aggregate stats table: daemon-written, group-readable, and
     ## deliberately NOT ``0600``.
+  hostStateDirectoryMode* = 0o755
+    ## The host-wide state directory (``/var/db/runquota``,
+    ## ``/var/lib/runquota``). This is the mode all three provisioning
+    ## routes in ``nix/host-state.nix``, the NixOS module and the by-hand
+    ## runbook write, and the daemon verifies it rather than merely
+    ## checking the directory exists.
+  defaultRendezvousGroup* = "runquota"
+    ## The group whose membership is the admission control for "may you
+    ## participate in the managed-resource system on this host".
+  defaultRendezvousUser* = "runquota"
+    ## The account ``runquotad`` runs as under the shipped install step.
+  endpointSocketName* = "runquotad.sock"
+
+  # THE FIXED SYSTEM PATH. Nothing in it derives from the caller: no uid,
+  # no `HOME`, no `XDG_RUNTIME_DIR`, no `TMPDIR`. Two different users
+  # compute the same string, which is the only way a host-wide daemon is
+  # reachable at all -- and the only way a second user gets `EACCES`
+  # instead of quietly starting a daemon of their own.
+  #
+  # Duplicated, machine-readably, in `nix/host-state.nix`, which is what
+  # the install step provisions from;
+  # `tests/integration/t_host_identity_refusal.nim` asserts the two agree.
+  hostWideEndpointDir* =
+    when defined(windows):
+      ""
+    elif defined(macosx):
+      "/var/run/runquota"
+    else:
+      "/run/runquota"
+
+type
+  RendezvousScope* = enum
+    ## WHAT THE ENDPOINT'S ADMISSION BOUNDARY ACTUALLY IS on this host.
+    ##
+    ## A GROUP THAT CANNOT BE RESOLVED MUST NOT SILENTLY SWITCH THE GROUP
+    ## CHECK OFF. The group IS the admission boundary: with no group there
+    ## is no boundary, and an endpoint that kept ``0750`` while skipping
+    ## the group comparison would be traversable by whatever group it
+    ## happened to inherit -- a real boundary nobody chose, verified
+    ## against nothing.
+    ##
+    ## Refusing to start is the wrong answer here, and the reason it is
+    ## wrong is the same reason it was RIGHT for ``host_id``: admission is
+    ## the mission. A host that has not created the group yet would lose
+    ## its whole build-capacity governor over a missing group entry.
+    ##
+    ## So the degradation is VISIBLE INSTEAD OF SILENT, and it degrades
+    ## the CLAIM rather than the enforcement: with no group, the endpoint
+    ## becomes ``0700``/``0600``, owner-only, and the daemon says so. The
+    ## host-wide daemon visibly becomes a per-user one -- which is a
+    ## boundary the kernel really enforces and this code really verifies --
+    ## rather than invisibly becoming no boundary at all.
+    ##
+    ## NOTE HOW THIS DIFFERS FROM THE ``host_id`` RULING. There the thing
+    ## that failed was observation, which is advisory, so capture went off
+    ## and admission carried on. Here the thing that fails IS the
+    ## boundary, so "carry on without it" is not available; what is
+    ## available is a smaller boundary, stated out loud.
+    rendezvousShared
+      ## The ``runquota`` group resolved. Directory ``0750``, socket
+      ## ``0660``, group-gated, group equality verified.
+    rendezvousSingleUser
+      ## The group could not be resolved. Directory ``0700``, socket
+      ## ``0600``, owner-only. Reported by ``rendezvousDegradationReport``.
+
+  RendezvousPolicy* = object
+    ## WHO the rendezvous must belong to, and HOW it must be moded. Carried
+    ## as a value rather than read from constants at each call site so the
+    ## daemon and the client verify the same thing against the same
+    ## configuration, and so a test can state the configuration instead of
+    ## having to be the account it names.
+    ownerUid*: int64
+      ## The uid ``runquotad`` runs as. THE CLIENT CHECK IS NOW ABOUT THIS
+      ## AND NOT ABOUT ``getuid()``: a shared rendezvous is owned by the
+      ## daemon, so a client asserting "owned by me" would refuse every
+      ## correctly-deployed host and accept nothing else.
+    groupGid*: int64
+      ## The gid of ``groupName``, or -1 when the host has no such group.
+      ## -1 means the group EQUALITY check cannot be made; the
+      ## never-group-writable invariant still is, because it lives in the
+      ## mode.
+    groupName*: string
+    directoryMode*: int
+    socketMode*: int
+    scope*: RendezvousScope
+      ## ``rendezvousSingleUser`` EXACTLY WHEN ``groupGid < 0``. Carried as
+      ## its own field rather than recomputed at each site so a caller
+      ## cannot forget to ask, and so a test can assert which of the two a
+      ## host is in without inferring it from a mode.
 
 proc requiredSegmentMode*(scope: SegmentScope): int =
   ## The mode a segment of ``scope`` must be created with and verified at.
@@ -271,9 +416,135 @@ proc segmentIsGroupReadable*(scope: SegmentScope): bool =
 proc modeText*(mode: int): string =
   if mode < 0: "unknown" else: toOct(mode, 4)
 
+proc groupText*(policy: RendezvousPolicy): string =
+  if policy.groupGid >= 0:
+    policy.groupName & " (gid " & $policy.groupGid & ")"
+  else:
+    policy.groupName & " (no such group on this host)"
+
 when defined(posix):
-  proc inspectPath(path: string; wantDirectory: bool; requiredMode: int;
-                   expectedOwnerUid: int64; label: string): PathTrust =
+  proc lookupUserUid(name: string): int64 =
+    if name.len == 0:
+      return -1
+    let entry = getpwnam(name.cstring)
+    if entry == nil: -1 else: int64(entry.pw_uid)
+
+  proc lookupGroupGid(name: string): int64 =
+    ## By name, or by NUMERIC GID. The numeric form exists because a group
+    ## can be real and unnamed to this process -- a host that has not
+    ## created `runquota` yet, a directory-service lookup that is
+    ## unavailable -- and "the group could not be resolved" must not be a
+    ## quiet way to switch the group check off.
+    if name.len == 0:
+      return -1
+    try:
+      return int64(parseBiggestInt(name))
+    except ValueError:
+      discard
+    let entry = getgrnam(name.cstring)
+    if entry == nil: -1 else: int64(entry.gr_gid)
+
+proc rendezvousPolicy*(): RendezvousPolicy =
+  ## The configuration both halves verify against.
+  ##
+  ## ``ownerUid`` resolves, in order: an explicit
+  ## ``RUNQUOTA_ENDPOINT_OWNER_UID``; the ``runquota`` account, when the
+  ## host has one; this process's own uid. The last is the single-account
+  ## development case, where the daemon and the client ARE the same person
+  ## and "the daemon's uid" and "my uid" coincide -- which is why the
+  ## fallback is not a hole: it never widens what is accepted beyond one
+  ## uid.
+  ##
+  ## ``groupGid`` resolves ``RUNQUOTA_ENDPOINT_GROUP`` (default
+  ## ``runquota``) by name or by numeric gid. A host without that group
+  ## yields -1, AND THAT CHANGES THE SCOPE rather than merely skipping a
+  ## check: the policy becomes ``rendezvousSingleUser``, ``0700``/``0600``,
+  ## owner-only, and ``rendezvousDegradationReport`` says so. See
+  ## ``RendezvousScope`` for why silently dropping the group comparison is
+  ## the one answer that is not available.
+  when defined(posix):
+    let groupName = getEnv("RUNQUOTA_ENDPOINT_GROUP", defaultRendezvousGroup)
+    var owner = -1'i64
+    let ownerOverride = getEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+    if ownerOverride.len > 0:
+      try:
+        owner = int64(parseBiggestInt(ownerOverride))
+      except ValueError:
+        owner = -1
+    if owner < 0:
+      owner = lookupUserUid(defaultRendezvousUser)
+    if owner < 0:
+      owner = int64(getuid())
+    let gid = lookupGroupGid(groupName)
+    if gid >= 0:
+      RendezvousPolicy(
+        ownerUid: owner,
+        groupGid: gid,
+        groupName: groupName,
+        directoryMode: endpointDirectoryMode,
+        socketMode: endpointSocketMode,
+        scope: rendezvousShared
+      )
+    else:
+      RendezvousPolicy(
+        ownerUid: owner,
+        groupGid: -1,
+        groupName: groupName,
+        directoryMode: singleUserEndpointDirectoryMode,
+        socketMode: singleUserEndpointSocketMode,
+        scope: rendezvousSingleUser
+      )
+  else:
+    # Windows: named pipes, no directory and no mode. Reported as shared
+    # because nothing has been degraded -- the kernel object namespace
+    # carries its own ACL.
+    RendezvousPolicy(
+      ownerUid: -1, groupGid: -1, groupName: defaultRendezvousGroup,
+      directoryMode: endpointDirectoryMode, socketMode: endpointSocketMode,
+      scope: rendezvousShared
+    )
+
+proc rendezvousDegradationReport*(policy = rendezvousPolicy()): string =
+  ## Empty EXACTLY when the endpoint is the shared, group-gated one.
+  ##
+  ## Non-empty is the whole point: the difference between "host-wide, and
+  ## the group is what admits you" and "per-user, because this host has no
+  ## such group" must be visible to whoever reads the daemon's output, not
+  ## merely present in a comment. `runquotad` appends this to its listening
+  ## line.
+  case policy.scope
+  of rendezvousShared: ""
+  of rendezvousSingleUser:
+    " (single-user mode: no group \"" & policy.groupName &
+      "\" on this host, so the endpoint is owner-only -- directory " &
+      modeText(policy.directoryMode) & ", socket " &
+      modeText(policy.socketMode) &
+      "; create the group and restart to serve every member of it)"
+
+proc endpointDirectoryPermissions*(policy = rendezvousPolicy()):
+    set[FilePermission] =
+  ## The rendezvous directory's mode as a permission set, for callers that
+  ## have to CREATE such a directory (fixtures, mostly). Derived from the
+  ## shipped policy rather than written as a literal: the mode is ``0750``
+  ## where a ``runquota`` group exists and ``0700`` where it does not, and
+  ## anything hardcoding either one is green on one kind of host and red on
+  ## the other.
+  result = {}
+  let mode = policy.directoryMode
+  if (mode and 0o400) != 0: result.incl fpUserRead
+  if (mode and 0o200) != 0: result.incl fpUserWrite
+  if (mode and 0o100) != 0: result.incl fpUserExec
+  if (mode and 0o040) != 0: result.incl fpGroupRead
+  if (mode and 0o020) != 0: result.incl fpGroupWrite
+  if (mode and 0o010) != 0: result.incl fpGroupExec
+  if (mode and 0o004) != 0: result.incl fpOthersRead
+  if (mode and 0o002) != 0: result.incl fpOthersWrite
+  if (mode and 0o001) != 0: result.incl fpOthersExec
+
+when defined(posix):
+  proc inspectPath*(path: string; wantDirectory: bool; requiredMode: int;
+                    expectedOwnerUid: int64; label: string;
+                    expectedGroupGid = -1'i64): PathTrust =
     ## The single implementation of "is this path trustworthy", shared by
     ## the rendezvous directory and by segment files.
     ##
@@ -282,9 +553,19 @@ when defined(posix):
     ## even when its mode is also wrong. Were the mode checked first, a
     ## build with the ownership check removed would still refuse most
     ## foreign directories -- for the wrong reason -- and the ownership
-    ## check would be untestable.
+    ## check would be untestable. Every real foreign-owned directory on
+    ## Unix is ``0755``, which is what makes mode-first fatal here. The
+    ## group check sits BETWEEN the two, with ownership and group -- the
+    ## two identity facts -- ahead of the mode.
+    ##
+    ## ``requiredMode < 0`` means "no exact mode is specified": the path
+    ## must still not be group- or other-writable, which is the invariant,
+    ## but the caller has not committed to a single legal mode. Used for
+    ## a state directory an operator named explicitly, where the exact mode
+    ## is their decision and "somebody else can replace what lives there"
+    ## is still not.
     result = PathTrust(reason: trustOk, path: path, mode: -1, ownerUid: -1,
-                       message: "")
+                       groupGid: -1, message: "")
     if path.len == 0:
       result.reason = trustMissing
       result.message = "runquota " & label & ": no path was given"
@@ -304,6 +585,7 @@ when defined(posix):
       return
     result.mode = int(info.st_mode) and 0o7777
     result.ownerUid = int64(info.st_uid)
+    result.groupGid = int64(info.st_gid)
     let isDirectory = S_ISDIR(info.st_mode)
     let isRegular = S_ISREG(info.st_mode)
     if (wantDirectory and not isDirectory) or
@@ -323,8 +605,30 @@ when defined(posix):
         ", and a rendezvous point another user owns is a rendezvous point " &
         "another user controls"
       return
-    if result.mode != requiredMode:
-      let writable = (result.mode and 0o022) != 0
+    if expectedGroupGid >= 0 and result.groupGid != expectedGroupGid:
+      # THE GROUP IS THE ADMISSION BOUNDARY, so a wrong one is not
+      # cosmetic. Too narrow and the daemon is unreachable by the users it
+      # exists to bound; too wide and the wrong population may participate.
+      # Either way the kernel is enforcing a different rule from the one
+      # that was configured, which is precisely what must not be assumed.
+      result.reason = trustForeignGroup
+      result.message = "runquota " & label & " " & path &
+        ": refusing a path in group gid " & $result.groupGid &
+        " with mode " & modeText(result.mode) &
+        "; the configured group is gid " & $expectedGroupGid &
+        ", and group membership is what the kernel admits callers by"
+      return
+    let writable = (result.mode and 0o022) != 0
+    if requiredMode < 0:
+      # No exact mode demanded, but the invariant is not negotiable.
+      if writable:
+        result.reason = trustBadMode
+        result.message = "runquota " & label & " " & path &
+          ": refusing mode " & modeText(result.mode) &
+          "; it is group- or world-writable, so another user can replace " &
+          "what lives there"
+        return
+    elif result.mode != requiredMode:
       result.reason = trustBadMode
       result.message = "runquota " & label & " " & path &
         ": refusing mode " & modeText(result.mode) & ", required " &
@@ -336,24 +640,36 @@ when defined(posix):
           "; the mode was not verified as created and MUST NOT be assumed")
       return
 
-proc endpointDirectoryTrust*(endpoint: Endpoint): PathTrust =
+proc endpointDirectoryTrust*(endpoint: Endpoint;
+                             policy = rendezvousPolicy()): PathTrust =
   ## Whether the directory the endpoint's socket lives in may be used.
   ## ``trustMissing`` is reported rather than refused: the daemon is about
   ## to create it with an explicit mode, and a client gets an ordinary
   ## connect failure.
+  ##
+  ## THE PREDICATE'S SHAPE CHANGED WITH THE ENDPOINT. It used to assert
+  ## ``owner == getuid()`` and ``mode == 0700``, which was coherent while
+  ## the rendezvous was per-user and is exactly backwards now: a shared
+  ## rendezvous is owned by the DAEMON, and a client demanding it be owned
+  ## by itself would refuse every correctly-deployed host. What is asserted
+  ## instead is the daemon's configured uid, the configured group, and --
+  ## the invariant that survives both -- never group- or other-writable.
   case endpoint.kind
   of endpointUnixSocket:
     when defined(posix):
       inspectPath(parentDir(endpoint.path), wantDirectory = true,
-        requiredMode = endpointDirectoryMode,
-        expectedOwnerUid = int64(getuid()),
-        label = "endpoint directory")
+        requiredMode = policy.directoryMode,
+        expectedOwnerUid = policy.ownerUid,
+        label = "endpoint directory",
+        expectedGroupGid = policy.groupGid)
     else:
-      PathTrust(reason: trustOk, path: "", mode: -1, ownerUid: -1, message: "")
+      PathTrust(reason: trustOk, path: "", mode: -1, ownerUid: -1,
+                groupGid: -1, message: "")
   of endpointNamedPipe, endpointUnsupported:
     # Windows: named pipes live in the kernel object namespace, so there is
     # no directory to own and no mode to widen.
-    PathTrust(reason: trustOk, path: "", mode: -1, ownerUid: -1, message: "")
+    PathTrust(reason: trustOk, path: "", mode: -1, ownerUid: -1, groupGid: -1,
+              message: "")
 
 proc segmentTrust*(path: string; scope: SegmentScope;
                    expectedOwnerUid = -1'i64): PathTrust =
@@ -361,6 +677,13 @@ proc segmentTrust*(path: string; scope: SegmentScope;
   ## deliberately not called from anywhere yet, so the segments the
   ## shared-memory transport introduces adopt this rule instead of growing
   ## a second one.
+  ##
+  ## PER-USER STATE DOES NOT FOLLOW THE RENDEZVOUS, and this proc is where
+  ## that is enforced. The rendezvous directory became group-traversable
+  ## and its socket group-writable; the budget segment and the observation
+  ## ring did NOT. So no ``RendezvousPolicy`` reaches this code: the owner
+  ## is the calling user, the group is not consulted at all, and the mode
+  ## comes from ``requiredSegmentMode``.
   when defined(posix):
     let owner =
       if expectedOwnerUid >= 0: expectedOwnerUid else: int64(getuid())
@@ -369,16 +692,19 @@ proc segmentTrust*(path: string; scope: SegmentScope;
       expectedOwnerUid = owner,
       label = "segment")
   else:
-    PathTrust(reason: trustOk, path: path, mode: -1, ownerUid: -1, message: "")
+    PathTrust(reason: trustOk, path: path, mode: -1, ownerUid: -1, groupGid: -1,
+              message: "")
 
-proc endpointDirectoryRefusal*(endpoint: Endpoint): string =
+proc endpointDirectoryRefusal*(endpoint: Endpoint;
+                               policy = rendezvousPolicy()): string =
   ## The refusal message, or the empty string when the directory is
   ## trustworthy or simply not there yet.
-  let trust = endpointDirectoryTrust(endpoint)
+  let trust = endpointDirectoryTrust(endpoint, policy)
   if trust.reason in {trustOk, trustMissing}: "" else: trust.message
 
-proc requireTrustedEndpointDir*(endpoint: Endpoint) =
-  let refusal = endpointDirectoryRefusal(endpoint)
+proc requireTrustedEndpointDir*(endpoint: Endpoint;
+                                policy = rendezvousPolicy()) =
+  let refusal = endpointDirectoryRefusal(endpoint, policy)
   if refusal.len > 0:
     raise newException(EndpointTrustError, refusal)
 
@@ -387,15 +713,20 @@ proc defaultEndpoint*(): Endpoint =
   if overridePath.len > 0:
     return endpointForPath(overridePath)
   when defined(posix):
-    # `XDG_RUNTIME_DIR` is already a private per-user directory the session
-    # manager made; the fallbacks are not, and `<tmp>/runquota-$UID` on a
-    # shared `/tmp` is exactly the predictable name on a world-writable
-    # parent §"Mechanism" names. The fallback stays -- a session without
-    # `pam_systemd` still needs a socket -- but the directory it points at
-    # is created with an explicit mode and verified, never assumed.
-    let base = getEnv("XDG_RUNTIME_DIR", getEnv("TMPDIR", getTempDir()))
-    let dir = base / ("runquota-" & $getuid())
-    unixEndpoint(dir / "runquotad.sock")
+    # A FIXED SYSTEM PATH, AND NOTHING CALLER-DERIVED IN IT.
+    #
+    # This used to be `<XDG_RUNTIME_DIR or TMPDIR>/runquota-$UID`, and the
+    # `$UID` is the whole defect: user B did not fail to reach user A's
+    # daemon, B COMPUTED A DIFFERENT PATH, found nothing, and started a
+    # second daemon. Two daemons then admitted against their own view of
+    # one machine's budget, which is RunQuota's primary mission failing in
+    # the case it was built for -- and it failed SILENTLY, because both
+    # users saw a working system.
+    #
+    # `XDG_RUNTIME_DIR` was not merely a bad default, it is unusable here
+    # by construction: it is per-user `0700` by definition, so no fixed
+    # path inside it can be shared.
+    unixEndpoint(hostWideEndpointDir / endpointSocketName)
   elif defined(windows):
     # Windows: named pipes don't need a parent directory and live in the
     # NPFS namespace, so just return the canonical per-user path.
@@ -403,12 +734,27 @@ proc defaultEndpoint*(): Endpoint =
   else:
     Endpoint(kind: endpointUnsupported, path: "")
 
+proc provisionEndpointDirCommand*(directory: string;
+                                  policy = rendezvousPolicy()): string =
+  ## The exact command an operator runs on a host the install step has not
+  ## reached. Named in the refusal itself, for the same reason the
+  ## host-state refusal names its own: an operator left to guess creates
+  ## the directory as whoever is logged in, which is the failure the rule
+  ## exists to prevent.
+  when defined(posix):
+    "sudo mkdir -p " & directory & " && sudo chown " & $policy.ownerUid &
+      ":" & policy.groupName & " " & directory & " && sudo chmod " &
+      modeText(policy.directoryMode) & " " & directory
+  else:
+    "mkdir " & directory
+
 when defined(posix):
-  proc createPrivateDirTree(path: string) =
-    ## Creates every missing component with an EXPLICIT ``0700``.
+  proc createRendezvousDirTree(path: string; policy: RendezvousPolicy) =
+    ## Creates every missing component with an EXPLICIT mode, and puts the
+    ## configured group on the components it created.
     ##
     ## ``mkdir(2)``'s mode argument is still masked by the umask, so a
-    ## component this call created is chmod'ed to exactly ``0700``
+    ## component this call created is chmod'ed to exactly the policy mode
     ## afterwards. A component that already existed is left alone and left
     ## to the verification that follows: silently tightening a directory
     ## somebody else made would turn the refusal this whole section is
@@ -425,26 +771,58 @@ when defined(posix):
       walk = parent
     for i in countdown(missing.high, 0):
       let component = missing[i]
-      if mkdir(component.cstring, Mode(endpointDirectoryMode)) != 0:
+      if mkdir(component.cstring, Mode(policy.directoryMode)) != 0:
         if errno != EEXIST:
           raise newException(OSError,
             "runquota endpoint directory " & component &
               ": cannot create (errno " & $errno & ")")
       else:
-        discard chmod(component.cstring, Mode(endpointDirectoryMode))
+        if policy.groupGid >= 0:
+          # -1 as the uid leaves the owner alone; only the group moves.
+          discard chown(component.cstring, cast[Uid](-1'i32),
+                        Gid(policy.groupGid))
+        discard chmod(component.cstring, Mode(policy.directoryMode))
 
-proc ensureEndpointDir*(endpoint: Endpoint) =
-  ## Creates the rendezvous directory with an explicit ``0700`` and then
+  proc applySocketMode*(path: string; policy: RendezvousPolicy) =
+    ## ``0660``, group ``runquota``, applied to the bound socket.
+    ##
+    ## The socket's own mode is belt to the directory's braces: some
+    ## kernels enforce it on ``connect(2)`` and some historically did not,
+    ## so the directory's search bit is what the non-member refusal
+    ## actually rests on. Setting both means the boundary does not depend
+    ## on which kernel this is.
+    if policy.groupGid >= 0:
+      discard chown(path.cstring, cast[Uid](-1'i32), Gid(policy.groupGid))
+    discard chmod(path.cstring, Mode(policy.socketMode))
+
+proc ensureEndpointDir*(endpoint: Endpoint; policy = rendezvousPolicy()) =
+  ## Creates the rendezvous directory with an explicit mode and then
   ## VERIFIES it. Both halves are required: creating it correctly says
   ## nothing about a directory that was already there when we arrived.
+  ##
+  ## THE FIXED HOST-WIDE PATH IS NOT CREATED HERE. It is provisioned by the
+  ## install step, exactly like the host-wide state directory and for the
+  ## same reason: a path any caller can create is a path any caller can
+  ## create DIFFERENTLY, with whatever owner and group the first starter
+  ## happened to have -- and a rendezvous whose group is whoever started
+  ## the daemon is a rendezvous with the wrong admission list. A path an
+  ## operator named explicitly (``--socket``) is their decision and is
+  ## still created on demand.
   case endpoint.kind
   of endpointUnixSocket:
     if endpoint.path.len > 0:
+      let directory = parentDir(endpoint.path)
       when defined(posix):
-        createPrivateDirTree(parentDir(endpoint.path))
+        if directory == hostWideEndpointDir and not dirExists(directory):
+          raise newException(EndpointTrustError,
+            "runquota endpoint directory " & directory &
+              ": does not exist. It is created by the RunQuota install " &
+              "step, never by the daemon; provision it with: " &
+              provisionEndpointDirCommand(directory, policy))
+        createRendezvousDirTree(directory, policy)
       else:
-        createDir(parentDir(endpoint.path))
-      requireTrustedEndpointDir(endpoint)
+        createDir(directory)
+      requireTrustedEndpointDir(endpoint, policy)
   of endpointNamedPipe, endpointUnsupported:
     # Windows: named pipes live in the kernel object namespace; no fs dir.
     discard
@@ -548,12 +926,17 @@ proc bindEndpoint*(endpoint: Endpoint): LocalListener =
     when defined(windows):
       raise newException(OSError, "Unix-socket endpoints are not supported on Windows")
     else:
-      ensureEndpointDir(endpoint)
+      let policy = rendezvousPolicy()
+      ensureEndpointDir(endpoint, policy)
       if fileExists(endpoint.path):
         removeFile(endpoint.path)
       var socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE)
       setCloseOnExec(cint(socket.getFd()))
       socket.bindUnix(endpoint.path)
+      # 0660, group `runquota`: a member may connect, a non-member is
+      # refused by the filesystem rather than by anything this process
+      # runs.
+      applySocketMode(endpoint.path, policy)
       socket.listen()
       LocalListener(kind: endpointUnixSocket, socket: socket, endpoint: endpoint)
   of endpointNamedPipe:

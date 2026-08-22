@@ -92,6 +92,7 @@
 import std/[algorithm, atomics, cpuinfo, os, osproc, posix, random, streams,
             strutils, times, unittest]
 
+from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
 import runquota_core
 import runquota_observation_store
@@ -330,10 +331,14 @@ proc scratchDir(name: string): string =
   # sanctioned shell and in CI and fails nowhere anyone looks.
   result = getTempDir() / ("rq-m11-" & $getCurrentProcessId() & "-" & name)
   removeDir(result)
-  # 0700, not whatever the umask leaves: `runquotad` and every client refuse a
-  # rendezvous directory whose mode or owner they cannot vouch for.
   createDir(result)
-  setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
+  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
+  # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
+  # where a `runquota` group exists and 0700 (owner-only, single-user mode)
+  # where it does not -- so a fixture hardcoding either one is green on one
+  # kind of host and red on the other. Fixture only; the modes themselves
+  # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+  setFilePermissions(result, endpointDirectoryPermissions())
 
 proc openSampledStore(dir: string; cadenceMillis: int):
     tuple[store: ObservationStore; hostId: string] =
