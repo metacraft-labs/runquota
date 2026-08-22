@@ -71,6 +71,21 @@ create table ext_m12_unkeyed (
 );
 """
 
+  # The DDL of an extension whose REGISTRY ROW exists and whose TABLE does
+  # not. It is never run -- an absent table is the whole point of the
+  # fixture -- and it is spelled out anyway so the declaration refused
+  # against it is a real one a client could have made.
+  ghostDdl = """
+create table ext_m12_ghost (
+  host_id text not null,
+  execution_id text not null,
+  probe_label text not null,
+  primary key (host_id, execution_id),
+  foreign key (host_id, execution_id)
+    references executions(host_id, execution_id)
+);
+"""
+
   # A second extension, used only to prove the prune is ONE transaction.
   guardDdl = """
 create table ext_m12_guard (
@@ -274,7 +289,8 @@ suite "observation_store_extensions":
   test "a synthetic extension registers, writes rows, and reads them back":
     let dir = scratchDir("register")
     defer: removeDir(dir)
-    let store = openObservationStore(dir / "o.sqlite")
+    let path = dir / "o.sqlite"
+    let store = openObservationStore(path)
     check store.captureEnabled
     seedSpine(store, "host-a")
     check store.insertExecution(execution("host-a", "exec-a", 1000))
@@ -325,6 +341,52 @@ suite "observation_store_extensions":
     hostile.extensionId = "m12 probe\"; drop table executions; --"
     check store.declareExtension(hostile) == eoRefusedIdentifier
     check store.readExecutions().len == 2
+
+    # THE DECLARE PATH IS NOT WHERE THE REFUSAL MATTERS, AND ASSERTING IT
+    # ONLY THERE IS WHAT LEFT THIS CHECK UNABLE TO FAIL FOR ITS OWN REASON.
+    # `declareExtension` puts the composed table name into SQL only inside
+    # `encodeText`, as a hex literal, so nothing a hostile id contains can
+    # change the meaning of anything it reaches there -- and the assertion
+    # above holds with the identifier rule deleted from every other entry
+    # point. The statements that CONCATENATE a name are the count, the read
+    # and the insert, so the same rule is asserted against those, with an
+    # id and a column name that would not merely fail to parse but would
+    # SILENTLY DO SOMETHING ELSE if they were admitted.
+    let versionBefore = userVersion(path)
+    check versionBefore == spineSchemaVersion
+
+    # Concatenated after `select ... from `, this id closes the statement
+    # and appends one of its own. The pragma it appends is not vandalism
+    # for its own sake: a store whose `user_version` has moved reads as
+    # unstorably-newer on the next open (`ssRefusedNewer`), so admitting
+    # this id would turn a read into the permanent loss of the store.
+    let injectingId =
+      "m12_probe; pragma user_version = " & $(spineSchemaVersion + 40) & "; --"
+    check store.extensionRowCount(injectingId) == -1
+    check store.readExtensionColumns(injectingId, ["probe_label"]).len == 0
+    # THE CONTROL, without which both refusals are satisfied by a store
+    # that has simply stopped answering: the REGISTERED id still counts and
+    # still reads.
+    check store.extensionRowCount(probeId) == 2
+    check store.readExtensionColumns(probeId, ["probe_label"]).len == 2
+    # ... and the statement the hostile id would have appended did not run.
+    check userVersion(path) == versionBefore
+
+    # A PAYLOAD COLUMN NAME IS THE OTHER RAW INTERPOLATION, and it is the
+    # half the composed-table-name rule cannot cover: column names go into
+    # the insert verbatim. This one turns the caller's insert of a new row
+    # into an upsert that REWRITES a row already there -- valid SQL, no
+    # error, and a stored observation quietly replaced.
+    check store.insertExtensionRow(probeV1(), ExtensionRow(
+      hostId: "host-a", executionId: "exec-a",
+      columns: @["probe_label, probe_count) values " &
+        "('host-a', 'exec-a', 'pwned', 99) on conflict (host_id, " &
+        "execution_id) do update set probe_label = 'pwned'; --"],
+      values: @[extText("alpha")])) == ewRefusedRow
+    check store.readExtensionColumns(probeId, ["probe_label"]) ==
+      @[@["alpha"], @["beta"]]
+    check userVersion(path) == versionBefore
+    check store.captureEnabled
 
     # A table without the spine key and the foreign key is refused, and
     # nothing of it survives: no table, no registry row.
@@ -387,6 +449,43 @@ suite "observation_store_extensions":
     check both.len == 2
     check both[0] == @["alpha", nullMarker]
     check both[1] == @["beta", "0.5"]
+
+    # AND THE MARKER IS NOT MERELY "SOMETHING OTHER THAN A VALUE". What it
+    # exists for is telling SQL NULL apart from a value that RENDERS AS
+    # NOTHING -- and that direction had never been written down here: every
+    # assertion above also holds for a decoder that answered the marker for
+    # any column it could not make a value out of, because until now no
+    # extension row in this file ever carried such a value.
+    #
+    # So the two hazards are stored and read back. `exec-c` carries the
+    # EMPTY STRING, which is a value the client wrote. `exec-d` carries a
+    # payload spelling the ROW AND COLUMN DELIMITERS and the marker
+    # character itself -- RunQuota is a courier for these bytes and the
+    # encoding is what stops a value from being read as structure.
+    check store.insertExecution(execution("host-a", "exec-c", 3000))
+    check store.insertExtensionRow(probeV2(), ExtensionRow(
+      hostId: "host-a", executionId: "exec-c",
+      columns: @["probe_label", "probe_count", "probe_weight"],
+      values: @[extText(""), extInt(0), extNull()])) == ewWritten
+    check store.insertExecution(execution("host-a", "exec-d", 4000))
+    check store.insertExtensionRow(probeV2(), ExtensionRow(
+      hostId: "host-a", executionId: "exec-d",
+      columns: @["probe_label", "probe_count", "probe_weight"],
+      values: @[extText("a|b\n" & nullMarker), extInt(0),
+                extReal(0.5)])) == ewWritten
+
+    let markers = store.readExtensionColumns(probeId,
+      ["probe_label", "probe_weight"])
+    check markers.len == 4
+    # `exec-a`: a column that is genuinely NULL.
+    check markers[0] == @["alpha", nullMarker]
+    # `exec-c`: the empty string comes back as the empty string, and NOT as
+    # a column that was never written.
+    check markers[2] == @["", nullMarker]
+    # `exec-d`: the delimiters and the marker survive as payload, and the
+    # column AFTER them still reads -- so no value can pass itself off as
+    # the end of a field or the end of a row.
+    check markers[3] == @["a|b\n" & nullMarker, "0.5"]
 
   test "the spine migrates while the extension stands still":
     # The other arm, and the one that makes the pair discriminating: a
@@ -580,6 +679,75 @@ suite "observation_store_extensions":
     # the hosts and runs they hang off.
     check store.readHosts().len == 1
     check store.readRuns().len == 1
+
+  test "a registry row whose table is missing is refused, not worked around":
+    # The registry is the only thing that says which extension tables
+    # exist, so a row claiming a table that is not there is the one
+    # inconsistency RunQuota cannot resolve by looking harder. BOTH places
+    # that read the registry have to survive it, and they have to survive
+    # it DIFFERENTLY:
+    #
+    # * `declareExtension` must REFUSE. Answering "up-to-date" would be a
+    #   lie the client cannot detect, and its next write would land on a
+    #   table that is not there -- which is not a constraint rejection, so
+    #   it degrades the store and turns capture off FOR THE SPINE AND EVERY
+    #   OTHER EXTENSION TOO.
+    # * `pruneExecutionsBefore` must SKIP it and finish, which is the same
+    #   reasoning read from the other end: one phantom row must not be able
+    #   to stop retention for the whole host, and it is one statement in a
+    #   single transaction away from doing exactly that.
+    let dir = scratchDir("ghost")
+    defer: removeDir(dir)
+    let store = openObservationStore(dir / "o.sqlite")
+    check store.captureEnabled
+    seedSpine(store, "host-a")
+    check store.insertExecution(execution("host-a", "exec-old", 1000))
+    check store.insertExecution(execution("host-a", "exec-new", 9000))
+    check store.declareExtension(probeV1()) == eoCreated
+    check store.insertExtensionRow(probeV1(),
+      probeRow("host-a", "exec-old", "old-one", 1)) == ewWritten
+
+    # A registry row for a table nobody created. The registry's own naming
+    # check still applies to it, so this is a row the SCHEMA considers
+    # perfectly well formed -- which is the point: nothing below the
+    # registry can catch this.
+    check store.runStatement(
+      "insert into extension_registry values ('m12_ghost', 1, " &
+        encodeText(probeOwner) & ", 'ext_m12_ghost', 1000);")
+    check store.readExtensionRegistry().len == 2
+    check not store.extensionTableExists("ext_m12_ghost")
+
+    # REFUSED, and specifically not "up-to-date": the version the client
+    # declares EQUALS the one the registry records, so every comparison
+    # downstream of the missing-table check would have said yes.
+    let ghost = ExtensionDeclaration(extensionId: "m12_ghost",
+      owner: probeOwner, schemaVersion: 1, migrations: @[ghostDdl])
+    check store.declareExtension(ghost) == eoRefusedShape
+    check store.captureEnabled
+
+    # And it is a refusal of THAT extension only -- the store is not now
+    # broken for everyone, which is the OS-4 half of the clause.
+    check store.declareExtension(probeV1()) == eoUpToDate
+    check store.insertExtensionRow(probeV1(),
+      probeRow("host-a", "exec-new", "recent", 2)) == ewWritten
+    check store.extensionRowCount(probeId) == 2
+
+    # RETENTION STILL RUNS, and the positive control comes first: the rows
+    # the prune is about to remove are asserted to be there, so "they are
+    # gone" cannot be satisfied by rows that never existed.
+    check store.readExecutions().len == 2
+    check store.extensionRowCount(probeId) == 2
+    let outcome = store.pruneExecutionsBefore("host-a", 5000)
+    check outcome.pruned
+    check outcome.executionsRemoved == 1
+    check outcome.extensionRowsRemoved == 1
+    # `m12_ghost` sorts BEFORE `m12_probe`, so the phantom is the first
+    # thing the cascade meets: it is skipped, and the real extension after
+    # it is still reached.
+    check outcome.extensionsCascaded == @[probeId]
+    check store.readExecutions().len == 1
+    check store.extensionRowCount(probeId) == 1
+    check store.captureEnabled
 
   test "a prune that cannot finish removes nothing":
     # ONE TRANSACTION, asserted rather than described. A cascade that
