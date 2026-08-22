@@ -544,6 +544,18 @@ proc readAmbientSamples*(store: ObservationStore): seq[AmbientSampleRow] =
       foreignCpuPct: parseFloat(row[9]),
       foreignRssBytes: parseBiggestInt(row[10])))
 
+proc runStatement*(store: ObservationStore; sql: string): bool =
+  ## Runs ``sql`` through the same degrade-never-fail path every spine
+  ## write uses. It exists for the extension mechanism (``extensions.nim``),
+  ## whose statements are built from a schema the DECLARING PRODUCT owns
+  ## and which therefore cannot be spelled out here: RunQuota manages
+  ## extension tables and MUST NOT interpret their columns (OS-5).
+  store.execute(sql)
+
+proc runQuery*(store: ObservationStore; sql: string): seq[seq[string]] =
+  ## The read half of ``runStatement``, with the same reason to exist.
+  store.query(sql)
+
 proc readExtensionRegistry*(store: ObservationStore):
     seq[ExtensionRegistryRow] =
   let sql = "select " & [

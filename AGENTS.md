@@ -28,6 +28,14 @@
 - `runquotad` is a lease authority. It must not spawn, sandbox, monitor, or kill
   client process trees.
 - Client-side process helpers live in `runquota_process` and `runquota_exec`.
+- Extension tables are owned by the product that declares them. RunQuota
+  creates, migrates, prunes and merges them and must not interpret extension
+  columns. Two rules make that structural rather than a matter of care: every
+  extension table name is composed from the `ext_` prefix and the registered
+  `extension_id`, so no concrete extension table name may appear in `libs/` or
+  `apps/` source; and the only column names RunQuota may write into a statement
+  against one are the spine key it is joined by, every other column name having
+  arrived from the caller.
 - Static helper libraries must compile with `--mm:arc --app:staticlib` and must
   not define or use Nim `ref` types.
 - JSON may be emitted for inspection output, diagnostics, or benchmark reports.

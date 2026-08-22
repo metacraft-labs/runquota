@@ -43,6 +43,20 @@ The execution spine (`runs`, `executions`), `hosts`, `host_profiles`,
 read. The daemon opens the store at startup and reports on stdout whether
 capture is on.
 
+**Domain extensions are live as a mechanism, with no extension yet using
+it.** A product declares an extension — an id, an owner, a schema version
+and a forward-only ladder — and RunQuota creates the `ext_<extension_id>`
+table, migrates it when a newer client arrives, accepts an older client
+unchanged, and refuses one declaring a version it has no route to rather
+than writing that client's rows into a shape it was not built for.
+Retention cascades from the spine into every registered extension in one
+transaction, driven by `extension_registry` rather than by any list in
+RunQuota. **An extension's version and the spine's move independently**:
+neither migration touches the other's schema. The two extensions that will
+really exist, `ext_test_execution` and `ext_repro_action`, are M19 and M17;
+the mechanism was deliberately built and gated against a synthetic
+extension so that no one product's shape decided what it can express.
+
 **Two writers run against that one store, not one.** Both are background
 threads, and both exist so that nothing on the lease path waits for IO:
 
@@ -276,7 +290,13 @@ As implemented:
 
 - **Schema ownership.** RunQuota owns every spine table. Extension tables are
   owned by the declaring product, must be named `ext_<extension_id>` (the
-  schema enforces it), and RunQuota never reads their columns.
+  schema enforces it), and RunQuota never reads their columns. That last
+  clause is enforced by inspection rather than by review:
+  `tests/unit/t_observation_store_extension_boundary.nim` walks `libs/` and
+  `apps/` — a discovered set, not a list that can drift — and fails on any
+  concrete extension table name or extension-owned column name in RunQuota
+  source, with positive controls so that a scanner matching nothing cannot
+  pass.
 - **Migrations.** Versioned through SQLite's `user_version` and forward-only.
   Each step is a text constant that is never edited once shipped; a database
   built from the frozen version-1 DDL must migrate to exactly the schema a
