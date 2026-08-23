@@ -149,6 +149,30 @@ proc enqueueExecutionRow*(row: ExecutionRow): bool {.discardable.} =
   finally:
     release(writerLock)
 
+proc flushObservationWriter*() =
+  ## Drains whatever is queued, synchronously, on the CALLER's thread.
+  ##
+  ## FOR THE READ PATH, NEVER FOR THE WRITE PATH. A query that could not
+  ## see an execution the daemon has already recorded would make the store
+  ## a system of record only after an unspecified delay, and a caller
+  ## cannot tell "not yet flushed" from "never happened". OS-1 is
+  ## untouched: this is not on the observation-recording path, it is on the
+  ## path of somebody who has just asked a question and is waiting for the
+  ## answer anyway.
+  ##
+  ## Safe to call concurrently with the drain thread: the queue swap is
+  ## under the same lock, so at worst one of the two callers finds nothing
+  ## to write.
+  ensureWriterLock()
+  var running = false
+  acquire(writerLock)
+  try:
+    running = writerActive
+  finally:
+    release(writerLock)
+  if running:
+    drainOnce()
+
 proc observationsDropped*(): int64 =
   ensureWriterLock()
   acquire(writerLock)

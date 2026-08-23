@@ -315,6 +315,42 @@ reports whether
 capture is on, which store is open, how many in-flight client reports were
 accepted and refused, and how many rows were dropped or failed to write.
 
+## Reading it back
+
+`runquotad` is the **only sanctioned reader**. No client may open the database
+file directly; queries go over the socket as `StatsQuery`/`StatsResponse`
+(`runquota_client.queryStats`), and never on the observation ring, which is a
+one-way MPSC write path of the opposite shape.
+
+Two consumers share one interface, differing in aggregation rather than in
+mechanism: a **resource distribution** over a stats key, for admission, and
+**rows and rankings**, for the human and agent surfaces.
+
+Four rules shape every answer:
+
+- **Host qualification.** Every response carries the host profile identity of
+  the rows it summarises, and rows from two hardware profiles are never pooled
+  into one set of figures. A caller wanting cross-host data asks for it
+  explicitly and receives one distribution *per profile*.
+- **Unknown is not zero.** A key with no history answers `unknown`; a key whose
+  history happens to be all zeros answers `known`, with zeros. Callers treat
+  unknown as "use the declared or default estimate".
+- **Uid scoping.** Row and ranking queries are scoped to the calling uid, taken
+  from peer credentials rather than from anything the caller declares. Widening
+  to the whole host is explicit and available. The **estimate path is
+  deliberately not uid-scoped**: the cost of a piece of work is a property of
+  the work and the hardware, not of who ran it.
+- **Client estimates are not second-guessed.** An estimate supplied with a lease
+  request is used unmodified — never clamped against the daemon's learned table.
+  The learned estimate is the fallback when none is supplied.
+
+The reader boundary is enforced by inspection rather than by review:
+`tests/unit/t_observation_store_reader_boundary.nim` walks `libs/` and `apps/` —
+a discovered set, not a list that can drift — and fails on any unsanctioned
+module that opens the store or reaches SQLite, with positive controls in both
+directions so that neither a scanner matching nothing nor one matching
+everything can pass.
+
 ## State-boundary requirements
 
 Any persistent RunQuota state must document schema ownership, migrations, backup,

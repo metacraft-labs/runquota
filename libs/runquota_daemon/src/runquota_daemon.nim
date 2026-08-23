@@ -872,6 +872,181 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
     "\"write_failures\":" & $observationWriteFailures() &
   "}}"
 
+# ---------------------------------------------------------------------------
+# The read path (M13a). `runquotad` is the ONLY sanctioned reader of the
+# observation store, so everything below is the whole of what a client can
+# learn from it.
+# ---------------------------------------------------------------------------
+
+# The wire enums mirror the store's, and the mapping below assumes they do.
+# Asserted rather than commented: an enum that gained a case on one side
+# only would otherwise translate silently into the wrong one.
+static:
+  doAssert ord(high(StatsScopeWire)) == ord(high(StatsScope))
+  doAssert ord(high(ProfileSpanWire)) == ord(high(ProfileSpan))
+  doAssert ord(high(StatsKnowledgeWire)) == ord(high(StatsKnowledge))
+
+proc toStore(scope: StatsScopeWire): StatsScope =
+  StatsScope(ord(scope))
+
+proc toStore(span: ProfileSpanWire): ProfileSpan =
+  ProfileSpan(ord(span))
+
+proc toWire(span: ProfileSpan): ProfileSpanWire =
+  ProfileSpanWire(ord(span))
+
+proc toWire(knowledge: StatsKnowledge): StatsKnowledgeWire =
+  StatsKnowledgeWire(ord(knowledge))
+
+proc toWire(profile: ProfileIdentity): ProfileIdentityWire =
+  ProfileIdentityWire(
+    hostId: profile.hostId,
+    profileIdPresent: profile.profileId.isSome,
+    profileId: if profile.profileId.isSome: profile.profileId.get else: "",
+    profileHash: profile.profileHash,
+    cpuModel: profile.cpuModel,
+    logicalCores: uint64(max(0'i64, profile.logicalCores)))
+
+proc nonNegative(value: int64): uint64 =
+  uint64(max(0'i64, value))
+
+proc statsOwnerUid(context: ConnectionContext): Option[int64] =
+  ## FROM PEER CREDENTIALS, never from anything the caller declared.
+  ## ``none`` when the transport cannot report them, and the caller below
+  ## turns that into an EMPTY uid-scoped answer rather than a host-wide
+  ## one: a scope-to-me query with nobody to scope to must not silently
+  ## become a scope-to-everybody query.
+  if context.peer.kind == peerIdentityUnavailable:
+    none(int64)
+  else:
+    some(int64(context.peer.userId))
+
+proc statsAnswer(daemon: var RunQuotaDaemon; context: ConnectionContext;
+                 request: StatsQueryMessage): StatsResponseMessage =
+  ## Answers one query over the recorded rows.
+  ##
+  ## THE DEFAULT PROFILE SPAN IS THIS HOST'S CURRENT PROFILE, and a wider
+  ## one is honoured but never merged: the store layer returns one
+  ## distribution per profile and nothing here folds them together.
+  let span = request.span.toStore
+  let profileId =
+    if daemon.observationProfileId.len > 0:
+      some(daemon.observationProfileId)
+    else:
+      none(string)
+  # A query must see what the daemon has already recorded. The observation
+  # queue is drained in the background, so without this a `repro stats`
+  # immediately after a build would report the build's own executions as
+  # missing -- indistinguishable, to the caller, from never having run.
+  flushObservationWriter()
+
+  result = StatsResponseMessage(
+    subject: request.subject,
+    statsKey: request.statsKey,
+    knowledge: statsKnowledgeWireUnknown,
+    scopeApplied: request.scope,
+    spanApplied: span.toWire,
+    ownerUidPresent: false,
+    ownerUid: 0'u64,
+    captureEnabled: daemon.observationCaptureEnabled(),
+    distributions: @[],
+    executions: @[],
+    rankings: @[],
+    extensionRows: @[],
+    diagnostic: okDiagnostic()
+  )
+
+  case request.subject
+  of statsSubjectDistribution:
+    # DELIBERATELY NOT UID-SCOPED, and the response says so rather than
+    # leaving the caller to assume either way. The cost of compiling a
+    # translation unit is a property of the work and the hardware, not of
+    # who ran it; scoping it per user would discard most of the history on
+    # exactly the machines that have the most -- a CI server where a dozen
+    # accounts build the same tree. `estimateFor` takes no uid at all, so
+    # this cannot be got wrong by passing one.
+    let answer = daemon.observationStore.estimateFor(
+      request.statsKey, span, profileId)
+    result.scopeApplied = statsScopeWireHost
+    result.ownerUidPresent = false
+    result.knowledge = answer.knowledge.toWire
+    for entry in answer.distributions:
+      result.distributions.add(ResourceDistributionWire(
+        profile: entry.profile.toWire,
+        knowledge: entry.knowledge.toWire,
+        sampleCount: nonNegative(entry.sampleCount),
+        durationMillisMin: nonNegative(entry.durationMillisMin),
+        durationMillisP50: nonNegative(entry.durationMillisP50),
+        durationMillisP90: nonNegative(entry.durationMillisP90),
+        durationMillisMax: nonNegative(entry.durationMillisMax),
+        peakRssBytesMax: nonNegative(entry.peakRssBytesMax)))
+  of statsSubjectExecutions, statsSubjectRanking, statsSubjectExtensionRows:
+    let owner = statsOwnerUid(context)
+    let query = RowQuery(
+      statsKey: request.statsKey,
+      scope: request.scope.toStore,
+      ownerUid: owner,
+      span: span,
+      profileId: profileId,
+      limit: int(request.limit))
+    if request.scope == statsScopeWireOwner and owner.isSome:
+      result.ownerUidPresent = true
+      result.ownerUid = uint64(owner.get)
+    if request.subject == statsSubjectExtensionRows:
+      # THE PAYLOAD PASSES THROUGH UNINTERPRETED (OS-5). The extension and
+      # its columns are named by the CALLER; the daemon checks nothing
+      # about what they mean, and the scope rules that decided which
+      # executions are visible are the same ones applied above -- an
+      # execution this caller may not see does not become visible because
+      # a product attached a fact to it.
+      var columns: seq[string] = @[]
+      for name in request.extensionColumns:
+        columns.add(name)
+      for entry in daemon.observationStore.queryExtensionRows(
+          query, request.extensionId, columns):
+        result.extensionRows.add(ExtensionRowWire(
+          hostId: entry.hostId,
+          executionId: entry.executionId,
+          statsKey: entry.statsKey,
+          profile: entry.profile.toWire,
+          ownerUidPresent: entry.ownerUid.isSome,
+          ownerUid:
+          if entry.ownerUid.isSome: uint64(entry.ownerUid.get) else: 0'u64,
+          columns: entry.columns,
+          values: entry.values))
+      if result.extensionRows.len > 0:
+        result.knowledge = statsKnowledgeWireKnown
+    elif request.subject == statsSubjectExecutions:
+      for entry in daemon.observationStore.queryExecutions(query):
+        result.executions.add(ExecutionSummaryWire(
+          executionId: entry.executionId,
+          statsKey: entry.statsKey,
+          profile: entry.profile.toWire,
+          ownerUidPresent: entry.ownerUid.isSome,
+          ownerUid:
+          if entry.ownerUid.isSome: uint64(entry.ownerUid.get) else: 0'u64,
+          startedAtUnixMillis: nonNegative(entry.startedAtUnixMillis),
+          durationMillis: nonNegative(entry.durationMillis),
+          peakRssBytes: nonNegative(entry.peakRssBytes),
+          exitStatus: nonNegative(entry.exitStatus),
+          termination: $entry.termination))
+      if result.executions.len > 0:
+        result.knowledge = statsKnowledgeWireKnown
+    else:
+      for entry in daemon.observationStore.queryRanking(query):
+        result.rankings.add(KeyRankingWire(
+          statsKey: entry.statsKey,
+          profile: entry.profile.toWire,
+          sampleCount: nonNegative(entry.sampleCount),
+          totalDurationMillis: nonNegative(entry.totalDurationMillis),
+          maxDurationMillis: nonNegative(entry.maxDurationMillis)))
+      if result.rankings.len > 0:
+        result.knowledge = statsKnowledgeWireKnown
+    if request.scope == statsScopeWireOwner and owner.isNone:
+      result.diagnostic = diagnostic(diagDenied,
+        "the transport did not report peer credentials",
+        "a uid-scoped query is answered empty rather than widened")
+
 proc inspectionJson(daemon: var RunQuotaDaemon;
     request: InspectionRequestMessage): string =
   case request.subject
@@ -997,9 +1172,33 @@ proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
   daemon.leases[id.value] = result
 
 proc effectiveResources(daemon: RunQuotaDaemon; sessionId: SessionId;
-                        commandStatsId: string;
-                            requested: ResourceVector): ResourceVector =
+                        commandStatsId: string; requested: ResourceVector;
+                        estimate: ClientEstimate): ResourceVector =
+  ## What admission actually reserves for a request.
+  ##
+  ## TWO BRANCHES, AND WHICH ONE FIRES IS DECIDED BY ONE FACT: whether the
+  ## CLIENT supplied an estimate.
+  ##
+  ## * **It did.** The estimate is used UNMODIFIED. Not compared with the
+  ##   daemon's learned table, not raised to it, not lowered to it, not
+  ##   validated against it. RunQuota expresses no opinion about the cache
+  ##   the client got it from — not its format, its key, its lifetime, or
+  ##   its freshness — and second-guessing it here would be exactly the
+  ##   validation the specification forbids. A client that under-declares
+  ##   spends its OWN user's budget, which is the whole reason the trust is
+  ##   affordable.
+  ## * **It did not.** The daemon's learned estimate is the FALLBACK, and
+  ##   this is the only branch it may be used on. It is a fallback when
+  ##   none is supplied, never a check on one that is.
+  ##
+  ## The distinction is carried by ``ClientEstimate.supplied`` rather than
+  ## by a zero sentinel, because zero is a legitimate estimate and because
+  ## "none was supplied" has to be a statable fact for the rule above to
+  ## be a rule at all.
   result = requested
+  if estimate.supplied:
+    result.memory = bytes(estimate.memoryBytes)
+    return
   if commandStatsId.len == 0 or not daemon.sessions.hasKey(sessionId.value):
     return
   let scope = daemon.sessions[sessionId.value].sessionScope()
@@ -1391,7 +1590,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       connection.sendError(frame.header.requestId, diagnostic(
           diagInvalidArgument, "unknown session id"))
       return
-    let effective = daemon.effectiveResources(msg.sessionId, msg.commandStatsId, msg.resources)
+    let effective = daemon.effectiveResources(msg.sessionId,
+        msg.commandStatsId, msg.resources, msg.estimate)
     var reason = ""
     if not daemon.possible(effective, reason):
       let denied = LeaseDeniedMessage(
@@ -1477,7 +1677,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     for candidate in msg.candidates:
       var reason = ""
       let effective = daemon.effectiveResources(msg.sessionId,
-          candidate.commandStatsId, candidate.resources)
+          candidate.commandStatsId, candidate.resources, candidate.estimate)
       if not daemon.possible(effective, reason):
         decisions.add(LeaseDecision(
           clientCandidateId: candidate.clientCandidateId,
@@ -1645,6 +1845,22 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
   of rqStatusRequest:
     connection.sendResponse(rqStatusResponse, frame.header.requestId,
         encodeStatus(daemon.status()))
+  of rqStatsQuery:
+    # THE READ PATH, OVER THE SOCKET. Request/response with a variable-size
+    # result, which is why it is here and not on the observation ring: the
+    # ring is a one-way MPSC write path of the opposite shape, and the one
+    # read with a latency budget (the admission estimate) is served from
+    # the published aggregate table instead.
+    var msg: StatsQueryMessage
+    if not decodeStatsQuery(frame.payload, msg):
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "invalid StatsQuery payload"))
+      return
+    connection.sendResponse(
+      rqStatsResponse,
+      frame.header.requestId,
+      encodeStatsResponse(daemon.statsAnswer(context, msg))
+    )
   of rqInspectionRequest:
     var msg: InspectionRequestMessage
     if not decodeInspectionRequest(frame.payload, msg):

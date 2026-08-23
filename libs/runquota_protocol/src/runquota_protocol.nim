@@ -7,11 +7,13 @@ export protocolTypes
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 1'u16
-const RqspProtocolMinor* = 3'u16
-  ## Minor 3 adds ``rqLeaseObservation`` (M13). Minor rather than major
-  ## because it is purely additive: a client that never sends one is
-  ## unaffected, and a daemon that does not know the kind refuses the
-  ## single frame rather than the connection.
+const RqspProtocolMinor* = 4'u16
+  ## Minor 3 added ``rqLeaseObservation`` (M13). Minor 4 adds the READ path
+  ## (M13a): ``rqStatsQuery``/``rqStatsResponse``, and the client estimate
+  ## carried on a lease request. Minor rather than major because the store
+  ## is a system of record either way: a client that never asks a question
+  ## and never supplies an estimate behaves exactly as before, and the
+  ## daemon's learned table remains the fallback for it.
 const RqspHeaderLen* = 24'u16
 const MaxCommandStatsIdBytes* = 64
 const FrameFlagRequest* = 0x0001'u16
@@ -283,6 +285,25 @@ proc decodeSessionClosed*(payload: string;
   msg = SessionClosedMessage(sessionId: sessionId(id))
   true
 
+proc writeClientEstimate(w: var BinaryWriter; estimate: ClientEstimate) =
+  ## PRESENCE FIRST, VALUE SECOND, and the presence flag is what the
+  ## admission rule is written against. See ``ClientEstimate``.
+  w.writeBool(estimate.supplied)
+  w.writeU64(estimate.memoryBytes)
+
+proc readClientEstimate(r: var BinaryReader;
+    estimate: var ClientEstimate): bool =
+  var supplied: bool
+  var memoryBytes: uint64
+  if not r.readBool(supplied): return false
+  if not r.readU64(memoryBytes): return false
+  # NOT VALIDATED, NOT CLAMPED, NOT RANGE-CHECKED against anything the
+  # daemon knows. A decoder that "corrected" an implausible estimate here
+  # would break the pass-through rule below the level the rule is written
+  # at, which is exactly how such rules stop holding.
+  estimate = ClientEstimate(supplied: supplied, memoryBytes: memoryBytes)
+  true
+
 proc encodeLeaseRequest*(msg: LeaseRequestMessage): string =
   var w = writer()
   w.writeU64(msg.sessionId.value)
@@ -293,6 +314,7 @@ proc encodeLeaseRequest*(msg: LeaseRequestMessage): string =
   w.writeU32(uint32(ord(msg.priority)))
   w.writeU32(uint32(ord(msg.purpose)))
   w.writeMetadata(msg.metadata)
+  w.writeClientEstimate(msg.estimate)
   w.data
 
 proc decodeLeaseRequest*(payload: string; msg: var LeaseRequestMessage): bool =
@@ -324,6 +346,8 @@ proc decodeLeaseRequest*(payload: string; msg: var LeaseRequestMessage): bool =
   if not r.readU32(purposeRaw): return false
   if purposeRaw > uint32(ord(high(LeasePurpose))): return false
   if not r.readMetadata(metadata): return false
+  var estimate: ClientEstimate
+  if not r.readClientEstimate(estimate): return false
   if r.remaining != 0: return false
   msg = LeaseRequestMessage(
     sessionId: sessionId(id),
@@ -333,7 +357,8 @@ proc decodeLeaseRequest*(payload: string; msg: var LeaseRequestMessage): bool =
     deadline: deadline,
     priority: PriorityClass(int(priorityRaw)),
     purpose: LeasePurpose(int(purposeRaw)),
-    metadata: metadata
+    metadata: metadata,
+    estimate: estimate
   )
   true
 
@@ -346,6 +371,7 @@ proc writeLeaseCandidate(w: var BinaryWriter; candidate: LeaseCandidate) =
   w.writeU32(uint32(ord(candidate.priority)))
   w.writeU32(uint32(ord(candidate.purpose)))
   w.writeMetadata(candidate.metadata)
+  w.writeClientEstimate(candidate.estimate)
 
 proc readLeaseCandidate(r: var BinaryReader;
     candidate: var LeaseCandidate): bool =
@@ -376,6 +402,8 @@ proc readLeaseCandidate(r: var BinaryReader;
   if not r.readU32(purposeRaw): return false
   if purposeRaw > uint32(ord(high(LeasePurpose))): return false
   if not r.readMetadata(metadata): return false
+  var estimate: ClientEstimate
+  if not r.readClientEstimate(estimate): return false
   candidate = LeaseCandidate(
     clientCandidateId: clientCandidateId,
     label: label,
@@ -384,7 +412,8 @@ proc readLeaseCandidate(r: var BinaryReader;
     deadline: deadline,
     priority: PriorityClass(int(priorityRaw)),
     purpose: LeasePurpose(int(purposeRaw)),
-    metadata: metadata
+    metadata: metadata,
+    estimate: estimate
   )
   true
 
@@ -840,6 +869,261 @@ proc observedCpuPct*(cpuMilliPct: uint32): float64 =
   ## The wire's integer thousandths-of-a-percent as the percent
   ## ``ambient.nim`` sums.
   float64(cpuMilliPct) / 1000.0
+
+# ---------------------------------------------------------------------------
+# The read path (M13a): stats queries over the socket.
+# ---------------------------------------------------------------------------
+
+proc writeProfileIdentity(w: var BinaryWriter; profile: ProfileIdentityWire) =
+  ## THE HARDWARE DIMENSION TRAVELS WITH EVERY ANSWER. It is written by one
+  ## helper used by all three result shapes so that a result shape added
+  ## later cannot quietly omit it.
+  w.writeString(profile.hostId)
+  w.writeBool(profile.profileIdPresent)
+  w.writeString(profile.profileId)
+  w.writeString(profile.profileHash)
+  w.writeString(profile.cpuModel)
+  w.writeU64(profile.logicalCores)
+
+proc readProfileIdentity(r: var BinaryReader;
+    profile: var ProfileIdentityWire): bool =
+  var hostId, profileId, profileHash, cpuModel: string
+  var present: bool
+  var logicalCores: uint64
+  if not r.readString(hostId): return false
+  if not r.readBool(present): return false
+  if not r.readString(profileId): return false
+  if not r.readString(profileHash): return false
+  if not r.readString(cpuModel): return false
+  if not r.readU64(logicalCores): return false
+  profile = ProfileIdentityWire(hostId: hostId, profileIdPresent: present,
+    profileId: profileId, profileHash: profileHash, cpuModel: cpuModel,
+    logicalCores: logicalCores)
+  true
+
+proc encodeStatsQuery*(msg: StatsQueryMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU32(uint32(ord(msg.subject)))
+  w.writeBytes(msg.statsKey)
+  w.writeU32(uint32(ord(msg.scope)))
+  w.writeU32(uint32(ord(msg.span)))
+  w.writeU32(msg.limit)
+  w.writeString(msg.extensionId)
+  w.writeU32(uint32(msg.extensionColumns.len))
+  for name in msg.extensionColumns:
+    w.writeString(name)
+  w.data
+
+proc decodeStatsQuery*(payload: string; msg: var StatsQueryMessage): bool =
+  var r = reader(payload)
+  var sessionRaw: uint64
+  var subjectRaw, scopeRaw, spanRaw, limit: uint32
+  var statsKey: string
+  if not r.readU64(sessionRaw): return false
+  if not r.readU32(subjectRaw): return false
+  if subjectRaw > uint32(ord(high(StatsSubject))): return false
+  if not r.readBytes(statsKey): return false
+  if statsKey.len > MaxCommandStatsIdBytes:
+    statsKey.setLen(MaxCommandStatsIdBytes)
+  if not r.readU32(scopeRaw): return false
+  # A SCOPE THE DAEMON DOES NOT KNOW IS REFUSED, NOT DEFAULTED. Defaulting
+  # an unrecognised widening request to the narrow value would be safe;
+  # defaulting it to the wide one would over-share, and a decoder that
+  # silently picks either makes the caller's request unknowable.
+  if scopeRaw > uint32(ord(high(StatsScopeWire))): return false
+  if not r.readU32(spanRaw): return false
+  if spanRaw > uint32(ord(high(ProfileSpanWire))): return false
+  if not r.readU32(limit): return false
+  var extensionId: string
+  var columnCount: uint32
+  if not r.readString(extensionId): return false
+  if not r.readU32(columnCount): return false
+  var extensionColumns: seq[string] = @[]
+  for _ in 0 ..< columnCount:
+    var name: string
+    if not r.readString(name): return false
+    extensionColumns.add(name)
+  if r.remaining != 0: return false
+  msg = StatsQueryMessage(
+    sessionId: sessionId(sessionRaw),
+    subject: StatsSubject(int(subjectRaw)),
+    statsKey: statsKey,
+    scope: StatsScopeWire(int(scopeRaw)),
+    span: ProfileSpanWire(int(spanRaw)),
+    limit: limit,
+    extensionId: extensionId,
+    extensionColumns: extensionColumns
+  )
+  true
+
+proc encodeStatsResponse*(msg: StatsResponseMessage): string =
+  var w = writer()
+  w.writeU32(uint32(ord(msg.subject)))
+  w.writeBytes(msg.statsKey)
+  w.writeU32(uint32(ord(msg.knowledge)))
+  w.writeU32(uint32(ord(msg.scopeApplied)))
+  w.writeU32(uint32(ord(msg.spanApplied)))
+  w.writeBool(msg.ownerUidPresent)
+  w.writeU64(msg.ownerUid)
+  w.writeBool(msg.captureEnabled)
+  w.writeU32(uint32(msg.distributions.len))
+  for entry in msg.distributions:
+    w.writeProfileIdentity(entry.profile)
+    w.writeU32(uint32(ord(entry.knowledge)))
+    w.writeU64(entry.sampleCount)
+    w.writeU64(entry.durationMillisMin)
+    w.writeU64(entry.durationMillisP50)
+    w.writeU64(entry.durationMillisP90)
+    w.writeU64(entry.durationMillisMax)
+    w.writeU64(entry.peakRssBytesMax)
+  w.writeU32(uint32(msg.executions.len))
+  for entry in msg.executions:
+    w.writeString(entry.executionId)
+    w.writeBytes(entry.statsKey)
+    w.writeProfileIdentity(entry.profile)
+    w.writeBool(entry.ownerUidPresent)
+    w.writeU64(entry.ownerUid)
+    w.writeU64(entry.startedAtUnixMillis)
+    w.writeU64(entry.durationMillis)
+    w.writeU64(entry.peakRssBytes)
+    w.writeU64(entry.exitStatus)
+    w.writeString(entry.termination)
+  w.writeU32(uint32(msg.rankings.len))
+  for entry in msg.rankings:
+    w.writeBytes(entry.statsKey)
+    w.writeProfileIdentity(entry.profile)
+    w.writeU64(entry.sampleCount)
+    w.writeU64(entry.totalDurationMillis)
+    w.writeU64(entry.maxDurationMillis)
+  w.writeU32(uint32(msg.extensionRows.len))
+  for entry in msg.extensionRows:
+    w.writeString(entry.hostId)
+    w.writeString(entry.executionId)
+    w.writeBytes(entry.statsKey)
+    w.writeProfileIdentity(entry.profile)
+    w.writeBool(entry.ownerUidPresent)
+    w.writeU64(entry.ownerUid)
+    w.writeU32(uint32(entry.columns.len))
+    for name in entry.columns:
+      w.writeString(name)
+    w.writeU32(uint32(entry.values.len))
+    for value in entry.values:
+      w.writeString(value)
+  w.writeDiagnostic(msg.diagnostic)
+  w.data
+
+proc decodeStatsResponse*(payload: string;
+    msg: var StatsResponseMessage): bool =
+  var r = reader(payload)
+  var subjectRaw, knowledgeRaw, scopeRaw, spanRaw, count: uint32
+  var statsKey: string
+  var ownerUidPresent, captureEnabled: bool
+  var ownerUid: uint64
+  if not r.readU32(subjectRaw): return false
+  if subjectRaw > uint32(ord(high(StatsSubject))): return false
+  if not r.readBytes(statsKey): return false
+  if not r.readU32(knowledgeRaw): return false
+  if knowledgeRaw > uint32(ord(high(StatsKnowledgeWire))): return false
+  if not r.readU32(scopeRaw): return false
+  if scopeRaw > uint32(ord(high(StatsScopeWire))): return false
+  if not r.readU32(spanRaw): return false
+  if spanRaw > uint32(ord(high(ProfileSpanWire))): return false
+  if not r.readBool(ownerUidPresent): return false
+  if not r.readU64(ownerUid): return false
+  if not r.readBool(captureEnabled): return false
+
+  var distributions: seq[ResourceDistributionWire] = @[]
+  if not r.readU32(count): return false
+  for _ in 0 ..< count:
+    var entry: ResourceDistributionWire
+    var entryKnowledge: uint32
+    if not r.readProfileIdentity(entry.profile): return false
+    if not r.readU32(entryKnowledge): return false
+    if entryKnowledge > uint32(ord(high(StatsKnowledgeWire))): return false
+    entry.knowledge = StatsKnowledgeWire(int(entryKnowledge))
+    if not r.readU64(entry.sampleCount): return false
+    if not r.readU64(entry.durationMillisMin): return false
+    if not r.readU64(entry.durationMillisP50): return false
+    if not r.readU64(entry.durationMillisP90): return false
+    if not r.readU64(entry.durationMillisMax): return false
+    if not r.readU64(entry.peakRssBytesMax): return false
+    distributions.add(entry)
+
+  var executions: seq[ExecutionSummaryWire] = @[]
+  if not r.readU32(count): return false
+  for _ in 0 ..< count:
+    var entry: ExecutionSummaryWire
+    if not r.readString(entry.executionId): return false
+    if not r.readBytes(entry.statsKey): return false
+    if not r.readProfileIdentity(entry.profile): return false
+    if not r.readBool(entry.ownerUidPresent): return false
+    if not r.readU64(entry.ownerUid): return false
+    if not r.readU64(entry.startedAtUnixMillis): return false
+    if not r.readU64(entry.durationMillis): return false
+    if not r.readU64(entry.peakRssBytes): return false
+    if not r.readU64(entry.exitStatus): return false
+    if not r.readString(entry.termination): return false
+    executions.add(entry)
+
+  var rankings: seq[KeyRankingWire] = @[]
+  if not r.readU32(count): return false
+  for _ in 0 ..< count:
+    var entry: KeyRankingWire
+    if not r.readBytes(entry.statsKey): return false
+    if not r.readProfileIdentity(entry.profile): return false
+    if not r.readU64(entry.sampleCount): return false
+    if not r.readU64(entry.totalDurationMillis): return false
+    if not r.readU64(entry.maxDurationMillis): return false
+    rankings.add(entry)
+
+  var extensionRows: seq[ExtensionRowWire] = @[]
+  if not r.readU32(count): return false
+  for _ in 0 ..< count:
+    var entry: ExtensionRowWire
+    var inner: uint32
+    if not r.readString(entry.hostId): return false
+    if not r.readString(entry.executionId): return false
+    if not r.readBytes(entry.statsKey): return false
+    if not r.readProfileIdentity(entry.profile): return false
+    if not r.readBool(entry.ownerUidPresent): return false
+    if not r.readU64(entry.ownerUid): return false
+    if not r.readU32(inner): return false
+    for _ in 0 ..< inner:
+      var name: string
+      if not r.readString(name): return false
+      entry.columns.add(name)
+    if not r.readU32(inner): return false
+    for _ in 0 ..< inner:
+      var value: string
+      if not r.readString(value): return false
+      entry.values.add(value)
+    # A ROW WHOSE COLUMNS AND VALUES DISAGREE IN LENGTH IS REFUSED, not
+    # zipped as far as it goes. RunQuota does not know what these mean, so
+    # it cannot repair a mispairing -- and a silently truncated payload is
+    # a product's fact turned into a different fact.
+    if entry.columns.len != entry.values.len: return false
+    extensionRows.add(entry)
+
+  var diag: Diagnostic
+  if not r.readDiagnostic(diag): return false
+  if r.remaining != 0: return false
+  msg = StatsResponseMessage(
+    subject: StatsSubject(int(subjectRaw)),
+    statsKey: statsKey,
+    knowledge: StatsKnowledgeWire(int(knowledgeRaw)),
+    scopeApplied: StatsScopeWire(int(scopeRaw)),
+    spanApplied: ProfileSpanWire(int(spanRaw)),
+    ownerUidPresent: ownerUidPresent,
+    ownerUid: ownerUid,
+    captureEnabled: captureEnabled,
+    distributions: distributions,
+    executions: executions,
+    rankings: rankings,
+    extensionRows: extensionRows,
+    diagnostic: diag
+  )
+  true
 
 proc encodeInspectionRequest*(msg: InspectionRequestMessage): string =
   var w = writer()

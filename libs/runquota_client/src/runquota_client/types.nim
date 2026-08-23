@@ -70,3 +70,9 @@ type
     priority*: PriorityClass
     purpose*: LeasePurpose
     metadata*: DynamicMetadata
+    estimate*: ClientEstimate
+      ## What the CLIENT already believes this work costs, from its own
+      ## cache or from the published aggregate table. Absent by default:
+      ## a client that caches nothing and never estimates must keep
+      ## working, and for it the daemon's learned table remains the
+      ## fallback exactly as before. See ``withEstimate``.

@@ -36,6 +36,16 @@
   `apps/` source; and the only column names RunQuota may write into a statement
   against one are the spine key it is joined by, every other column name having
   arrived from the caller.
+- `runquotad` is the only sanctioned reader of the observation store. No client
+  may open the database file directly: queries go over the socket, where the
+  daemon scopes them to the calling uid from peer credentials and qualifies
+  every answer with the hardware profile it describes. A client that read the
+  file would skip both, silently, on a schema RunQuota owns. Arbitrary reads
+  are request/response on the socket and must never be placed on the
+  observation ring, which is a one-way write path of the opposite shape.
+- A client-supplied estimate on a lease request is taken at face value. RunQuota
+  must not clamp it, second-guess it, or validate it against its own learned
+  table; the learned estimate is the fallback when none is supplied.
 - Static helper libraries must compile with `--mm:arc --app:staticlib` and must
   not define or use Nim `ref` types.
 - JSON may be emitted for inspection output, diagnostics, or benchmark reports.

@@ -47,8 +47,22 @@ proc resourceRequest*(label: string; cpu: MilliCpu;
     deadline: noDeadline(),
     priority: priorityNormal,
     purpose: leasePurposeWork,
-    metadata: metadataNone()
+    metadata: metadataNone(),
+    estimate: ClientEstimate(supplied: false, memoryBytes: 0'u64)
   )
+
+proc withEstimate*(request: ResourceRequest;
+                   memoryBytes: uint64): ResourceRequest =
+  ## Attaches the client's OWN estimate to a request.
+  ##
+  ## The daemon takes it at face value: it MUST NOT clamp it, second-guess
+  ## it, or validate it against its own learned table. That is only sound
+  ## because the blast radius stops at the per-user boundary — a client
+  ## that under-declares spends its own user's budget — and it is what lets
+  ## the estimate arrive WITH the request, so admission costs no round trip
+  ## at the moment of asking.
+  result = request
+  result.estimate = ClientEstimate(supplied: true, memoryBytes: memoryBytes)
 
 proc benchmarkRequest*(request: ResourceRequest): ResourceRequest =
   result = request
@@ -204,7 +218,8 @@ proc requestLease*(session: var RunQuotaSession;
     deadline: request.deadline,
     priority: request.priority,
     purpose: request.purpose,
-    metadata: request.metadata
+    metadata: request.metadata,
+    estimate: request.estimate
   )
   let requestId = session.client[].requestFrame(rqRequestLease,
       encodeLeaseRequest(msg))
@@ -243,7 +258,8 @@ proc toCandidate*(clientCandidateId: uint64;
     deadline: request.deadline,
     priority: request.priority,
     purpose: request.purpose,
-    metadata: request.metadata
+    metadata: request.metadata,
+    estimate: request.estimate
   )
 
 proc sendCandidateOffer*(session: var RunQuotaSession;
@@ -416,6 +432,48 @@ proc requestLeaseWaiting*(session: var RunQuotaSession; request: ResourceRequest
     sleep(pollMillis)
   session.client[].lastDiagnostic = diagnostic(diagDenied, "timed out waiting for lease grant")
   raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+
+proc queryStats*(client: var RunQuotaClient; subject: StatsSubject;
+                 statsKey = ""; scope = statsScopeWireOwner;
+                 span = profileSpanWireSingle; limit = 0'u32;
+                 extensionId = ""; extensionColumns: openArray[string] = [];
+                 sessionId = sessionId(0)): StatsResponseMessage =
+  ## Ask ``runquotad`` a question about the recorded rows.
+  ##
+  ## OVER THE SOCKET, WHICH IS THE WHOLE POINT OF THIS PROC EXISTING. This
+  ## library does not link the observation store and MUST NOT: ``runquotad``
+  ## is the only sanctioned reader, and a client that opened the database
+  ## file would be a second reader of a schema RunQuota owns, past every
+  ## scoping rule the daemon applies. That is not merely discouraged; it is
+  ## checked by inspection (``t_observation_store_reader_boundary``).
+  ##
+  ## The uid this answer is scoped to is NOT a parameter. It comes from the
+  ## connection's peer credentials on the daemon side; a caller can widen
+  ## to ``statsScopeWireHost``, which is explicit and available, but it
+  ## cannot name somebody else.
+  var columns: seq[string] = @[]
+  for name in extensionColumns:
+    columns.add(name)
+  let msg = StatsQueryMessage(
+    sessionId: sessionId,
+    subject: subject,
+    statsKey: statsKey,
+    scope: scope,
+    span: span,
+    limit: limit,
+    extensionId: extensionId,
+    extensionColumns: columns
+  )
+  let requestId = client.requestFrame(rqStatsQuery, encodeStatsQuery(msg))
+  let frame = client.readResponse(requestId)
+  if frame.header.messageKind != rqStatsResponse:
+    client.lastDiagnostic = diagnostic(diagProtocol,
+      "daemon did not answer with stats data")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  if not decodeStatsResponse(frame.payload, result):
+    client.lastDiagnostic = diagnostic(diagProtocol,
+      "invalid StatsResponse payload")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
 
 proc inspectionJson*(client: var RunQuotaClient; subject: string;
                      sessionId = sessionId(0)): string =
