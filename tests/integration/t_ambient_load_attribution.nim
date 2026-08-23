@@ -93,6 +93,7 @@ import std/[algorithm, atomics, cpuinfo, os, osproc, posix, random, streams,
             strutils, times, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions
+from runquota_protocol import observedCpuPct
 import runquota_client
 import runquota_core
 import runquota_observation_store
@@ -987,6 +988,14 @@ suite "ambient_load_attribution":
     var rowsWhileRunning: seq[AmbientSampleRow] = @[]
     var ticksPossible = 0
     var eligibleTicks = 0
+    # The in-flight figures this test's client declares about its own lease
+    # (M13). Held as constants so the daemon's `self_*` can be asserted to
+    # the bit rather than inside a band.
+    const
+      reportedCpuMilliPct = 7_250'u32 # 7.25% of the whole host
+      reportedRssBytes = 3_500_000_000'u64
+    let reportedCpuPct = observedCpuPct(reportedCpuMilliPct)
+    var reportedAt = 0'i64
     try:
       # Exactly the three lines the daemon prints when a store path was
       # given, and then it goes quiet.
@@ -1019,6 +1028,24 @@ suite "ambient_load_attribution":
       # quickly a daemon starts and grants.
       eligibleTicks = cadenceFlushedTicks - 1 -
         int((epochTime() - daemonStartedAt) * 1000.0 / float(cadenceMillis))
+
+      # M13 CLOSES M11'S DEFERRAL (1), AND THIS IS WHERE IT SHOWS.
+      #
+      # M11 recorded that nothing fed `self_*` in production, because RQSP
+      # carried no in-flight client figures: a live daemon therefore wrote
+      # `self_* = 0` and attributed every execution it had itself admitted
+      # to `foreign`. This test asserted that zero, on purpose, so the gap
+      # stayed visible in the suite. The protocol carries the figures now,
+      # so the assertion below is its opposite.
+      #
+      # The figures are DECLARED CONSTANTS rather than a measurement of
+      # anything, and that is what makes the assertion exact: the daemon
+      # must write back the sum of what it was told, to the bit, and any
+      # implementation that derives `self` from a measurement of its own
+      # (a process-tree walk, the lease reservation) writes something else.
+      reportedAt = unixMillisNow()
+      lease.reportObservation(reportedCpuMilliPct, reportedRssBytes,
+        uint64(reportedAt))
 
       sleep(cadenceWindowMillis)
       let store = openObservationStore(dbPath)
@@ -1083,19 +1110,67 @@ suite "ambient_load_attribution":
 
     var previousAt = 0'i64
     var gaps: seq[float] = @[]
+    # Rows are split at the instant the client's report was SENT, and the
+    # two halves carry opposite assertions.
+    #
+    # THE SPLIT IS NOT A HEDGE, it is the only honest way to state this: a
+    # sampler tick can fall between the lease being granted and the report
+    # arriving, and such a row has genuinely never been told anything. The
+    # ORIGINAL M11 assertion is what governs it, unchanged. Everything from
+    # a full cadence after the report onwards has been told, and must show
+    # it. `reportedAt + cadenceMillis` skips the one tick that may have
+    # been in flight across the send.
+    #
+    # AND THE "BEFORE" HALF IS A TOLERANCE, NOT AN ASSERTED HALF. The
+    # report is sent before the first eligible tick, so in practice it is
+    # EMPTY -- every observed run reports `before=0`. It is kept because
+    # a slower host could land a tick there and that row would be
+    # legitimately untold, not because it proves anything. Nothing here
+    # relies on it, and the M11 property it used to carry -- that a lease
+    # RESERVATION never becomes a measurement -- is carried instead by the
+    # exact equality in the "after" half below: `self` must be the sum of
+    # what was DECLARED to the bit, so a daemon that added the lease's
+    # requested 1000 milli-CPU / 256 MiB to it fails there. That is the
+    # mutation this split was checked against, and where it fails.
+    var rowsBeforeReport = 0
+    var rowsAfterReport = 0
     for row in rowsWhileRunning:
       check row.sampledAtUnixMillis > previousAt
       if previousAt > 0:
         gaps.add(float(row.sampledAtUnixMillis - previousAt))
       previousAt = row.sampledAtUnixMillis
-      # The lease was admitted but the protocol carries no in-flight
-      # figures, so nothing ever reached the self columns and everything
-      # the machine did is foreign. A lease RESERVATION is not a
-      # measurement and must not become one.
-      check row.selfCpuPct == 0.0
-      check row.selfRssBytes == 0
-      check row.foreignCpuPct == row.cpuBusyPct
       check row.memAvailableBytes > 0
+      if row.sampledAtUnixMillis <= reportedAt:
+        # Nothing had reached the self columns yet, so everything the
+        # machine did is foreign. A lease RESERVATION is not a measurement
+        # and must not become one: the lease was granted before this row
+        # and its requested 1000 milli-CPU / 256 MiB appear nowhere.
+        inc rowsBeforeReport
+        check row.selfCpuPct == 0.0
+        check row.selfRssBytes == 0
+        check row.foreignCpuPct == row.cpuBusyPct
+      elif row.sampledAtUnixMillis > reportedAt + cadenceMillis:
+        # M13: the protocol carries in-flight client figures, so `self_*`
+        # is the sum of what clients declared -- exactly, and nothing else.
+        inc rowsAfterReport
+        check row.selfCpuPct == reportedCpuPct
+        check row.selfRssBytes == int64(reportedRssBytes)
+        check row.foreignCpuPct == max(0.0, row.cpuBusyPct - reportedCpuPct)
+    # NON-VACUITY, and it is the whole reason the split is safe to make.
+    # "Every row after the report shows the declared figures" is trivially
+    # true of an empty set, and an empty set is exactly what a daemon that
+    # silently dropped the report would produce. The "after" half is
+    # therefore REQUIRED non-empty; the "before" half is not, for the
+    # reason given above, and claiming both were would be a claim this
+    # test does not make.
+    echo "  m13 self columns: before=", rowsBeforeReport,
+      " after=", rowsAfterReport, " of ", rowsWhileRunning.len
+    check rowsAfterReport > 0
+    # And the split loses AT MOST ONE ROW -- the single tick that may have
+    # been in flight while the report crossed the socket. A wider hole
+    # would mean rows escaping both assertions, which is how a split like
+    # this quietly becomes a way of not asserting anything.
+    check rowsWhileRunning.len - rowsBeforeReport - rowsAfterReport <= 1
     # A FIXED cadence: the median gap is the configured interval, not a
     # burst at shutdown and not a function of anything the daemon was asked
     # to do.

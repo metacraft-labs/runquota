@@ -280,6 +280,41 @@ filled in, so an operator who hits it does not have to come back here.
 host. It does not change the rule: the directory containing `PATH` must exist
 before the daemon starts.
 
+## Capture is on without any flag
+
+The observation store is **enabled by default**. Its primary readers need the
+history to already exist at the moment a question is asked, and nobody can
+retroactively enable capture for the week that would have answered "did this
+test ever pass on this host" — an opt-in store is empty exactly when it is
+first needed. The reasoning is normative in
+`reprobuild-specs/RunQuota-Observation-Store.md` §"Capture Is Enabled By
+Default".
+
+So `runquotad` with no store flag at all records into
+`<host state directory>/observations.sqlite3` — beside the host identity
+file, in the same directory the install step above provisions. The two are
+derived from one another rather than being two constants, so an operator who
+relocates the host state with `--host-identity-file` relocates the store with
+it and the two can never disagree.
+
+Three ways to say where, in precedence order:
+
+| Setting | Effect |
+|---|---|
+| `--no-write-stats` | Capture off. Nothing is opened, no store file and no host identity file is created, and admission carries on untouched. Wins over `--observation-db`. |
+| `--observation-db PATH` | Capture into `PATH`. |
+| neither | Capture into the host default beside the host identity file. |
+
+On a host where the state directory has not been provisioned, capture
+degrades to off with a report naming the directory and the command that
+creates it — the same OS-4 degradation a corrupt store gets, and for the same
+reason: an advisory subsystem may not take out a machine's build capacity.
+
+`runquota observations --json` (RQSP inspection subject `observations`)
+reports whether
+capture is on, which store is open, how many in-flight client reports were
+accepted and refused, and how many rows were dropped or failed to write.
+
 ## State-boundary requirements
 
 Any persistent RunQuota state must document schema ownership, migrations, backup,
@@ -310,10 +345,28 @@ As implemented:
 - **Benchmarks.** Recording on the lease-finish path is an in-memory append:
   157–381 ns per row across seven repetitions on an aarch64 macOS host whose
   load average was 66–90 at the time. Nothing on that path opens a file, and
-  the database write happens on a drain thread in batches. Neither
-  per-execution overhead figure exists yet: M13 measures the socket path and
-  M22 measures the ring, and it is M22's number that the default-on decision
-  rests on.
+  the database write happens on a drain thread in batches.
+
+  **The socket write path's per-execution added latency is 0.7–1.9 µs**
+  (median). Measured by `just bench-observation-write-path` against a
+  `runquotad --no-write-stats` control: two daemons of the same binary run
+  at once, each round times one complete execution against each in
+  alternating order, and the headline is the paired median difference over
+  400 rounds after 20 discarded warm-up rounds. Three consecutive full runs
+  gave 1.0 µs, 1.9 µs and 0.7 µs against a control execution latency of
+  58–62 µs, so **1.2–3.1 % of the cost of an execution**; a release build
+  gave 1.9 µs and 1.2 µs against a 47–48 µs control (2.5–4.1 %). Paired p95
+  was 11–20 µs. Host: aarch64 macOS, Apple M3 Max, 16 logical cores.
+
+  Pairing rather than a before/after pair is not fussiness: M11 measured
+  this machine's host-wide busy figure wandering between 56 % and 88 % over
+  twenty consecutive one-second readings, which is larger than the effect
+  being measured. The harness also refuses to report at all unless the
+  capture arm recorded one row per execution and the control arm wrote no
+  store, so a silently degraded store cannot produce a flattering figure.
+
+  **This number does not decide the default.** M13 is the fallback path;
+  M22 measures the ring and carries the default-on decision.
 
 Two rules apply to every persistent store here:
 

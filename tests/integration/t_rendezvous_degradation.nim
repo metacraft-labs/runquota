@@ -77,10 +77,13 @@ proc startDaemon(socketPath, group: string): DaemonHandle =
   for _ in 0 ..< 400:
     if socketExists(socketPath): break
     sleep(25)
-  # Exactly ONE startup line when no store path was given. The degradation
-  # is APPENDED to it rather than printed on its own line precisely so this
-  # count does not change: the startup output is consumed by count, and a
-  # reader that guessed wrong would block or misread.
+  # The LISTENING line, which is always the first of the daemon's fixed
+  # three. The degradation is APPENDED to it rather than printed on its own
+  # line precisely so that this read stays a read of line one: the startup
+  # output is consumed by count, and a reader that guessed wrong would
+  # block or misread. (Before M13 there were three startup lines only when
+  # a store path was given and one when it was not; capture is on without
+  # any flag now, so there are always three and the first is still this.)
   let line = process.outputStream.readLine()
   delEnv("RUNQUOTA_ENDPOINT_GROUP")
   DaemonHandle(process: process, listeningLine: line)

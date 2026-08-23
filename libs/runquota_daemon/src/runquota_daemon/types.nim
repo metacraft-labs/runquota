@@ -56,6 +56,17 @@ type
     estimateDbPath*: string
     estimateQueueCapacity*: int
     observationDbPath*: string
+      ## An EXPLICIT store path, or empty for the host's default one.
+      ## Empty no longer means "capture off": capture is on by default
+      ## (the specification's §"Capture Is Enabled By Default"), and the
+      ## way to turn it off is ``writeStatsDisabled`` below.
+    writeStatsDisabled*: bool
+      ## The operator's off switch (``runquotad --no-write-stats``). It is
+      ## a FLAG rather than "leave the path empty" so that the two states
+      ## the operator cares about — "on, at the default location" and
+      ## "off, deliberately" — are distinguishable in the config, in the
+      ## startup report, and in a test. An empty path meaning "off" would
+      ## have made the default-on requirement unstatable.
     observationQueueCapacity*: int
     hostIdentityFilePath*: string
       ## Where this machine's ``host_id`` is kept. Empty means the
@@ -146,6 +157,21 @@ type
     observationBootId*: string
     observationRunIds*: Table[uint64, string]
       ## Session id to the ``runs`` row it opened.
+    observationsAccepted*: uint64
+      ## In-flight ``LeaseObservation`` reports folded into ``self_*``.
+    observationsRejected*: uint64
+      ## Reports refused, for any reason. OS-2 wants every lost
+      ## observation COUNTED, and a refusal is a loss: the client believes
+      ## it reported and the store disagrees, so the number has to be
+      ## readable somewhere. It is one counter rather than one per reason
+      ## because the reason is already in the daemon's own view and the
+      ## count is what a reader needs to distrust a window.
+    selfReportsReaped*: uint64
+      ## Live self-reports dropped on behalf of a client that did not end
+      ## them itself — a supervisor whose connection died mid-execution.
+      ## Non-zero means the crash exit fired, which is the only evidence
+      ## that the leak M11 recorded is actually closed rather than merely
+      ## unreachable in the happy path.
     activeLeaseCount*: uint32
     activeBenchmarkCount*: uint32
     machineUsage*: Table[string, MachineUsage]

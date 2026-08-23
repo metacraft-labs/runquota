@@ -67,6 +67,17 @@ const hostIdPrefix* = "host-"
 
 const
   hostIdentityFileName = "host-id"
+  observationDbFileName* = "observations.sqlite3"
+    ## The default store file, kept in the SAME host-wide directory as the
+    ## identity file. Both are host state, both are daemon-owned, and both
+    ## are provisioned by the same install step, so an operator who has to
+    ## relocate one has to relocate the other — one decision rather than
+    ## two paths that can silently disagree.
+    ##
+    ## This does NOT put the identity inside a database *directory*, which
+    ## is what the module comment above forbids: the store is one file
+    ## beside the identity file, so copying, merging or discarding a store
+    ## never carries the machine's identity with it.
   # HOST-WIDE AND DAEMON-OWNED, not per-user.
   #
   # `runquotad` is one daemon per host, so `host_id` identifies the MACHINE
@@ -136,6 +147,31 @@ proc defaultHostIdentityFile*(): string =
   ## explicitly (``--host-identity-file``), which is a decision the host
   ## makes once rather than one each session inherits.
   hostWideStateDir / hostIdentityFileName
+
+proc observationDbBeside*(hostIdentityFile: string): string =
+  ## The store that belongs to the host state named by ``hostIdentityFile``.
+  ##
+  ## CAPTURE IS ON BY DEFAULT (the specification's §"Capture Is Enabled By
+  ## Default"), so the daemon needs a store path when nobody gave it one,
+  ## and this is that path. It is derived from the identity file rather
+  ## than being a second constant because the two must never disagree: an
+  ## operator who moves the host state with ``--host-identity-file`` moves
+  ## the store with it, and a store recording rows against a ``host_id``
+  ## kept somewhere else is a store nobody can interpret.
+  ##
+  ## Reads no environment, for the reason ``defaultHostIdentityFile``
+  ## gives: a per-user override reintroduces per-user divergence into
+  ## host-wide state.
+  let file =
+    if hostIdentityFile.len > 0: hostIdentityFile else: defaultHostIdentityFile()
+  let directory = file.parentDir
+  if directory.len == 0:
+    return observationDbFileName
+  directory / observationDbFileName
+
+proc defaultObservationDbFile*(): string =
+  ## The store this host uses when no path was configured.
+  observationDbBeside(defaultHostIdentityFile())
 
 proc resolveHostIdentity*(path = ""): HostIdentity =
   ## Reads the machine's ``host_id``, minting and persisting one on first

@@ -46,7 +46,7 @@ when isMainModule:
     quit 0
 
   var config = defaultDaemonConfig(defaultEndpoint())
-  let usage = "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--ambient-sample-interval-millis N] [--host-identity-file PATH]"
+  let usage = "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH]"
   var i = 0
   while i < args.len:
     case args[i]
@@ -130,6 +130,14 @@ when isMainModule:
         quit 2
       config.observationDbPath = args[i + 1]
       i += 2
+    of "--no-write-stats":
+      # THE OFF SWITCH, and the only one. Capture is on without any flag
+      # because the store's readers need history to already exist when a
+      # question is asked; this is how an operator who does not want that
+      # says so. It takes no argument and it wins over `--observation-db`,
+      # so "disabled" is never a matter of argument order.
+      config.writeStatsDisabled = true
+      i += 1
     of "--ambient-sample-interval-millis":
       # The FIXED cadence of ambient load sampling, independent of
       # execution boundaries. Overridable so a test can watch a load it

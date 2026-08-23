@@ -88,6 +88,29 @@ type
     executionId*: string
     cpuPct*: float64
     rssBytes*: int64
+    ownerKey*: string
+      ## WHO WOULD HAVE TO DIE FOR THIS REPORT TO BE GARBAGE.
+      ##
+      ## A report has exactly two honest exits: the client says the
+      ## execution ended, or the client itself is gone. Before M13 there
+      ## was only the first, because a report was keyed by a bare
+      ## ``executionId`` with no association to anything the daemon
+      ## already reclaims — so a client that reported an execution and then
+      ## crashed leaked its figures into ``self_*`` for the daemon's whole
+      ## lifetime, understating every later ``foreign_*`` until the clamp
+      ## pinned it to zero. That was latent only because nothing in
+      ## production called ``reportSelfExecution``; M13 is what makes it
+      ## live, so the second exit has to exist.
+      ##
+      ## The key is opaque here on purpose: this library knows nothing
+      ## about sessions or leases. The daemon puts its session identity in
+      ## it, and its EXISTING crash-reclamation path — the one that already
+      ## handles a client dying mid-lease — reaps by it for free.
+      ##
+      ## Empty means no owner was declared, and an unowned report is never
+      ## swept by ``endSelfReportsForOwner``: sweeping "everything with no
+      ## owner" on one session's teardown would drop reports belonging to
+      ## nobody in particular, which is not the same set.
 
   ReadingPair* = enum
     ## Whether a pair of readings supports a measurement at all.
@@ -518,7 +541,7 @@ proc ambientLiveLeaseCount*(): int =
     release(samplerLock)
 
 proc reportSelfExecution*(executionId: string; cpuPct: float64;
-                          rssBytes: int64) =
+                          rssBytes: int64; ownerKey = "") =
   ## Records what a client said about one of ITS OWN live executions.
   ##
   ## This is the only way a figure becomes ``self``. The daemon never
@@ -537,9 +560,10 @@ proc reportSelfExecution*(executionId: string; cpuPct: float64;
       if samplerReports[i].executionId == executionId:
         samplerReports[i].cpuPct = cpuPct
         samplerReports[i].rssBytes = rssBytes
+        samplerReports[i].ownerKey = ownerKey
         return
     samplerReports.add(SelfReport(executionId: executionId, cpuPct: cpuPct,
-      rssBytes: rssBytes))
+      rssBytes: rssBytes, ownerKey: ownerKey))
   finally:
     release(samplerLock)
 
@@ -554,6 +578,36 @@ proc endSelfReportedExecution*(executionId: string) =
       if samplerReports[i].executionId == executionId:
         samplerReports.delete(i)
         return
+  finally:
+    release(samplerLock)
+
+proc endSelfReportsForOwner*(ownerKey: string): int {.discardable.} =
+  ## Drops every live report an owner left behind, returning how many.
+  ##
+  ## THE CRASH EXIT. ``endSelfReportedExecution`` is the exit a working
+  ## client takes; this is the one taken FOR a client that cannot take it
+  ## itself — killed, disconnected, or wedged. The daemon calls it from the
+  ## reclamation path it already runs when a supervisor's connection drops,
+  ## which is why the owner key exists at all: that path had nothing to
+  ## reap self-reports by, so it reaped leases and left the figures.
+  ##
+  ## AN EMPTY KEY SWEEPS NOTHING, deliberately. Reports arriving without an
+  ## owner belong to no session, and letting one session's teardown carry
+  ## them off would make the reaped set depend on which session happened to
+  ## end first.
+  if ownerKey.len == 0:
+    return 0
+  ensureSamplerLock()
+  acquire(samplerLock)
+  try:
+    var kept: seq[SelfReport] = @[]
+    for report in samplerReports:
+      if report.ownerKey == ownerKey:
+        inc result
+      else:
+        kept.add(report)
+    if result > 0:
+      samplerReports = kept
   finally:
     release(samplerLock)
 

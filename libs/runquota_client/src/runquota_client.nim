@@ -493,6 +493,45 @@ proc markRunning*(lease: var RunQuotaLease; childProcessId = 0'u64;
     raise newException(RunQuotaClientError, lease.session[].client[].lastDiagnostic.message)
   lease.state = leaseClientRunning
 
+proc reportObservation*(lease: var RunQuotaLease; cpuMilliPct: uint32;
+                        rssBytes: uint64; sampledAtUnixMillis: uint64) =
+  ## Report what this client has MEASURED about its own running child.
+  ##
+  ## ONE BUFFERED WRITE AND NO ROUND TRIP. Nothing is read back, no request
+  ## id is registered, and no in-flight slot is consumed: §"Write Path"
+  ## forbids an observation from introducing an additional round trip, and
+  ## OS-1 forbids recording one from blocking the work being observed. A
+  ## caller sends this from the loop it already runs while waiting for its
+  ## child, next to the telemetry sample it already takes.
+  ##
+  ## THE FIGURES MUST BE MEASURED. Passing the lease's requested resources
+  ## here would put a reservation into `self_*` — a number nobody measured,
+  ## in a column whose entire purpose is to be one — and the daemon has no
+  ## way to tell the two apart. `runquota_process` samples the child's
+  ## resident size and CPU time while it waits; that is the source.
+  ##
+  ## SILENT ON A DEAD CONNECTION, deliberately. A failed send is a lost
+  ## observation, and losing an observation is always preferable to
+  ## perturbing the work being observed. The caller finds out about a dead
+  ## daemon on the next message it actually needs an answer to.
+  if not lease.active:
+    return
+  let msg = LeaseObservationMessage(
+    sessionId: lease.session[].id,
+    leaseId: lease.id,
+    cpuMilliPct: cpuMilliPct,
+    rssBytes: rssBytes,
+    sampledAtUnixMillis: sampledAtUnixMillis
+  )
+  inc lease.session[].client[].nextRequestId
+  let requestId = lease.session[].client[].nextRequestId
+  try:
+    lease.session[].client[].connection.sendFrame(
+      encodeFrame(rqLeaseObservation, FrameFlagRequest, requestId,
+        encodeLeaseObservation(msg)))
+  except CatchableError:
+    discard
+
 proc finish*(lease: var RunQuotaLease; outcome = leaseFinishSucceeded;
              exitCode = 0'u32; signal = 0'u32; finishDiagnostic = okDiagnostic();
              peakMemoryBytes = 0'u64; processCount = 0'u32;

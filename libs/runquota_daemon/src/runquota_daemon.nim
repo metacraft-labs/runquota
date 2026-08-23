@@ -44,6 +44,7 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     estimateDbPath: "",
     estimateQueueCapacity: 128,
     observationDbPath: "",
+    writeStatsDisabled: false,
     observationQueueCapacity: 1024,
     hostIdentityFilePath: "",
     ambientSampleIntervalMillis: defaultAmbientCadenceMillis
@@ -158,9 +159,39 @@ proc estimateTableKey(scope, commandStatsId: string): string =
 proc sessionScope(session: SessionRow): string =
   "session:" & session.name
 
+proc effectiveObservationDbPath*(config: DaemonConfig): string =
+  ## Where this daemon's observation store lives, given its configuration.
+  ##
+  ## CAPTURE IS ON WITHOUT ANY FLAG. The specification's §"Capture Is
+  ## Enabled By Default" gives the reason and it is not a preference:
+  ## the store's primary reader needs the history to ALREADY EXIST at the
+  ## moment a question is asked, and nobody can retroactively enable
+  ## capture for the week that would have answered it. An opt-in store is
+  ## empty exactly when it is first needed.
+  ##
+  ## Three states, and the order matters:
+  ##
+  ## 1. ``writeStatsDisabled`` — the operator said no. An empty path, which
+  ##    every downstream component already reads as "capture off". It wins
+  ##    over an explicit path, so ``--observation-db X --no-write-stats``
+  ##    is off rather than ambiguous.
+  ## 2. an explicit ``observationDbPath`` — the operator named a file.
+  ## 3. otherwise the host default, beside the host identity file.
+  if config.writeStatsDisabled:
+    return ""
+  if config.observationDbPath.len > 0:
+    return config.observationDbPath
+  observationDbBeside(config.hostIdentityFilePath)
+
 proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
   var effectiveConfig = config
   effectiveConfig.normalizeTopology()
+  # Resolved ONCE, here, and written back into the config the daemon keeps.
+  # Every later reader — the store, the writer thread, the sampler, the
+  # startup report — then sees one path rather than re-deriving it, which
+  # is what stops "the default" from meaning two different files in two
+  # places.
+  effectiveConfig.observationDbPath = effectiveObservationDbPath(config)
   result = RunQuotaDaemon(
     config: effectiveConfig,
     state: dsStarting,
@@ -188,7 +219,10 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
     observationProfileId: "",
     observationIdentityReport: "",
     observationBootId: opaqueId("boot-"),
-    observationRunIds: initTable[uint64, string]()
+    observationRunIds: initTable[uint64, string](),
+    observationsAccepted: 0'u64,
+    observationsRejected: 0'u64,
+    selfReportsReaped: 0'u64
   )
   for row in loadLearnedEstimates(effectiveConfig.estimateDbPath):
     result.estimates[estimateTableKey(row.scope, row.commandStatsId)] = row
@@ -281,6 +315,19 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
       result.observationIdentityReport =
         "runquota observation store " & result.observationStore.path &
           ": the host row could not be written; executions are not recorded"
+  elif effectiveConfig.writeStatsDisabled:
+    # NAMED AS A DECISION, not as an accident. Capture being off because
+    # the operator asked and capture being off because the store would not
+    # open are the same state to every consumer and completely different
+    # facts to the person reading the log, so the two must not print the
+    # same line. `openObservationStore("")` says "no path configured",
+    # which is true and useless here.
+    result.observationStore.report =
+      "runquota observation store: capture disabled by --no-write-stats; " &
+        "no observations are recorded and no store file is opened"
+    result.observationIdentityReport =
+      "runquota observation store: host identity and hardware profile not " &
+        "recorded; capture disabled by --no-write-stats"
   else:
     result.observationIdentityReport =
       "runquota observation store " & effectiveConfig.observationDbPath &
@@ -788,11 +835,50 @@ proc pressureJson(daemon: var RunQuotaDaemon): string =
     "\"source\":" & jsonEscape(sample.source) & "," &
     "\"diagnostic\":" & jsonEscape(sample.diagnostic.message) & "}}"
 
+proc observationCaptureEnabled(daemon: RunQuotaDaemon): bool =
+  ## Capture is running IF AND ONLY IF both halves hold: a store that
+  ## opened, and a host identity that persisted. An identity that could not
+  ## be persisted is a refusal (M13c-fix), so rows would have no honest
+  ## `host_id` to carry and OS-6 forbids writing them anyway.
+  daemon.observationStore.captureEnabled and daemon.observationHostId.len > 0
+
+proc observationsJson(daemon: RunQuotaDaemon): string =
+  ## The write path's own honesty, readable from outside the daemon.
+  ##
+  ## ``rqLeaseObservation`` is one-way, so a client is never told that its
+  ## report was refused — which leaves nowhere else for OS-2's "every
+  ## dropped observation MUST be counted" to be satisfied on this path.
+  ## ``rejected`` is that count. ``self_reports_reaped`` is the crash
+  ## exit's, and it is here rather than inferred because "the leak is
+  ## closed" and "the leak was never exercised" produce identical stores.
+  ##
+  ## ``self_cpu_pct``/``self_rss_bytes`` are the SUMS, reported beside the
+  ## count because a count cannot distinguish "the report was refused" from
+  ## "the report was applied and then replaced" — which is exactly what a
+  ## partially-applied report would look like: same number of live reports,
+  ## different figures in them.
+  "{\"observations\":{" &
+    "\"capture_enabled\":" & $(daemon.observationCaptureEnabled()) & "," &
+    "\"store_path\":" & jsonEscape(daemon.observationStore.path) & "," &
+    "\"write_stats_disabled\":" & $(daemon.config.writeStatsDisabled) & "," &
+    "\"accepted\":" & $daemon.observationsAccepted & "," &
+    "\"rejected\":" & $daemon.observationsRejected & "," &
+    "\"live_self_reports\":" & $liveSelfReports().len & "," &
+    "\"self_cpu_pct\":" & $sumSelfCpuPct(liveSelfReports()) & "," &
+    "\"self_rss_bytes\":" & $sumSelfRssBytes(liveSelfReports()) & "," &
+    "\"self_reports_reaped\":" & $daemon.selfReportsReaped & "," &
+    "\"queued\":" & $observationsWritten() & "," &
+    "\"dropped\":" & $observationsDropped() & "," &
+    "\"write_failures\":" & $observationWriteFailures() &
+  "}}"
+
 proc inspectionJson(daemon: var RunQuotaDaemon;
     request: InspectionRequestMessage): string =
   case request.subject
   of "sessions":
     daemon.sessionsJson()
+  of "observations":
+    daemon.observationsJson()
   of "leases":
     daemon.leasesJson()
   of "explain":
@@ -955,9 +1041,6 @@ proc updateEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
   daemon.estimates[key] = row
   discard enqueueEstimateWrite(daemon.estimateStore, row)
 
-proc observationCaptureEnabled(daemon: RunQuotaDaemon): bool =
-  daemon.observationStore.captureEnabled and daemon.observationHostId.len > 0
-
 proc openObservationRun(daemon: var RunQuotaDaemon; session: SessionRow) =
   ## One ``runs`` row per registered session. The row is written once, at
   ## registration, and never updated: ``finished_at`` and ``exit_status``
@@ -984,6 +1067,75 @@ proc openObservationRun(daemon: var RunQuotaDaemon; session: SessionRow) =
     captureCompleteness: ccComplete,
     droppedObservations: 0
   ))
+
+proc selfReportExecutionKey(id: LeaseId): string =
+  ## The live-set key for one lease's in-flight figures.
+  "lease-" & $id.value
+
+proc selfReportOwnerKey(id: SessionId): string =
+  ## The owner every one of a session's reports carries, so the daemon's
+  ## existing reclamation path can drop them all when the client behind
+  ## that session goes away without ending them.
+  "session-" & $id.value
+
+proc applyLeaseObservation(daemon: var RunQuotaDaemon;
+                           context: ConnectionContext;
+                           msg: LeaseObservationMessage): bool =
+  ## Folds one in-flight client report into ambient attribution, or
+  ## refuses it. Returns whether it was accepted.
+  ##
+  ## NOTHING IS APPLIED UNTIL EVERY CHECK HAS PASSED. The order below is
+  ## checks first, single mutation last, and it is not stylistic: a
+  ## half-applied report is a row that describes no moment — the exact
+  ## defect M11 spent a rewrite removing from the sampler — and "reject
+  ## the rest of the message" is no help once the CPU figure is already in
+  ## the live set.
+  ##
+  ## THE OWNERSHIP CHECK IS THE ONE THAT MATTERS. One host-wide daemon
+  ## holds every user's leases, so a report naming a lease the sending
+  ## session does not own would let any local participant deflate another
+  ## user's ``foreign_*`` — silently, since the arithmetic stays
+  ## self-consistent and the clamp hides the overshoot. The session must
+  ## exist, must be one THIS CONNECTION registered, and must own the lease.
+  if not daemon.sessions.hasKey(msg.sessionId.value):
+    return false
+  var ownsSession = false
+  for id in context.sessionIds:
+    if id.value == msg.sessionId.value:
+      ownsSession = true
+      break
+  if not ownsSession:
+    return false
+  if not daemon.leases.hasKey(msg.leaseId.value):
+    return false
+  let lease = daemon.leases[msg.leaseId.value]
+  if lease.sessionId.value != msg.sessionId.value:
+    return false
+  # A figure for an execution that is not running describes nothing that is
+  # consuming the machine now, and `self_*` is a sum over CONCURRENTLY LIVE
+  # executions.
+  if lease.state notin {leaseStateGranted, leaseStateStarting,
+      leaseStateRunning}:
+    return false
+  if leaseObservationRefusal(msg, unixMillisNow()).len > 0:
+    return false
+  reportSelfExecution(
+    selfReportExecutionKey(msg.leaseId),
+    observedCpuPct(msg.cpuMilliPct),
+    int64(min(msg.rssBytes, uint64(high(int64)))),
+    selfReportOwnerKey(msg.sessionId))
+  true
+
+proc endLeaseSelfReport(daemon: var RunQuotaDaemon; id: LeaseId) =
+  ## The ordinary exit: this lease is over, so its figures stop counting
+  ## towards ``self_*``. Leaving them in would grow ``self`` without bound
+  ## and drive ``foreign`` to the clamp.
+  endSelfReportedExecution(selfReportExecutionKey(id))
+
+proc reapSessionSelfReports(daemon: var RunQuotaDaemon; id: SessionId) =
+  ## The crash exit, taken on behalf of a client that cannot take it.
+  daemon.selfReportsReaped +=
+    uint64(endSelfReportsForOwner(selfReportOwnerKey(id)))
 
 proc observationTermination(finish: LeaseFinishedMessage): Termination =
   ## The protocol's finish outcome mapped onto the specification's
@@ -1160,6 +1312,18 @@ proc cleanupLostSession(daemon: var RunQuotaDaemon; sessionId: SessionId) =
     daemon.leases[id] = lost
   for id in deleteLeaseIds:
     daemon.removeLeaseFromTable(id)
+  # THE CRASH EXIT FOR IN-FLIGHT SELF-REPORTS, and it costs one line here
+  # because the reports are keyed by this session.
+  #
+  # This is the path a client takes when it does not get to say anything:
+  # killed mid-execution, or its socket dropped. Its leases are reclaimed
+  # above and always were; its reported CPU and RSS figures were not, and
+  # before M13 they stayed in the live set for the daemon's whole lifetime,
+  # subtracting a dead process's load from every subsequent `foreign_*`
+  # until the clamp pinned the column to zero. Nothing about that is
+  # visible in the data — the arithmetic stays self-consistent — which is
+  # why it is reaped here rather than bounded by a timeout somewhere.
+  daemon.reapSessionSelfReports(sessionId)
   daemon.sessions.del(sessionId.value)
   discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
 
@@ -1208,6 +1372,9 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
         connection.sendError(frame.header.requestId, diagnostic(
             diagInvalidArgument, "session still owns leases"))
         return
+    # An orderly close is still a close: whatever the session reported and
+    # did not end goes with it, by the same key the crash path uses.
+    daemon.reapSessionSelfReports(msg.sessionId)
     daemon.sessions.del(msg.sessionId.value)
     connection.sendResponse(
       rqSessionClosed,
@@ -1279,6 +1446,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       connection.sendError(frame.header.requestId, diagnostic(
           diagInvalidArgument, "lease belongs to another session"))
       return
+    daemon.endLeaseSelfReport(msg.leaseId)
     daemon.releaseLease(msg.leaseId)
     connection.sendResponse(
       rqLeaseReleased,
@@ -1442,6 +1610,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     lease.hardLimitOrOom = msg.hardLimitOrOom
     daemon.updateEstimateFromFinish(lease, msg)
     daemon.captureObservation(lease, msg)
+    daemon.endLeaseSelfReport(msg.leaseId)
     inc daemon.totalFinished
     daemon.leases[msg.leaseId.value] = lease
     discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
@@ -1451,6 +1620,28 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       encodeLeaseFinishedAck(LeaseFinishedAckMessage(sessionId: msg.sessionId,
           leaseId: msg.leaseId))
     )
+  of rqLeaseObservation:
+    # ONE-WAY, AND THAT IS THE POINT. No acknowledgement is sent on any
+    # path here — not on success, not on a refusal, not on a payload that
+    # will not decode. §"Write Path" says an observation may not introduce
+    # an additional round trip, and a reply the client would have to read
+    # is exactly that; OS-1 says recording an observation must not block
+    # the work being observed, and a reply is what a client would block on.
+    #
+    # A REFUSAL IS THEREFORE COUNTED RATHER THAN REPORTED. The client is
+    # not told, because telling it would cost the round trip this message
+    # exists to avoid, and because a client cannot do anything useful with
+    # the news. The count is readable through the `observations` inspection
+    # subject, which is where OS-2's "every dropped observation MUST be
+    # counted" is satisfied for this path.
+    var msg: LeaseObservationMessage
+    if not decodeLeaseObservation(frame.payload, msg):
+      inc daemon.observationsRejected
+      return
+    if daemon.applyLeaseObservation(context, msg):
+      inc daemon.observationsAccepted
+    else:
+      inc daemon.observationsRejected
   of rqStatusRequest:
     connection.sendResponse(rqStatusResponse, frame.header.requestId,
         encodeStatus(daemon.status()))
@@ -1645,14 +1836,18 @@ proc serve*(config: DaemonConfig): int =
   # endpoint is group-gated or owner-only.
   echo "runquotad listening " & config.endpoint.path &
     rendezvousDegradationReport()
-  if config.observationDbPath.len > 0:
-    # The report is the "clear report" half of OS-4: a store that will not
-    # open says so on stdout and the daemon carries on serving leases.
-    # Exactly two lines, always, whenever a store path was given: a reader
-    # that has to guess how many lines it will get is a reader that
-    # deadlocks on a daemon which then goes quiet.
-    echo sharedDaemon.daemon.observationStore.report
-    echo sharedDaemon.daemon.observationIdentityReport
+  # The report is the "clear report" half of OS-4: a store that will not
+  # open says so on stdout and the daemon carries on serving leases.
+  #
+  # EXACTLY THREE STARTUP LINES, ALWAYS, and the "always" is new with M13.
+  # It used to be three lines when a store path was given and one when it
+  # was not — a distinction that stopped existing the moment capture became
+  # ON WITHOUT ANY FLAG, because there is now always a store to report on,
+  # including the one the operator turned off. A reader that has to guess
+  # how many lines it will get is a reader that deadlocks on a daemon which
+  # then goes quiet, so the count is fixed rather than conditional.
+  echo sharedDaemon.daemon.observationStore.report
+  echo sharedDaemon.daemon.observationIdentityReport
   flushFile(stdout)
   var threads: seq[Thread[void]] = @[]
   for _ in 0 ..< connectionWorkerCount():

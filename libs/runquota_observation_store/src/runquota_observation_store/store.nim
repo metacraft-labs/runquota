@@ -45,9 +45,31 @@ proc libraryInfo*(): LibraryInfo =
 proc captureEnabled*(store: ObservationStore): bool =
   not store.isNil and store.status == ssOpen
 
+proc oneLine(text: string): string =
+  ## Folds every embedded newline out of a report.
+  ##
+  ## ``report`` IS ONE LINE, ALWAYS, for the same reason ``HostIdentity``'s
+  ## is: the daemon prints it as one of a FIXED number of startup lines and
+  ## a reader consumes that output by count, so a report that is silently
+  ## two lines leaves every reader of the next one blocked or misaligned.
+  ##
+  ## The sources that embed one are real and reached by the default
+  ## configuration, not by an exotic one. ``OSError.msg`` on macOS is two
+  ## lines -- the message and an "Additional info:" line -- and it is what
+  ## an unprovisionable parent directory produces; ``sqlite3``'s stderr is
+  ## multi-line whenever it reports more than one thing. Folding here
+  ## rather than at each construction site is what makes the guarantee
+  ## hold for the branches added later, too.
+  var parts: seq[string] = @[]
+  for line in text.splitLines:
+    let trimmed = line.strip()
+    if trimmed.len > 0:
+      parts.add(trimmed)
+  parts.join(" ")
+
 proc degrade(store: ObservationStore; status: StoreStatus; report: string) =
   store.status = status
-  store.report = report
+  store.report = oneLine(report)
 
 # ---------------------------------------------------------------------------
 # Opening, integrity, and migration

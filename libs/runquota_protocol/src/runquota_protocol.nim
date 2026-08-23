@@ -7,7 +7,11 @@ export protocolTypes
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 1'u16
-const RqspProtocolMinor* = 2'u16
+const RqspProtocolMinor* = 3'u16
+  ## Minor 3 adds ``rqLeaseObservation`` (M13). Minor rather than major
+  ## because it is purely additive: a client that never sends one is
+  ## unaffected, and a daemon that does not know the kind refuses the
+  ## single frame rather than the connection.
 const RqspHeaderLen* = 24'u16
 const MaxCommandStatsIdBytes* = 64
 const FrameFlagRequest* = 0x0001'u16
@@ -750,6 +754,92 @@ proc decodeProtocolError*(payload: string;
   if r.remaining != 0: return false
   msg = ProtocolErrorMessage(diagnostic: diagnostic)
   true
+
+const
+  ObservationFutureSkewMillis* = 2_000'i64
+    ## How far ahead of the daemon's clock a client's reading may be
+    ## stamped before it is refused. Not zero: the client and the daemon
+    ## read two different clocks, and a few hundred milliseconds of skew
+    ## between two calls to the same wall clock is ordinary. Two seconds of
+    ## slack, and a figure stamped beyond it is refused — a measurement
+    ## from the future was not made.
+  ObservationMaxAgeMillis* = 30_000'i64
+    ## How old a reading may be and still be folded into ``self_*``.
+    ##
+    ## THIS BOUND IS THE ONE THAT PROTECTS THE ARITHMETIC. ``foreign =
+    ## host_total - sum(self)`` subtracts two measurements and means
+    ## nothing unless both describe about the same instant; M11 found this
+    ## the expensive way, where self figures read a moment after the host
+    ## counters produced rows describing no moment that ever existed. A
+    ## half-minute-old figure summed into a sample taken now is the same
+    ## defect with a bigger gap, so it is refused rather than folded in.
+
+proc leaseObservationRefusal*(msg: LeaseObservationMessage;
+                              nowUnixMillis: int64): string =
+  ## Why this observation must be rejected, or "" if it is acceptable.
+  ##
+  ## PURE, and separate from the daemon, so the refusal can be exercised
+  ## on values a well-behaved client cannot send. The daemon adds the
+  ## checks only it can make — that the session exists and that the lease
+  ## belongs to it — because those need daemon state.
+  ##
+  ## A REFUSAL IS TOTAL. There is no such thing as accepting the memory
+  ## figure from a report whose timestamp is a lie: the caller applies
+  ## nothing until this has returned "".
+  if msg.sampledAtUnixMillis == 0'u64:
+    return "observation carries no sample time"
+  let sampledAt = int64(msg.sampledAtUnixMillis)
+  if sampledAt < 0:
+    return "observation sample time is not representable"
+  if sampledAt - nowUnixMillis > ObservationFutureSkewMillis:
+    return "observation sample time is " & $(sampledAt - nowUnixMillis) &
+      "ms in the future"
+  if nowUnixMillis - sampledAt > ObservationMaxAgeMillis:
+    return "observation sample time is " & $(nowUnixMillis - sampledAt) &
+      "ms stale"
+  ""
+
+proc encodeLeaseObservation*(msg: LeaseObservationMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU64(msg.leaseId.value)
+  w.writeU32(msg.cpuMilliPct)
+  w.writeU64(msg.rssBytes)
+  w.writeU64(msg.sampledAtUnixMillis)
+  w.data
+
+proc decodeLeaseObservation*(payload: string;
+    msg: var LeaseObservationMessage): bool =
+  ## ALL OR NOTHING. ``msg`` is assigned once, at the end, from locals: a
+  ## payload that runs out halfway through leaves the caller's message
+  ## exactly as it was, so there is no state in which half a report has
+  ## been applied. The trailing-bytes check is part of the same rule — a
+  ## frame carrying more than this message is not this message.
+  var r = reader(payload)
+  var sessionRaw: uint64
+  var leaseRaw: uint64
+  var cpuMilliPct: uint32
+  var rssBytes: uint64
+  var sampledAtUnixMillis: uint64
+  if not r.readU64(sessionRaw): return false
+  if not r.readU64(leaseRaw): return false
+  if not r.readU32(cpuMilliPct): return false
+  if not r.readU64(rssBytes): return false
+  if not r.readU64(sampledAtUnixMillis): return false
+  if r.remaining != 0: return false
+  msg = LeaseObservationMessage(
+    sessionId: sessionId(sessionRaw),
+    leaseId: leaseId(leaseRaw),
+    cpuMilliPct: cpuMilliPct,
+    rssBytes: rssBytes,
+    sampledAtUnixMillis: sampledAtUnixMillis
+  )
+  true
+
+proc observedCpuPct*(cpuMilliPct: uint32): float64 =
+  ## The wire's integer thousandths-of-a-percent as the percent
+  ## ``ambient.nim`` sums.
+  float64(cpuMilliPct) / 1000.0
 
 proc encodeInspectionRequest*(msg: InspectionRequestMessage): string =
   var w = writer()

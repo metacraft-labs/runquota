@@ -19,6 +19,7 @@ proc renderUsage*(programName: string): string =
     "  " & programName & " sessions --json\n" &
     "  " & programName & " leases --json\n" &
     "  " & programName & " topology --json\n" &
+    "  " & programName & " observations --json\n" &
     "  " & programName & " explain SESSION_ID\n" &
     "  " & programName & " daemon start|status\n" &
     "  " & programName & " acquire --cpu N --mem BYTES [--label TEXT] [--machine ID] [--benchmark] [-- COMMAND [ARG...]]"
@@ -186,6 +187,14 @@ proc runThinApp*(programName: string): int =
       of "topology":
         if args.len == 2 and args[1] == "--json":
           return printInspection("topology")
+      of "observations":
+        # Whether capture is on, which store is open, and how many
+        # in-flight client reports were accepted, refused or dropped.
+        # `--no-write-stats` and a store that degraded look identical from
+        # outside otherwise, and an operator who cannot tell them apart
+        # cannot tell a deliberate decision from a broken host.
+        if args.len == 2 and args[1] == "--json":
+          return printInspection("observations")
       of "explain":
         if args.len == 2:
           return printInspection("explain", sessionId(parseUInt(args[1])))

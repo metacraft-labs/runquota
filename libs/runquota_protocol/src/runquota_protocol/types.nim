@@ -31,6 +31,7 @@ type
     rqGrantNext = 23
     rqInspectionRequest = 24
     rqInspectionResponse = 25
+    rqLeaseObservation = 26
 
   MessageKind* = RqspMessageKind
 
@@ -198,6 +199,39 @@ type
 
   ProtocolErrorMessage* = object
     diagnostic*: Diagnostic
+
+  LeaseObservationMessage* = object
+    ## What a client has MEASURED about one of its own live executions,
+    ## while that execution is still running.
+    ##
+    ## THIS IS THE MESSAGE THAT MAKES ``self_*`` MEAN ANYTHING. Ambient
+    ## attribution is by difference — ``foreign = host_total - sum(self)``
+    ## — and the daemon deliberately never inspects a client's process
+    ## tree, so without an in-flight figure from the client every admitted
+    ## execution lands in ``foreign`` and ``self_*`` is a column of zeros.
+    ##
+    ## MEASURED, never reserved. The figures must come from the client's
+    ## own telemetry of its child (``runquota_process`` already samples
+    ## exactly this while it waits), never from the lease's requested
+    ## resources: a reservation is a number nobody measured, and writing
+    ## one here would put an invention into the store this design exists to
+    ## keep out of it.
+    ##
+    ## ONE-WAY: the daemon sends no acknowledgement, so a client pays one
+    ## buffered write and no round trip (OS-1, and §"Write Path": "No
+    ## observation may introduce an additional round trip").
+    sessionId*: SessionId
+    leaseId*: LeaseId
+    cpuMilliPct*: uint32
+      ## Thousandths of one percent of a whole host's CPU capacity, so a
+      ## fully busy 16-core box reads 1_600_000. An integer because the
+      ## codec has no float and a float on the wire would need an encoding,
+      ## a NaN rule and an endianness rule for a quantity that needs none.
+    rssBytes*: uint64
+    sampledAtUnixMillis*: uint64
+      ## When the client took the reading. Carried so a stale report is
+      ## recognisable as stale rather than being silently folded in as
+      ## current; the daemon refuses one from the future.
 
   InspectionRequestMessage* = object
     subject*: string

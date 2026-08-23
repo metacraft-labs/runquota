@@ -49,6 +49,13 @@ bench-runquota-ipc *args:
     mkdir -p bench-results test-logs
     bash scripts/run-m5-benchmark.sh ipc {{args}} 2> >(tee test-logs/bench-runquota-ipc.log >&2)
 
+# M13: per-execution latency the SOCKET observation write path adds, against
+# a `--no-write-stats` control. The fallback path's cost; the ring (M22)
+# carries the default-on decision.
+bench-observation-write-path *args:
+    mkdir -p bench-results test-logs
+    bash scripts/run-m13-benchmark.sh {{args}} 2> >(tee test-logs/bench-observation-write-path.log >&2)
+
 repomix *args:
     mkdir -p {{REPOMIX_OUT_DIR}}
     repomix \
