@@ -1108,11 +1108,11 @@
     "nim-shm-lease": {
       "flake": false,
       "locked": {
-        "lastModified": 1787161191,
-        "narHash": "sha256-wHbnpPNx3mkdJcTelAy80TlAYs/qQdWu/jTc2iUvSjc=",
+        "lastModified": 1787532379,
+        "narHash": "sha256-iGn2tdtIYKuAMkHOH0XT8KtLx5Fe0eFBXFieJyFgzrk=",
         "owner": "metacraft-labs",
         "repo": "nim-shm-lease",
-        "rev": "fe0529409360188d3de98174b36dfee300d38154",
+        "rev": "2e8b66fdd260ed356dca440fe6394e1f56fe0018",
         "type": "github"
       },
       "original": {
