@@ -1105,6 +1105,22 @@
         "type": "github"
       }
     },
+    "nim-shm-lease": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1787161191,
+        "narHash": "sha256-wHbnpPNx3mkdJcTelAy80TlAYs/qQdWu/jTc2iUvSjc=",
+        "owner": "metacraft-labs",
+        "repo": "nim-shm-lease",
+        "rev": "fe0529409360188d3de98174b36dfee300d38154",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "repo": "nim-shm-lease",
+        "type": "github"
+      }
+    },
     "nix": {
       "inputs": {
         "flake-compat": [
@@ -1932,6 +1948,7 @@
           "nixos-modules",
           "git-hooks-nix"
         ],
+        "nim-shm-lease": "nim-shm-lease",
         "nixos-modules": "nixos-modules",
         "nixpkgs": [
           "nixos-modules",

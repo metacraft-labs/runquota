@@ -5,6 +5,7 @@ import runquota_ipc
 import runquota_observation_store
 import runquota_persistence
 import runquota_protocol
+import runquota_stats_table/publisher
 
 type
   LibraryInfo* = object
@@ -166,6 +167,18 @@ type
       ## readable somewhere. It is one counter rather than one per reason
       ## because the reason is already in the daemon's own view and the
       ## count is what a reader needs to distrust a window.
+    statsPublisher*: StatsPublisher
+      ## M13b's published aggregate table. WRITE-ONLY FROM HERE: nothing in
+      ## the daemon ever reads it back, and no daemon decision depends on
+      ## it. It is published output living in a host-wide segment, and a
+      ## decision that consulted it would be a decision that depends on
+      ## memory outside the daemon's own address space — which the
+      ## transport spec's §"Trust and the privilege boundary" forbids.
+      ##
+      ## Started AFTER the rendezvous directory exists, by
+      ## ``startStatsPublisher``, because the table lives beside the socket.
+      ## A daemon that cannot publish keeps serving: the socket is the
+      ## answer of record and this only removes a round trip from it.
     selfReportsReaped*: uint64
       ## Live self-reports dropped on behalf of a client that did not end
       ## them itself — a supervisor whose connection died mid-execution.

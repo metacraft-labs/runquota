@@ -6,6 +6,28 @@
     nixpkgs.follows = "nixos-modules/nixpkgs-unstable";
     flake-parts.follows = "nixos-modules/flake-parts";
     git-hooks.follows = "nixos-modules/git-hooks-nix";
+
+    # THE SHARED-MEMORY LIBRARY, and M13b is the first thing in this repo
+    # that needs it. `runquota_stats_table` -- the published aggregate
+    # table -- reuses `shm_lease/anchor` (boot id, process start time, the
+    # pid-reuse-proof liveness verdict), `shm_lease/waitword` (the host
+    # page size, which is 16 KiB on Apple Silicon and never 4096) and, in
+    # the tests, `shm_lease/syscount` (the KERNEL-maintained syscall
+    # counter the zero-syscall gate is measured with rather than argued
+    # from).
+    #
+    # AN INPUT RATHER THAN A SIBLING CHECKOUT, because `packages.default`
+    # builds from a pure `src = ./.` copy with no siblings in it. Wiring
+    # this only through `config.nims`'s workspace fallback would have left
+    # `nix build .#default` producing a `runquotad` that silently does not
+    # publish -- a feature difference between the packaged daemon and the
+    # developer's, which is the failure mode this whole campaign keeps
+    # finding. `flake = false`: `nim-shm-lease` is a source tree, not a
+    # flake.
+    nim-shm-lease = {
+      url = "github:metacraft-labs/nim-shm-lease";
+      flake = false;
+    };
   };
 
   outputs =
@@ -140,6 +162,7 @@
               '${./.}' \
               "$gate_self"
           '';
+          shmLeaseSrc = "${inputs.nim-shm-lease}/src";
           runquota = pkgs.stdenv.mkDerivation {
             pname = "runquota";
             inherit version;
@@ -147,6 +170,12 @@
 
             strictDeps = true;
             dontConfigure = true;
+
+            # Read by `config.nims`. Not a convenience: without it the
+            # published aggregate table does not compile, and the point of
+            # setting it HERE is that the packaged daemon is built from the
+            # same sources as the developer's.
+            SHM_LEASE_SRC = shmLeaseSrc;
 
             nativeBuildInputs = [
               pkgs.bash
@@ -295,6 +324,7 @@
               pkgs.shfmt
               pkgs.typos
             ];
+            SHM_LEASE_SRC = shmLeaseSrc;
             shellHook = pre-commit-check.shellHook;
           };
         };

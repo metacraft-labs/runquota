@@ -17,3 +17,4 @@ runquota_observation_store
 runquota_daemon
 runquota_cli_support
 runquota_partition
+runquota_stats_table

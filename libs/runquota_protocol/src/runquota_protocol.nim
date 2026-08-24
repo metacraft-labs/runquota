@@ -14,6 +14,14 @@ const RqspProtocolMinor* = 4'u16
   ## is a system of record either way: a client that never asks a question
   ## and never supplies an estimate behaves exactly as before, and the
   ## daemon's learned table remains the fallback for it.
+  ##
+  ## THAT CLAIM IS NOW TRUE OF THE DECODER AS WELL, which it was not when
+  ## minor 4 shipped: ``decodeLeaseRequest`` read the estimate
+  ## unconditionally and rejected a frame that ended before it, so a
+  ## genuinely pre-M13a payload failed to decode against a version number
+  ## promising it would not. An absent estimate now takes the not-supplied
+  ## branch. Either the decoder tolerates the absent field or the claim
+  ## changes; this is the first of those.
 const RqspHeaderLen* = 24'u16
 const MaxCommandStatsIdBytes* = 64
 const FrameFlagRequest* = 0x0001'u16
@@ -346,8 +354,25 @@ proc decodeLeaseRequest*(payload: string; msg: var LeaseRequestMessage): bool =
   if not r.readU32(purposeRaw): return false
   if purposeRaw > uint32(ord(high(LeasePurpose))): return false
   if not r.readMetadata(metadata): return false
-  var estimate: ClientEstimate
-  if not r.readClientEstimate(estimate): return false
+  # THE FIELD IS OPTIONAL ON THE WIRE, WHICH IS WHAT A MINOR BUMP PROMISED.
+  #
+  # M13a added `ClientEstimate` to this message and shipped it as protocol
+  # MINOR 4 with a comment calling the change purely additive — while the
+  # decoder read the field unconditionally and then rejected the frame for
+  # having no trailing bytes. A genuinely pre-M13a client's payload therefore
+  # FAILED to decode, and the version number said otherwise. In-tree the
+  # defect was invisible, because client and daemon build from one source
+  # tree; what was wrong was the CLAIM, and a version number that overstates
+  # compatibility is worse than one that understates it, because the party it
+  # misleads is the one that cannot see this code.
+  #
+  # An absent field takes the NOT-SUPPLIED branch, which is byte-identical in
+  # effect to the pre-M13a `effectiveResources` body: the daemon's learned
+  # estimate is the fallback, exactly as it was before the field existed. So
+  # this is a decoder change and not a semantic one.
+  var estimate = ClientEstimate(supplied: false, memoryBytes: 0'u64)
+  if r.remaining != 0:
+    if not r.readClientEstimate(estimate): return false
   if r.remaining != 0: return false
   msg = LeaseRequestMessage(
     sessionId: sessionId(id),

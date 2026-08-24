@@ -401,6 +401,23 @@ type
       ## cannot forget to ask, and so a test can assert which of the two a
       ## host is in without inferring it from a mode.
 
+const statsTableSegmentName* = "stats-table"
+  ## The published aggregate table lives beside the socket, in the same
+  ## host-wide, daemon-owned rendezvous directory — because it is
+  ## discovered the same way and by the same population. It does NOT go in
+  ## the state directory: that holds durable identity, and this is a
+  ## working set that may be dropped, resized or zeroed at any moment.
+
+proc defaultStatsTablePath*(endpoint: Endpoint): string =
+  ## Where the published aggregate table is, derived from the endpoint so
+  ## the two cannot end up in different directories — a table published
+  ## somewhere the clients of THIS daemon do not look is an unpublished
+  ## table with extra moving parts, and it fails silently as a permanently
+  ## cold cache.
+  case endpoint.kind
+  of endpointUnixSocket: parentDir(endpoint.path) / statsTableSegmentName
+  of endpointNamedPipe, endpointUnsupported: ""
+
 proc requiredSegmentMode*(scope: SegmentScope): int =
   ## The mode a segment of ``scope`` must be created with and verified at.
   ## Segment files themselves arrive with the shared-memory transport; this

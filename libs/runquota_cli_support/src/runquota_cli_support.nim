@@ -3,7 +3,12 @@ import std/[os, osproc, strutils]
 import runquota_client
 import runquota_core
 import runquota_exec
+# NARROWED ON PURPOSE. A plain `import runquota_ipc` here makes
+# `connectDefault` ambiguous against `runquota_client`'s, which is the
+# transport-level one no CLI path should reach for.
+from runquota_ipc import defaultEndpoint, defaultStatsTablePath
 import runquota_protocol
+import runquota_stats_table
 
 proc wantsVersion*(args: openArray[string]): bool =
   args.len == 1 and args[0] in ["--version", "-V"]
@@ -22,7 +27,8 @@ proc renderUsage*(programName: string): string =
     "  " & programName & " observations --json\n" &
     "  " & programName & " explain SESSION_ID\n" &
     "  " & programName & " daemon start|status\n" &
-    "  " & programName & " acquire --cpu N --mem BYTES [--label TEXT] [--machine ID] [--benchmark] [-- COMMAND [ARG...]]"
+    "  " & programName & " stats-table [KEY]\n" &
+    "  " & programName & " acquire --cpu N --mem BYTES [--label TEXT] [--machine ID] [--stats-key KEY] [--benchmark] [-- COMMAND [ARG...]]"
 
 proc parseMemory(value: string): uint64 =
   let lower = value.toLowerAscii()
@@ -100,11 +106,59 @@ proc runDaemonStart(): int =
   echo "runquotad did not become ready"
   1
 
+proc openPublishedTable*(): StatsTable =
+  ## The client's read-only view of `runquotad`'s published aggregate table.
+  ## Never raises and never blocks; an unavailable table is a miss.
+  openDefaultStatsTable(defaultStatsTablePath(defaultEndpoint()))
+
+proc socketEstimateFallback*(client: ptr RunQuotaClient): SocketEstimateFallback =
+  ## THE ANSWER OF RECORD, and the reason the fast path above it is safe to
+  ## have. M13a's ``statsSubjectDistribution`` read, over the socket, is what
+  ## the daemon publishes into the table in the first place — the same rows,
+  ## the same profile, the same number. So a table miss costs a round trip
+  ## and changes no admission decision, which is what "a cache, not a second
+  ## source of truth" has to mean to be worth anything.
+  result = proc (statsKey: string; memoryBytes: var uint64): bool =
+    try:
+      let answer = client[].queryStats(statsSubjectDistribution,
+        statsKey = statsKey)
+      if answer.knowledge != statsKnowledgeWireKnown:
+        return false
+      for entry in answer.distributions:
+        if entry.knowledge == statsKnowledgeWireKnown:
+          memoryBytes = entry.peakRssBytesMax
+          return true
+      false
+    except CatchableError:
+      false
+
+proc printStatsTable(statsKey: string): int =
+  ## What the local view of the published table looks like, including the
+  ## RETRY COUNTER — the one number that says whether the seqlock's retry
+  ## path has ever actually run on this host.
+  var table = openPublishedTable()
+  defer: table.close()
+  echo statsTableReport(table)
+  if statsKey.len > 0:
+    var estimate: PublishedEstimate
+    case table.lookupEstimate(statsKey, estimate)
+    of stlHit:
+      echo statsKey & ": " & $estimate.memoryBytes & " bytes over " &
+        $estimate.sampleCount & " samples (" & $estimate.knowledge & ")"
+    of stlAbsent:
+      echo statsKey & ": not resident (ask over the socket)"
+    of stlTorn:
+      echo statsKey & ": torn under a concurrent publisher (ask over the socket)"
+    of stlUnavailable:
+      echo statsKey & ": no table attached (ask over the socket)"
+  0
+
 proc runDebugAcquire(args: seq[string]): int =
   var cpu = 1000'u32
   var memory = 128'u64 * 1024'u64 * 1024'u64
   var label = "debug"
   var machineId = ""
+  var statsKey = ""
   var benchmark = false
   var command: seq[string] = @[]
   var i = 0
@@ -126,6 +180,10 @@ proc runDebugAcquire(args: seq[string]): int =
       if i + 1 >= args.len: return 2
       machineId = args[i + 1]
       i += 2
+    of "--stats-key":
+      if i + 1 >= args.len: return 2
+      statsKey = args[i + 1]
+      i += 2
     of "--benchmark":
       benchmark = true
       i += 1
@@ -144,6 +202,27 @@ proc runDebugAcquire(args: seq[string]): int =
   var request = resourceRequest(label, milliCpu(cpu), bytes(memory))
   if machineId.len > 0:
     request = request.forMachine(machineId)
+  var estimateSource = esNone
+  if statsKey.len > 0:
+    request.commandStatsId = statsKey
+    # THE ADMISSION ESTIMATE ARRIVES WITH THE REQUEST. Published table
+    # first (no syscall), socket second, and no estimate at all third —
+    # in which case the daemon's learned table is the fallback exactly as
+    # it was before this milestone existed. The three arms produce the
+    # same number wherever the number exists; only the cost differs.
+    var table = openPublishedTable()
+    defer: table.close()
+    var estimateBytes = 0'u64
+    estimateSource = table.resolveAdmissionEstimate(statsKey,
+      socketEstimateFallback(addr client), estimateBytes)
+    if estimateSource != esNone:
+      request = request.withEstimate(estimateBytes)
+    if getEnv("RUNQUOTA_REPORT_ESTIMATE_SOURCE").len > 0:
+      # Not decoration: the emptied-table control has to show that the
+      # SOURCE changed while the ANSWER did not, and neither fact is
+      # observable from the outside otherwise.
+      echo "estimate source " & $estimateSource & " bytes " & $estimateBytes &
+        " " & statsTableReport(table)
   if benchmark:
     request = request.benchmarkRequest()
   if command.len > 0:
@@ -203,6 +282,14 @@ proc runThinApp*(programName: string): int =
           return runDaemonStart()
         if args.len == 2 and args[1] == "status":
           return printStatus(false)
+      of "stats-table":
+        # The published aggregate table as THIS client sees it. Reading it
+        # costs no round trip, which is the entire point, so an operator
+        # asking what the daemon has published does not perturb the daemon.
+        if args.len == 1:
+          return printStatsTable("")
+        if args.len == 2:
+          return printStatsTable(args[1])
       of "acquire":
         return runDebugAcquire(args[1 .. ^1])
       else:

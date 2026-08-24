@@ -86,6 +86,68 @@ suite "RQSP protocol and codec":
     check offer.candidates[0].estimate.supplied
     check offer.candidates[0].estimate.memoryBytes == 0'u64
 
+  test "a PRE-M13a lease request still decodes, which is what MINOR 4 promised":
+    # M13a added `ClientEstimate` to `LeaseRequestMessage` and shipped it as
+    # protocol MINOR 4, with a comment calling the change purely additive --
+    # while the decoder read the field unconditionally and rejected a frame
+    # that ended before it. A genuinely pre-M13a client's payload therefore
+    # FAILED to decode against a version number promising it would not.
+    #
+    # THE FIXTURE IS THE OLD ENCODER, WRITTEN OUT. Re-encoding with the
+    # current one and truncating would be a test of `encodeLeaseRequest`'s
+    # field order; what has to decode is the byte sequence a pre-M13a peer
+    # really produces, which is every field up to and including the metadata
+    # and then nothing.
+    var writer = writer()
+    writer.writeU64(1'u64)
+    writer.writeString("pre-m13a")
+    writer.writeBytes("codec-key")
+    writer.writeResourceVector(resourceVector(milliCpu(1000), bytes(4096)))
+    writer.writeDeadline(noDeadline())
+    writer.writeU32(uint32(ord(priorityNormal)))
+    writer.writeU32(uint32(ord(leasePurposeWork)))
+    writer.writeMetadata(metadataNone())
+    let legacyPayload = writer.data
+
+    # The fixture is really the OLD shape and not the new one -- otherwise
+    # this test would be asserting that the current encoder decodes, which
+    # nobody doubts.
+    check legacyPayload.len < encodeLeaseRequest(LeaseRequestMessage(
+      sessionId: sessionId(1), label: "pre-m13a", commandStatsId: "codec-key",
+      resources: resourceVector(milliCpu(1000), bytes(4096)),
+      deadline: noDeadline(), priority: priorityNormal,
+      purpose: leasePurposeWork, metadata: metadataNone(),
+      estimate: ClientEstimate(supplied: false, memoryBytes: 0'u64))).len
+
+    var decoded: LeaseRequestMessage
+    check decodeLeaseRequest(legacyPayload, decoded)
+    check decoded.label == "pre-m13a"
+    check decoded.commandStatsId == "codec-key"
+    check decoded.resources.memory.value == 4096'u64
+    # AND IT TAKES THE NOT-SUPPLIED BRANCH, which is the half that makes
+    # this genuinely additive rather than merely tolerant: the daemon's
+    # learned estimate remains the fallback for this request, exactly as it
+    # was before the field existed.
+    check not decoded.estimate.supplied
+    check decoded.estimate.memoryBytes == 0'u64
+
+    # A TRUNCATED estimate is still a refusal. Tolerating an ABSENT field is
+    # not the same as tolerating a MALFORMED one, and a decoder that
+    # conflated them would accept a frame it had only partly understood.
+    var truncated = writer.data
+    truncated.add('\1') # `supplied`, with the u64 that must follow
+    var rejected: LeaseRequestMessage
+    check not decodeLeaseRequest(truncated, rejected)
+
+    # ...and trailing bytes after a complete estimate are still refused.
+    check not decodeLeaseRequest(encodeLeaseRequest(LeaseRequestMessage(
+      sessionId: sessionId(1), label: "pre-m13a", commandStatsId: "codec-key",
+      resources: resourceVector(milliCpu(1000), bytes(4096)),
+      deadline: noDeadline(), priority: priorityNormal,
+      purpose: leasePurposeWork, metadata: metadataNone(),
+      estimate: ClientEstimate(supplied: false, memoryBytes: 0'u64))) & "junk",
+      rejected)
+
   test "a stats query and its answer round trip with the profile attached":
     let query = StatsQueryMessage(
       sessionId: sessionId(0),

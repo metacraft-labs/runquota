@@ -46,6 +46,16 @@
 - A client-supplied estimate on a lease request is taken at face value. RunQuota
   must not clamp it, second-guess it, or validate it against its own learned
   table; the learned estimate is the fallback when none is supplied.
+- `runquotad` is the only writer of the published aggregate table, and no client
+  may hold a writable mapping of it. It is the one host-wide segment in the
+  design — daemon-owned, group-readable, `0640` — and it is safe to share
+  precisely because no client can write it. The daemon must not read it back as
+  authority either: it is published output, and a daemon decision that depended
+  on it would depend on a page outside its own address space.
+- The published aggregate table is a cache and never a second source of truth.
+  The socket must be able to answer anything it can, and no behaviour may exist
+  only while an entry is resident — which is what lets the table be dropped,
+  resized or skipped in a degraded mode with no correctness argument at all.
 - Static helper libraries must compile with `--mm:arc --app:staticlib` and must
   not define or use Nim `ref` types.
 - JSON may be emitted for inspection output, diagnostics, or benchmark reports.

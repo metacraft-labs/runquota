@@ -18,6 +18,7 @@ import runquota_ipc
 import runquota_observation_store
 import runquota_persistence
 import runquota_protocol
+import runquota_stats_table/publisher as statsPublisherLib
 
 export daemonTypes
 
@@ -182,6 +183,39 @@ proc effectiveObservationDbPath*(config: DaemonConfig): string =
   if config.observationDbPath.len > 0:
     return config.observationDbPath
   observationDbBeside(config.hostIdentityFilePath)
+
+proc statsTablePath*(config: DaemonConfig): string =
+  ## Where this daemon publishes its aggregate table, or "" for not at all.
+  ##
+  ## ``RUNQUOTA_STATS_TABLE=off`` turns the fast path off entirely, and that
+  ## switch is not only a test affordance: "can be dropped, resized, or
+  ## skipped in a degraded mode without any correctness argument at all" is
+  ## the property the table is supposed to have, and an option nobody can
+  ## exercise is a claim rather than a property.
+  if getEnv("RUNQUOTA_STATS_TABLE") == "off":
+    return ""
+  let overridePath = getEnv("RUNQUOTA_STATS_TABLE_PATH")
+  if overridePath.len > 0:
+    return overridePath
+  defaultStatsTablePath(config.endpoint)
+
+proc startStatsPublisher*(daemon: var RunQuotaDaemon) =
+  ## Called AFTER the rendezvous directory exists, because the table lives
+  ## in it. Failure is not an error: the socket answers everything the table
+  ## can, so a daemon that cannot publish serves exactly as before, one
+  ## round trip slower on the admission read.
+  ##
+  ## ``segmentHostWide``, and it is the one segment that is: the table is
+  ## written only by `runquotad`, so a page no client can write cannot be
+  ## used by one user to perturb another. ``requiredSegmentMode`` is asked
+  ## rather than ``0640`` written out, so a blanket per-segment ``0600``
+  ## cannot silently make the host-wide table unreadable by every user but
+  ## one.
+  let path = statsTablePath(daemon.config)
+  if path.len == 0:
+    return
+  daemon.statsPublisher = createStatsPublisher(path, DefaultStatsSlotCount,
+    requiredSegmentMode(segmentHostWide))
 
 proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
   var effectiveConfig = config
@@ -1208,6 +1242,53 @@ proc effectiveResources(daemon: RunQuotaDaemon; sessionId: SessionId;
     if learned > result.memory.value:
       result.memory = bytes(learned)
 
+proc publishAggregate(daemon: var RunQuotaDaemon; statsKey: string) =
+  ## Publish the CURRENT aggregate for one stats key into the segment, as
+  ## the daemon folds in the run that just finished.
+  ##
+  ## THE PUBLISHED FIGURE IS THE ONE THE SOCKET ANSWERS WITH, deliberately
+  ## and to the byte: ``estimateFor`` is the same call ``statsAnswer``
+  ## makes for ``statsSubjectDistribution``, over the same rows, for the
+  ## same profile. That equality is what makes the table a CACHE — a miss
+  ## costs a round trip and changes no number — and it is what
+  ## ``t_stats_table_cache_control.nim`` measures with the table emptied.
+  ## Publishing some other, better figure here would be the moment the
+  ## table quietly became a second source of truth.
+  ##
+  ## NOTHING IS READ BACK. The publisher writes; the daemon's own decisions
+  ## are taken from ``daemon.estimates``, its private learned table, exactly
+  ## as before this milestone.
+  if not daemon.statsPublisher.available: return
+  if statsKey.len == 0: return
+  if not daemon.observationCaptureEnabled: return
+  let profileId =
+    if daemon.observationProfileId.len > 0:
+      some(daemon.observationProfileId)
+    else:
+      none(string)
+  # The row that has just been captured is still in the writer's queue, and
+  # an aggregate published without it would be one run stale from the moment
+  # it was written. This is the same flush `statsAnswer` performs before
+  # answering, for the same reason.
+  flushObservationWriter()
+  let answer = daemon.observationStore.estimateFor(statsKey, spanSingleProfile,
+    profileId)
+  var payload = PublishedEstimate(
+    statsKey: statsKey,
+    knowledge: statsTableUnknown,
+    memoryBytes: 0'u64,
+    recentPeakBytes: 0'u64,
+    sampleCount: 0'u64,
+    updatedUnixMillis: nowUnixMillis())
+  for entry in answer.distributions:
+    if entry.knowledge == statsKnown:
+      payload.knowledge = statsTableKnown
+      payload.memoryBytes = uint64(max(0'i64, entry.peakRssBytesMax))
+      payload.recentPeakBytes = payload.memoryBytes
+      payload.sampleCount = uint64(max(0'i64, entry.sampleCount))
+      break
+  discard daemon.statsPublisher.publishEstimate(statsKey, payload)
+
 proc updateEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
                               finish: LeaseFinishedMessage) =
   if lease.commandStatsId.len == 0 or finish.peakMemoryBytes == 0:
@@ -1810,6 +1891,12 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     lease.hardLimitOrOom = msg.hardLimitOrOom
     daemon.updateEstimateFromFinish(lease, msg)
     daemon.captureObservation(lease, msg)
+    # M13b: AS IT FOLDS IN THIS RUN'S RESULTS, and after the row has been
+    # captured so the aggregate includes it. Ordered after
+    # `captureObservation` rather than beside `updateEstimateFromFinish`
+    # because publishing an aggregate that excludes the run that triggered
+    # it would make every published entry exactly one execution stale.
+    daemon.publishAggregate(lease.commandStatsId)
     daemon.endLeaseSelfReport(msg.leaseId)
     inc daemon.totalFinished
     daemon.leases[msg.leaseId.value] = lease
@@ -2044,14 +2131,25 @@ proc serve*(config: DaemonConfig): int =
     deinitConnectionQueue()
     return endpointRefusedExitCode
   sharedDaemon.daemon.state = dsServing
+  # AFTER the rendezvous directory exists and has been verified, because the
+  # published table lives in it and is discovered the same way the socket is.
+  sharedDaemon.daemon.startStatsPublisher()
   # THE DEGRADATION IS SAID OUT LOUD, and it is appended to the listening
   # line rather than printed on one of its own: the startup output is a
   # FIXED number of lines that readers consume by count, and a fourth line
   # would leave every reader of the third one misreading or blocked. An
   # operator sees, on the line they already read, whether this host's
   # endpoint is group-gated or owner-only.
+  #
+  # M13b's table is reported on THIS line for the same reason the
+  # degradation is: the startup output is a FIXED THREE LINES that readers
+  # consume by count, and a fourth would leave every reader of the third one
+  # misreading or blocked. That rule has already cost this campaign one
+  # defect (M13's unfolded `OSError.msg`), so a new subsystem appends rather
+  # than announces.
   echo "runquotad listening " & config.endpoint.path &
-    rendezvousDegradationReport()
+    rendezvousDegradationReport() & "; " &
+    statsPublisherReport(sharedDaemon.daemon.statsPublisher)
   # The report is the "clear report" half of OS-4: a store that will not
   # open says so on stdout and the daemon carries on serving leases.
   #
@@ -2083,6 +2181,13 @@ proc serve*(config: DaemonConfig): int =
       stopEstimateStore(sharedDaemon.daemon.estimateStore)
       stopAmbientSampler()
       stopObservationWriter()
+      # The FILE is deliberately left behind. A table whose publisher has
+      # exited is STALE, not invalid, and a stale entry is a slightly worse
+      # estimate rather than an incorrect admission — the anchor in its
+      # header is what tells a reader which it is holding. Unlinking here
+      # would turn "tolerate staleness", which is specified behaviour, into
+      # a path nothing ever takes.
+      sharedDaemon.daemon.statsPublisher.close()
     finally:
       release(sharedDaemon.lock)
       listener.close()

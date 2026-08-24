@@ -86,6 +86,33 @@ if reprobuildSrc.len > 0:
     reprobuildSrc / "libs" / "stint" / "src",
   ], "stint.nim")
 
+# `nim-shm-lease` — THE FIRST DEPENDENCY RUNQUOTA HAS ON THE SHARED-MEMORY
+# LIBRARY, introduced by M13b's published aggregate table.
+#
+# Unlike the REPROBUILD_SRC block above, this one is NOT opt-in, and the
+# difference is deliberate. The reprobuild block is a convenience for
+# `nim check repro.nim`, and a silent sibling fallback there would let a
+# runquota lib start importing `repro_core` without a standalone-CI build
+# break. Here the dependency is real and load-bearing: `runquota_stats_table`
+# does not compile without it and `runquotad` does not publish without it, so
+# a build that silently dropped it would produce a daemon missing a feature
+# rather than a clear failure. It is therefore resolved on EVERY compile,
+# from `SHM_LEASE_SRC` (exported by the dev shell and by the Nix package
+# build, both from the flake input) with a workspace-sibling fallback for an
+# interactive `nim c` in a `repo` checkout.
+#
+# Nothing is added to the path when neither resolves: the compile then fails
+# on the import with the module name in it, which is the diagnosis.
+block shmLeasePath:
+  let fromEnv = getEnv("SHM_LEASE_SRC")
+  if fromEnv.len > 0 and fileExists(fromEnv / "shm_lease" / "anchor.nim"):
+    switch("path", fromEnv)
+    break shmLeasePath
+  for candidate in ["../nim-shm-lease/src", "../../nim-shm-lease/src"]:
+    if fileExists(candidate / "shm_lease" / "anchor.nim"):
+      switch("path", candidate)
+      break shmLeasePath
+
 switch("path", "libs/runquota_core/src")
 switch("path", "libs/runquota_codec/src")
 switch("path", "libs/runquota_protocol/src")
@@ -104,3 +131,4 @@ switch("path", "libs/runquota_observation_store/src")
 switch("path", "libs/runquota_daemon/src")
 switch("path", "libs/runquota_cli_support/src")
 switch("path", "libs/runquota_partition/src")
+switch("path", "libs/runquota_stats_table/src")
