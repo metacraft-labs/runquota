@@ -475,6 +475,63 @@ pass every assertion. With a reader holding a snapshot — which is what a live
 store has — the plain copy silently comes back with 5 of 25 executions and
 the backup with 25.
 
+### Export and redaction
+
+`exportObservationStore(source, destination, policy)` writes a redacted copy for
+handing across a trust boundary. It is the operation whose receiving end is
+`merge`, so an artifact is a real observation store: openable, still immutable,
+still mergeable.
+
+**Redaction is applied at export and never at capture.** A local store is as
+trusted as the machine it sits on, and redacting on the way in would destroy
+detail its owner is entitled to and that no later query could recover. Nothing
+in `redaction.nim` names the source as the target of a write; exporting a store
+onto itself is refused rather than allowed to become the one in-place path.
+
+The policies are `CLI/stats.md`'s `--redact=none|default|strict`:
+
+| | `none` | `default` | `strict` |
+|---|---|---|---|
+| absolute paths, anywhere in any text cell | | ✓ | ✓ |
+| relative, slash-bearing tokens | | | ✓ |
+| `runs.git_branch`, `runs.workspace_id` | | ✓ | ✓ |
+| `executions.command_stats_id` | | ✓ | ✓ |
+| `carried_extension_rows.payload` | | ✓ | ✓ |
+| `runs.git_commit`, `runs.profile` | | | ✓ |
+| non-key text in `ext_*` tables | | | ✓ |
+
+Two rules explain the shape of that table. Path redaction is **value-shaped**:
+a path can appear in any text cell, including columns the specification says
+are not paths, so it is applied to every table discovered from `sqlite_master`
+rather than to a list of columns somebody expected paths in. Everything else is
+**column-shaped**, and only for spine columns RunQuota owns and can classify —
+OS-5 forbids it from deciding that a product's own column is a branch name, so
+`strict` resolves that by redacting all of them and `default` by redacting none
+of them, which is a visible hole rather than a silent one.
+
+`carried_extension_rows.payload` is redacted from `default` upward because it
+is a hex rendering of another machine's row: the scanner is structurally blind
+inside it, and blindness at a trust boundary resolves to redaction rather than
+to "no paths were found".
+
+Values become `[redacted:<category>:<16 hex of sha256>]`, which is stable, so a
+receiver can still group by a path it cannot read and two exports of one store
+are identical. It is therefore **not** a defence against an attacker who
+guesses candidate paths and hashes them; that needs a keyed digest and the key
+is the exporting organisation's business.
+
+Never redacted: primary keys and both ends of every foreign key (a rewritten
+key is a broken join, and the spine's ids are specified as opaque anyway), and
+every integer and real — the durations and byte counts the artifact exists to
+carry.
+
+The applied policy is recorded in an `export_manifest` table written into the
+destination only. It records the format, the policy, the **set of categories
+the policy activated** and a per-category count, so a reader can tell "this
+policy does not redact branches" from "it does, and there were none". A store
+with no manifest has never been exported, which is a third state and must not
+read as either of the others.
+
 ## State-boundary requirements
 
 Any persistent RunQuota state must document schema ownership, migrations, backup,

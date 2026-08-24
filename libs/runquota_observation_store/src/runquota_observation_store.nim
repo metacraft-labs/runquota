@@ -8,7 +8,7 @@
 
 import runquota_observation_store/[
   ambient, canonical, extensions, hardware, identity, ids, merge, query,
-  retention, schema, sha256, sqlite_cli, store, types, writer]
+  redaction, retention, schema, sha256, sqlite_cli, store, types, writer]
 
 export ambient, canonical, extensions, hardware, identity, ids, merge, query,
-  retention, schema, sha256, sqlite_cli, store, types, writer
+  redaction, retention, schema, sha256, sqlite_cli, store, types, writer
