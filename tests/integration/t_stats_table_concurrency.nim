@@ -65,10 +65,22 @@ suite "stats_table_concurrency":
       if compiler.len > 0:
         let outPath = getCurrentDir() / "build" / "test-bin" /
           "stats_table_publish_driver"
-        let build = execProcess(compiler,
-          args = ["c", "--threads:on",
-                  "--nimcache:build/nimcache/stats_table_publish_driver",
-                  "--out:" & outPath, driverSource],
+        # THE INNER COMPILE INHERITS THIS FILE'S BUILD MODE, and it has to.
+        # The writer's release fences are what the reader's acquire fence
+        # pairs with, and neither is observable at -O0: removing them leaves
+        # a debug build green. The driver is the WRITER, so a hardcoded
+        # argument list here would leave the writer at -O0 no matter how the
+        # suite was built -- which is exactly the hole M13b's writer-fence
+        # mutation fell into. It was reported red under `-d:release`, and it
+        # was red the way it was run by hand; the shipped test could not
+        # reach that configuration at all.
+        var buildArgs = @["c", "--threads:on",
+                          "--nimcache:build/nimcache/stats_table_publish_driver",
+                          "--out:" & outPath]
+        when defined(release):
+          buildArgs.add("-d:release")
+        buildArgs.add(driverSource)
+        let build = execProcess(compiler, args = buildArgs,
           env = nil, options = {poStdErrToStdOut})
         if not fileExists(outPath):
           echo build

@@ -96,6 +96,43 @@ proc writesTheTable(source: string): bool =
     "createStatsPublisher" in text or
     "publishEstimate" in text
 
+const
+  segmentLoadTokens = [
+    # A LOAD FROM THE SEGMENT, however it is spelled. The publisher maps the
+      # table read-WRITE, so nothing in the type system stops a load; the only
+      # thing that does is that no load is written, and that is what this scans
+      # for. `ATOMIC_ACQUIRE`/`ATOMIC_CONSUME` are here because a load is the
+      # only operation those orderings apply to -- an acquire in the write path
+      # is a read of somebody's published state by definition.
+    "atomicLoadN",
+    "atomicLoad",
+    "ATOMIC_ACQUIRE",
+    "ATOMIC_CONSUME"]
+
+  # The publisher's READ-WRITE mapping address, exported so the SM-7
+  # assertion can show the writer and the reader really are at different
+  # virtual bases. Nothing in the library calls it, and `runquota_daemon`
+  # already imports the publisher -- so a daemon decision that depended on
+  # the published page is ONE LINE away and would look entirely ordinary.
+  # The gate is that the daemon never names it at all.
+  mappedBaseToken = "unsafeMappedBase"
+
+proc loadsFromTheSegment(source: string): seq[string] =
+  ## Every load token the file names, reported individually so a failure says
+  ## what it saw rather than merely that it saw something.
+  let text = codeOnly(source)
+  for token in segmentLoadTokens:
+    if token in text and token notin result:
+      result.add(token)
+
+proc daemonSideSources(): seq[string] =
+  ## The daemon library and the daemon app: everything that already has the
+  ## publisher in scope.
+  for path in shippedSources():
+    let rel = relativeToRepo(path)
+    if rel.startsWith("libs/runquota_daemon/") or rel.startsWith("apps/runquotad/"):
+      result.add(path)
+
 suite "stats_table_rules":
 
   test "the boundary is written down where a reader of this repo will see it":
@@ -418,3 +455,99 @@ suite "stats_table_rules":
                 "libs/runquota_exec/src/runquota_exec.nim"]:
       let text = codeOnly(readFile(repoRoot / rel))
       check "runquota_stats_table/publisher" notin text
+
+  # -------------------------------------------------------------------------
+  # NOT READ BACK AS AUTHORITY -- the third boundary rule, and the only one of
+  # the three with no runtime moment at which it misbehaves.
+  #
+  # `t_stats_table_cache_control.nim` already shows that ZEROING the segment
+  # changes nothing about what the daemon decides, which is the behavioural
+  # half. But that measures the code as it stands: it says the daemon does not
+  # depend on the table TODAY, not that it cannot. The dependency would be one
+  # line -- the daemon already imports the publisher, and `unsafeMappedBase`
+  # already hands out the read-write address -- and the day after it was added
+  # the cache-control test would simply start failing for a reason nobody
+  # would connect to this rule. So the structural half is asserted here, at
+  # the source, where the one line would be written.
+  # -------------------------------------------------------------------------
+
+  test "the scanner can see a load, and can see that a pure writer is not one":
+    # BOTH CONTROLS FIRST. A scanner that matches nothing passes everywhere,
+    # and the gate below is a `notin` -- exactly the shape that is satisfied
+    # by a broken detector.
+    #
+    # The POSITIVE control is not a fixture but the shipped READER, which
+    # really does acquire-load the sequence word out of this very segment. If
+    # the scanner cannot see that, "the publisher never loads" is a statement
+    # about the scanner.
+    let readerHits = loadsFromTheSegment(readFile(repoRoot / "libs" /
+      "runquota_stats_table" / "src" / "runquota_stats_table.nim"))
+    check "atomicLoadN" in readerHits
+    check "ATOMIC_ACQUIRE" in readerHits
+    # The NEGATIVE control, in the other direction: a scanner that flagged
+    # every file would pass the line above and forbid the write path itself.
+    # `types.nim` is pure layout and touches no memory at all.
+    check loadsFromTheSegment(readFile(repoRoot / "libs" /
+      "runquota_stats_table" / "src" / "runquota_stats_table" /
+      "types.nim")).len == 0
+    # ...and the scanner is reading a file that DOES do atomics, so "no load"
+    # is not being satisfied by a module with no memory operations in it.
+    let writerSource = codeOnly(readFile(repoRoot / "libs" /
+      "runquota_stats_table" / "src" / "runquota_stats_table" /
+      "publisher.nim"))
+    check "atomicStoreN" in writerSource
+    check "ATOMIC_RELEASE" in writerSource
+
+  test "NOT READ BACK: the publisher loads nothing from the segment it maps":
+    # THE GATE. The publisher maps read-write, so nothing but this stops a
+    # load being added; every sequence number, every eviction victim and every
+    # slot placement comes from the private-heap shadow instead.
+    let publisherPath = repoRoot / "libs" / "runquota_stats_table" / "src" /
+      "runquota_stats_table" / "publisher.nim"
+    check fileExists(publisherPath)
+    let hits = loadsFromTheSegment(readFile(publisherPath))
+    if hits.len > 0:
+      echo "publisher.nim loads from the published segment: " & hits.join(", ")
+    check hits.len == 0
+
+  test "the scanner can see the mapped-base export where it is really named":
+    # THE POSITIVE CONTROL for the token gate below, and it is a real one:
+    # the publisher DEFINES `unsafeMappedBase`, and the concurrency fixture
+    # genuinely CALLS it. Both must be seen, or the sweep below is measuring
+    # nothing.
+    check mappedBaseToken in codeOnly(readFile(repoRoot / "libs" /
+      "runquota_stats_table" / "src" / "runquota_stats_table" /
+      "publisher.nim"))
+    let fixture = repoRoot / "tests" / "fixtures" / "stats-table" /
+      "publish_driver.nim"
+    check fileExists(fixture)
+    check mappedBaseToken in codeOnly(readFile(fixture))
+
+  test "NOT READ BACK: no daemon-side source names the publisher's mapping":
+    # The other half of the same rule, and the reason it is separate: the
+    # publisher not loading is worth nothing if it HANDS THE ADDRESS OUT to a
+    # caller that does. `unsafeMappedBase` returns the READ-WRITE base and
+    # `runquota_daemon` already imports the module it lives in.
+    let sources = daemonSideSources()
+    # THE SCAN SET IS REAL, and it is the set the hole is in.
+    check sources.len > 0
+    var sawDaemonModule = false
+    var sawPublisherImport = false
+    var offenders: seq[string] = @[]
+    for path in sources:
+      let rel = relativeToRepo(path)
+      if rel == "libs/runquota_daemon/src/runquota_daemon.nim":
+        sawDaemonModule = true
+      let text = codeOnly(readFile(path))
+      if "runquota_stats_table/publisher" in text:
+        sawPublisherImport = true
+      if mappedBaseToken in text:
+        offenders.add(rel)
+    check sawDaemonModule
+    # ...and the daemon really does have the publisher in scope, so this gate
+    # is guarding a reachable one-liner rather than an impossible one.
+    check sawPublisherImport
+    if offenders.len > 0:
+      echo "daemon-side sources naming the publisher's mapping address:"
+      for path in offenders: echo "  " & path
+    check offenders.len == 0

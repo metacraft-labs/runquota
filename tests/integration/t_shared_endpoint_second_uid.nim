@@ -227,10 +227,18 @@ suite "shared_endpoint_second_uid_preflight":
     check compiler.len > 0
     if compiler.len > 0:
       let binaryPath = toolDir / "probe"
-      let build = execProcess(compiler,
-        args = ["c", "--threads:on",
-                "--nimcache:build/nimcache/rendezvous_probe_second_uid",
-                "--out:" & binaryPath, probeSource],
+      # THE INNER COMPILE INHERITS THIS FILE'S BUILD MODE. Same rule as the
+      # driver in `t_stats_table_concurrency`: a fixture binary built with a
+      # hardcoded argument list is built the same way whatever the suite was
+      # built with, so any property that only shows up optimised is asserted
+      # against a debug binary and cannot fail.
+      var buildArgs = @["c", "--threads:on",
+                        "--nimcache:build/nimcache/rendezvous_probe_second_uid",
+                        "--out:" & binaryPath]
+      when defined(release):
+        buildArgs.add("-d:release")
+      buildArgs.add(probeSource)
+      let build = execProcess(compiler, args = buildArgs,
         env = nil, options = {poStdErrToStdOut})
       if not fileExists(binaryPath):
         echo build

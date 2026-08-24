@@ -21,6 +21,21 @@ test:
 
 t: test
 
+# THE SAME SUITE, COMPILED OPTIMISED. Not a nicety: a memory-ordering defect
+# is invisible at -O0, so a clause about release/acquire fences that only ever
+# ran under `just test` has asserted nothing. `RUNQUOTA_BUILD_MODE` is the
+# variable `scripts/build_apps.sh` already reads; `scripts/run_tests.sh` now
+# reads it too, and the tests that compile a fixture binary of their own pass
+# `-d:release` down to that inner compile when they were themselves built with
+# it. Slower than `just test` and meant to be run in addition to it, not
+# instead of it.
+test-release:
+    mkdir -p test-logs
+    rc=0; \
+    RUNQUOTA_BUILD_MODE=release bash scripts/run_tests.sh 2>&1 | tee test-logs/test-release.log || rc=$?; \
+    runquota-static-helper-gate 2>&1 | tee -a test-logs/test-release.log || rc=$?; \
+    exit $rc
+
 lint:
     mkdir -p test-logs
     bash scripts/check_repo_requirements.sh 2>&1 | tee test-logs/lint.log

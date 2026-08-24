@@ -23,6 +23,35 @@ set -euo pipefail
 
 mkdir -p build/test-bin build/nimcache
 
+# ---------------------------------------------------------------------------
+# Build mode
+# ---------------------------------------------------------------------------
+#
+# THE SUITE MUST BE ABLE TO COMPILE OPTIMISED, and until M13b it could not.
+# A memory-ordering defect is INVISIBLE IN A DEBUG BUILD: removing the
+# publisher's release fences or the reader's acquire fence leaves the suite
+# green at -O0 and turns it red under `-d:release`, because the optimiser is
+# what exposes the reordering the fences forbid. A runner with no build-mode
+# plumbing therefore makes every ordering clause in the tree vacuous, however
+# carefully those clauses are written.
+#
+# Same variable and same shape as `scripts/build_apps.sh`, deliberately: one
+# convention for the whole repository rather than a second one here. The
+# apps build below reads it too, so `RUNQUOTA_BUILD_MODE=release` gives an
+# optimised tree end to end.
+nim_flags=(--threads:on)
+case "${RUNQUOTA_BUILD_MODE:-${REPROBUILD_BUILD_MODE:-debug}}" in
+  debug|"")
+    ;;
+  release)
+    nim_flags+=(-d:release)
+    ;;
+  *)
+    echo "unknown RUNQUOTA_BUILD_MODE: ${RUNQUOTA_BUILD_MODE:-${REPROBUILD_BUILD_MODE:-debug}}" >&2
+    exit 2
+    ;;
+esac
+
 # Application binaries are a prerequisite for the tests (t_entrypoints and the
 # e2e suites exec them), so a failure here is fatal rather than aggregated.
 ./scripts/build_apps.sh
@@ -102,7 +131,7 @@ for test_file in "${test_files[@]}"; do
   # still capturing the real exit status of the command itself.
   status=0
   nim c \
-    --threads:on \
+    "${nim_flags[@]}" \
     --nimcache:"build/nimcache/${test_name}" \
     --out:"build/test-bin/${test_name}" \
     "${test_file}" || status=$?
@@ -133,6 +162,9 @@ failed=${#failures[@]}
 
 echo
 echo "==================== test summary ===================="
+# THE MODE IS PART OF THE RESULT. "This suite passed" says nothing about an
+# ordering property unless the build it passed in is on the record beside it.
+echo "  build mode: ${RUNQUOTA_BUILD_MODE:-${REPROBUILD_BUILD_MODE:-debug}} (nim ${nim_flags[*]})"
 echo "  discovered: ${discovered}"
 echo "  compiled:   ${compiled}"
 echo "  ran:        ${ran}"
