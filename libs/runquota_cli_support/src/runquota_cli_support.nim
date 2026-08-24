@@ -1,8 +1,9 @@
-import std/[os, osproc, strutils]
+import std/[os, osproc, strutils, times]
 
 import runquota_client
 import runquota_core
 import runquota_exec
+import runquota_process
 # NARROWED ON PURPOSE. A plain `import runquota_ipc` here makes
 # `connectDefault` ambiguous against `runquota_client`'s, which is the
 # transport-level one no CLI path should reach for.
@@ -139,6 +140,14 @@ proc printStatsTable(statsKey: string): int =
   var table = openPublishedTable()
   defer: table.close()
   echo statsTableReport(table)
+  if not daemonReachable(defaultEndpoint()):
+    # UNAVAILABLE, SAID PLAINLY. Both answers this command can give live
+    # behind `runquotad`: it is the only sanctioned reader of the store,
+    # and it is the only writer of the published table. With no daemon
+    # there is no source for either, and "not resident, ask over the
+    # socket" would be directions to a door that is not there.
+    echo standaloneStatsReport().detail
+    return 0
   if statsKey.len > 0:
     var estimate: PublishedEstimate
     case table.lookupEstimate(statsKey, estimate)
@@ -152,6 +161,87 @@ proc printStatsTable(statsKey: string): int =
     of stlUnavailable:
       echo statsKey & ": no table attached (ask over the socket)"
   0
+
+const StandaloneReportEnv* = "RUNQUOTA_REPORT_STANDALONE"
+  ## Set to any non-empty value to have a standalone run print its own
+  ## degradation to stderr.
+  ##
+  ## OFF BY DEFAULT, and that is the specification's decision rather than a
+  ## preference: §"Standalone mode" says a missing daemon MUST NOT be
+  ## reported as an error, and the stream a wrapped build writes its
+  ## diagnostics to is the last place to volunteer a line that a log
+  ## scanner, a CI annotation rule or a human in a hurry will read as one.
+  ## The state is not hidden — it is one environment variable away, and it
+  ## is the same shape as `RUNQUOTA_REPORT_ESTIMATE_SOURCE` beside it.
+
+proc standaloneUnixMillis(): uint64 =
+  uint64(max(0'i64, int64(epochTime() * 1000.0)))
+
+proc standaloneOutcome(completion: ProcessCompletion): LeaseFinishOutcome =
+  if completion.cancelled or completion.timedOut:
+    leaseFinishCancelled
+  elif completion.signaled:
+    leaseFinishCrashed
+  elif completion.exited and completion.exitCode == 0:
+    leaseFinishSucceeded
+  else:
+    leaseFinishFailed
+
+proc runStandaloneAcquire(label, statsKey: string;
+                          command: seq[string]): int =
+  ## `runquota acquire` WITH NO DAEMON: run the work, buffer the
+  ## observation, report no error.
+  ##
+  ## THE WHOLE OF M14 IS VISIBLE IN WHAT THIS PROC DOES NOT DO. It takes no
+  ## lease, because there is no authority to grant one. It opens no
+  ## database, because a client that wrote the store to compensate for a
+  ## missing daemon would have put a database write on the per-execution
+  ## path — forbidden by §"Standalone mode" and settled by the write path's
+  ## first rule, that losing an observation is preferable to perturbing the
+  ## work being observed. It invents no estimate, because there is nothing
+  ## to learn one from and a plausible number in a measured column is worse
+  ## than no number. And it returns the CHILD's exit status, because the
+  ## absence of a daemon is not a failure of the work.
+  ##
+  ## SHORT-LIVED, so the buffered observation is dropped at exit. This
+  ## process wraps one command; the connect attempt a long-lived client
+  ## amortises over hundreds of executions would here be a large fraction
+  ## of everything it did.
+  var capture = initStandaloneCapture("runquota acquire", versionString(),
+    "standalone", clShortLived)
+  var exitCode = 0
+  if command.len > 0:
+    let startedAt = standaloneUnixMillis()
+    var child = launchProcess(commandSpec(command))
+    let completion = child.waitForCompletion()
+    child.close()
+    stdout.write(completion.stdout)
+    stderr.write(completion.stderr)
+    capture.record(deferredRecord(
+      label = label,
+      commandStatsId = statsKey,
+      startedAtUnixMillis = startedAt,
+      finishedAtUnixMillis = standaloneUnixMillis(),
+      outcome = standaloneOutcome(completion),
+      exitStatus =
+        if completion.exited: uint32(max(completion.exitCode, 0)) else: 0'u32,
+      signal =
+        if completion.signaled: uint32(max(completion.signal, 0)) else: 0'u32,
+      peakRssBytes = completion.peakResidentMemoryBytes,
+      processCount = completion.processCount))
+    exitCode =
+      if completion.exited: completion.exitCode
+      elif completion.signaled: 128 + completion.signal
+      else: 1
+  # THROUGH THE SAME EXIT-FLUSH ENTRY POINT A LONG-LIVED CLIENT USES, on
+  # purpose. What makes this process drop its observation is the LIFETIME
+  # it declared, decided inside `planExitFlush`, and not a different call
+  # site here — so "a short-lived client drops them" is a rule one place
+  # implements rather than a coincidence of which branch was written where.
+  let reason = capture.flushStandaloneAtExit(defaultEndpoint())
+  if getEnv(StandaloneReportEnv).len > 0:
+    stderr.writeLine(standaloneReport(capture, reason))
+  exitCode
 
 proc runDebugAcquire(args: seq[string]): int =
   var cpu = 1000'u32
@@ -196,7 +286,16 @@ proc runDebugAcquire(args: seq[string]): int =
     else:
       echo "unknown acquire argument: " & args[i]
       return 2
-  var client = connectDefault()
+  # NO DAEMON IS NOT AN ERROR (OS-4, §"Standalone mode"). The CodeTracer
+  # test runner explicitly MAY run without RunQuota and Reprobuild has
+  # direct-mode invocations, so refusing here would fail work that has
+  # nothing wrong with it. This supersedes the M7 rule under which a
+  # direct-mode `--write-stats` failed clearly.
+  var client: RunQuotaClient
+  try:
+    client = connectDefault()
+  except CatchableError:
+    return runStandaloneAcquire(label, statsKey, command)
   defer: client.close()
   var session = client.registerSession("runquota acquire", versionString())
   var request = resourceRequest(label, milliCpu(cpu), bytes(memory))

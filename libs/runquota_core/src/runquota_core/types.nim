@@ -13,6 +13,27 @@ type
     ioHeavy
     ioExclusive
 
+  CaptureCompleteness* = enum
+    ## Per-run and per-row honesty about whether the observation window is
+    ## whole (OS-2). ``ccDegraded`` means observations were lost.
+    ##
+    ## HERE RATHER THAN IN THE STORE LIBRARY, and the move is load-bearing
+    ## rather than tidiness. A standalone client — one running with no
+    ## ``runquotad`` at all — has to be able to STATE that its window is
+    ## incomplete, and it must do so without linking the observation store:
+    ## `runquota_client` naming that library is a boundary violation the
+    ## repository already checks by inspection
+    ## (``tests/unit/t_observation_store_reader_boundary.nim``). Duplicating
+    ## the enum on the client side would have been the other way out, and it
+    ## would mean the verdict a client sends and the verdict a store records
+    ## are two types that merely look alike.
+    ##
+    ## ``runquota_observation_store`` re-exports it, so every existing
+    ## spelling still resolves.
+    ccComplete = "complete"
+    ccSampled = "sampled"
+    ccDegraded = "degraded"
+
   PriorityClass* = enum
     priorityNormal
     priorityInteractive

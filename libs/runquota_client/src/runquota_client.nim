@@ -4,12 +4,14 @@ when defined(posix):
   import std/posix
 
 import runquota_client/types as clientTypes
+import runquota_client/standalone as clientStandalone
 import runquota_codec
 import runquota_core
 import runquota_ipc
 import runquota_protocol
 
 export clientTypes
+export clientStandalone
 
 const libraryName* = "runquota_client"
 
@@ -640,6 +642,79 @@ proc daemonStatus*(client: var RunQuotaClient;
   if not decodeStatus(frame.payload, result):
     client.lastDiagnostic = diagnostic(diagProtocol, "invalid StatusResponse payload")
     raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+
+# ---------------------------------------------------------------------------
+# Standalone mode: no daemon at all (M14)
+# ---------------------------------------------------------------------------
+
+proc daemonReachable*(endpoint: Endpoint): bool =
+  ## Whether a ``runquotad`` answers at ``endpoint`` RIGHT NOW.
+  ##
+  ## A full Hello handshake rather than a socket-file test: a stale socket
+  ## inode outlives the daemon that bound it, and a client that treated the
+  ## file's existence as an answer would take the daemon path and fail the
+  ## work — which is the outcome OS-4 forbids.
+  try:
+    var client = connect(endpoint)
+    client.close()
+    true
+  except CatchableError:
+    false
+
+proc flushStandaloneAtExit*(capture: var StandaloneCapture;
+                            endpoint: Endpoint): StandaloneFlushReason =
+  ## THE SINGLE BEST-EFFORT FLUSH, over the socket and nowhere else.
+  ##
+  ## One connect attempt, one frame, no reply waited for, and no retry: a
+  ## client that retried would be blocking its own exit on a daemon that by
+  ## hypothesis is not there. If the connection fails — the usual case,
+  ## since nothing has changed since the client gave up at startup — the
+  ## observations are dropped and counted.
+  ##
+  ## THE ONE PLACE THIS COULD HAVE OPENED THE DATABASE, and it does not.
+  ## Everything below is transport. The specification forbids a client
+  ## writing the store to compensate for a missing daemon, and this is the
+  ## moment at which a client would be most tempted to: it has real rows in
+  ## hand, it is about to throw them away, and the file is right there.
+  let plan = capture.planExitFlush()
+  if not plan.attempt:
+    return plan.reason
+  var delivered = false
+  try:
+    var client = connect(endpoint)
+    try:
+      inc client.nextRequestId
+      client.connection.sendFrame(encodeFrame(rqDeferredObservations,
+        FrameFlagRequest, client.nextRequestId,
+        encodeDeferredObservations(plan.message)))
+      delivered = true
+    finally:
+      client.close()
+  except CatchableError:
+    delivered = false
+  capture.finishExitFlush(delivered)
+  plan.reason
+
+proc deferredRecord*(label, commandStatsId: string;
+                     startedAtUnixMillis, finishedAtUnixMillis: uint64;
+                     outcome: LeaseFinishOutcome; exitStatus, signal: uint32;
+                     peakRssBytes: uint64; processCount: uint32;
+                     majorPageFaults = 0'u64): DeferredExecutionRecord =
+  ## One buffered execution, from figures the client MEASURED about a child
+  ## it ran itself. Same rule as ``reportObservation``: never a request's
+  ## reserved resources, which is a number nobody measured.
+  DeferredExecutionRecord(
+    label: label,
+    commandStatsId: commandStatsId,
+    startedAtUnixMillis: startedAtUnixMillis,
+    finishedAtUnixMillis: finishedAtUnixMillis,
+    exitStatus: exitStatus,
+    signal: signal,
+    outcome: outcome,
+    peakRssBytes: peakRssBytes,
+    processCount: processCount,
+    majorPageFaults: majorPageFaults
+  )
 
 template withLease*(session: var RunQuotaSession; request: ResourceRequest;
     body: untyped) =

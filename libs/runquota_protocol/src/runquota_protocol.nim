@@ -896,6 +896,105 @@ proc observedCpuPct*(cpuMilliPct: uint32): float64 =
   float64(cpuMilliPct) / 1000.0
 
 # ---------------------------------------------------------------------------
+# The standalone flush (M14): observations buffered with no daemon present,
+# delivered once at exit if a daemon happens to be there by then.
+# ---------------------------------------------------------------------------
+
+const MaxDeferredRecords* = 4096'u32
+  ## A bound on the wire, not merely on the buffer. The frame limit already
+  ## caps the payload, but a length prefix a peer can set to four billion is
+  ## an allocation a peer can ask for before a single record has been read;
+  ## the decoder refuses past this before reserving anything.
+
+proc encodeDeferredObservations*(msg: DeferredObservationsMessage): string =
+  var w = writer()
+  w.writeString(msg.tool)
+  w.writeString(msg.toolVersion)
+  w.writeString(msg.invocationKind)
+  w.writeU32(uint32(ord(msg.completeness)))
+  w.writeU32(msg.droppedObservations)
+  w.writeU32(uint32(msg.records.len))
+  for record in msg.records:
+    w.writeString(record.label)
+    w.writeBytes(record.commandStatsId)
+    w.writeU64(record.startedAtUnixMillis)
+    w.writeU64(record.finishedAtUnixMillis)
+    w.writeU32(record.exitStatus)
+    w.writeU32(record.signal)
+    w.writeU32(uint32(ord(record.outcome)))
+    w.writeU64(record.peakRssBytes)
+    w.writeU32(record.processCount)
+    w.writeU64(record.majorPageFaults)
+  w.data
+
+proc decodeDeferredObservations*(payload: string;
+    msg: var DeferredObservationsMessage): bool =
+  ## ALL OR NOTHING, like every other decoder here: ``msg`` is assigned once
+  ## at the end from locals, so a payload that runs out in the middle of the
+  ## seventh record leaves the caller's message untouched rather than
+  ## holding six records and a claim about how many there were.
+  var r = reader(payload)
+  var tool: string
+  var toolVersion: string
+  var invocationKind: string
+  var completenessRaw: uint32
+  var droppedObservations: uint32
+  var count: uint32
+  if not r.readString(tool): return false
+  if not r.readString(toolVersion): return false
+  if not r.readString(invocationKind): return false
+  if not r.readU32(completenessRaw): return false
+  if completenessRaw > uint32(ord(high(CaptureCompleteness))): return false
+  if not r.readU32(droppedObservations): return false
+  if not r.readU32(count): return false
+  if count > MaxDeferredRecords: return false
+  var records: seq[DeferredExecutionRecord] = @[]
+  for _ in 0 ..< int(count):
+    var record: DeferredExecutionRecord
+    var outcomeRaw: uint32
+    if not r.readString(record.label): return false
+    if not r.readBytes(record.commandStatsId): return false
+    if not r.readU64(record.startedAtUnixMillis): return false
+    if not r.readU64(record.finishedAtUnixMillis): return false
+    if not r.readU32(record.exitStatus): return false
+    if not r.readU32(record.signal): return false
+    if not r.readU32(outcomeRaw): return false
+    if outcomeRaw > uint32(ord(high(LeaseFinishOutcome))): return false
+    record.outcome = LeaseFinishOutcome(int(outcomeRaw))
+    if not r.readU64(record.peakRssBytes): return false
+    if not r.readU32(record.processCount): return false
+    if not r.readU64(record.majorPageFaults): return false
+    records.add(record)
+  if r.remaining != 0: return false
+  msg = DeferredObservationsMessage(
+    tool: tool,
+    toolVersion: toolVersion,
+    invocationKind: invocationKind,
+    completeness: CaptureCompleteness(int(completenessRaw)),
+    droppedObservations: droppedObservations,
+    records: records
+  )
+  true
+
+proc deferredObservationsRefusal*(msg: DeferredObservationsMessage): string =
+  ## Why a decoded flush is not recordable, or "" when it is.
+  ##
+  ## THE REFUSAL THIS MILESTONE TURNS ON. A standalone client's window was
+  ## never drained by anything, so it is incomplete by construction; a batch
+  ## claiming ``ccComplete`` would put a window that lost an unknown number
+  ## of observations into the store as an authoritative one, which is the
+  ## single thing OS-2 forbids by name. Refused here — in a pure predicate
+  ## on the message — rather than inside the daemon's handler, so it can be
+  ## asserted at the exact value that straddles the boundary.
+  if msg.completeness == ccComplete:
+    return "a deferred batch may not claim a complete capture window"
+  if msg.tool.len == 0:
+    return "a deferred batch must say which tool produced it"
+  if msg.records.len == 0 and msg.droppedObservations == 0:
+    return "a deferred batch with nothing in it and nothing dropped"
+  ""
+
+# ---------------------------------------------------------------------------
 # The read path (M13a): stats queries over the socket.
 # ---------------------------------------------------------------------------
 

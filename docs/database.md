@@ -383,16 +383,32 @@ As implemented:
   load average was 66–90 at the time. Nothing on that path opens a file, and
   the database write happens on a drain thread in batches.
 
-  **The socket write path's per-execution added latency is 0.7–1.9 µs**
-  (median). Measured by `just bench-observation-write-path` against a
+  **The socket write path's per-execution added latency is 1.2–1.9 µs with
+  optimised daemons, and 0.7–1.9 µs with unoptimised ones** (median).
+  Measured by `just bench-observation-write-path` against a
   `runquotad --no-write-stats` control: two daemons of the same binary run
   at once, each round times one complete execution against each in
   alternating order, and the headline is the paired median difference over
-  400 rounds after 20 discarded warm-up rounds. Three consecutive full runs
-  gave 1.0 µs, 1.9 µs and 0.7 µs against a control execution latency of
-  58–62 µs, so **1.2–3.1 % of the cost of an execution**; a release build
-  gave 1.9 µs and 1.2 µs against a 47–48 µs control (2.5–4.1 %). Paired p95
-  was 11–20 µs. Host: aarch64 macOS, Apple M3 Max, 16 logical cores.
+  400 rounds after 20 discarded warm-up rounds.
+
+  Both figures are recorded because the build mode moves the denominator
+  more than it moves the effect, and quoting the wider band alone would
+  attribute an unoptimised measurement to shipped code. With unoptimised
+  daemons: 1.0, 1.9 and 0.7 µs over three runs against a 58–62 µs control,
+  **1.2–3.1 %** of an execution. With `RUNQUOTA_BUILD_MODE=release`
+  daemons: 1.9 and 1.2 µs against a 47–48 µs control, **2.5–4.1 %** — a
+  higher share of a cheaper execution. Paired p95 was 11–20 µs. Host:
+  aarch64 macOS, Apple M3 Max, 16 logical cores.
+
+  Two limits on these numbers, stated because a benchmark figure whose
+  provenance is not recorded is no better than an unattributed test result.
+  The **harness binary itself was unoptimised in every run above**:
+  `scripts/run-m13-benchmark.sh` compiles it with no build-mode plumbing,
+  so `RUNQUOTA_BUILD_MODE` reaches the daemons under test and not the
+  measuring code. And that script rebuilds the daemons only when the binary
+  is absent, so on a warm tree the variable silently does nothing — the
+  emitted JSON records no build-mode field, which means neither figure is
+  reproducible from the recipe alone without checking what was on disk.
 
   Pairing rather than a before/after pair is not fussiness: M11 measured
   this machine's host-wide busy figure wandering between 56 % and 88 % over

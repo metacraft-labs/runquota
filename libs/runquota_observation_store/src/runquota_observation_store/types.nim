@@ -8,16 +8,16 @@
 
 import std/options
 
+# `CaptureCompleteness` LIVES IN `runquota_core` and is re-exported here.
+# A standalone client has to say "this window is incomplete" without
+# linking the store library, so the enum cannot live in the store; it is
+# re-exported so every `import runquota_observation_store` still sees it.
+import runquota_core/types as coreTypes
+export coreTypes.CaptureCompleteness
+
 type
   LibraryInfo* = object
     name*: string
-
-  CaptureCompleteness* = enum
-    ## Per-run and per-row honesty about whether the observation window is
-    ## whole (OS-2). ``ccDegraded`` means observations were lost.
-    ccComplete = "complete"
-    ccSampled = "sampled"
-    ccDegraded = "degraded"
 
   Termination* = enum
     ## Failure modes a bare exit status conflates.

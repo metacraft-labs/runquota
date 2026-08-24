@@ -34,6 +34,7 @@ type
     rqLeaseObservation = 26
     rqStatsQuery = 27
     rqStatsResponse = 28
+    rqDeferredObservations = 29
 
   MessageKind* = RqspMessageKind
 
@@ -257,6 +258,57 @@ type
       ## When the client took the reading. Carried so a stale report is
       ## recognisable as stale rather than being silently folded in as
       ## current; the daemon refuses one from the future.
+
+  DeferredExecutionRecord* = object
+    ## One execution a client ran with NO DAEMON TO ASK, buffered in
+    ## memory at the time and carried here afterwards.
+    ##
+    ## There is no ``leaseId``: nothing granted this execution, and
+    ## inventing one would put a lease into the store that no admission
+    ## decision ever made.
+    label*: string
+    commandStatsId*: string
+    startedAtUnixMillis*: uint64
+    finishedAtUnixMillis*: uint64
+    exitStatus*: uint32
+    signal*: uint32
+    outcome*: LeaseFinishOutcome
+    peakRssBytes*: uint64
+    processCount*: uint32
+    majorPageFaults*: uint64
+
+  DeferredObservationsMessage* = object
+    ## THE SINGLE BEST-EFFORT FLUSH a long-lived standalone client makes
+    ## when it exits, and the only way an execution that ran without a
+    ## lease can ever reach the store.
+    ##
+    ## §"Standalone mode": without a daemon, observations are buffered in
+    ## memory; a long-lived client MAY make one best-effort flush at exit
+    ## and a short-lived one drops them. This message is that flush. It
+    ## exists so the flush stays on the SOCKET — a client that wrote the
+    ## store itself to compensate for a missing daemon is precisely what
+    ## the specification forbids, and giving the honest path no wire form
+    ## at all is how an implementer is pushed into the dishonest one.
+    ##
+    ## ``completeness`` MAY NOT BE ``ccComplete``, and the daemon refuses
+    ## the batch when it is. A window nothing drained while it was open is
+    ## incomplete by construction, and OS-2 says a thin sample must never
+    ## be presentable as a whole one. The verdict is on the message rather
+    ## than assumed by the daemon so that the client states it — it is the
+    ## only party that knows how much it dropped.
+    ##
+    ## ONE-WAY, like ``rqLeaseObservation``: nothing is acknowledged. The
+    ## client is exiting; a reply is something it would have to wait for.
+    tool*: string
+    toolVersion*: string
+    invocationKind*: string
+    completeness*: CaptureCompleteness
+    droppedObservations*: uint32
+      ## How many observations the buffer had to throw away. Counted
+      ## rather than estimated, because OS-2 requires dropped observations
+      ## to be counted and a run whose losses are unknown is not a run
+      ## whose losses are zero.
+    records*: seq[DeferredExecutionRecord]
 
   # -------------------------------------------------------------------------
   # The read path (M13a). ARBITRARY READS GO OVER THE SOCKET, never on the

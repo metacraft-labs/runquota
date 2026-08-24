@@ -167,6 +167,18 @@ type
       ## readable somewhere. It is one counter rather than one per reason
       ## because the reason is already in the daemon's own view and the
       ## count is what a reader needs to distrust a window.
+    deferredBatchesAccepted*: uint64
+      ## Exit flushes from standalone clients that were recorded (M14). A
+      ## batch, not a row: one long-lived client that ran without a daemon
+      ## produces exactly one of these however many executions it buffered.
+    deferredBatchesRefused*: uint64
+      ## Exit flushes refused — a batch that would not decode, or one
+      ## claiming a COMPLETE capture window, which a client that ran with
+      ## nothing draining it cannot have had. Counted here because the
+      ## message is one-way: the client is exiting and is never told.
+    deferredExecutionsRecorded*: uint64
+      ## Rows written out of accepted batches, so "the flush landed" and
+      ## "the flush arrived empty" are distinguishable from outside.
     statsPublisher*: StatsPublisher
       ## M13b's published aggregate table. WRITE-ONLY FROM HERE: nothing in
       ## the daemon ever reads it back, and no daemon decision depends on

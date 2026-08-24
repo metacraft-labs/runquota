@@ -256,6 +256,9 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
     observationRunIds: initTable[uint64, string](),
     observationsAccepted: 0'u64,
     observationsRejected: 0'u64,
+    deferredBatchesAccepted: 0'u64,
+    deferredBatchesRefused: 0'u64,
+    deferredExecutionsRecorded: 0'u64,
     selfReportsReaped: 0'u64
   )
   for row in loadLearnedEstimates(effectiveConfig.estimateDbPath):
@@ -901,6 +904,10 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
     "\"self_cpu_pct\":" & $sumSelfCpuPct(liveSelfReports()) & "," &
     "\"self_rss_bytes\":" & $sumSelfRssBytes(liveSelfReports()) & "," &
     "\"self_reports_reaped\":" & $daemon.selfReportsReaped & "," &
+    "\"deferred_batches_accepted\":" & $daemon.deferredBatchesAccepted & "," &
+    "\"deferred_batches_refused\":" & $daemon.deferredBatchesRefused & "," &
+    "\"deferred_executions_recorded\":" &
+      $daemon.deferredExecutionsRecorded & "," &
     "\"queued\":" & $observationsWritten() & "," &
     "\"dropped\":" & $observationsDropped() & "," &
     "\"write_failures\":" & $observationWriteFailures() &
@@ -1489,6 +1496,103 @@ proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
         some(int64(lease.peer.userId))
   ))
 
+proc deferredTermination(record: DeferredExecutionRecord): Termination =
+  ## Same mapping ``observationTermination`` applies to a lease finish, on
+  ## the same enum, so a standalone row and an admitted row describe a
+  ## crash with the same word.
+  if record.outcome == leaseFinishResourceLimit:
+    return tOomKilled
+  if record.signal != 0'u32 or record.outcome == leaseFinishCrashed:
+    return tSignalled
+  case record.outcome
+  of leaseFinishCancelled, leaseFinishLaunchFailed: tRefused
+  else: tExited
+
+proc captureDeferredBatch(daemon: var RunQuotaDaemon;
+                          context: ConnectionContext;
+                          msg: DeferredObservationsMessage): bool =
+  ## Record one standalone client's exit flush: a ``runs`` row and one
+  ## ``executions`` row per buffered record.
+  ##
+  ## THE COMPLETENESS VERDICT COMES FROM THE CLIENT AND IS WRITTEN AS SENT.
+  ## The daemon has no way to know how much a client it never spoke to
+  ## dropped, so it cannot form the verdict itself — but it can and does
+  ## refuse the one verdict that cannot be true. ``ccComplete`` on a batch
+  ## like this claims a window that nothing drained was nevertheless whole,
+  ## and OS-2 exists to keep exactly that out of the store.
+  ##
+  ## THE ROWS CARRY NO ``lease_id``. Nothing admitted these executions;
+  ## synthesising an id would put a lease in the store that no decision
+  ## ever granted, and every later join through it would be a join onto an
+  ## invention.
+  if not daemon.observationCaptureEnabled:
+    return false
+  if deferredObservationsRefusal(msg).len > 0:
+    return false
+  let runId = opaqueId("run-")
+  let now = unixMillisNow()
+  discard enqueueRunRow(RunRow(
+    runId: runId,
+    hostId: daemon.observationHostId,
+    tool: msg.tool,
+    toolVersion: msg.toolVersion,
+    invocationKind: msg.invocationKind,
+    startedAtUnixMillis: now,
+    finishedAtUnixMillis: some(now),
+    exitStatus: none(int64),
+    workspaceId: none(string),
+    profile: none(string),
+    gitCommit: none(string),
+    gitBranch: none(string),
+    captureCompleteness: msg.completeness,
+    droppedObservations: int64(msg.droppedObservations)
+  ))
+  for record in msg.records:
+    let startedAt = int64(record.startedAtUnixMillis)
+    let finishedAt = int64(record.finishedAtUnixMillis)
+    discard enqueueExecutionRow(ExecutionRow(
+      executionId: opaqueId("exec-"),
+      hostId: daemon.observationHostId,
+      hostProfileId:
+        if daemon.observationProfileId.len > 0:
+          some(daemon.observationProfileId)
+        else:
+          none(string),
+      runId: runId,
+      commandStatsId: record.commandStatsId,
+      leaseId: none(int64),
+      startedAtUnixMillis: startedAt,
+      finishedAtUnixMillis: finishedAt,
+      durationMillis: max(0'i64, finishedAt - startedAt),
+      exitStatus: int64(record.exitStatus),
+      termination: deferredTermination(record),
+      attempt: 1,
+      retryOf: none(string),
+      peakRssBytes: int64(record.peakRssBytes),
+      cpuUserMillis: none(int64),
+      cpuSysMillis: none(int64),
+      maxProcesses: int64(record.processCount),
+      majorPageFaults: int64(record.majorPageFaults),
+      ioReadBytes: none(int64),
+      ioWriteBytes: none(int64),
+      # PER-ROW, not merely per-run. OS-2 wants the verdict at both
+      # granularities, and a reader that filtered executions without
+      # joining `runs` would otherwise see rows with nothing on them
+      # saying the window they came from lost records.
+      captureCompleteness: msg.completeness,
+      droppedObservations: 0,
+      # FROM PEER CREDENTIALS, exactly as on the admitted path. A
+      # standalone client is no more entitled to name its own owner than
+      # a leased one.
+      ownerUid:
+        if context.peer.kind == peerIdentityUnavailable:
+          none(int64)
+        else:
+          some(int64(context.peer.userId))
+    ))
+  inc daemon.deferredExecutionsRecorded, uint64(msg.records.len)
+  true
+
 proc grantQueuedLease(daemon: var RunQuotaDaemon; id: uint64; delivered: bool) =
   var lease = daemon.leases[id]
   daemon.transitionLeaseState(lease, leaseStateGranted)
@@ -1929,6 +2033,22 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       inc daemon.observationsAccepted
     else:
       inc daemon.observationsRejected
+  of rqDeferredObservations:
+    # ONE-WAY, for the same reason ``rqLeaseObservation`` is: the client
+    # sending this is EXITING. A reply is something it would have to stay
+    # alive to read, and a standalone client's degradation must not cost
+    # the work it just finished anything at all.
+    #
+    # A REFUSAL IS THEREFORE COUNTED RATHER THAN REPORTED, and readable
+    # through the `observations` inspection subject.
+    var msg: DeferredObservationsMessage
+    if not decodeDeferredObservations(frame.payload, msg):
+      inc daemon.deferredBatchesRefused
+      return
+    if daemon.captureDeferredBatch(context, msg):
+      inc daemon.deferredBatchesAccepted
+    else:
+      inc daemon.deferredBatchesRefused
   of rqStatusRequest:
     connection.sendResponse(rqStatusResponse, frame.header.requestId,
         encodeStatus(daemon.status()))
