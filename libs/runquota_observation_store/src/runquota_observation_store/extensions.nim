@@ -41,7 +41,7 @@
 
 import std/[options, strutils]
 
-import ./ids, ./sqlite_cli, ./store, ./types
+import ./ids, ./schema, ./sqlite_cli, ./store, ./types
 
 const
   extensionTablePrefix* = "ext_"
@@ -121,6 +121,28 @@ type
     columns*: seq[string]
     values*: seq[ExtensionValue]
 
+  DoomedKind* = enum
+    dkStartedBefore = "started-before"
+    dkBeyondNewest = "beyond-newest"
+
+  DoomedExecutions* = object
+    ## WHICH executions a pass is about, as a value.
+    ##
+    ## M12 had one shape and spelled it as an ``int64`` cutoff. M15's
+    ## row-count bound cannot be spelled that way at all: with N rows to
+    ## keep, whether a given row is doomed depends on how many others there
+    ## are, so there is no timestamp that expresses it. Making the doomed
+    ## set a value keeps ONE cascade — the registry-driven one below — for
+    ## both bounds, instead of a second copy of it that could drift.
+    ##
+    ## RunQuota composes every predicate here. A caller supplies a number,
+    ## never a fragment of SQL.
+    case kind*: DoomedKind
+    of dkStartedBefore:
+      cutoffUnixMillis*: int64
+    of dkBeyondNewest:
+      keepNewest*: int64
+
   PruneOutcome* = object
     ## What a retention pass removed. The extension figure is reported
     ## separately from the spine figure because "the cascade ran" and "the
@@ -128,6 +150,11 @@ type
     pruned*: bool
     executionsRemoved*: int64
     extensionRowsRemoved*: int64
+    carriedRowsRemoved*: int64
+      ## Rows in the merge quarantine that went with their parent. Counted
+      ## apart from ``extensionRowsRemoved`` because they are rows of a
+      ## schema this database does not have, and pooling the two figures
+      ## would report a cascade into tables that do not exist here.
     extensionsCascaded*: seq[string]
     detail*: string
 
@@ -212,8 +239,35 @@ proc extensionInsertStatement*(tableName: string; row: ExtensionRow): string =
   "insert into " & tableName & " (" & columns.join(", ") & ") values (" &
     values.join(", ") & ");"
 
-proc extensionCascadeStatement*(tableName, hostId: string;
-                                startedBeforeUnixMillis: int64): string =
+proc startedBefore*(cutoffUnixMillis: int64): DoomedExecutions =
+  DoomedExecutions(kind: dkStartedBefore, cutoffUnixMillis: cutoffUnixMillis)
+
+proc beyondNewest*(keepNewest: int64): DoomedExecutions =
+  DoomedExecutions(kind: dkBeyondNewest, keepNewest: max(0'i64, keepNewest))
+
+proc doomedExecutionsClause*(hostId: string;
+                             doomed: DoomedExecutions): string =
+  ## The ``where`` clause naming the doomed executions of one host.
+  ##
+  ## Every column in it belongs to ``executions``, which is a spine table
+  ## RunQuota owns; nothing here knows an extension column. The row-count
+  ## arm's ordering is TOTAL — ``started_at`` then the execution id — so
+  ## two hosts with the same timestamps do not get different answers on
+  ## different runs, which a merge asserting order-independence would
+  ## otherwise see as a difference.
+  let host = keyHostColumn & " = " & encodeText(hostId)
+  case doomed.kind
+  of dkStartedBefore:
+    host & " and started_at_unix_millis < " &
+      encodeInt(doomed.cutoffUnixMillis)
+  of dkBeyondNewest:
+    host & " and " & keyExecutionColumn & " not in (select " &
+      keyExecutionColumn & " from executions where " & host &
+      " order by started_at_unix_millis desc, " & keyExecutionColumn &
+      " desc limit " & encodeInt(doomed.keepNewest) & ")"
+
+proc extensionCascadeWhere*(tableName, hostId: string;
+                            doomed: DoomedExecutions): string =
   ## The retention cascade for one extension table.
   ##
   ## It selects the doomed rows BY THE SPINE KEY and by nothing else: the
@@ -223,9 +277,27 @@ proc extensionCascadeStatement*(tableName, hostId: string;
   ## product's rows are worth keeping.
   "delete from " & tableName & " where (" & keyHostColumn & ", " &
     keyExecutionColumn & ") in (select " & keyHostColumn & ", " &
-    keyExecutionColumn & " from executions where " & keyHostColumn & " = " &
-    encodeText(hostId) & " and started_at_unix_millis < " &
-    encodeInt(startedBeforeUnixMillis) & ");"
+    keyExecutionColumn & " from executions where " &
+    doomedExecutionsClause(hostId, doomed) & ");"
+
+proc extensionCascadeStatement*(tableName, hostId: string;
+                                startedBeforeUnixMillis: int64): string =
+  ## The age-bounded cascade, which is the shape M12 shipped.
+  extensionCascadeWhere(tableName, hostId,
+    startedBefore(startedBeforeUnixMillis))
+
+proc carriedCascadeStatement*(hostId: string;
+                              doomed: DoomedExecutions): string =
+  ## The same cascade, into the merge quarantine.
+  ##
+  ## Carried rows are facts about an execution whose schema this database
+  ## does not have, and retention is not excused from them: leaving them
+  ## behind would orphan rows no query can reach and no later pass would
+  ## find, because the pass is driven by the parent.
+  "delete from " & carriedExtensionTable & " where (" & keyHostColumn &
+    ", " & keyExecutionColumn & ") in (select " & keyHostColumn & ", " &
+    keyExecutionColumn & " from executions where " &
+    doomedExecutionsClause(hostId, doomed) & ");"
 
 # ---------------------------------------------------------------------------
 # Registration and migration
@@ -413,10 +485,10 @@ proc extensionRowCount*(store: ObservationStore; extensionId: string): int64 =
 # Retention cascade
 # ---------------------------------------------------------------------------
 
-proc pruneExecutionsBefore*(store: ObservationStore; hostId: string;
-                            startedBeforeUnixMillis: int64): PruneOutcome =
-  ## Removes every execution of ``hostId`` that started before the cutoff,
-  ## and every extension row that belonged to one.
+proc pruneExecutions*(store: ObservationStore; hostId: string;
+                      doomed: DoomedExecutions): PruneOutcome =
+  ## Removes every execution of ``hostId`` in the doomed set, and every
+  ## extension row and carried row that belonged to one.
   ##
   ## THE CASCADE IS DRIVEN BY THE REGISTRY, not by a list in this file. An
   ## extension RunQuota has never heard of is still pruned, because the
@@ -428,8 +500,8 @@ proc pruneExecutionsBefore*(store: ObservationStore; hostId: string;
   ## longer exist — rows no query can reach and no later pass would find,
   ## because the pass is driven by the parent.
   result = PruneOutcome(pruned: false, executionsRemoved: 0,
-                        extensionRowsRemoved: 0, extensionsCascaded: @[],
-                        detail: "")
+                        extensionRowsRemoved: 0, carriedRowsRemoved: 0,
+                        extensionsCascaded: @[], detail: "")
   if not store.captureEnabled:
     result.detail = "store is not open"
     return
@@ -437,12 +509,16 @@ proc pruneExecutionsBefore*(store: ObservationStore; hostId: string;
     result.detail = "no host"
     return
 
-  let doomed = store.runQuery("select count(*) from executions where " &
-    keyHostColumn & " = " & encodeText(hostId) &
-    " and started_at_unix_millis < " & encodeInt(startedBeforeUnixMillis) & ";")
-  if doomed.len == 1 and doomed[0].len == 1:
+  let clause = doomedExecutionsClause(hostId, doomed)
+  let membership = "(" & keyHostColumn & ", " & keyExecutionColumn &
+    ") in (select " & keyHostColumn & ", " & keyExecutionColumn &
+    " from executions where " & clause & ")"
+
+  let counted = store.runQuery(
+    "select count(*) from executions where " & clause & ";")
+  if counted.len == 1 and counted[0].len == 1:
     try:
-      result.executionsRemoved = parseBiggestInt(doomed[0][0].strip())
+      result.executionsRemoved = parseBiggestInt(counted[0][0].strip())
     except ValueError:
       discard
 
@@ -457,11 +533,7 @@ proc pruneExecutionsBefore*(store: ObservationStore; hostId: string;
     if not store.extensionTableExists(tableName):
       continue
     let doomedRows = store.runQuery("select count(*) from " & tableName &
-      " where (" & keyHostColumn & ", " & keyExecutionColumn &
-      ") in (select " & keyHostColumn & ", " & keyExecutionColumn &
-      " from executions where " & keyHostColumn & " = " & encodeText(hostId) &
-      " and started_at_unix_millis < " &
-      encodeInt(startedBeforeUnixMillis) & ");")
+      " where " & membership & ";")
     if doomedRows.len == 1 and doomedRows[0].len == 1:
       try:
         result.extensionRowsRemoved +=
@@ -469,16 +541,29 @@ proc pruneExecutionsBefore*(store: ObservationStore; hostId: string;
       except ValueError:
         discard
     result.extensionsCascaded.add(entry.extensionId)
-    sql.add(extensionCascadeStatement(tableName, hostId,
-      startedBeforeUnixMillis) & "\n")
-  sql.add("delete from executions where " & keyHostColumn & " = " &
-    encodeText(hostId) & " and started_at_unix_millis < " &
-    encodeInt(startedBeforeUnixMillis) & ";\n")
+    sql.add(extensionCascadeWhere(tableName, hostId, doomed) & "\n")
+
+  let doomedCarried = store.runQuery("select count(*) from " &
+    carriedExtensionTable & " where " & membership & ";")
+  if doomedCarried.len == 1 and doomedCarried[0].len == 1:
+    try:
+      result.carriedRowsRemoved = parseBiggestInt(doomedCarried[0][0].strip())
+    except ValueError:
+      discard
+  sql.add(carriedCascadeStatement(hostId, doomed) & "\n")
+
+  sql.add("delete from executions where " & clause & ";\n")
   sql.add("commit;\n")
 
   if not store.runStatement(sql):
     result.executionsRemoved = 0
     result.extensionRowsRemoved = 0
+    result.carriedRowsRemoved = 0
     result.detail = store.lastError
     return
   result.pruned = true
+
+proc pruneExecutionsBefore*(store: ObservationStore; hostId: string;
+                            startedBeforeUnixMillis: int64): PruneOutcome =
+  ## The age-bounded pass, which is the shape M12 shipped.
+  store.pruneExecutions(hostId, startedBefore(startedBeforeUnixMillis))

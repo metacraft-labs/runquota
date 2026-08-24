@@ -11,10 +11,15 @@
 ## registered in ``extension_registry`` (M12).
 
 const
-  spineSchemaVersion* = 4'i64
+  spineSchemaVersion* = 5'i64
     ## The schema version this build understands. A database whose
     ## ``user_version`` exceeds it is REFUSED, never degraded (see
     ## ``openObservationStore``).
+
+  carriedExtensionTable* = "carried_extension_rows"
+    ## Quarantine for extension rows a merge could not place, named here
+    ## because it is a SPINE table RunQuota owns outright — it is not an
+    ## ``ext_`` table and no product declares it.
 
   spineTableNames* = [
     "hosts",
@@ -22,7 +27,8 @@ const
     "runs",
     "executions",
     "ambient_samples",
-    "extension_registry"
+    "extension_registry",
+    carriedExtensionTable
   ]
 
   migrationV1 = """
@@ -176,7 +182,49 @@ create unique index host_profiles_current
 alter table executions add column owner_uid integer;
 """
 
-  migrations* = [migrationV1, migrationV2, migrationV3, migrationV4]
+  # Version 5 is where a merge puts an extension row it must CARRY and
+  # must not let anybody query (M15, OS-7). Three of its columns are
+  # decisions rather than storage.
+  #
+  # `queryable` is pinned to zero by a CHECK CONSTRAINT rather than by a
+  # default. "Marked unqueryable" has to survive a client reaching past
+  # this library into `sqlite3`, and a default is only a suggestion about
+  # rows nobody named a value for.
+  #
+  # `payload` is OPAQUE and stays opaque: it holds the source's own column
+  # names and their values, rendered as bytes. RunQuota carries it and
+  # never reads a column out of it, which is OS-5's non-interpretation
+  # clause applied to a row whose schema RunQuota does not have.
+  #
+  # THERE IS NO TIMESTAMP, AND THE OMISSION IS THE REQUIREMENT. A
+  # `carried_at` column would make merging two sources in one order
+  # produce a different database from the other order, because whichever
+  # source arrived first would be stamped earlier. OS-7 is
+  # order-independence; a clock in this table would be the one thing that
+  # destroys it.
+  #
+  # The foreign key to `executions` is what puts these rows inside the
+  # retention cascade: a carried row is a fact about an execution, and it
+  # is pruned with its parent like every other extension row.
+  migrationV5 = """
+create table carried_extension_rows (
+  extension_id text not null,
+  schema_version integer not null,
+  host_id text not null,
+  execution_id text not null,
+  payload text not null,
+  queryable integer not null default 0 check (queryable = 0),
+  primary key (extension_id, schema_version, host_id, execution_id),
+  foreign key (host_id, execution_id)
+    references executions(host_id, execution_id)
+);
+
+create index carried_extension_rows_by_execution
+  on carried_extension_rows(host_id, execution_id);
+"""
+
+  migrations* = [migrationV1, migrationV2, migrationV3, migrationV4,
+                 migrationV5]
     ## Index ``i`` migrates ``user_version`` ``i`` to ``i + 1``.
 
 static:

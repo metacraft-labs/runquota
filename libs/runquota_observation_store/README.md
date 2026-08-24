@@ -41,9 +41,28 @@ Repository posture and state-boundary requirements: `../../docs/database.md`.
   the extension-level form of the refusal `openObservationStore` already
   makes for the spine. `insertExtensionRow` refuses that client's rows too,
   rather than writing them into a shape it was not built for.
-  `pruneExecutionsBefore` cascades retention from the spine into every
-  registered extension, in one transaction, driven by `extension_registry`
-  rather than by any list in RunQuota.
+  `pruneExecutions` cascades retention from the spine into every
+  registered extension and into the merge quarantine, in one transaction,
+  driven by `extension_registry` rather than by any list in RunQuota.
+- `applyRetention(store, hostId, now, policy)` enforces the two bounds —
+  age and row count, each optional and configurable — over executions and
+  over `ambient_samples`. It never deletes `hosts` or `host_profiles`: a
+  live machine's *current* hardware profile is as old as the last time its
+  hardware changed, so an age bound applied to hardware would delete the
+  row every surviving execution points at. `orphanReport` checks the whole
+  store by outer join, so it can see an orphan the foreign keys could not
+  have created. **Nothing calls `applyRetention` yet**: the daemon has no
+  retention flag and no periodic pass.
+- `mergeObservationStore` unions another store in: an append-only union
+  with no conflict resolution, no clock anywhere on the path, extension
+  rows whose schema this receiver does not know CARRIED into
+  `carried_extension_rows` and marked unqueryable by a check constraint
+  rather than dropped, and a source without the host and hardware
+  dimension REFUSED before anything is written. `canonicalDump` renders a
+  whole database so two of them can be compared for observable content
+  rather than for bytes — which two logically identical SQLite files never
+  share, because rowids are assigned in insertion order and `VACUUM`
+  preserves them.
 - **RunQuota never interprets an extension column** (OS-5). Extension table
   names are composed from the `ext_` prefix and a registered
   `extension_id`, and the only column names RunQuota writes into a

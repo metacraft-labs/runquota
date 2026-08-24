@@ -351,6 +351,130 @@ module that opens the store or reaches SQLite, with positive controls in both
 directions so that neither a scanner matching nothing nor one matching
 everything can pass.
 
+## Retention, backup and merge
+
+### Retention
+
+Two bounds, both configurable and both optional, applied per host by
+`applyRetention` in `libs/runquota_observation_store`:
+
+| Bound | Meaning |
+|---|---|
+| `maxExecutionAgeMillis` | remove executions that started before `now − limit` |
+| `maxExecutions` | keep only the newest N executions |
+| `maxAmbientSampleAgeMillis`, `maxAmbientSamples` | the same two bounds for `ambient_samples` |
+
+`none` means the bound does not apply, which is a different value from a
+bound of zero — a limit of zero executions is a legitimate instruction to
+keep none. The age bound runs first and the count bound second, so "the
+newest N" is a statement about what is kept rather than about what happened
+to be in the table when the pass started.
+
+Every pass cascades from the spine into every registered extension table and
+into `carried_extension_rows`, driven by `extension_registry` rather than by
+any list in RunQuota. The doomed set is a value (`DoomedExecutions`) rather
+than a timestamp, because a row-count bound cannot be expressed as one: which
+rows are outside the newest N depends on how many others there are.
+
+**Retention never deletes `hosts` or `host_profiles`, and that is the
+requirement rather than an omission.** A machine whose hardware last changed
+two years ago has a *current* profile row whose `valid_from` is two years old
+and which every surviving execution points at, so an age bound applied to
+hardware deletes exactly the row every survivor needs — and OS-6 goes with
+it, because an execution whose profile cannot be resolved is a duration
+pooled across unknown hardware. `orphanReport` checks the whole store by
+outer join rather than by trusting foreign keys, so it can see a state the
+library itself cannot create.
+
+**Crash safety, precisely.** Each pass is one SQLite transaction, so a
+process killed while one is open leaves the store as it was before that pass;
+a run applying both bounds is two transactions, and a kill between them
+leaves the store consistent and partially pruned. That is what
+`tests/integration/t_observation_store_retention_crash.nim` asserts, with a
+real `SIGKILL` to a real process group — the prune runs in a child that makes
+itself a group leader so its `sqlite3` is killed with it — and the signal is
+sent only once a second connection has been refused `begin immediate` *and*
+the write-ahead log (truncated to zero beforehand) holds uncommitted pages.
+Both conditions are printed, so where the signal landed is on the record.
+
+**Retention is not yet wired into the daemon.** There is no flag, no cadence
+and no periodic pass: `runquotad` never calls `applyRetention`. The mechanism
+and its bounds exist and are gated; scheduling them is not done, so a
+long-lived daemon's store still grows without limit.
+
+### Merge
+
+`mergeObservationStore` / `mergeObservationStores` union a source database
+into a destination. Every row is an immutable fact about a completed event,
+so the merge is an append-only union with no conflict resolution: executions
+dedup on (`host_id`, `execution_id`), runs on (`host_id`, `run_id`),
+`host_profiles` on (`host_id`, `profile_id`). Neither side needs a daemon —
+the two-path entry point takes only file names.
+
+- **A merge writes nothing that depends on when it ran.** There is no clock
+  in the merge path, and `carried_extension_rows` has no `carried_at` column
+  for that reason: whichever source arrived first would be stamped earlier,
+  and "two sources in either order" would produce two different databases.
+- **Extension rows the receiver does not know are carried, never dropped.**
+  Two cases, both handled: an `extension_id` with no registry row, and a
+  registered one whose version in the source is *newer* than the receiver
+  carries. The second is the dangerous one — the columns line up well enough
+  that a merge could insert the subset it recognises and lose the rest
+  silently. Carried rows land in `carried_extension_rows` with the source's
+  own column names and values as an opaque payload, and `queryable` is pinned
+  to `0` by a check constraint rather than by a default, so no row can claim
+  otherwise even if written past this library.
+- **`extension_registry` is not merged.** Copying a source's registry row for
+  an extension the receiver does not know would make the receiver claim to
+  know it, which is the claim the quarantine exists to avoid.
+- **A source without the host and hardware dimension is refused**, before
+  anything is written: no `hosts`/`host_profiles` table, a row naming a host
+  that is not there, an execution with a NULL `host_profile_id`, or one naming
+  a profile that is not there. A source at a schema newer than this build
+  understands is refused too, exactly as `openObservationStore` refuses one.
+
+**The gate for this milestone asks for byte-identical databases and that is
+not achievable for this schema.** Every spine table is an ordinary rowid
+table, so SQLite assigns each inserted row an implicit rowid in *insertion*
+order and two merges that insert the same facts in different orders place
+them under different rowids on different pages; `VACUUM` repacks a database
+but preserves rowids, so it does not launder the difference either. The
+identity is therefore asserted over a **canonical form**
+(`canonical.nim`): every table discovered from `sqlite_master`, every column
+of every row rendered as its storage class plus the hex of its bytes, rows
+and schema objects sorted, `user_version` included, digested with SHA-256.
+`tests/unit/t_observation_store_merge.nim` measures the substitution rather
+than asserting around it — it requires two logically identical databases to
+differ in their *bytes*, before and after `VACUUM INTO`, while their digests
+match — and puts the canonicalisation itself under positive controls: an
+extra row, a changed cell, `NULL` against the empty string, an integer
+against its own text, a moved `user_version`, a new index, and a table
+nothing in RunQuota has heard of all change the digest. Only physical layout
+does not.
+
+Two destinations being compared are always **copies of one starting point**,
+because `extension_registry` records when a registration was made and two
+receivers built a millisecond apart differ before a merge has happened at
+all.
+
+### Backup
+
+`backupTo` uses `VACUUM INTO`, which takes a read transaction: the store is
+copyable while the daemon runs and the copy is a single file that opens
+standalone.
+`tests/integration/t_observation_store_backup_standalone.nim` takes the copy
+with a real `runquotad` up and still writing, then stops it and deletes its
+entire state directory — store, log, shared-memory index, identity file,
+socket — before opening the copy, and asserts the copy holds the rows the
+store held at the moment of the copy and *not* the ones written afterwards.
+
+Its second test is the control that decides the first: on a store nobody else
+has open, SQLite checkpoints the log when the last connection closes, so
+`cp` produces a perfect copy and a backup implemented as `copyFile` would
+pass every assertion. With a reader holding a snapshot — which is what a live
+store has — the plain copy silently comes back with 5 of 25 executions and
+the backup with 25.
+
 ## State-boundary requirements
 
 Any persistent RunQuota state must document schema ownership, migrations, backup,
@@ -374,7 +498,9 @@ As implemented:
   fresh database gets, which is asserted rather than assumed.
 - **Backup and restore.** `backupTo` uses `VACUUM INTO`, which takes a read
   transaction: the store is copyable while the daemon runs and the copy opens
-  standalone. Combining a restored copy with a live one is merge, which is M15.
+  standalone. Combining a restored copy with a live one is merge. Both are
+  built and gated; see "Retention, backup and merge" above for what each one
+  does and what it refuses.
 - **Corruption handling.** Corruption is detected at open with
   `pragma quick_check`, reported verbatim, and never repaired. The store
   degrades to no capture and the daemon keeps serving leases.
