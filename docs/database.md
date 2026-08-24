@@ -407,8 +407,16 @@ As implemented:
   so `RUNQUOTA_BUILD_MODE` reaches the daemons under test and not the
   measuring code. And that script rebuilds the daemons only when the binary
   is absent, so on a warm tree the variable silently does nothing — the
-  emitted JSON records no build-mode field, which means neither figure is
-  reproducible from the recipe alone without checking what was on disk.
+  emitted JSON records no build-mode field.
+
+  Which means the labels above are **weaker than they read**. The second
+  pair was taken with `RUNQUOTA_BUILD_MODE=release` set, but nothing in the
+  recipe confirms the daemons timed in that run were the optimised ones
+  rather than whatever `build/bin` already held. Read "optimised daemons"
+  as *what was asked for*, not as *what was verified*. Making it verifiable
+  means plumbing the build mode into the harness and stamping it into the
+  JSON, which moves the figures and so belongs with its own re-derived
+  thresholds rather than in a documentation correction.
 
   Pairing rather than a before/after pair is not fussiness: M11 measured
   this machine's host-wide busy figure wandering between 56 % and 88 % over
