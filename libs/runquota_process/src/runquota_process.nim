@@ -490,6 +490,36 @@ proc launchResult*(processId: uint64; running: bool): LaunchResult =
     backend: backendProfile()
   )
 
+proc appendCapturedOutput(target: var string; total: var uint64;
+                          data: pointer; count, limit: int;
+                          unlimitedWhenNonPositive: bool) =
+  ## Keep the newest bounded bytes so a failed command retains its terminal
+  ## diagnostic. ``total`` still records every byte emitted.
+  if count <= 0:
+    return
+  total += uint64(count)
+  let source = cast[ptr UncheckedArray[char]](data)
+  if limit <= 0:
+    if unlimitedWhenNonPositive:
+      let oldLen = target.len
+      target.setLen(oldLen + count)
+      copyMem(addr target[oldLen], addr source[0], count)
+    return
+  if count >= limit:
+    target.setLen(limit)
+    copyMem(addr target[0], addr source[count - limit], limit)
+    return
+
+  let overflow = max(0, target.len + count - limit)
+  if overflow > 0:
+    let retained = target.len - overflow
+    if retained > 0:
+      moveMem(addr target[0], addr target[overflow], retained)
+    target.setLen(retained)
+  let oldLen = target.len
+  target.setLen(oldLen + count)
+  copyMem(addr target[oldLen], addr source[0], count)
+
 when defined(posix):
   proc closeFd(fd: var int) =
     if fd >= 0:
@@ -503,15 +533,9 @@ when defined(posix):
 
   proc appendBounded(target: var string; total: var uint64; data: pointer;
                      count, limit: int) =
-    if count <= 0:
-      return
-    total += uint64(count)
-    if limit <= 0 or target.len >= limit:
-      return
-    let take = min(count, limit - target.len)
-    let oldLen = target.len
-    target.setLen(oldLen + take)
-    copyMem(addr target[oldLen], data, take)
+    appendCapturedOutput(
+      target, total, data, count, limit,
+      unlimitedWhenNonPositive = false)
 
   proc drainFd(fd: var int; target: var string; total: var uint64; limit: int) =
     if fd < 0:
@@ -689,22 +713,9 @@ when defined(windows):
 
   proc winAppendBounded(target: var string; total: var uint64; data: pointer;
                         count, limit: int) =
-    # Windows: mirrors the POSIX `appendBounded` — always accumulate the true
-    # byte count, but only keep up to `limit` bytes of text.
-    if count <= 0:
-      return
-    total += uint64(count)
-    if limit <= 0:
-      let oldLen = target.len
-      target.setLen(oldLen + count)
-      copyMem(addr target[oldLen], data, count)
-      return
-    if target.len >= limit:
-      return
-    let take = min(count, limit - target.len)
-    let oldLen = target.len
-    target.setLen(oldLen + take)
-    copyMem(addr target[oldLen], data, take)
+    appendCapturedOutput(
+      target, total, data, count, limit,
+      unlimitedWhenNonPositive = true)
 
   proc winDrainOutput(child: var LaunchedProcess; process: Process;
                       blocking: bool) =
