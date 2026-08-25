@@ -158,6 +158,44 @@ type
     observationBootId*: string
     observationRunIds*: Table[uint64, string]
       ## Session id to the ``runs`` row it opened.
+    observationExecutionIds*: Table[uint64, tuple[executionId: string,
+        sessionId: uint64]]
+      ## Lease id to the ``executions`` row it produced, and to the session
+      ## that owned the lease (M17).
+      ##
+      ## THE ONLY WAY AN EXTENSION ROW CAN BE JOINED TO THE SPINE. The
+      ## execution id is minted here when the lease finishes and is never
+      ## sent to the client, so a client-supplied key would be an
+      ## invention; the client names the LEASE it was granted, and this
+      ## table is what turns that into the row's key.
+      ##
+      ## THE SESSION IS REMEMBERED BESIDE IT, AND IS THE OWNERSHIP CHECK.
+      ## It cannot be `daemon.leases`: a client releases a lease as soon as
+      ## its process exits, which deletes the row, whereas the facts a
+      ## build knows about that action -- its output sizes, its dependency
+      ## evidence -- are not complete until much later. Checking a table
+      ## the client has already been told to empty would refuse every
+      ## honest row and accept none.
+      ##
+      ## BOUNDED, and the bound is what makes a late row a DROP rather
+      ## than a leak: a build that runs a million actions must not grow a
+      ## million-entry map for rows most of its clients will never send.
+      ## The oldest entries go first, and a row arriving after its entry
+      ## was evicted is counted as a rejected observation like any other
+      ## loss.
+    observationExecutionOrder*: seq[uint64]
+      ## Insertion order for the bound above. A sequence rather than a
+      ## timestamp because eviction is by AGE OF ENTRY, and two leases
+      ## finishing in the same millisecond must still evict in a defined
+      ## order or two runs of the same build could differ.
+    observationExtensionRows*: uint64
+      ## Extension rows admitted and queued for the writer.
+    observationExtensionRowsRefused*: uint64
+      ## Extension rows refused, for any reason — a payload that would not
+      ## decode, a lease this connection does not own, a lease whose
+      ## execution has been evicted, or a row the store would not admit.
+      ## Counted rather than reported, because the message is one-way and
+      ## a reply is the round trip it exists to avoid.
     observationsAccepted*: uint64
       ## In-flight ``LeaseObservation`` reports folded into ``self_*``.
     observationsRejected*: uint64

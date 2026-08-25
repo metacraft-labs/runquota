@@ -26,6 +26,7 @@ var
   writerCapacity = 0
   writerRuns: seq[RunRow] = @[]
   writerExecutions: seq[ExecutionRow] = @[]
+  writerExtensionInserts: seq[string] = @[]
   writerDropped = 0'i64
   writerFailures = 0'i64
   writerQueued = 0'i64
@@ -42,6 +43,7 @@ proc drainOnce() {.gcsafe.} =
   {.cast(gcsafe).}:
     var runs: seq[RunRow] = @[]
     var executions: seq[ExecutionRow] = @[]
+    var extensionInserts: seq[string] = @[]
     var path = ""
     acquire(writerLock)
     try:
@@ -52,18 +54,25 @@ proc drainOnce() {.gcsafe.} =
       if writerExecutions.len > 0:
         executions = writerExecutions
         writerExecutions = @[]
+      if writerExtensionInserts.len > 0:
+        extensionInserts = writerExtensionInserts
+        writerExtensionInserts = @[]
     finally:
       release(writerLock)
-    if path.len == 0 or (runs.len == 0 and executions.len == 0):
+    if path.len == 0 or
+        (runs.len == 0 and executions.len == 0 and
+         extensionInserts.len == 0):
       return
-    let outcome = appendBatchAt(path, runs, executions)
+    let outcome = appendBatchAt(path, runs, executions, extensionInserts)
     acquire(writerLock)
     try:
       if outcome.ok:
-        writerWritten += int64(runs.len + executions.len)
+        writerWritten += int64(runs.len + executions.len +
+          extensionInserts.len)
       else:
         writerFailures += 1
-        writerDropped += int64(runs.len + executions.len)
+        writerDropped += int64(runs.len + executions.len +
+          extensionInserts.len)
     finally:
       release(writerLock)
 
@@ -95,6 +104,7 @@ proc startObservationWriter*(path: string; capacity = 1024) =
     writerCapacity = max(1, capacity)
     writerRuns = @[]
     writerExecutions = @[]
+    writerExtensionInserts = @[]
     writerStop = false
     writerDropped = 0
     writerFailures = 0
@@ -144,6 +154,34 @@ proc enqueueExecutionRow*(row: ExecutionRow): bool {.discardable.} =
       writerDropped += 1
       return false
     writerExecutions.add(row)
+    writerQueued += 1
+    true
+  finally:
+    release(writerLock)
+
+proc enqueueExtensionInsert*(statement: string): bool {.discardable.} =
+  ## Queue one already-admitted extension insert (M17).
+  ##
+  ## THE STATEMENT ARRIVES COMPOSED, and that is the boundary working
+  ## rather than a shortcut around it. Composing it needs the registry,
+  ## which lives behind the ``ObservationStore`` ref the daemon thread
+  ## owns and this writer must never touch; ``admitExtensionRow`` does the
+  ## composing on that thread, having made every check
+  ## ``insertExtensionRow`` makes. What reaches here is opaque to the
+  ## writer, which is exactly what an extension is supposed to be.
+  ##
+  ## The queue is shared with runs and executions and bounded by the same
+  ## capacity, so an extension row can be dropped like any other
+  ## observation, and is counted like one.
+  ensureWriterLock()
+  acquire(writerLock)
+  try:
+    if not writerActive or statement.len == 0 or
+        writerRuns.len + writerExecutions.len + writerExtensionInserts.len >=
+          writerCapacity:
+      writerDropped += 1
+      return false
+    writerExtensionInserts.add(statement)
     writerQueued += 1
     true
   finally:

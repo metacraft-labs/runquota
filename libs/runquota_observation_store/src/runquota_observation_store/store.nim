@@ -375,9 +375,21 @@ proc registerExtension*(store: ObservationStore;
     extensionValues(row)))
 
 proc batchStatement*(runs: openArray[RunRow];
-                     executions: openArray[ExecutionRow]): string =
+                     executions: openArray[ExecutionRow];
+                     extensionInserts: openArray[string] = []): string =
   ## One transaction for a drained queue. ``insert or ignore`` for runs
   ## because several executions share a run and the row may already exist.
+  ##
+  ## EXTENSION INSERTS COME LAST, AND THE ORDER IS LOAD-BEARING. An
+  ## extension row carries a foreign key to ``executions`` and
+  ## ``foreign_keys`` is on, so an insert placed before its parent's would
+  ## abort the whole transaction — taking the parent execution with it.
+  ## The parent is either already committed by an earlier batch or is in
+  ## this one above these lines; there is no third case, because a row is
+  ## only admitted after the lease that produced it finished.
+  ##
+  ## The statements are opaque here (see ``enqueueExtensionInsert``); this
+  ## procedure appends them and does not read them.
   result = "begin immediate;\n"
   for row in runs:
     result.add("insert or ignore into runs (" & runColumns.join(", ") &
@@ -385,15 +397,18 @@ proc batchStatement*(runs: openArray[RunRow];
   for row in executions:
     result.add(insertStatement("executions", executionColumns,
       executionValues(row)) & "\n")
+  for statement in extensionInserts:
+    result.add(statement & "\n")
   result.add("commit;\n")
 
 proc appendBatchAt*(path: string; runs: openArray[RunRow];
-                    executions: openArray[ExecutionRow]): SqliteOutcome =
+                    executions: openArray[ExecutionRow];
+                    extensionInserts: openArray[string] = []): SqliteOutcome =
   ## Path-addressed batch append, for the background writer: it must not
   ## touch the ``ObservationStore`` ref owned by the daemon thread.
-  if runs.len == 0 and executions.len == 0:
+  if runs.len == 0 and executions.len == 0 and extensionInserts.len == 0:
     return SqliteOutcome(ok: true, exitCode: 0, output: "", error: "")
-  runSqlite(path, batchStatement(runs, executions))
+  runSqlite(path, batchStatement(runs, executions, extensionInserts))
 
 proc ambientBatchStatement*(rows: openArray[AmbientSampleRow]): string =
   ## One transaction for a drained run of ambient samples.

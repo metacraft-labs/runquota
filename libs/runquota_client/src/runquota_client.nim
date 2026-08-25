@@ -435,6 +435,87 @@ proc requestLeaseWaiting*(session: var RunQuotaSession; request: ResourceRequest
   session.client[].lastDiagnostic = diagnostic(diagDenied, "timed out waiting for lease grant")
   raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
 
+# ---------------------------------------------------------------------------
+# Domain extensions: the write path (M17)
+# ---------------------------------------------------------------------------
+
+proc declareExtension*(session: var RunQuotaSession;
+                       extensionId, owner: string; schemaVersion: int64;
+                       migrations: openArray[string]): string =
+  ## Register an extension, returning "" on acceptance and the daemon's
+  ## outcome name on refusal.
+  ##
+  ## OVER THE SOCKET, for the same reason ``queryStats`` is: this library
+  ## does not link the observation store and must not. A product owns its
+  ## extension's schema; RunQuota owns where and how it is stored, and the
+  ## only place those two meet is here.
+  ##
+  ## REQUEST/RESPONSE, unlike a row. This is not an observation: it
+  ## happens once per client, its payload is a DDL ladder rather than a
+  ## measurement, and its answer decides whether any row may be sent at
+  ## all. Making it one-way would leave a client writing rows into a
+  ## table that was refused, and finding out never.
+  var steps: seq[string] = @[]
+  for step in migrations:
+    steps.add(step)
+  let msg = DeclareExtensionMessage(
+    sessionId: session.id,
+    extensionId: extensionId,
+    owner: owner,
+    schemaVersion: uint32(max(0'i64, schemaVersion)),
+    migrations: steps)
+  let requestId = session.client[].requestFrame(rqDeclareExtension,
+    encodeDeclareExtension(msg))
+  let frame = session.client[].readResponse(requestId)
+  if frame.header.messageKind != rqExtensionDeclared:
+    session.client[].lastDiagnostic = diagnostic(diagProtocol,
+      "daemon did not answer the extension declaration")
+    raise newException(RunQuotaClientError,
+      session.client[].lastDiagnostic.message)
+  var declared: ExtensionDeclaredMessage
+  if not decodeExtensionDeclared(frame.payload, declared):
+    session.client[].lastDiagnostic = diagnostic(diagProtocol,
+      "invalid ExtensionDeclared payload")
+    raise newException(RunQuotaClientError,
+      session.client[].lastDiagnostic.message)
+  if declared.accepted: "" else: declared.outcome
+
+proc recordExtensionRow*(session: var RunQuotaSession; leaseId: uint64;
+                         extensionId: string; schemaVersion: int64;
+                         columns: openArray[string];
+                         values: openArray[ExtensionCellWire]) =
+  ## Attach one extension row to the execution the named lease produced.
+  ##
+  ## ONE BUFFERED WRITE AND NO ROUND TRIP, exactly like ``lease.observe``.
+  ## Nothing is read back and no in-flight slot is consumed: §"Write Path"
+  ## forbids an observation from introducing an additional round trip and
+  ## OS-1 forbids recording one from blocking the work being observed.
+  ##
+  ## SILENT ON A DEAD CONNECTION, deliberately. A failed send is a lost
+  ## observation, and losing one is always preferable to perturbing the
+  ## work being observed.
+  var columnNames: seq[string] = @[]
+  for name in columns:
+    columnNames.add(name)
+  var cells: seq[ExtensionCellWire] = @[]
+  for cell in values:
+    cells.add(cell)
+  let msg = ExtensionRowMessage(
+    sessionId: session.id,
+    leaseId: leaseId(leaseId),
+    extensionId: extensionId,
+    schemaVersion: uint32(max(0'i64, schemaVersion)),
+    columns: columnNames,
+    values: cells)
+  inc session.client[].nextRequestId
+  let requestId = session.client[].nextRequestId
+  try:
+    session.client[].connection.sendFrame(
+      encodeFrame(rqExtensionRow, FrameFlagRequest, requestId,
+        encodeExtensionRow(msg)))
+  except CatchableError:
+    discard
+
 proc queryStats*(client: var RunQuotaClient; subject: StatsSubject;
                  statsKey = ""; scope = statsScopeWireOwner;
                  span = profileSpanWireSingle; limit = 0'u32;

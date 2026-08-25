@@ -35,6 +35,9 @@ type
     rqStatsQuery = 27
     rqStatsResponse = 28
     rqDeferredObservations = 29
+    rqDeclareExtension = 30
+    rqExtensionDeclared = 31
+    rqExtensionRow = 32
 
   MessageKind* = RqspMessageKind
 
@@ -372,6 +375,86 @@ type
       ## The columns the CALLER wants. RunQuota checks them for being
       ## storable identifiers and for nothing else; it does not know what
       ## any of them mean.
+
+  # -------------------------------------------------------------------------
+  # The extension WRITE path (M17). M12 built the extension mechanism as a
+  # STORE API and gated it against a synthetic extension declared in the
+  # daemon's own process; M13a then gave extension rows a way OUT over the
+  # socket but none in. A real client cannot use an in-process API: no
+  # client may open the database file, so without these three messages the
+  # only way for a product to populate its own extension would be the one
+  # thing the boundary forbids.
+  #
+  # The shapes mirror the store's ``ExtensionDeclaration`` and
+  # ``ExtensionRow`` exactly, INCLUDING the four storage classes, so the
+  # transport can express everything the mechanism can. A wire that
+  # carried only text and integers would have quietly narrowed the
+  # mechanism to what its first client happened to need, which is the
+  # failure M12's synthetic-extension gate exists to prevent.
+  # -------------------------------------------------------------------------
+
+  ExtensionCellKind* = enum
+    extCellNull = 0
+    extCellText = 1
+    extCellInt = 2
+    extCellReal = 3
+
+  ExtensionCellWire* = object
+    ## One opaque cell. RunQuota knows the storage class because it has to
+    ## write a literal; it knows nothing about what the value means.
+    ##
+    ## A FLAT RECORD RATHER THAN A VARIANT, deliberately: the codec has no
+    ## sum type and a variant would need a second encoding rule per arm.
+    ## ``real`` travels as the IEEE-754 BIT PATTERN in a ``uint64`` -- the
+    ## codec has no float, and a bit pattern needs no NaN rule and no
+    ## endianness rule beyond the one the codec already has for integers.
+    kind*: ExtensionCellKind
+    text*: string
+    number*: int64
+    realBits*: uint64
+
+  DeclareExtensionMessage* = object
+    ## A client registering its own extension. Request/response, and NOT
+    ## on the observation path: this happens once per client, carries a
+    ## DDL ladder that can be long, and its answer decides whether any
+    ## rows may be sent at all.
+    sessionId*: SessionId
+    extensionId*: string
+    owner*: string
+    schemaVersion*: uint32
+    migrations*: seq[string]
+      ## ``migrations[i]`` takes the table from version ``i`` to ``i + 1``.
+      ## Passed through to the store verbatim; RunQuota runs these
+      ## statements and does not read them.
+
+  ExtensionDeclaredMessage* = object
+    ## What happened, in the store's own vocabulary.
+    ##
+    ## ACCEPTANCE IS A SEPARATE BOOLEAN FROM THE OUTCOME NAME, because the
+    ## four acceptances and four refusals must never be told apart by a
+    ## client parsing a string: a client that misread "accepted-older" as
+    ## a refusal would stop writing rows it is entitled to write.
+    accepted*: bool
+    outcome*: string
+
+  ExtensionRowMessage* = object
+    ## One extension row, attached to the execution one of this client's
+    ## leases produced.
+    ##
+    ## KEYED BY THE LEASE, NOT BY THE EXECUTION. The execution id is minted
+    ## by the daemon when the lease finishes and is never told to the
+    ## client, so a client-supplied execution id would be an invention.
+    ## The daemon resolves the lease to the execution it recorded.
+    ##
+    ## ONE-WAY, like ``rqLeaseObservation``: no acknowledgement, no
+    ## request id to await, one buffered write. §"Write Path" forbids an
+    ## observation from introducing an additional round trip.
+    sessionId*: SessionId
+    leaseId*: LeaseId
+    extensionId*: string
+    schemaVersion*: uint32
+    columns*: seq[string]
+    values*: seq[ExtensionCellWire]
 
   ProfileIdentityWire* = object
     hostId*: string

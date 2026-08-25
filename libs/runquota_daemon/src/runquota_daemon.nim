@@ -908,6 +908,12 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
     "\"deferred_batches_refused\":" & $daemon.deferredBatchesRefused & "," &
     "\"deferred_executions_recorded\":" &
       $daemon.deferredExecutionsRecorded & "," &
+    # M17: same reasoning as ``rejected`` above. ``rqExtensionRow`` is
+    # one-way, so a client is never told its row was refused, and this is
+    # the only place the loss can be counted.
+    "\"extension_rows\":" & $daemon.observationExtensionRows & "," &
+    "\"extension_rows_refused\":" &
+      $daemon.observationExtensionRowsRefused & "," &
     "\"queued\":" & $observationsWritten() & "," &
     "\"dropped\":" & $observationsDropped() & "," &
     "\"write_failures\":" & $observationWriteFailures() &
@@ -1437,6 +1443,13 @@ proc observationTermination(finish: LeaseFinishedMessage): Termination =
   of leaseFinishCancelled, leaseFinishLaunchFailed: tRefused
   else: tExited
 
+const MaxRememberedExecutions = 4096
+  ## How many finished leases keep their execution id available for an
+  ## extension row (M17). Large enough that a client sending its rows at
+  ## the END of a build -- which is when a build system knows the output
+  ## sizes and evidence counts -- still finds them, small enough that a
+  ## client which never sends any costs a bounded amount.
+
 proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
                         finish: LeaseFinishedMessage) =
   ## Appends one immutable execution row. In-memory only: the enqueue takes
@@ -1449,8 +1462,20 @@ proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
   let finishedAt = unixMillisNow()
   let startedAt =
     if lease.startedAtUnixMillis > 0: lease.startedAtUnixMillis else: finishedAt
+  let executionId = opaqueId("exec-")
+  # REMEMBERED BEFORE THE ROW IS ENQUEUED, so a client whose extension row
+  # arrives immediately after its LeaseFinished ack still finds the entry.
+  # The row itself is queued, not written, so "the execution exists" is a
+  # statement about this table and not about the database.
+  daemon.observationExecutionIds[lease.id.value] =
+    (executionId: executionId, sessionId: lease.sessionId.value)
+  daemon.observationExecutionOrder.add(lease.id.value)
+  while daemon.observationExecutionOrder.len > MaxRememberedExecutions:
+    let evicted = daemon.observationExecutionOrder[0]
+    daemon.observationExecutionOrder.delete(0)
+    daemon.observationExecutionIds.del(evicted)
   discard enqueueExecutionRow(ExecutionRow(
-    executionId: opaqueId("exec-"),
+    executionId: executionId,
     hostId: daemon.observationHostId,
     # The profile current when this ran (OS-6). NULL only when detection
     # could not establish one: a wrong profile id would be worse than an
@@ -1495,6 +1520,107 @@ proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
       else:
         some(int64(lease.peer.userId))
   ))
+
+proc declareClientExtension(daemon: var RunQuotaDaemon;
+                            context: ConnectionContext;
+                            msg: DeclareExtensionMessage):
+    ExtensionDeclaredMessage =
+  ## Register a client's extension (M17), answering with the store's own
+  ## outcome.
+  ##
+  ## RUNQUOTA DOES NOT READ THE LADDER. The migration statements are the
+  ## product's, run verbatim; nothing here parses them, and nothing here
+  ## knows what a column of this extension means (OS-5). Every refusal the
+  ## store can make is passed through by NAME, because "refused" and
+  ## "accepted an older client" must never be told apart by their side
+  ## effects alone.
+  ##
+  ## THE SESSION MUST BE ONE THIS CONNECTION REGISTERED, exactly as for an
+  ## observation. A declaration creates a table in a host-wide store; a
+  ## connection naming a session it never opened has no business doing so.
+  if not daemon.observationCaptureEnabled:
+    return ExtensionDeclaredMessage(accepted: false, outcome: $eoUnavailable)
+  var ownsSession = false
+  for id in context.sessionIds:
+    if id.value == msg.sessionId.value:
+      ownsSession = true
+      break
+  if not ownsSession:
+    return ExtensionDeclaredMessage(accepted: false,
+      outcome: "unknown-session")
+  let declaration = ExtensionDeclaration(
+    extensionId: msg.extensionId,
+    owner: msg.owner,
+    schemaVersion: int64(msg.schemaVersion),
+    migrations: msg.migrations)
+  let outcome = daemon.observationStore.declareExtension(declaration)
+  ExtensionDeclaredMessage(
+    accepted: outcome in {eoCreated, eoUpToDate, eoMigrated, eoAcceptedOlder},
+    outcome: $outcome)
+
+proc recordClientExtensionRow(daemon: var RunQuotaDaemon;
+                              context: ConnectionContext;
+                              msg: ExtensionRowMessage): bool =
+  ## Attach one extension row to the execution the named lease produced.
+  ##
+  ## NOTHING IS QUEUED UNTIL EVERY CHECK HAS PASSED, in the same order and
+  ## for the same reason as ``applyLeaseObservation``: the ownership check
+  ## first, because one host-wide daemon holds every user's leases and a
+  ## row naming somebody else's lease would attach this client's facts to
+  ## another user's execution.
+  ##
+  ## IT GOES ON THE WRITER'S QUEUE, NOT INTO THE DATABASE. The insert is
+  ## composed here (which needs the registry, which lives behind the store
+  ## ref this thread owns) and executed by the background writer inside the
+  ## same transaction that carries its parent execution -- so the foreign
+  ## key is satisfied by construction rather than by timing.
+  if not daemon.observationCaptureEnabled:
+    return false
+  if extensionRowRefusal(msg).len > 0:
+    return false
+  if not daemon.sessions.hasKey(msg.sessionId.value):
+    return false
+  var ownsSession = false
+  for id in context.sessionIds:
+    if id.value == msg.sessionId.value:
+      ownsSession = true
+      break
+  if not ownsSession:
+    return false
+  if not daemon.observationExecutionIds.hasKey(msg.leaseId.value):
+    # No execution was recorded for this lease, or its entry has aged out.
+    # Either way there is no spine row to join to, and a row with an
+    # invented key is worse than no row.
+    return false
+  let recorded = daemon.observationExecutionIds[msg.leaseId.value]
+  # THE OWNERSHIP CHECK, against the session that actually held the lease
+  # when the execution was recorded. A row naming somebody else's lease
+  # would attach this client's facts to another user's execution, and one
+  # host-wide daemon holds every user's rows.
+  if recorded.sessionId != msg.sessionId.value:
+    return false
+  var cells: seq[ExtensionValue] = @[]
+  for cell in msg.values:
+    cells.add(
+      case cell.kind
+      of extCellNull: extNull()
+      of extCellText: extText(cell.text)
+      of extCellInt: extInt(cell.number)
+      of extCellReal: extReal(wireRealValue(cell)))
+  let admitted = daemon.observationStore.admitExtensionRow(
+    ExtensionDeclaration(
+      extensionId: msg.extensionId,
+      owner: "",
+      schemaVersion: int64(msg.schemaVersion),
+      migrations: @[]),
+    ExtensionRow(
+      hostId: daemon.observationHostId,
+      executionId: recorded.executionId,
+      columns: msg.columns,
+      values: cells))
+  if admitted.outcome != ewWritten:
+    return false
+  enqueueExtensionInsert(admitted.statement)
 
 proc deferredTermination(record: DeferredExecutionRecord): Termination =
   ## Same mapping ``observationTermination`` applies to a lease finish, on
@@ -2049,6 +2175,35 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       inc daemon.deferredBatchesAccepted
     else:
       inc daemon.deferredBatchesRefused
+  of rqDeclareExtension:
+    # REQUEST/RESPONSE, unlike a row. A declaration is not an observation:
+    # it happens once per client, and its answer decides whether any row
+    # may be sent at all. A client told nothing would write rows into a
+    # table that was refused and never find out.
+    var msg: DeclareExtensionMessage
+    if not decodeDeclareExtension(frame.payload, msg):
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "invalid DeclareExtension payload"))
+      return
+    connection.sendResponse(
+      rqExtensionDeclared,
+      frame.header.requestId,
+      encodeExtensionDeclared(daemon.declareClientExtension(context, msg))
+    )
+  of rqExtensionRow:
+    # ONE-WAY, for the reasons ``rqLeaseObservation`` is: §"Write Path"
+    # forbids an observation from introducing an additional round trip,
+    # and a reply is what a client would block on. A REFUSAL IS THEREFORE
+    # COUNTED RATHER THAN REPORTED, and readable through the
+    # `observations` inspection subject.
+    var msg: ExtensionRowMessage
+    if not decodeExtensionRow(frame.payload, msg):
+      inc daemon.observationExtensionRowsRefused
+      return
+    if daemon.recordClientExtensionRow(context, msg):
+      inc daemon.observationExtensionRows
+    else:
+      inc daemon.observationExtensionRowsRefused
   of rqStatusRequest:
     connection.sendResponse(rqStatusResponse, frame.header.requestId,
         encodeStatus(daemon.status()))

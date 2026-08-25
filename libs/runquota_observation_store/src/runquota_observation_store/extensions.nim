@@ -407,11 +407,21 @@ proc declareExtension*(store: ObservationStore;
 # Writing and reading extension rows
 # ---------------------------------------------------------------------------
 
-proc insertExtensionRow*(store: ObservationStore;
-                         declaration: ExtensionDeclaration;
-                         row: ExtensionRow): ExtensionWrite =
-  ## Writes one extension row on behalf of a client declaring
-  ## ``declaration.schemaVersion``.
+proc admitExtensionRow*(store: ObservationStore;
+                        declaration: ExtensionDeclaration;
+                        row: ExtensionRow):
+    tuple[outcome: ExtensionWrite, statement: string] =
+  ## Every check ``insertExtensionRow`` makes, WITHOUT executing anything,
+  ## returning the statement that would be run.
+  ##
+  ## Split out for the write path M17 needs and for no other reason. The
+  ## background observation writer is PATH-ADDRESSED — it must not touch
+  ## the ``ObservationStore`` ref owned by the daemon thread — so the
+  ## checks, every one of which needs the registry, have to happen on the
+  ## daemon thread while the statement is executed later by the writer.
+  ## Splitting is the only way to keep ONE copy of those checks; a second
+  ## validating path is a second thing to keep correct, and the one that
+  ## drifted would be the one nothing tested.
   ##
   ## A client declaring a version NEWER than the registry carries is
   ## refused here and not silently written: its row is shaped for a table
@@ -421,22 +431,33 @@ proc insertExtensionRow*(store: ObservationStore;
   ## is written — the columns it does not know take their declared
   ## defaults, which is the whole point of a forward-only ladder.
   if not store.captureEnabled:
-    return ewUnavailable
+    return (ewUnavailable, "")
   if not isStorableIdentifier(declaration.extensionId):
-    return ewRefusedRow
+    return (ewRefusedRow, "")
   if row.columns.len != row.values.len:
-    return ewRefusedRow
+    return (ewRefusedRow, "")
   for name in row.columns:
     if not isStorableIdentifier(name) or
         name == keyHostColumn or name == keyExecutionColumn:
-      return ewRefusedRow
+      return (ewRefusedRow, "")
   let existing = store.extensionRegistryEntry(declaration.extensionId)
   if existing.isNone:
-    return ewNotRegistered
+    return (ewNotRegistered, "")
   if declaration.schemaVersion > existing.get.schemaVersion:
-    return ewRefusedUnstorableVersion
+    return (ewRefusedUnstorableVersion, "")
   let tableName = extensionTableName(declaration.extensionId)
-  if not store.runStatement(extensionInsertStatement(tableName, row)):
+  (ewWritten, extensionInsertStatement(tableName, row))
+
+proc insertExtensionRow*(store: ObservationStore;
+                         declaration: ExtensionDeclaration;
+                         row: ExtensionRow): ExtensionWrite =
+  ## Writes one extension row on behalf of a client declaring
+  ## ``declaration.schemaVersion``. Admission and execution, in the
+  ## synchronous shape M12 shipped.
+  let admitted = store.admitExtensionRow(declaration, row)
+  if admitted.outcome != ewWritten:
+    return admitted.outcome
+  if not store.runStatement(admitted.statement):
     return ewRejected
   ewWritten
 

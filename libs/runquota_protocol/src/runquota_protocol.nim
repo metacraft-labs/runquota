@@ -995,6 +995,167 @@ proc deferredObservationsRefusal*(msg: DeferredObservationsMessage): string =
   ""
 
 # ---------------------------------------------------------------------------
+# The extension WRITE path (M17): declaration, then rows.
+# ---------------------------------------------------------------------------
+
+const
+  MaxExtensionMigrations* = 64
+  MaxExtensionColumns* = 128
+    ## Bounds on the two variable-length parts, so a malformed length
+    ## prefix allocates a bounded amount rather than whatever a 32-bit
+    ## count says. The store refuses anything it cannot name anyway; these
+    ## exist so the DECODER never has to trust the number to find out.
+
+proc wireNull*(): ExtensionCellWire =
+  ExtensionCellWire(kind: extCellNull)
+
+proc wireText*(value: string): ExtensionCellWire =
+  ExtensionCellWire(kind: extCellText, text: value)
+
+proc wireInt*(value: int64): ExtensionCellWire =
+  ExtensionCellWire(kind: extCellInt, number: value)
+
+proc wireReal*(value: float64): ExtensionCellWire =
+  ExtensionCellWire(kind: extCellReal, realBits: cast[uint64](value))
+
+proc wireRealValue*(cell: ExtensionCellWire): float64 =
+  cast[float64](cell.realBits)
+
+proc encodeDeclareExtension*(msg: DeclareExtensionMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeString(msg.extensionId)
+  w.writeString(msg.owner)
+  w.writeU32(msg.schemaVersion)
+  w.writeU32(uint32(msg.migrations.len))
+  for step in msg.migrations:
+    w.writeString(step)
+  w.data
+
+proc decodeDeclareExtension*(payload: string;
+                             msg: var DeclareExtensionMessage): bool =
+  var r = reader(payload)
+  var sessionRaw: uint64
+  var extensionId, owner: string
+  var schemaVersion, stepCount: uint32
+  if not r.readU64(sessionRaw): return false
+  if not r.readString(extensionId): return false
+  if not r.readString(owner): return false
+  if not r.readU32(schemaVersion): return false
+  if not r.readU32(stepCount): return false
+  if stepCount > uint32(MaxExtensionMigrations): return false
+  var migrations: seq[string] = @[]
+  for _ in 0 ..< stepCount:
+    var step: string
+    if not r.readString(step): return false
+    migrations.add(step)
+  msg = DeclareExtensionMessage(
+    sessionId: sessionId(sessionRaw),
+    extensionId: extensionId,
+    owner: owner,
+    schemaVersion: schemaVersion,
+    migrations: migrations)
+  true
+
+proc encodeExtensionDeclared*(msg: ExtensionDeclaredMessage): string =
+  var w = writer()
+  w.writeBool(msg.accepted)
+  w.writeString(msg.outcome)
+  w.data
+
+proc decodeExtensionDeclared*(payload: string;
+                              msg: var ExtensionDeclaredMessage): bool =
+  var r = reader(payload)
+  var accepted: bool
+  var outcome: string
+  if not r.readBool(accepted): return false
+  if not r.readString(outcome): return false
+  msg = ExtensionDeclaredMessage(accepted: accepted, outcome: outcome)
+  true
+
+proc encodeExtensionRow*(msg: ExtensionRowMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU64(msg.leaseId.value)
+  w.writeString(msg.extensionId)
+  w.writeU32(msg.schemaVersion)
+  w.writeU32(uint32(msg.columns.len))
+  for name in msg.columns:
+    w.writeString(name)
+  w.writeU32(uint32(msg.values.len))
+  for cell in msg.values:
+    w.writeU8(uint8(ord(cell.kind)))
+    w.writeString(cell.text)
+    w.writeU64(cast[uint64](cell.number))
+    w.writeU64(cell.realBits)
+  w.data
+
+proc decodeExtensionRow*(payload: string; msg: var ExtensionRowMessage): bool =
+  var r = reader(payload)
+  var sessionRaw, leaseRaw: uint64
+  var extensionId: string
+  var schemaVersion, columnCount, valueCount: uint32
+  if not r.readU64(sessionRaw): return false
+  if not r.readU64(leaseRaw): return false
+  if not r.readString(extensionId): return false
+  if not r.readU32(schemaVersion): return false
+  if not r.readU32(columnCount): return false
+  if columnCount > uint32(MaxExtensionColumns): return false
+  var columns: seq[string] = @[]
+  for _ in 0 ..< columnCount:
+    var name: string
+    if not r.readString(name): return false
+    columns.add(name)
+  if not r.readU32(valueCount): return false
+  if valueCount > uint32(MaxExtensionColumns): return false
+  var values: seq[ExtensionCellWire] = @[]
+  for _ in 0 ..< valueCount:
+    var kindRaw: uint8
+    var text: string
+    var number, realBits: uint64
+    if not r.readU8(kindRaw): return false
+    # A STORAGE CLASS THE DAEMON DOES NOT KNOW IS REFUSED, NOT DEFAULTED.
+    # Defaulting an unknown class to text would write the wrong literal
+    # into a column whose type the client, not RunQuota, chose.
+    if kindRaw > uint8(ord(high(ExtensionCellKind))): return false
+    if not r.readString(text): return false
+    if not r.readU64(number): return false
+    if not r.readU64(realBits): return false
+    values.add(ExtensionCellWire(
+      kind: ExtensionCellKind(kindRaw),
+      text: text,
+      number: cast[int64](number),
+      realBits: realBits))
+  msg = ExtensionRowMessage(
+    sessionId: sessionId(sessionRaw),
+    leaseId: leaseId(leaseRaw),
+    extensionId: extensionId,
+    schemaVersion: schemaVersion,
+    columns: columns,
+    values: values)
+  true
+
+proc extensionRowRefusal*(msg: ExtensionRowMessage): string =
+  ## Why this row must be rejected before the store is ever consulted,
+  ## or "" if it is worth passing on.
+  ##
+  ## A COUNT MISMATCH IS THE ONE THE TRANSPORT MUST CATCH. The store
+  ## indexes ``values`` by the position of ``columns``, so a row with
+  ## fewer values than columns is not a refusal there but an out-of-bounds
+  ## read — and a row with MORE values silently drops the extras into a
+  ## table the client believes it filled.
+  if msg.extensionId.len == 0:
+    return "an extension row must name its extension"
+  if msg.columns.len == 0:
+    return "an extension row with no columns"
+  if msg.columns.len != msg.values.len:
+    return "an extension row with " & $msg.columns.len & " columns and " &
+      $msg.values.len & " values"
+  if msg.schemaVersion == 0:
+    return "an extension row declaring schema version 0"
+  ""
+
+# ---------------------------------------------------------------------------
 # The read path (M13a): stats queries over the socket.
 # ---------------------------------------------------------------------------
 
