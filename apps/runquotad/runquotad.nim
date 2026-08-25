@@ -1,9 +1,18 @@
 import std/os
-import std/[strutils, tables]
+import std/[options, strutils, tables]
 
 import runquota_core
 import runquota_daemon
 import runquota_ipc
+
+proc optionalRetentionBound(text: string): Option[int64] =
+  ## A NEGATIVE VALUE TURNS THE BOUND OFF, AND ZERO DOES NOT. ``none``
+  ## means "this bound does not apply"; a limit of zero is a legitimate
+  ## instruction to keep nothing. They are different answers and an
+  ## operator has to be able to give either, so the flag cannot spell one
+  ## of them as the absence of the other.
+  let value = parseBiggestInt(text)
+  if value < 0: none(int64) else: some(value)
 
 proc parseCpuShareGroupSpec(config: var DaemonConfig; spec: string): bool =
   let parts = spec.split("=", 1)
@@ -46,7 +55,7 @@ when isMainModule:
     quit 0
 
   var config = defaultDaemonConfig(defaultEndpoint())
-  let usage = "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH]"
+  let usage = "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N]"
   var i = 0
   while i < args.len:
     case args[i]
@@ -146,6 +155,49 @@ when isMainModule:
       if i + 1 >= args.len:
         quit 2
       config.ambientSampleIntervalMillis = parseInt(args[i + 1])
+      i += 2
+    of "--retention-sweep-interval-millis":
+      # THE CADENCE OF THE SCHEDULED PRUNE, and the off switch with it.
+      # Retention bounds are configured in days, so an hourly pass is two
+      # orders of magnitude finer than the thing it enforces and the exact
+      # moment never matters; zero or negative turns retention off without
+      # disturbing capture, which is the one state an operator who does
+      # not want a daemon deleting rows needs to be able to say.
+      if i + 1 >= args.len:
+        quit 2
+      config.retentionSweepIntervalMillis = parseInt(args[i + 1])
+      i += 2
+    of "--retention-max-deferred-sweeps":
+      # How many consecutive sweeps a live lease may defer. A prune
+      # competes for the disk the observed work runs on, so it waits for a
+      # quiet tick -- but a machine that is never idle is exactly the one
+      # whose store grows fastest, so the wait has a ceiling.
+      if i + 1 >= args.len:
+        quit 2
+      config.retentionMaxDeferredSweeps = parseInt(args[i + 1])
+      i += 2
+    of "--retention-max-execution-age-millis":
+      if i + 1 >= args.len:
+        quit 2
+      config.retentionPolicy.maxExecutionAgeMillis =
+        optionalRetentionBound(args[i + 1])
+      i += 2
+    of "--retention-max-executions":
+      if i + 1 >= args.len:
+        quit 2
+      config.retentionPolicy.maxExecutions = optionalRetentionBound(args[i + 1])
+      i += 2
+    of "--retention-max-ambient-sample-age-millis":
+      if i + 1 >= args.len:
+        quit 2
+      config.retentionPolicy.maxAmbientSampleAgeMillis =
+        optionalRetentionBound(args[i + 1])
+      i += 2
+    of "--retention-max-ambient-samples":
+      if i + 1 >= args.len:
+        quit 2
+      config.retentionPolicy.maxAmbientSamples =
+        optionalRetentionBound(args[i + 1])
       i += 2
     of "--host-identity-file":
       # Where this machine's opaque `host_id` is kept. Overridable so a

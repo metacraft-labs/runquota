@@ -77,6 +77,25 @@ type
       ## The FIXED cadence of ambient load sampling (M11), independent of
       ## execution boundaries. Zero or negative turns ambient sampling off
       ## while leaving execution capture on.
+    retentionPolicy*: RetentionPolicy
+      ## The bounds the scheduled retention pass enforces. M15 built them
+      ## and nothing called them; this is what a daemon carries so that a
+      ## store which is ON BY DEFAULT is also BOUNDED by default. The two
+      ## have to travel together: the argument for default-on capture is
+      ## that an opt-in store is empty exactly when it is first needed,
+      ## and that argument does not survive an unbounded one.
+    retentionSweepIntervalMillis*: int
+      ## Cadence of that pass. Zero or negative turns retention off while
+      ## leaving capture on — the same shape as
+      ## ``ambientSampleIntervalMillis`` above and for the same reason:
+      ## "off" has to be a state an operator can name, in the config, in
+      ## the startup report, and in a test.
+    retentionMaxDeferredSweeps*: int
+      ## How many consecutive sweeps a live lease may defer before one
+      ## runs anyway. A prune competes for the disk the work runs on, so
+      ## waiting for a quiet tick is right; waiting for one forever is not
+      ## a bound, and a machine that is never idle is the one whose store
+      ## grows fastest.
 
   SessionRow* = object
     id*: SessionId

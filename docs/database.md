@@ -74,7 +74,9 @@ threads, and both exist so that nothing on the lease path waits for IO:
   gate a one-second cadence would write about 86k such rows per host per day
   through an idle night. Gating costs no information and bounds ambient growth
   by build activity, the same bound the spine already obeys. Bounded retention
-  (M15) is still wanted; it is no longer a precondition for turning capture on.
+  (M15) is scheduled by the daemon as well — see "Retention" below — so both
+  tables are bounded in row count and in age, not only by how much work the
+  host does.
 
 Because there are two of them, `sqlite3` is given a busy timeout — through the
 `.timeout` dot-command rather than `pragma busy_timeout`, since the pragma
@@ -397,10 +399,82 @@ sent only once a second connection has been refused `begin immediate` *and*
 the write-ahead log (truncated to zero beforehand) holds uncommitted pages.
 Both conditions are printed, so where the signal landed is on the record.
 
-**Retention is not yet wired into the daemon.** There is no flag, no cadence
-and no periodic pass: `runquotad` never calls `applyRetention`. The mechanism
-and its bounds exist and are gated; scheduling them is not done, so a
-long-lived daemon's store still grows without limit.
+### Scheduling
+
+**`runquotad` runs the pass itself, on a cadence, without being asked.** A
+sweeper thread in `retention.nim` applies the bounds above against its *own*
+`ObservationStore` handle, opened from the path. That is not tidiness: every
+request the daemon serves is handled under one daemon-wide lock, so a prune
+reached from a request handler — or from anything else holding that lock —
+stops the lease authority for as long as the delete runs. The sweeper takes
+its own lock only to read its configuration and to publish its counters,
+never across the pass, because a counter read that blocked would hold the
+daemon lock just as surely as the pass would.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--retention-sweep-interval-millis` | `3600000` (one hour) | cadence; zero or negative turns retention off and leaves capture on |
+| `--retention-max-deferred-sweeps` | `24` | how many consecutive ticks a live lease may defer a sweep |
+| `--retention-max-execution-age-millis` | `7776000000` (90 days) | negative turns the bound off; zero keeps nothing |
+| `--retention-max-executions` | `2000000` | |
+| `--retention-max-ambient-sample-age-millis` | `1209600000` (14 days) | |
+| `--retention-max-ambient-samples` | `2000000` | |
+
+A cadence rather than an event, because the bounds are configured in days: a
+pass an hour is two orders of magnitude finer than the thing it enforces, so
+the exact moment never matters and a tick is far cheaper than a growth
+estimate maintained on the write path.
+
+**A sweep prefers an idle machine and will not wait forever for one.** A bulk
+delete competes for the same disk as the work being observed, and the lease
+authority already publishes its live-lease count for the ambient sampler, so
+a tick over any interval in which a lease was live is deferred. Deferring
+without limit is not a bound, though — and a machine that is never idle is
+exactly the one whose store grows fastest — so after
+`--retention-max-deferred-sweeps` consecutive deferrals a sweep runs anyway
+and is counted separately as `forced`.
+
+The pass is reported on the daemon's third startup line (appended to the
+identity report, because the startup output is a fixed three lines consumed
+by count) and under `observations.retention` in
+`runquota inspect observations`: whether the sweeper is active, the interval,
+sweeps started / finished / deferred / forced, failures, the rows each
+category removed, the wall-clock instants the last pass started and finished,
+and the reason the last failure gave. Retention is work nobody asks for, so
+when it stops there is no request to fail and no client to tell; those
+counters are the only thing that separates "the store is being bounded" from
+"the store quietly stopped being bounded".
+
+**What a pass still costs the write path, stated plainly.** *Recording* an
+observation is an in-memory append and is never blocked by a prune — the
+integration test takes a lease and records an in-flight report inside a real
+pass and pins both against the instants the daemon stamped the pass with.
+The *drain* is a different matter: the writer's batch waits on SQLite's
+five-second busy timeout while a pass holds the write lock, and
+`LeaseFinished` flushes that writer synchronously because M13b publishes the
+aggregate on that path. So a lease that finishes mid-prune waits for the
+prune. The idle preference is what keeps that overlap rare, and the busy
+timeout is what keeps it from becoming a dropped observation.
+
+Only the first half is pinned by a test.
+`tests/integration/t_observation_retention_scheduled.nim` asserts that an
+observation recorded inside a real pass survives and that nothing was
+dropped — but that holds because the writer's 25 ms background drain wins the
+race, not because of the timeout: rebuilding with `.timeout 0` leaves the arm
+green. The timeout only does work for a pass longer than five seconds, which
+is above the fixture's ceiling. When it *is* exhausted the writer drops the
+whole batch and counts it, which is OS-2-honest and is the trade OS-1 asks
+for — losing an observation over perturbing the work — and nothing bounds how
+long a `LeaseFinished` waits below that. The realistic way to reach it is the
+first sweep over a store that accumulated before retention was scheduled.
+
+**Failures degrade and are counted (OS-1, OS-4).** A pass that cannot run —
+a full disk, a store made read-only underneath the daemon, a file somebody
+removed — increments `failures`, keeps its reason in `last_detail`, and
+changes nothing else: the sweeper keeps its cadence, and the daemon keeps
+granting leases. The handle is reopened on the next tick when it is no longer
+usable, so a transient failure does not silence retention for the daemon's
+whole life.
 
 ### Merge
 

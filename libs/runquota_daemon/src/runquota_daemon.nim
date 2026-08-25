@@ -48,7 +48,10 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     writeStatsDisabled: false,
     observationQueueCapacity: 1024,
     hostIdentityFilePath: "",
-    ambientSampleIntervalMillis: defaultAmbientCadenceMillis
+    ambientSampleIntervalMillis: defaultAmbientCadenceMillis,
+    retentionPolicy: defaultRetentionPolicy(),
+    retentionSweepIntervalMillis: defaultRetentionSweepIntervalMillis,
+    retentionMaxDeferredSweeps: defaultMaxDeferredSweeps
   )
 
 proc machineCapacity*(id: string; cpuSlots: MilliCpu; memoryBytes: Bytes;
@@ -342,11 +345,33 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
           ambientReport = "ambient sampling every " &
             $effectiveConfig.ambientSampleIntervalMillis &
             "ms while a lease is live"
+      # RETENTION IS SCHEDULED HERE, AND THIS IS THE WHOLE OF WHAT M15 WAS
+      # MISSING. The bounds, the cascade and the crash-safe prune all
+      # existed and NOTHING CALLED THEM, so a daemon that ran for a year
+      # kept a year of rows. Capture being on by default made that a
+      # promise nobody meant to make.
+      #
+      # AFTER the writer and the sampler, and deliberately: the sweeper's
+      # idle gate reads the live-lease count `setAmbientLiveLeaseCount`
+      # publishes, and starting it before the components that produce the
+      # rows it bounds would put the one thread that deletes ahead of
+      # every thread that writes.
+      var retentionReport = "retention off"
+      if effectiveConfig.retentionSweepIntervalMillis > 0:
+        startRetentionSweeper(result.observationStore.path, identity.hostId,
+          effectiveConfig.retentionPolicy,
+          effectiveConfig.retentionSweepIntervalMillis,
+          effectiveConfig.retentionMaxDeferredSweeps)
+        if retentionSweeperActive():
+          retentionReport = "retention every " &
+            $effectiveConfig.retentionSweepIntervalMillis & "ms when idle (" &
+            describe(effectiveConfig.retentionPolicy) & ")"
       result.observationIdentityReport =
         "runquota observation store " & result.observationStore.path &
           ": host " & identity.hostId & "; hardware profile " &
           (if result.observationProfileId.len > 0: result.observationProfileId
-            else: "unavailable") & "; " & ambientReport & "; " & identity.report
+            else: "unavailable") & "; " & ambientReport & "; " &
+          retentionReport & "; " & identity.report
     else:
       result.observationHostId = ""
       result.observationIdentityReport =
@@ -879,6 +904,42 @@ proc observationCaptureEnabled(daemon: RunQuotaDaemon): bool =
   ## `host_id` to carry and OS-6 forbids writing them anyway.
   daemon.observationStore.captureEnabled and daemon.observationHostId.len > 0
 
+proc retentionJson(intervalMillis: int): string =
+  ## THE SCHEDULED PASS, READABLE FROM OUTSIDE THE DAEMON.
+  ##
+  ## Retention is work nobody asks for, so when it stops there is no
+  ## request to fail and no client to tell. "The store is being bounded"
+  ## and "the store quietly stopped being bounded" are the same state to
+  ## every consumer and completely different facts to an operator, and
+  ## these counters are the only thing that can separate them.
+  ##
+  ## ``deferred`` and ``forced`` are reported APART for the same reason. A
+  ## host that never goes idle looks identical to one being swept on
+  ## schedule in every other figure here, and which of the two it is
+  ## decides whether the bound is being honoured or merely intended.
+  "\"retention\":{" &
+    "\"active\":" & $retentionSweeperActive() & "," &
+    "\"interval_millis\":" & $intervalMillis & "," &
+    "\"sweeps_started\":" & $retentionSweepsStarted() & "," &
+    "\"sweeps_finished\":" & $retentionSweepsFinished() & "," &
+    "\"deferred\":" & $retentionSweepsDeferred() & "," &
+    "\"forced\":" & $retentionSweepsForced() & "," &
+    "\"failures\":" & $retentionSweepFailures() & "," &
+    "\"executions_removed\":" & $retentionExecutionsRemoved() & "," &
+    "\"extension_rows_removed\":" & $retentionExtensionRowsRemoved() & "," &
+    "\"carried_rows_removed\":" & $retentionCarriedRowsRemoved() & "," &
+    "\"ambient_samples_removed\":" & $retentionAmbientSamplesRemoved() & "," &
+    # WALL-CLOCK INSTANTS, NOT A DURATION. A caller that wants to know
+    # whether something it did fell inside a pass needs both edges of the
+    # pass on the same clock its own timestamps came from; a duration
+    # answers a different question and cannot be turned back into this one.
+    "\"last_pass_started_at_unix_millis\":" &
+      $retentionLastPassStartedAtUnixMillis() & "," &
+    "\"last_pass_finished_at_unix_millis\":" &
+      $retentionLastPassFinishedAtUnixMillis() & "," &
+    "\"last_detail\":" & jsonEscape(retentionLastDetail()) &
+  "}"
+
 proc observationsJson(daemon: RunQuotaDaemon): string =
   ## The write path's own honesty, readable from outside the daemon.
   ##
@@ -916,7 +977,8 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
       $daemon.observationExtensionRowsRefused & "," &
     "\"queued\":" & $observationsWritten() & "," &
     "\"dropped\":" & $observationsDropped() & "," &
-    "\"write_failures\":" & $observationWriteFailures() &
+    "\"write_failures\":" & $observationWriteFailures() & "," &
+    retentionJson(daemon.config.retentionSweepIntervalMillis) &
   "}}"
 
 # ---------------------------------------------------------------------------
@@ -2401,6 +2463,7 @@ proc serve*(config: DaemonConfig): int =
     flushFile(stdout)
     stopEstimateStore(sharedDaemon.daemon.estimateStore)
     stopAmbientSampler()
+    stopRetentionSweeper()
     stopObservationWriter()
     deinitLock(sharedDaemon.lock)
     deinitConnectionQueue()
@@ -2455,6 +2518,11 @@ proc serve*(config: DaemonConfig): int =
       sharedDaemon.daemon.state = dsStopping
       stopEstimateStore(sharedDaemon.daemon.estimateStore)
       stopAmbientSampler()
+      # BEFORE the writer, and it matters. `stopRetentionSweeper` lets a
+      # pass already in flight commit; stopping the writer first would
+      # leave its final drain queued behind a transaction nothing was
+      # waiting on any more.
+      stopRetentionSweeper()
       stopObservationWriter()
       # The FILE is deliberately left behind. A table whose publisher has
       # exited is STALE, not invalid, and a stale entry is a slightly worse
