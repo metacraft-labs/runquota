@@ -72,6 +72,12 @@ proc addMetric(metrics: var seq[BenchMetric]; name, unit: string; value: float;
                extra: string) =
   metrics.add(BenchMetric(name: name, unit: unit, value: value, extra: extra))
 
+# HOW THIS BINARY WAS COMPILED, decided by the compiler rather than reported
+# by the caller. See the identical constant in `runquota_m13_bench`: a
+# published number is only comparable to another built the same way, and until
+# now nothing on either said which.
+const BuildMode* = when defined(release): "release" else: "debug"
+
 proc emitJson(metrics: openArray[BenchMetric]) =
   stdout.write("[")
   for i, metric in metrics:
@@ -80,7 +86,8 @@ proc emitJson(metrics: openArray[BenchMetric]) =
     stdout.write("{\"name\":\"" & jsonEscape(metric.name) & "\",")
     stdout.write("\"unit\":\"" & jsonEscape(metric.unit) & "\",")
     stdout.write("\"value\":" & formatFloat(metric.value, ffDecimal, 3) & ",")
-    stdout.write("\"extra\":\"" & jsonEscape(metric.extra) & "\"}")
+    stdout.write("\"extra\":\"" &
+      jsonEscape(metric.extra & "; build=" & BuildMode) & "\"}")
   stdout.write("]\n")
 
 proc elapsedMillis(startSeconds: float): float =

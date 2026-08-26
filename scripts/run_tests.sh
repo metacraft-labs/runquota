@@ -39,18 +39,10 @@ mkdir -p build/test-bin build/nimcache
 # convention for the whole repository rather than a second one here. The
 # apps build below reads it too, so `RUNQUOTA_BUILD_MODE=release` gives an
 # optimised tree end to end.
-nim_flags=(--threads:on)
-case "${RUNQUOTA_BUILD_MODE:-${REPROBUILD_BUILD_MODE:-debug}}" in
-  debug|"")
-    ;;
-  release)
-    nim_flags+=(-d:release)
-    ;;
-  *)
-    echo "unknown RUNQUOTA_BUILD_MODE: ${RUNQUOTA_BUILD_MODE:-${REPROBUILD_BUILD_MODE:-debug}}" >&2
-    exit 2
-    ;;
-esac
+# shellcheck source=scripts/lib/build_mode.sh
+. "$(dirname "$0")/lib/build_mode.sh"
+resolve_build_mode debug
+nim_flags=(--threads:on ${nim_mode_flags[@]+"${nim_mode_flags[@]}"})
 
 # Application binaries are a prerequisite for the tests (t_entrypoints and the
 # e2e suites exec them), so a failure here is fatal rather than aggregated.

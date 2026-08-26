@@ -73,6 +73,14 @@ proc addMetric(metrics: var seq[BenchMetric]; name, unit: string; value: float;
                extra: string) =
   metrics.add(BenchMetric(name: name, unit: unit, value: value, extra: extra))
 
+# HOW THIS BINARY WAS COMPILED, decided by the compiler rather than reported
+# by the caller. A published result carries it so a reader can tell whether
+# two numbers are comparable at all: this repository's benchmarks were built
+# `opt: none` for their entire history, while the shm arm they are weighed
+# against is `-d:release`, and nothing on either result said so. A flag could
+# be passed wrongly; `when defined` cannot.
+const BuildMode* = when defined(release): "release" else: "debug"
+
 proc emitJson(metrics: openArray[BenchMetric]) =
   stdout.write("[")
   for i, metric in metrics:
@@ -81,7 +89,8 @@ proc emitJson(metrics: openArray[BenchMetric]) =
     stdout.write("{\"name\":\"" & jsonEscape(metric.name) & "\",")
     stdout.write("\"unit\":\"" & jsonEscape(metric.unit) & "\",")
     stdout.write("\"value\":" & formatFloat(metric.value, ffDecimal, 4) & ",")
-    stdout.write("\"extra\":\"" & jsonEscape(metric.extra) & "\"}")
+    stdout.write("\"extra\":\"" &
+      jsonEscape(metric.extra & "; build=" & BuildMode) & "\"}")
   stdout.write("]\n")
 
 proc percentile(values: seq[float]; pct: float): float =
