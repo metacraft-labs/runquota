@@ -33,9 +33,7 @@ proc sampleRecord(label: string; exitStatus = 0'u32): DeferredExecutionRecord =
     commandStatsId = "stats-" & label,
     startedAtUnixMillis = 1_700_000_000_000'u64,
     finishedAtUnixMillis = 1_700_000_000_500'u64,
-    outcome = if exitStatus == 0: leaseFinishSucceeded else: leaseFinishFailed,
-    exitStatus = exitStatus,
-    signal = 0'u32,
+    finish = if exitStatus == 0: succeeded() else: failed(exitStatus),
     peakRssBytes = 4_000_000'u64,
     processCount = 1'u32)
 
@@ -239,7 +237,9 @@ suite "standalone_capture_rules":
     let payload = encodeDeferredObservations(sent)
 
     var received: DeferredObservationsMessage
-    check decodeDeferredObservations(payload, received)
+    var dropped = 0
+    check decodeDeferredObservations(payload, received, dropped)
+    check dropped == 0
     check received.tool == sent.tool
     check received.toolVersion == sent.toolVersion
     check received.invocationKind == sent.invocationKind
@@ -251,8 +251,8 @@ suite "standalone_capture_rules":
     check received.records[0].startedAtUnixMillis ==
       sent.records[0].startedAtUnixMillis
     check received.records[0].peakRssBytes == sent.records[0].peakRssBytes
-    check received.records[1].exitStatus == 3'u32
-    check received.records[1].outcome == leaseFinishFailed
+    check received.records[1].finish.kind == lfFailed
+    check received.records[1].finish.exitCode == 3'u32
 
     # ALL OR NOTHING, ASSERTED RATHER THAN DESCRIBED. The target is
     # PRE-LOADED with a sentinel and must come back carrying it after
@@ -271,24 +271,25 @@ suite "standalone_capture_rules":
 
     var truncated = sentinel
     check not decodeDeferredObservations(payload[0 ..< payload.len - 3],
-      truncated)
+      truncated, dropped)
     check isSentinel(truncated)
 
     var empty = sentinel
-    check not decodeDeferredObservations("", empty)
+    check not decodeDeferredObservations("", empty, dropped)
     check isSentinel(empty)
 
     # ONE BYTE SHORT OF THE LAST FIELD OF THE LAST RECORD: the reader has
     # consumed a whole batch bar one field, which is the case a
     # field-by-field decoder gets furthest with.
     var almost = sentinel
-    check not decodeDeferredObservations(payload[0 ..< payload.len - 1], almost)
+    check not decodeDeferredObservations(payload[0 ..< payload.len - 1],
+      almost, dropped)
     check isSentinel(almost)
 
     # TRAILING BYTES. A frame carrying more than this message is not this
     # message.
     var trailing = sentinel
-    check not decodeDeferredObservations(payload & "\x00", trailing)
+    check not decodeDeferredObservations(payload & "\x00", trailing, dropped)
     check isSentinel(trailing)
 
   test "a batch that claims more records than it carries is refused outright":
@@ -310,14 +311,15 @@ suite "standalone_capture_rules":
     let completenessAt = header.len - 12
     let honest = batch(@[sampleRecord("a")])
     var decoded: DeferredObservationsMessage
-    check decodeDeferredObservations(honest, decoded)
+    var dropped = 0
+    check decodeDeferredObservations(honest, decoded, dropped)
     check decoded.records.len == 1
 
     var hostile = honest
     for i in 0 ..< 4:
       hostile[countAt + i] = char(0xFF)
     var refused: DeferredObservationsMessage
-    check not decodeDeferredObservations(hostile, refused)
+    check not decodeDeferredObservations(hostile, refused, dropped)
     check MaxDeferredRecords < 0xFFFFFFFF'u32
 
     # An out-of-range completeness value is refused rather than cast into
@@ -326,7 +328,7 @@ suite "standalone_capture_rules":
     var badCompleteness = honest
     badCompleteness[completenessAt] = char(200)
     var alsoRefused: DeferredObservationsMessage
-    check not decodeDeferredObservations(badCompleteness, alsoRefused)
+    check not decodeDeferredObservations(badCompleteness, alsoRefused, dropped)
 
   # -------------------------------------------------------------------------
   # What a standalone client is allowed to say about statistics

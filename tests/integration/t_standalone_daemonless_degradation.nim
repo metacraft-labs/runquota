@@ -116,9 +116,11 @@ proc runHonestRole(socketPath: string) =
       commandStatsId = "m14-stats-key",
       startedAtUnixMillis = execution.startedAt,
       finishedAtUnixMillis = execution.finishedAt,
-      outcome = leaseFinishSucceeded,
-      exitStatus = uint32(max(execution.completion.exitCode, 0)),
-      signal = 0'u32,
+      finish =
+        if execution.completion.exited and execution.completion.exitCode > 0:
+          failed(uint32(execution.completion.exitCode))
+        else:
+          succeeded(),
       peakRssBytes = execution.completion.peakResidentMemoryBytes,
       processCount = execution.completion.processCount))
   let bufferedBeforeExit = capture.bufferedCount
@@ -663,8 +665,7 @@ suite "standalone_daemonless_degradation":
             label = label, commandStatsId = "m14-refusal-key",
             startedAtUnixMillis = uint64(max(0'i64, unixMillisNow())),
             finishedAtUnixMillis = uint64(max(0'i64, unixMillisNow())),
-            outcome = leaseFinishSucceeded, exitStatus = 0'u32,
-            signal = 0'u32, peakRssBytes = 1_000_000'u64,
+            finish = succeeded(), peakRssBytes = 1_000_000'u64,
             processCount = 1'u32)])
         client.connection.sendFrame(encodeFrame(rqDeferredObservations,
           FrameFlagRequest, 9_000'u64, encodeDeferredObservations(msg)))
@@ -707,9 +708,13 @@ suite "standalone_daemonless_degradation":
     # record costs, and the answer -- one record, not the batch -- is not
     # visible from the predicate at all.
     #
-    # ANOTHER HAND-BUILT FRAME. `StandaloneCapture` composes its records
-    # from what it measured, so a record whose outcome and exit disagree is
-    # not something the client library can be asked for.
+    # ANOTHER HAND-BUILT FRAME, AND NOW A HAND-EDITED ONE. A record's
+    # finish is a `LeaseFinish`, so a kill claim with no evidence is not
+    # something ANY client can be asked for -- not `StandaloneCapture`, not
+    # `deferredRecord`, not the constructors underneath them. The bytes are
+    # therefore made by encoding an honest kill and erasing its evidence in
+    # the buffer, which is what a peer on an older major version would put
+    # on the socket.
     const ContradictoryKey = "m14-contradiction-key"
     const HonestKey = "m14-honest-key"
     let root = scratchRoot("t")
@@ -721,26 +726,39 @@ suite "standalone_daemonless_degradation":
       check daemon.startupLines[1].contains("capture enabled")
       let now = uint64(max(0'i64, unixMillisNow()))
 
-      proc record(key: string; outcome: LeaseFinishOutcome;
-                  exitStatus, signal: uint32): DeferredExecutionRecord =
+      proc record(key: string; finish: LeaseFinish): DeferredExecutionRecord =
         deferredRecord(label = "m14-mixed", commandStatsId = key,
           startedAtUnixMillis = now, finishedAtUnixMillis = now + 5'u64,
-          outcome = outcome, exitStatus = exitStatus, signal = signal,
-          peakRssBytes = 1_000_000'u64, processCount = 1'u32)
+          finish = finish, peakRssBytes = 1_000_000'u64, processCount = 1'u32)
 
+      # A SENTINEL EXIT STATUS ON THE RECORD THAT IS ABOUT TO LOSE IT, so
+      # the four bytes to erase can be FOUND rather than counted out by
+      # hand — an offset arithmetic slip would silently corrupt a
+      # different field and this test would be about something else.
+      const Sentinel = 0x51EE_D00D'u32
       putEnv("RUNQUOTA_SOCKET", socketPath)
       var client = connectDefault()
       let msg = DeferredObservationsMessage(
         tool: "m14-mixed", toolVersion: "0.1.0", invocationKind: "standalone",
         completeness: ccDegraded, droppedObservations: 2'u32,
         records: @[
-          record(HonestKey, leaseFinishSucceeded, 0'u32, 0'u32),
-          # A memory kill beside a successful exit: `oom_killed` and
-          # "exited successfully" in one immutable row.
-          record(ContradictoryKey, leaseFinishResourceLimit, 0'u32, 0'u32),
-          record(HonestKey, leaseFinishResourceLimit, 137'u32, 0'u32)])
+          record(HonestKey, succeeded()),
+          record(ContradictoryKey, oomKilled(killedWithExitCode(Sentinel))),
+          record(HonestKey, oomKilled(killedWithExitCode(137'u32)))])
+      var payload = encodeDeferredObservations(msg)
+      var sentinelBytes = ""
+      for shift in [0, 8, 16, 24]:
+        sentinelBytes.add(char((Sentinel shr uint32(shift)) and 0xFF'u32))
+      let at = payload.find(sentinelBytes)
+      # EXACTLY ONCE, or the erase below is aimed at a coincidence.
+      check at >= 0
+      check payload.find(sentinelBytes, at + 1) < 0
+      # ERASED: `oom_killed` beside exit status 0 and no signal, which is
+      # `oom_killed` and "exited successfully" in one immutable row.
+      for i in 0 ..< 4:
+        payload[at + i] = '\0'
       client.connection.sendFrame(encodeFrame(rqDeferredObservations,
-        FrameFlagRequest, 9_100'u64, encodeDeferredObservations(msg)))
+        FrameFlagRequest, 9_100'u64, payload))
       sleep(300)
       let after = observationsJson(socketPath)
       client.close()

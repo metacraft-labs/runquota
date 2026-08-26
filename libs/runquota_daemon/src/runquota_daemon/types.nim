@@ -123,13 +123,12 @@ type
     childProcessId*: uint64
     processGroupId*: uint64
     cleanupRegistered*: bool
-    finishOutcome*: LeaseFinishOutcome
+    finish*: LeaseFinish
     finishDiagnostic*: Diagnostic
     peakMemoryBytes*: uint64
     processCount*: uint32
     majorPageFaults*: uint64
     pressureEvents*: uint32
-    hardLimitOrOom*: bool
     queueDiagnostic*: Diagnostic
     startedAtUnixMillis*: int64
       ## When the client reported the lease as starting. Observation only:

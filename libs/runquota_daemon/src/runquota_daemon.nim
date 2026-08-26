@@ -1274,13 +1274,12 @@ proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
     childProcessId: 0'u64,
     processGroupId: 0'u64,
     cleanupRegistered: false,
-    finishOutcome: leaseFinishCancelled,
+    finish: cancelled(),
     finishDiagnostic: okDiagnostic(),
     peakMemoryBytes: 0'u64,
     processCount: 0'u32,
     majorPageFaults: 0'u64,
     pressureEvents: 0'u32,
-    hardLimitOrOom: false,
     queueDiagnostic: okDiagnostic()
   )
   daemon.leases[id.value] = result
@@ -1379,7 +1378,7 @@ proc updateEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
   let key = estimateTableKey(scope, lease.commandStatsId)
   let observed = finish.peakMemoryBytes
   var conservative =
-    if finish.outcome == leaseFinishResourceLimit or finish.hardLimitOrOom:
+    if finish.finish.kind == lfOomKilled:
       max(observed, lease.resources.memory.value) * 2'u64
     else:
       max(observed, (observed * 125'u64) div 100'u64)
@@ -1395,7 +1394,7 @@ proc updateEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
     conservativeMemoryBytes: conservative,
     recentPeakMemoryBytes: observed,
     sampleCount: sampleCount,
-    lastOutcome: uint32(ord(finish.outcome)),
+    lastOutcome: uint32(ord(finish.finish.kind)),
     updatedUnixMillis: nowUnixMillis()
   )
   daemon.estimates[key] = row
@@ -1497,31 +1496,39 @@ proc reapSessionSelfReports(daemon: var RunQuotaDaemon; id: SessionId) =
   daemon.selfReportsReaped +=
     uint64(endSelfReportsForOwner(selfReportOwnerKey(id)))
 
-proc observationTermination*(finish: LeaseFinishedMessage): Termination =
-  ## The protocol's finish outcome mapped onto the specification's
+proc observationTermination*(finish: LeaseFinish): Termination =
+  ## The client's stated conclusion mapped onto the specification's
   ## termination set.
   ##
   ## EXPORTED SO THE MAPPING CAN BE ENUMERATED. Every one of the five
   ## ``Termination`` values must be REACHABLE from some finish a client can
-  ## send -- ``tTimeout`` was not until ``leaseFinishTimedOut`` existed,
-  ## and a value no code can produce is a claim the schema makes and the
-  ## daemon cannot keep. That is a property of this function, so it is
-  ## asserted on this function.
+  ## send -- ``tTimeout`` was not until ``lfTimedOut`` existed, and a value
+  ## no code can produce is a claim the schema makes and the daemon cannot
+  ## keep. That is a property of this function, so it is asserted on this
+  ## function.
   ##
-  ## THE ORDER IS SPECIFICITY, NOT CONVENIENCE. A process killed for
-  ## exceeding memory and a process killed at a deadline are both killed by
-  ## a signal, so both tests must precede the signal test or the more
-  ## specific fact is thrown away; and memory precedes the deadline because
-  ## a supervisor that reports both has told us what the kill was FOR.
-  if finish.hardLimitOrOom or finish.outcome == leaseFinishResourceLimit:
-    return tOomKilled
-  if finish.outcome == leaseFinishTimedOut:
-    return tTimeout
-  if finish.signal != 0'u32 or finish.outcome == leaseFinishCrashed:
-    return tSignalled
-  case finish.outcome
-  of leaseFinishCancelled, leaseFinishLaunchFailed: tRefused
-  else: tExited
+  ## THERE IS NO ORDERING QUESTION LEFT, AND NO ``else`` BRANCH. This used
+  ## to be a ladder of tests ordered "by specificity", because a finish
+  ## carried four overlapping fields and a kill for memory, a kill at a
+  ## deadline and a kill by signal could all be true of one message at
+  ## once; whichever test ran first won, and the comment explaining why
+  ## was longer than the code. ``LeaseFinish`` names ONE conclusion, so
+  ## this is a total function over its kinds.
+  ##
+  ## THE MISSING ``else`` IS PART OF THE PREVENTION. An eighth kind added
+  ## later is a compile error here rather than a silent fall-through onto
+  ## ``exited``, which is what an ``else`` would have made of it.
+  ##
+  ## ONE FUNCTION FOR BOTH WRITE PATHS. The standalone flush carries the
+  ## same ``LeaseFinish``, so a lease-backed row and a deferred row cannot
+  ## describe the same death with different words -- they used to be two
+  ## mappings over two shapes, kept in step by hand.
+  case finish.kind
+  of lfSucceeded, lfFailed: tExited
+  of lfCrashed: tSignalled
+  of lfOomKilled: tOomKilled
+  of lfTimedOut: tTimeout
+  of lfCancelled, lfLaunchFailed: tRefused
 
 const MaxRememberedExecutions = 4096
   ## How many finished leases keep their execution id available for an
@@ -1536,37 +1543,23 @@ proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
   ## an uncontended lock and returns, and a background thread does the IO
   ## (OS-1). A dropped row is counted, never an error to the client.
   ##
-  ## A FINISH WHOSE OWN EVIDENCE DISAGREES PRODUCES NO ROW AT ALL, and the
-  ## lease still finishes. Both halves are deliberate.
+  ## NOTHING HERE CHECKS THE FINISH AGAINST ITSELF ANY MORE, and that is
+  ## the point of ``LeaseFinish`` rather than an omission. This proc used
+  ## to open by refusing a finish that claimed a kill beside exit status 0
+  ## and no signal, because the client API let a caller state one by
+  ## accident and §"The Execution Spine" forbids a row whose termination
+  ## its other columns contradict. The claim and its evidence now travel
+  ## as one value, so ``finish.finish`` reaching this line at all is proof
+  ## it reconciles -- ``decodeLeaseFinished`` is the only way in and it
+  ## builds nothing else.
   ##
-  ## NO ROW, because the alternative verdicts are worse. Writing it stores
-  ## an immutable (OS-3) claim that a process was killed for exceeding a
-  ## bound AND exited successfully, which the specification calls
-  ## unfalsifiable and worse than an absent row. Repairing it -- demoting
-  ## the kill to ``exited`` because the exit status is zero -- would
-  ## manufacture a verdict out of evidence that does not support one.
-  ## Deriving ``termination`` from a single field instead would make the
-  ## other field dead for this purpose, and the dead one would be the
-  ## OOM evidence: a client reporting ``hardLimitOrOom`` beside
-  ## ``leaseFinishFailed`` would land on ``exited``, losing precisely the
-  ## distinction §"The Execution Spine" calls most of the value of the
-  ## column.
-  ##
-  ## THE LEASE STILL FINISHES, because refusing the message is not
-  ## available. ``LeaseFinished`` is how the authority learns the resources
-  ## are free; an error in its place strands the lease in ``running``, and
-  ## every later request on this host queues behind capacity nothing holds.
-  ## OS-4 forbids failing a client's work over capture, so the cost of the
-  ## refusal is paid where the specification says to pay it: the row is
-  ## absent, and the loss is COUNTED (OS-2) rather than hidden -- readable
-  ## through the ``observations`` inspection subject, exactly as the
-  ## one-way paths' refusals are. The client is not told, which is the
-  ## honest statement of what this costs: it believes it reported an
-  ## execution, and the store holds none.
+  ## THE REFUSAL DID NOT DISAPPEAR, IT MOVED TO THE FRAME. Bytes from a
+  ## socket are outside the type system, so the check now lives where the
+  ## bytes are read and what it catches is a MALFORMED FRAME -- see
+  ## ``leaseFinishFromWire``. The loss is still COUNTED (OS-2) in
+  ## ``observationsContradictory`` and still readable through the
+  ## ``observations`` inspection subject.
   if not daemon.observationCaptureEnabled:
-    return
-  if leaseFinishedContradiction(finish).len > 0:
-    inc daemon.observationsContradictory
     return
   if not daemon.observationRunIds.hasKey(lease.sessionId.value):
     return
@@ -1603,8 +1596,8 @@ proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
     startedAtUnixMillis: startedAt,
     finishedAtUnixMillis: finishedAt,
     durationMillis: max(0'i64, finishedAt - startedAt),
-    exitStatus: int64(finish.exitCode),
-    termination: observationTermination(finish),
+    exitStatus: int64(finish.finish.exitStatus),
+    termination: observationTermination(finish.finish),
     attempt: 1,
     retryOf: none(string),
     peakRssBytes: int64(finish.peakMemoryBytes),
@@ -1733,25 +1726,10 @@ proc recordClientExtensionRow(daemon: var RunQuotaDaemon;
     return false
   enqueueExtensionInsert(admitted.statement)
 
-proc deferredTermination*(record: DeferredExecutionRecord): Termination =
-  ## Same mapping ``observationTermination`` applies to a lease finish, on
-  ## the same enum, so a standalone row and an admitted row describe a
-  ## crash with the same word — and a deadline with the same word, which is
-  ## why ``leaseFinishTimedOut`` is answered here too rather than only on
-  ## the leased path.
-  if record.outcome == leaseFinishResourceLimit:
-    return tOomKilled
-  if record.outcome == leaseFinishTimedOut:
-    return tTimeout
-  if record.signal != 0'u32 or record.outcome == leaseFinishCrashed:
-    return tSignalled
-  case record.outcome
-  of leaseFinishCancelled, leaseFinishLaunchFailed: tRefused
-  else: tExited
-
 proc captureDeferredBatch(daemon: var RunQuotaDaemon;
                           context: ConnectionContext;
-                          msg: DeferredObservationsMessage): bool =
+                          msg: DeferredObservationsMessage;
+                          contradictory: int): bool =
   ## Record one standalone client's exit flush: a ``runs`` row and one
   ## ``executions`` row per buffered record.
   ##
@@ -1767,20 +1745,20 @@ proc captureDeferredBatch(daemon: var RunQuotaDaemon;
   ## ever granted, and every later join through it would be a join onto an
   ## invention.
   ##
-  ## A RECORD WHOSE EVIDENCE DISAGREES IS DROPPED, AND THE DROP IS ADDED TO
-  ## THE RUN'S OWN COUNT. Counted BEFORE the ``runs`` row is enqueued
-  ## because that row is immutable once written (OS-3) and carries the
-  ## window's `dropped_observations`: a loss discovered afterwards would
-  ## have nowhere to go, and OS-2 wants the verdict at the run's
-  ## granularity as well as in the daemon's counters.
+  ## A RECORD WHOSE BYTES SPELL NO ``LeaseFinish`` NEVER GETS THIS FAR,
+  ## AND THE DROP IS ADDED TO THE RUN'S OWN COUNT.
+  ## ``decodeDeferredObservations`` discards it and reports how many in
+  ## ``contradictory``, so every record below carries a finish that
+  ## reconciles by construction. The count is applied BEFORE the ``runs``
+  ## row is enqueued because that row is immutable once written (OS-3) and
+  ## carries the window's `dropped_observations`: a loss discovered
+  ## afterwards would have nowhere to go, and OS-2 wants the verdict at
+  ## the run's granularity as well as in the daemon's counters.
   if not daemon.observationCaptureEnabled:
     return false
-  if deferredObservationsRefusal(msg).len > 0:
+  if deferredObservationsRefusal(msg, contradictory).len > 0:
     return false
-  var contradictory = 0
-  for record in msg.records:
-    if deferredRecordContradiction(record).len > 0:
-      contradictory += 1
+  daemon.observationsContradictory += uint64(contradictory)
   let runId = opaqueId("run-")
   let now = unixMillisNow()
   discard enqueueRunRow(RunRow(
@@ -1800,9 +1778,6 @@ proc captureDeferredBatch(daemon: var RunQuotaDaemon;
     droppedObservations: int64(msg.droppedObservations) + int64(contradictory)
   ))
   for record in msg.records:
-    if deferredRecordContradiction(record).len > 0:
-      inc daemon.observationsContradictory
-      continue
     let startedAt = int64(record.startedAtUnixMillis)
     let finishedAt = int64(record.finishedAtUnixMillis)
     discard enqueueExecutionRow(ExecutionRow(
@@ -1819,8 +1794,8 @@ proc captureDeferredBatch(daemon: var RunQuotaDaemon;
       startedAtUnixMillis: startedAt,
       finishedAtUnixMillis: finishedAt,
       durationMillis: max(0'i64, finishedAt - startedAt),
-      exitStatus: int64(record.exitStatus),
-      termination: deferredTermination(record),
+      exitStatus: int64(record.finish.exitStatus),
+      termination: observationTermination(record.finish),
       attempt: 1,
       retryOf: none(string),
       peakRssBytes: int64(record.peakRssBytes),
@@ -1845,10 +1820,13 @@ proc captureDeferredBatch(daemon: var RunQuotaDaemon;
         else:
           some(int64(context.peer.userId))
     ))
-  # ROWS WRITTEN, not records offered. A count that included the ones this
-  # pass refused would say the flush landed whole when part of it did not.
-  inc daemon.deferredExecutionsRecorded,
-    uint64(msg.records.len - contradictory)
+  # ROWS WRITTEN, not records offered. A count that included the ones the
+  # decoder refused would say the flush landed whole when part of it did
+  # not -- and ``msg.records`` IS the rows written, because
+  # ``decodeDeferredObservations`` has already removed the others.
+  # Subtracting ``contradictory`` here as well would take the loss off the
+  # count twice.
+  inc daemon.deferredExecutionsRecorded, uint64(msg.records.len)
   true
 
 proc grantQueuedLease(daemon: var RunQuotaDaemon; id: uint64; delivered: bool) =
@@ -2231,7 +2209,26 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     )
   of rqLeaseFinished:
     var msg: LeaseFinishedMessage
-    if not decodeLeaseFinished(frame.payload, msg):
+    # A FRAME WHOSE FINISH INTEGERS SPELL NO ``LeaseFinish`` IS REFUSED
+    # LIKE ANY OTHER UNREADABLE FRAME, AND COUNTED AS A LOST EXECUTION.
+    #
+    # IT USED TO BE ACKNOWLEDGED, and that was right while a correct
+    # client could produce one: `finish` took the conclusion and its
+    # evidence as four independent parameters, so a self-contradicting
+    # finish was one argument list away on the public API, and OS-4
+    # forbids failing a client's work over capture. No client library can
+    # produce these bytes any more -- ``LeaseFinish`` has nowhere to put
+    # them -- so a peer that sends them is speaking a protocol this daemon
+    # does not, and pretending to have understood it is the less honest of
+    # the two answers. The peer is told, and the ``observations`` subject
+    # still carries the count OS-2 asks for.
+    let decoded = decodeLeaseFinished(frame.payload, msg)
+    if decoded == lfdContradictoryFinish:
+      inc daemon.observationsContradictory
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "LeaseFinished names an outcome its own evidence cannot support"))
+      return
+    if decoded != lfdOk:
       connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
           "invalid LeaseFinished payload"))
       return
@@ -2244,13 +2241,12 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           diagInvalidArgument, "lease is not running"))
       return
     daemon.transitionLeaseState(lease, leaseStateFinished)
-    lease.finishOutcome = msg.outcome
+    lease.finish = msg.finish
     lease.finishDiagnostic = msg.diagnostic
     lease.peakMemoryBytes = msg.peakMemoryBytes
     lease.processCount = msg.processCount
     lease.majorPageFaults = msg.majorPageFaults
     lease.pressureEvents = msg.pressureEvents
-    lease.hardLimitOrOom = msg.hardLimitOrOom
     daemon.updateEstimateFromFinish(lease, msg)
     daemon.captureObservation(lease, msg)
     # M13b: AS IT FOLDS IN THIS RUN'S RESULTS, and after the row has been
@@ -2300,10 +2296,11 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     # A REFUSAL IS THEREFORE COUNTED RATHER THAN REPORTED, and readable
     # through the `observations` inspection subject.
     var msg: DeferredObservationsMessage
-    if not decodeDeferredObservations(frame.payload, msg):
+    var contradictory = 0
+    if not decodeDeferredObservations(frame.payload, msg, contradictory):
       inc daemon.deferredBatchesRefused
       return
-    if daemon.captureDeferredBatch(context, msg):
+    if daemon.captureDeferredBatch(context, msg, contradictory):
       inc daemon.deferredBatchesAccepted
     else:
       inc daemon.deferredBatchesRefused

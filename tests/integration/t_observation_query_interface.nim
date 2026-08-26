@@ -135,7 +135,7 @@ proc completeOneExecution(client: var RunQuotaClient; statsKey: string) =
   lease.markStarting()
   lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
   sleep(30)
-  lease.finish(outcome = leaseFinishSucceeded, exitCode = 0'u32,
+  lease.finish(outcome = succeeded(),
     peakMemoryBytes = 5_000_000'u64, processCount = 1'u32,
     majorPageFaults = 0'u64)
   lease.release()
@@ -516,7 +516,7 @@ suite "observation_query_interface":
       check seedLease.active
       seedLease.markStarting()
       seedLease.markRunning(childProcessId = uint64(getCurrentProcessId()))
-      seedLease.finish(outcome = leaseFinishSucceeded, exitCode = 0'u32,
+      seedLease.finish(outcome = succeeded(),
         peakMemoryBytes = ObservedPeakBytes, processCount = 1'u32,
         majorPageFaults = 0'u64)
       seedLease.release()
@@ -665,7 +665,7 @@ suite "observation_query_interface":
         check lease.active
         lease.markStarting()
         lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
-        lease.finish(outcome = leaseFinishSucceeded, exitCode = 0'u32,
+        lease.finish(outcome = succeeded(),
           peakMemoryBytes = 5_000_000'u64, processCount = 1'u32,
           majorPageFaults = 0'u64)
         lease.release()

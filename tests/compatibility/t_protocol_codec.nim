@@ -262,17 +262,42 @@ suite "RQSP protocol and codec":
     check decoded.extensionRows[0].values == @["a", "7"]
 
   test "compatibility rejects unsupported major versions":
-    let result = compatible(HelloMessage(
-      clientName: "old",
-      clientVersion: "0.0.1",
-      minProtocolMajor: 2'u16,
-      maxProtocolMajor: 2'u16,
-      processId: 1'u64,
-      userId: 1'u64,
-      desiredCapabilities: ""
-    ))
-    check not result.compatible
-    check result.diagnostic.code == diagUnsupportedVersion
+    ## THE FIXTURE IS MAJOR 1, AND THAT IS THE POINT OF THE BUMP. RQSP 2
+    ## changed the shape and the meaning of ``LeaseFinished`` -- the
+    ## finish now carries the evidence for its own conclusion and the
+    ## trailing ``hardLimitOrOom`` byte is gone -- so a version-1 peer's
+    ## payload is a different length and its fields mean different things.
+    ## No reading of it is compatible, and this is where that is refused:
+    ## at the handshake, before a lease exists, rather than at a
+    ## ``LeaseFinished`` whose refusal would strand one.
+    ##
+    ## IT USED TO NAME MAJOR 2 AS THE UNSUPPORTED ONE, when 2 was simply
+    ## "one past the end". Leaving it there after the bump would have made
+    ## the clause assert that the daemon refuses ITSELF.
+    proc verdict(major: uint16): CompatibilityResult =
+      compatible(HelloMessage(
+        clientName: "peer",
+        clientVersion: "0.0.1",
+        minProtocolMajor: major,
+        maxProtocolMajor: major,
+        processId: 1'u64,
+        userId: 1'u64,
+        desiredCapabilities: ""
+      ))
+
+    let old = verdict(1'u16)
+    check not old.compatible
+    check old.diagnostic.code == diagUnsupportedVersion
+
+    let ahead = verdict(RqspProtocolMajor + 1'u16)
+    check not ahead.compatible
+
+    # AND THE ACCEPTING CASE, without which the two refusals above are
+    # satisfied by a handshake that refuses everyone.
+    let current = verdict(RqspProtocolMajor)
+    check current.compatible
+    check current.selectedMajor == RqspProtocolMajor
+    check current.selectedMinor == RqspProtocolMinor
 
   test "lease lifecycle messages keep child completion explicit":
     let running = LeaseRunningMessage(
@@ -290,22 +315,40 @@ suite "RQSP protocol and codec":
     let finished = LeaseFinishedMessage(
       sessionId: sessionId(1),
       leaseId: leaseId(2),
-      outcome: leaseFinishCrashed,
-      exitCode: 0'u32,
-      signal: 11'u32,
+      finish: crashed(11'u32),
       peakMemoryBytes: 4096'u64,
       processCount: 2'u32,
       majorPageFaults: 3'u64,
       pressureEvents: 1'u32,
-      hardLimitOrOom: true,
       diagnostic: diagnostic(diagCancelled, "child crashed")
     )
     var decodedFinished: LeaseFinishedMessage
-    check decodeLeaseFinished(encodeLeaseFinished(finished), decodedFinished)
-    check decodedFinished.outcome == leaseFinishCrashed
-    check decodedFinished.signal == 11'u32
+    check decodeLeaseFinished(encodeLeaseFinished(finished),
+      decodedFinished) == lfdOk
+    check decodedFinished.finish.kind == lfCrashed
+    check decodedFinished.finish.crashSignal == 11'u32
     check decodedFinished.peakMemoryBytes == 4096'u64
-    check decodedFinished.hardLimitOrOom
+
+    # EVERY KIND ROUND-TRIPS, INCLUDING BOTH SHAPES OF KILL EVIDENCE. The
+    # wire carries three integers and the type carries one variant, so a
+    # per-kind round trip is the only thing that shows the two agree about
+    # which integer means what -- a single crashed fixture would be
+    # satisfied by an encoder that wrote the signal into the exit-status
+    # slot for every arm.
+    for probe in [succeeded(), failed(7'u32), crashed(11'u32),
+                  oomKilled(killedWithExitCode(137'u32)),
+                  oomKilled(killedBySignal(9'u32)),
+                  timedOut(killedWithExitCode(124'u32)),
+                  timedOut(killedBySignal(15'u32)),
+                  cancelled(), launchFailed()]:
+      var back: LeaseFinishedMessage
+      let payload = encodeLeaseFinished(LeaseFinishedMessage(
+        sessionId: sessionId(1), leaseId: leaseId(2), finish: probe,
+        diagnostic: okDiagnostic()))
+      check decodeLeaseFinished(payload, back) == lfdOk
+      check back.finish.kind == probe.kind
+      check back.finish.wireExitCode == probe.wireExitCode
+      check back.finish.wireSignal == probe.wireSignal
 
   test "status reports supervisor-lost and finished leases separately":
     let status = DaemonStatusMessage(

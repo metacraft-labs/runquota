@@ -673,24 +673,30 @@ proc reportObservation*(lease: var RunQuotaLease; cpuMilliPct: uint32;
   except CatchableError:
     discard
 
-proc finish*(lease: var RunQuotaLease; outcome = leaseFinishSucceeded;
-             exitCode = 0'u32; signal = 0'u32; finishDiagnostic = okDiagnostic();
+proc finish*(lease: var RunQuotaLease; outcome = succeeded();
+             finishDiagnostic = okDiagnostic();
              peakMemoryBytes = 0'u64; processCount = 0'u32;
-             majorPageFaults = 0'u64; pressureEvents = 0'u32;
-             hardLimitOrOom = false) =
+             majorPageFaults = 0'u64; pressureEvents = 0'u32) =
+  ## Report how this execution ended, and free what it held.
+  ##
+  ## ONE PARAMETER SAYS WHY IT ENDED, and it is a ``LeaseFinish``. It used
+  ## to be four -- an outcome, an exit code, a signal and an
+  ## ``hardLimitOrOom`` flag -- which between them could describe a
+  ## process that was killed for exceeding memory AND exited successfully.
+  ## The daemon had to refuse that at runtime because this signature let a
+  ## caller write it by accident. It no longer can: the conclusion and the
+  ## evidence for it arrive together or not at all, and the constructors
+  ## in ``runquota_protocol`` are the only way to pair them.
   if not lease.active:
     return
   let msg = LeaseFinishedMessage(
     sessionId: lease.session[].id,
     leaseId: lease.id,
-    outcome: outcome,
-    exitCode: exitCode,
-    signal: signal,
+    finish: outcome,
     peakMemoryBytes: peakMemoryBytes,
     processCount: processCount,
     majorPageFaults: majorPageFaults,
     pressureEvents: pressureEvents,
-    hardLimitOrOom: hardLimitOrOom,
     diagnostic: finishDiagnostic
   )
   let requestId = lease.session[].client[].requestFrame(rqLeaseFinished,
@@ -778,20 +784,23 @@ proc flushStandaloneAtExit*(capture: var StandaloneCapture;
 
 proc deferredRecord*(label, commandStatsId: string;
                      startedAtUnixMillis, finishedAtUnixMillis: uint64;
-                     outcome: LeaseFinishOutcome; exitStatus, signal: uint32;
+                     finish: LeaseFinish;
                      peakRssBytes: uint64; processCount: uint32;
                      majorPageFaults = 0'u64): DeferredExecutionRecord =
   ## One buffered execution, from figures the client MEASURED about a child
   ## it ran itself. Same rule as ``reportObservation``: never a request's
   ## reserved resources, which is a number nobody measured.
+  ##
+  ## THE SAME ``LeaseFinish`` THE LEASED PATH SENDS, so a standalone row
+  ## and an admitted row cannot describe the same death with different
+  ## words -- and so the impossible states are impossible on both paths
+  ## from one type rather than from two rules kept in step by hand.
   DeferredExecutionRecord(
     label: label,
     commandStatsId: commandStatsId,
     startedAtUnixMillis: startedAtUnixMillis,
     finishedAtUnixMillis: finishedAtUnixMillis,
-    exitStatus: exitStatus,
-    signal: signal,
-    outcome: outcome,
+    finish: finish,
     peakRssBytes: peakRssBytes,
     processCount: processCount,
     majorPageFaults: majorPageFaults

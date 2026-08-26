@@ -112,7 +112,7 @@ proc completeOneExecution(client: var RunQuotaClient; statsKey: string;
   lease.markStarting()
   lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
   sleep(20)
-  lease.finish(outcome = leaseFinishSucceeded, exitCode = 0'u32,
+  lease.finish(outcome = succeeded(),
     peakMemoryBytes = peakBytes, processCount = 1'u32, majorPageFaults = 0'u64)
   lease.release()
   session.closeSession()

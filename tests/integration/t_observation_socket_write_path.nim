@@ -166,24 +166,14 @@ proc completeOneExecution(client: var RunQuotaClient; label: string;
     lease.reportObservation(CrashCpuMilliPct, CrashRssBytes,
       uint64(unixMillisNow()))
   sleep(60)
-  lease.finish(outcome = leaseFinishSucceeded, exitCode = 0'u32,
+  lease.finish(outcome = succeeded(),
     peakMemoryBytes = 1_234_567'u64, processCount = 3'u32,
     majorPageFaults = 11'u64)
   lease.release()
   session.closeSession()
 
-proc finishOneExecution(client: var RunQuotaClient; label, key: string;
-                        outcome: LeaseFinishOutcome; exitCode = 0'u32;
-                        signal = 0'u32; hardLimitOrOom = false) =
-  ## The same whole execution, with the FINISH spelled out by the caller.
-  ##
-  ## THIS IS A REAL CLIENT DOING SOMETHING A SENSIBLE ONE WOULD NOT.
-  ## ``RunQuotaLease.finish`` takes ``outcome`` and ``hardLimitOrOom`` as
-  ## two independent defaulted parameters and cross-validates neither, so
-  ## a finish that contradicts itself needs no forged frame and no fixture
-  ## — it is one argument list away on the public API, which is why the
-  ## daemon has to be the one that refuses it.
-  var session = client.registerSession("m13-" & label, "0.2.0")
+proc leaseForKey(client: var RunQuotaClient; session: var RunQuotaSession;
+                 label, key: string): RunQuotaLease =
   # THE STATS KEY IS SET EXPLICITLY. `resourceRequest` leaves
   # `commandStatsId` empty, and four executions sharing one empty key would
   # make the rows below indistinguishable from each other — which is the
@@ -191,13 +181,61 @@ proc finishOneExecution(client: var RunQuotaClient; label, key: string;
   var request = resourceRequest(label, milliCpu(1000),
     bytes(256'u64 * 1024'u64 * 1024'u64))
   request.commandStatsId = key
-  var lease = session.requestLease(request)
-  doAssert lease.active
-  lease.markStarting()
-  lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
-  lease.finish(outcome = outcome, exitCode = exitCode, signal = signal,
-    peakMemoryBytes = 1_234_567'u64, processCount = 3'u32,
-    majorPageFaults = 11'u64, hardLimitOrOom = hardLimitOrOom)
+  result = session.requestLease(request)
+  doAssert result.active
+  result.markStarting()
+  result.markRunning(childProcessId = uint64(getCurrentProcessId()))
+
+proc finishOneExecution(client: var RunQuotaClient; label, key: string;
+                        outcome: LeaseFinish) =
+  ## The same whole execution, with the FINISH spelled out by the caller.
+  var session = client.registerSession("m13-" & label, "0.2.0")
+  var lease = leaseForKey(client, session, label, key)
+  lease.finish(outcome = outcome, peakMemoryBytes = 1_234_567'u64,
+    processCount = 3'u32, majorPageFaults = 11'u64)
+  lease.release()
+  session.closeSession()
+
+proc forgeUnevidencedKill(client: var RunQuotaClient;
+                          label, key: string): RqspFrame =
+  ## The same execution, finished with BYTES THAT NO CLIENT CAN BUILD.
+  ##
+  ## THE FRAME IS FORGED, AND IT HAS TO BE. This probe used to be one
+  ## argument list on the public API: `finish` took the outcome and the
+  ## kill evidence as independently defaulted parameters, so "killed for
+  ## exceeding memory, exit status 0, no signal" was reachable from a real
+  ## client by accident. `LeaseFinish` has nowhere to put that, and the
+  ## constructors refuse the zero, so the only remaining producer of these
+  ## bytes is something that never went through either — a peer on an
+  ## older major version, a corrupted buffer, a fuzzer. That is what this
+  ## sends: the wire's three finish integers written by hand as
+  ## `oom_killed, 0, 0`.
+  ##
+  ## THE LEASE IS RELEASED EXPLICITLY afterwards. The daemon answers this
+  ## frame with an error rather than an ack, so the lease is still
+  ## `running` and still holds capacity; a supervising client that got an
+  ## error back would release, and so does this.
+  var session = client.registerSession("m13-" & label, "0.2.0")
+  var lease = leaseForKey(client, session, label, key)
+  var payload = encodeLeaseFinished(LeaseFinishedMessage(
+    sessionId: session.id,
+    leaseId: lease.id,
+    finish: oomKilled(killedWithExitCode(137'u32)),
+    peakMemoryBytes: 1_234_567'u64,
+    processCount: 3'u32,
+    majorPageFaults: 11'u64,
+    diagnostic: okDiagnostic()))
+  # The exit-status word sits immediately after the two ids and the kind,
+  # so zeroing it leaves a kill claim with no evidence at all.
+  const ExitStatusAt = 8 + 8 + 4
+  doAssert payload[ExitStatusAt] == char(137)
+  for i in 0 ..< 4:
+    payload[ExitStatusAt + i] = '\0'
+  inc client.nextRequestId
+  let requestId = client.nextRequestId
+  client.connection.sendFrame(encodeFrame(rqLeaseFinished, FrameFlagRequest,
+    requestId, payload))
+  doAssert client.connection.receiveFrame(result)
   lease.release()
   session.closeSession()
 
@@ -292,7 +330,7 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
   #
   # AGAINST THE DAEMON BINARY, and it has to be. The refusal lives in
-  # `captureObservation`, which runs in `runquotad`; a mutation that only
+  # `decodeLeaseFinished`, which runs in `runquotad`; a mutation that only
   # recompiled this file would leave `build/bin/runquotad` in place and
   # read green, which is the trap M10 and M11 both recorded.
   #
@@ -301,8 +339,16 @@ suite "observation_socket_write_path":
   # produce three rows through the same code path, so "no fourth row" is a
   # statement about the refusal rather than about a daemon that recorded
   # nothing.
+  #
+  # THE FOURTH IS NOW A FORGED FRAME, AND THAT IS THE WHOLE OF THE CHANGE.
+  # It used to be a real client call, because `finish` took the conclusion
+  # and its evidence as four independent parameters and a contradictory
+  # finish was one argument list away. `LeaseFinish` has nowhere to put
+  # one, so the bytes have to come from something that never went through
+  # a constructor — which is exactly what the refusal is FOR now, and what
+  # the daemon answers as a malformed frame rather than acknowledging.
 
-  test "a finish whose own evidence disagrees writes no row, and says so":
+  test "bytes that spell no finish write no row, and say so":
     const
       ExitedKey = "m13-contra-exited"
       OomKey = "m13-contra-oom"
@@ -323,26 +369,26 @@ suite "observation_socket_write_path":
     var settled: seq[ExecutionRow] = @[]
     var reported: JsonNode = nil
     var status = DaemonStatusMessage()
+    var answer = RqspFrame()
     try:
       var client = connectDefault()
 
-      # (1) NEITHER KILL FIELD: an ordinary non-zero exit.
-      client.finishOneExecution("contra-exited", ExitedKey,
-        leaseFinishFailed, exitCode = 1'u32)
-      # (2) THE OUTCOME ENUM ALONE, beside the exit status a real OOM kill
-      #     leaves behind. Two facts that reconcile.
+      # (1) AN ORDINARY NON-ZERO EXIT, no kill claimed.
+      client.finishOneExecution("contra-exited", ExitedKey, failed(1'u32))
+      # (2) A MEMORY KILL, evidenced by the exit status a real OOM kill
+      #     leaves behind. A conclusion and evidence that support it.
       client.finishOneExecution("contra-oom", OomKey,
-        leaseFinishResourceLimit, exitCode = 137'u32)
+        oomKilled(killedWithExitCode(137'u32)))
       # (3) A DEADLINE, delivered by the signal a deadline is delivered by.
-      #     Before `leaseFinishTimedOut` existed this row said `signalled`
-      #     and the deadline was not recoverable from the store at all.
+      #     Before `lfTimedOut` existed this row said `signalled` and the
+      #     deadline was not recoverable from the store at all.
       client.finishOneExecution("contra-timeout", TimeoutKey,
-        leaseFinishTimedOut, signal = 9'u32)
-      # (4) THE FLAG ALONE, beside exit status 0 and no signal: an
-      #     immutable row asserting both that this process was killed for
-      #     exceeding memory and that it exited successfully.
-      client.finishOneExecution("contra-impossible", ContradictoryKey,
-        leaseFinishFailed, hardLimitOrOom = true)
+        timedOut(killedBySignal(9'u32)))
+      # (4) A KILL CLAIM WITH ITS EVIDENCE ERASED ON THE WIRE: bytes
+      #     asserting both that this process was killed for exceeding
+      #     memory and that it exited successfully.
+      answer = client.forgeUnevidencedKill("contra-impossible",
+        ContradictoryKey)
 
       rows = waitForExecutions(expectedDb, 3)
       # A WHOLE SECOND FOR A FOURTH ROW TO SHOW UP LATE. Without it "three
@@ -356,14 +402,23 @@ suite "observation_socket_write_path":
     finally:
       daemon.stop()
 
-    # EVERY LEASE WAS GRANTED AND FINISHED, INCLUDING THE FOURTH. This is
-    # the half that makes the refusal a degradation rather than a failure:
-    # `finish` raises when the daemon does not acknowledge, so reaching
-    # here at all means the contradictory finish was acknowledged — and had
-    # it not been, the lease would sit in `running` and hold capacity
-    # nothing is using, which is a worse outcome than an absent row.
+    # EVERY LEASE WAS GRANTED; THREE OF THE FOUR FINISHED. The fourth's
+    # frame was refused, so nothing about it was recorded — and the
+    # capacity it held was freed by the release the client sent after
+    # reading the error, which is the half that keeps the refusal from
+    # stranding a lease.
     check status.totalGranted == 4'u64
-    check status.totalFinished == 4'u64
+    check status.totalFinished == 3'u64
+
+    # AND THE PEER WAS TOLD, in the vocabulary it can act on. The frame is
+    # unreadable, so it is answered like any other unreadable frame rather
+    # than acknowledged as if it had been understood.
+    check answer.header.messageKind == rqError
+    check (answer.header.flags and FrameFlagError) != 0'u16
+    var errorMessage = ProtocolErrorMessage()
+    check decodeProtocolError(answer.payload, errorMessage)
+    check errorMessage.diagnostic.code == diagProtocol
+    check "evidence" in errorMessage.diagnostic.message
 
     var byKey = initTable[string, ExecutionRow]()
     for row in settled:
@@ -380,14 +435,24 @@ suite "observation_socket_write_path":
     # THE DEADLINE SURVIVED THE SIGNAL IT WAS DELIVERED WITH, over the real
     # wire and out of the real database.
     check byKey[TimeoutKey].termination == tTimeout
+    # AND SO DID THE SIGNAL NUMBER, which is the only place it can be: the
+    # spine has no signal column, so `exit_status` renders the kill as
+    # 128 + 9 and a reader gets the 9 back by subtracting. A row saying
+    # `timeout` beside `exit_status = 0` would be asserting that this
+    # process was killed at a deadline AND exited successfully.
+    check byKey[TimeoutKey].exitStatus == 137
+    # READ OUT OF SQLITE, NOT COMPUTED HERE: no killed execution in this
+    # store reads as a success.
+    for row in settled:
+      if row.termination in {tSignalled, tOomKilled, tTimeout}:
+        check row.exitStatus != 0
 
     # AND THE FOURTH PRODUCED NOTHING. Not a row with a repaired verdict,
     # not a row with a NULL termination: no row.
     check not byKey.hasKey(ContradictoryKey)
 
-    # COUNTED, NOT HIDDEN (OS-2). The client was acknowledged and believes
-    # it reported an execution the store does not hold, so this counter is
-    # the only place that loss is visible.
+    # COUNTED, NOT HIDDEN (OS-2). A peer sent an execution the store does
+    # not hold, and this counter is where that loss is visible.
     check reported != nil
     check reported["executions_contradictory"].getInt() == 1
     # AND THE HONEST THREE COST NOTHING: a refusal that fired on everything
@@ -804,7 +869,7 @@ suite "observation_socket_write_path":
       # only the session teardown reaped them, `self_*` would grow across
       # every execution of a long-lived client and drive `foreign_*` to the
       # clamp — the same leak as the crash case, just slower.
-      victimLease.finish(outcome = leaseFinishSucceeded)
+      victimLease.finish(outcome = succeeded())
       victimLease.release()
       var settledAfterRelease = victim.observations()
       for _ in 0 ..< 200:
@@ -937,7 +1002,7 @@ suite "observation_socket_write_path":
       # AND THE CONNECTION IS STILL GOOD. A malformed observation must cost
       # the observation and nothing else: it must not close the session,
       # and the next real request must get its own answer.
-      lease.finish(outcome = leaseFinishSucceeded)
+      lease.finish(outcome = succeeded())
       lease.release()
       session.closeSession()
       check client.daemonStatus().totalFinished >= 1'u64

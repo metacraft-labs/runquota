@@ -192,43 +192,100 @@ type
     sessionId*: SessionId
     leaseId*: LeaseId
 
-  LeaseFinishOutcome* = enum
-    ## Why an execution ended, as the supervising client saw it.
+  KillEvidence* = object
+    ## What a supervisor SAW when it says a process was killed.
     ##
-    ## ``leaseFinishTimedOut`` IS HERE BECAUSE THE SPINE HAS NOWHERE ELSE
-    ## TO LEARN IT. The observation store's ``termination`` column names
-    ## ``timeout`` as one of its five kinds, and until this member existed
-    ## no value of this enum and no other field of ``LeaseFinishedMessage``
-    ## could produce it: a deadline is a POLICY THE CLIENT HOLDS, RunQuota
-    ## imposes none, and every fact that reaches the daemon about a
-    ## timed-out execution -- a non-zero exit, a kill signal -- is
-    ## indistinguishable from an ordinary kill. A timed-out execution
-    ## therefore landed on the spine as ``signalled``, which is true and
-    ## useless, and the schema carried a value no code could ever write.
+    ## A KILL CLAIM WITHOUT EVIDENCE IS THE STATE THIS TYPE ABOLISHES.
+    ## ``reprobuild-specs/RunQuota-Observation-Store.md`` §"The Execution
+    ## Spine" says a row MUST NOT carry a termination its other columns
+    ## contradict, and the pair that cannot both be true is a kill beside
+    ## exit status 0 with no signal: the kill says the supervisor ENDED
+    ## this process, the clean exit says it ended of its own accord and
+    ## succeeded. That row is immutable (OS-3) and unfalsifiable, and no
+    ## later reader can tell it from a measurement.
     ##
-    ## APPENDED, NEVER INSERTED. ``decodeLeaseFinished`` bounds the wire
-    ## ordinal by ``high(LeaseFinishOutcome)``, so an older peer's five
-    ## values keep their meanings and a newer peer's sixth is simply one
-    ## an older daemon would refuse rather than misread.
-    leaseFinishSucceeded
-    leaseFinishFailed
-    leaseFinishCrashed
-    leaseFinishResourceLimit
-    leaseFinishCancelled
-    leaseFinishLaunchFailed
-    leaseFinishTimedOut
+    ## A VARIANT RATHER THAN TWO INTEGERS, so the state is not refused but
+    ## ABSENT. Two independent fields make "both zero" statable, and
+    ## anything statable eventually gets stated; one field per arm makes
+    ## the conjunction impossible to write down. The remaining hole --
+    ## naming an arm and leaving its single integer at zero -- is closed
+    ## by ``killedBySignal``/``killedWithExitCode``, which are the only
+    ## way to name one and refuse zero.
+    ##
+    ## SIGNAL AND EXIT STATUS ARE STILL BOTH ACCEPTABLE EVIDENCE. A
+    ## supervisor on POSIX that reaped its child knows the signal; one
+    ## that only holds a status integer (Windows, or a wrapper that
+    ## reports 128+N) knows the exit code. Either falsifies the claim,
+    ## which is all the spine asks for.
+    case bySignal*: bool
+    of true:
+      signal*: uint32
+    of false:
+      exitCode*: uint32
+
+  LeaseFinishKind* = enum
+    ## The CONCLUSION a supervising client reached about its own
+    ## execution. Each arm of ``LeaseFinish`` carries exactly the evidence
+    ## its conclusion requires and nothing else.
+    ##
+    ## ``lfTimedOut`` IS HERE BECAUSE THE SPINE HAS NOWHERE ELSE TO LEARN
+    ## IT. The observation store's ``termination`` column names ``timeout``
+    ## as one of its five kinds, and no other member could produce it: a
+    ## deadline is a POLICY THE CLIENT HOLDS, RunQuota imposes none, and
+    ## every fact that reaches the daemon about a timed-out execution -- a
+    ## non-zero exit, a kill signal -- is indistinguishable from an
+    ## ordinary kill. Without this member a timed-out execution landed on
+    ## the spine as ``signalled``, which is true and useless.
+    lfSucceeded
+    lfFailed
+    lfCrashed
+    lfOomKilled
+    lfCancelled
+    lfLaunchFailed
+    lfTimedOut
+
+  LeaseFinish* = object
+    ## Why an execution ended, as the supervising client saw it, together
+    ## with the evidence for it.
+    ##
+    ## ONE FIELD NAMES THE CONCLUSION. It replaced four independently
+    ## settable ones -- an outcome enum, an exit code, a signal and an
+    ## ``hardLimitOrOom`` flag -- whose combinations included states that
+    ## cannot be true, and which the daemon therefore had to refuse at
+    ## runtime. The refusals are gone because the states are: a defect
+    ## that has no representation needs no handling.
+    ##
+    ## ``lfSucceeded`` CARRIES NOTHING, which is the whole of the second
+    ## impossible state. A finish that says the work succeeded cannot also
+    ## hand over a kill's evidence or a non-zero exit, because there is no
+    ## field to put one in.
+    ##
+    ## ``lfFailed`` AND ``lfCrashed`` CARRY DIFFERENT THINGS ON PURPOSE. A
+    ## process that died of a signal has no exit status at all, so
+    ## ``lfCrashed`` names the signal and the spine records ``exit_status
+    ## = 0`` meaning "not applicable"; a process that returned a status
+    ## names it, and the constructor refuses zero because "failed with
+    ## exit status 0" is the same contradiction in a smaller costume.
+    case kind*: LeaseFinishKind
+    of lfSucceeded:
+      discard
+    of lfFailed:
+      exitCode*: uint32
+    of lfCrashed:
+      crashSignal*: uint32
+    of lfOomKilled, lfTimedOut:
+      kill*: KillEvidence
+    of lfCancelled, lfLaunchFailed:
+      discard
 
   LeaseFinishedMessage* = object
     sessionId*: SessionId
     leaseId*: LeaseId
-    outcome*: LeaseFinishOutcome
-    exitCode*: uint32
-    signal*: uint32
+    finish*: LeaseFinish
     peakMemoryBytes*: uint64
     processCount*: uint32
     majorPageFaults*: uint64
     pressureEvents*: uint32
-    hardLimitOrOom*: bool
     diagnostic*: Diagnostic
 
   LeaseFinishedAckMessage* = object
@@ -291,9 +348,7 @@ type
     commandStatsId*: string
     startedAtUnixMillis*: uint64
     finishedAtUnixMillis*: uint64
-    exitStatus*: uint32
-    signal*: uint32
-    outcome*: LeaseFinishOutcome
+    finish*: LeaseFinish
     peakRssBytes*: uint64
     processCount*: uint32
     majorPageFaults*: uint64
@@ -561,3 +616,165 @@ type
     selectedMajor*: uint16
     selectedMinor*: uint16
     diagnostic*: Diagnostic
+
+# ---------------------------------------------------------------------------
+# The only way to name a finish
+# ---------------------------------------------------------------------------
+#
+# THE TYPE ABOVE MAKES THE IMPOSSIBLE STATES UNWRITABLE; THESE CLOSE THE
+# LAST HOLE IN IT. A variant arm cannot hold a signal AND an exit status,
+# so "killed, exit status 0, signal 0" has no representation at all -- but
+# an arm holding one integer can still be left at zero, and zero is the
+# value that means "no evidence". So no constructor accepts it, and there
+# is no other constructor: a caller reaches these or it reaches nothing.
+#
+# THEY RAISE RATHER THAN RETURNING A SENTINEL, because a sentinel finish
+# is a finish, and it would travel. A supervisor that cannot tell what
+# happened has an honest thing to say -- ``cancelled()`` -- and
+# ``killEvidence`` below is how it finds out that is what it must say.
+
+proc killedBySignal*(signal: uint32): KillEvidence =
+  ## A kill the supervisor reaped: it holds the signal number.
+  if signal == 0'u32:
+    raise newException(ValueError,
+      "a kill reported by signal must name a non-zero signal")
+  KillEvidence(bySignal: true, signal: signal)
+
+proc killedWithExitCode*(exitCode: uint32): KillEvidence =
+  ## A kill the supervisor knows only as a status integer.
+  ##
+  ## NOT A LESSER FORM OF THE ABOVE. On Windows there are no POSIX
+  ## signals and a killed child is reported as a raw exit code, so this is
+  ## the ONLY evidence a Windows supervisor can offer for a deadline kill
+  ## -- and without it every timed-out execution there would have to
+  ## degrade to ``cancelled``.
+  if exitCode == 0'u32:
+    raise newException(ValueError,
+      "a kill reported by exit status must carry a non-zero one")
+  KillEvidence(bySignal: false, exitCode: exitCode)
+
+proc killEvidence*(exitCode, signal: uint32; kill: var KillEvidence): bool =
+  ## The evidence a supervisor actually holds, or ``false`` when it holds
+  ## none.
+  ##
+  ## THE ONE PLACE EVERY CLIENT DEGRADES THE SAME WAY. A client that
+  ## cannot evidence a kill must not claim one, and the alternative it
+  ## must fall back to (``cancelled()``) is the same everywhere; writing
+  ## that decision once keeps two supervisors from disagreeing about what
+  ## an unevidenced deadline is.
+  ##
+  ## THE SIGNAL WINS WHEN BOTH ARE PRESENT: it is the kernel's own record
+  ## of the kill, while a status integer is at best a convention over it.
+  if signal != 0'u32:
+    kill = KillEvidence(bySignal: true, signal: signal)
+    true
+  elif exitCode != 0'u32:
+    kill = KillEvidence(bySignal: false, exitCode: exitCode)
+    true
+  else:
+    false
+
+proc succeeded*(): LeaseFinish = LeaseFinish(kind: lfSucceeded)
+
+proc failed*(exitCode: uint32): LeaseFinish =
+  if exitCode == 0'u32:
+    raise newException(ValueError,
+      "a failed finish must carry a non-zero exit status")
+  LeaseFinish(kind: lfFailed, exitCode: exitCode)
+
+proc crashed*(signal: uint32): LeaseFinish =
+  if signal == 0'u32:
+    raise newException(ValueError,
+      "a crashed finish must name the signal it died of")
+  LeaseFinish(kind: lfCrashed, crashSignal: signal)
+
+proc oomKilled*(kill: KillEvidence): LeaseFinish =
+  LeaseFinish(kind: lfOomKilled, kill: kill)
+
+proc timedOut*(kill: KillEvidence): LeaseFinish =
+  LeaseFinish(kind: lfTimedOut, kill: kill)
+
+proc cancelled*(): LeaseFinish = LeaseFinish(kind: lfCancelled)
+
+proc launchFailed*(): LeaseFinish = LeaseFinish(kind: lfLaunchFailed)
+
+# ---------------------------------------------------------------------------
+# What a finish puts on the wire, and what it puts in the spine's column
+# ---------------------------------------------------------------------------
+#
+# TWO DIFFERENT NUMBERS, AND THEY MUST NOT BE ONE FUNCTION. The WIRE
+# carries the finish itself, so it needs the arms' own fields back
+# unchanged or ``leaseFinishFromWire`` cannot rebuild the value it
+# encoded. The SPINE carries a single ``exit_status`` integer that a SQL
+# reader will compare against 0, so it needs a RENDERING of the finish in
+# the one convention such readers already share. Conflating them is
+# caught: a frame built from the spine's column does not decode.
+
+const SignalledExitStatusBase* = 128'u32
+  ## What the spine's ``exit_status`` adds to a signal number.
+  ##
+  ## THE SHELL CONVENTION, BECAUSE THE COLUMN IS READ BY THINGS THAT
+  ## ALREADY SPEAK IT. ``exit_status`` is one integer and has to represent
+  ## two kinds of ending; every shell, CI system and process supervisor
+  ## renders "died of signal N" as 128 + N, and a reader who knows nothing
+  ## about RunQuota still reads 139 as "killed", never as "fine".
+  ##
+  ## AND IT IS LOSSLESS, which a bare 0 was not. The signal arrives on the
+  ## wire and the store has no column for it, so writing 0 discarded it
+  ## irrecoverably; ``exit_status - 128`` gives it back.
+  ##
+  ## THIS IS WHY IT IS NOT 0. ``RunQuota-Observation-Store.md`` §"The
+  ## Execution Spine" says a row MUST NOT carry a termination its other
+  ## columns contradict. A row reading ``termination = signalled`` beside
+  ## ``exit_status = 0`` asserts both that a signal ended this process and
+  ## that it exited of its own accord, successfully -- the same
+  ## unfalsifiable pairing this whole type exists to abolish, reintroduced
+  ## one layer down. A docstring calling that zero "not applicable" does
+  ## not reach the SQL reader the column exists for.
+
+proc wireExitCode*(finish: LeaseFinish): uint32 =
+  ## The exit code THIS ARM CARRIES, and 0 when it carries none. For the
+  ## codec only: it is what ``leaseFinishFromWire`` expects to read back.
+  case finish.kind
+  of lfSucceeded: 0'u32
+  of lfFailed: finish.exitCode
+  of lfCrashed: 0'u32
+  of lfOomKilled, lfTimedOut:
+    if finish.kill.bySignal: 0'u32 else: finish.kill.exitCode
+  of lfCancelled, lfLaunchFailed: 0'u32
+
+proc wireSignal*(finish: LeaseFinish): uint32 =
+  ## The signal THIS ARM NAMES, and 0 when it names none. For the codec
+  ## only, like ``wireExitCode``.
+  case finish.kind
+  of lfCrashed: finish.crashSignal
+  of lfOomKilled, lfTimedOut:
+    if finish.kill.bySignal: finish.kill.signal else: 0'u32
+  else: 0'u32
+
+proc exitStatus*(finish: LeaseFinish): uint32 =
+  ## The spine's ``exit_status`` column for this finish.
+  ##
+  ## ZERO APPEARS TWICE HERE AND MEANS TWO DIFFERENT THINGS, so the two
+  ## are worth telling apart:
+  ##
+  ## * ``lfSucceeded`` -- the process ran and returned 0. A measurement.
+  ## * ``lfCancelled`` / ``lfLaunchFailed`` -- NO PROCESS PRODUCED A
+  ##   STATUS. These are the two kinds whose ``termination`` is
+  ##   ``refused``, the word for work that never ran, so the column is
+  ##   making no claim about a process at all and 0 cannot be mistaken
+  ##   for one.
+  ##
+  ## EVERY KIND THAT DESCRIBES A PROCESS WHICH RAN AND WAS ENDED BY
+  ## SOMETHING RETURNS NON-ZERO -- by its own status where it has one,
+  ## and by ``128 + signal`` where a signal ended it.
+  case finish.kind
+  of lfSucceeded: 0'u32
+  of lfFailed: finish.exitCode
+  of lfCrashed: SignalledExitStatusBase + finish.crashSignal
+  of lfOomKilled, lfTimedOut:
+    if finish.kill.bySignal:
+      SignalledExitStatusBase + finish.kill.signal
+    else:
+      finish.kill.exitCode
+  of lfCancelled, lfLaunchFailed: 0'u32

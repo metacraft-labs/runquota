@@ -6,22 +6,29 @@ export protocolTypes
 
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
-const RqspProtocolMajor* = 1'u16
-const RqspProtocolMinor* = 4'u16
-  ## Minor 3 added ``rqLeaseObservation`` (M13). Minor 4 adds the READ path
-  ## (M13a): ``rqStatsQuery``/``rqStatsResponse``, and the client estimate
-  ## carried on a lease request. Minor rather than major because the store
-  ## is a system of record either way: a client that never asks a question
-  ## and never supplies an estimate behaves exactly as before, and the
-  ## daemon's learned table remains the fallback for it.
+const RqspProtocolMajor* = 2'u16
+const RqspProtocolMinor* = 0'u16
+  ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
+  ## finish now travels as a CONCLUSION plus the evidence that conclusion
+  ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
+  ## gone from the wire entirely. A version-1 peer's payload is one byte
+  ## longer and its fields mean different things; no reading of it is
+  ## compatible, so nothing here claims one.
   ##
-  ## THAT CLAIM IS NOW TRUE OF THE DECODER AS WELL, which it was not when
-  ## minor 4 shipped: ``decodeLeaseRequest`` read the estimate
-  ## unconditionally and rejected a frame that ended before it, so a
-  ## genuinely pre-M13a payload failed to decode against a version number
-  ## promising it would not. An absent estimate now takes the not-supplied
-  ## branch. Either the decoder tolerates the absent field or the claim
-  ## changes; this is the first of those.
+  ## THE BUMP ALSO STOPS THE VERSION OVERSTATING WHAT THE DECODER DOES.
+  ## The 3 -> 4 minor bump claimed that an older peer keeps working, and
+  ## the decoder never provided it: ``decodeLeaseFinished`` bounds the
+  ## wire's outcome ordinal by the RECEIVER's ``high()``, so an older
+  ## daemon meeting a newer member REFUSES the frame rather than reading
+  ## it compatibly -- and a refused ``LeaseFinished`` is not a lost message
+  ## but a lease left holding capacity. Minor versions are negotiated by
+  ## nothing: ``compatible`` compares MAJORS only and reports the minor for
+  ## information. So a minor bump here would have been a third statement
+  ## of a compatibility no code implements. Two peers either agree on the
+  ## major or do not speak.
+  ##
+  ## THE MINOR RESETS TO 0 with the major, as it must: minor 4 of major 2
+  ## would name a version that never existed.
 const RqspHeaderLen* = 24'u16
 const MaxCommandStatsIdBytes* = 64
 const FrameFlagRequest* = 0x0001'u16
@@ -681,112 +688,148 @@ proc decodeLeaseRunningAck*(payload: string;
       leaseId: leaseId(leaseRaw))
   true
 
+# ---------------------------------------------------------------------------
+# The finish, on the wire and back
+# ---------------------------------------------------------------------------
+#
+# THREE INTEGERS, NOT A SUM TYPE. The codec has no variant encoding and
+# adding one for a single message would need a second framing rule per
+# arm; ``ExtensionCellWire`` already made the same trade for the same
+# reason. So a finish travels as its kind plus the two integer columns the
+# spine keeps, and the arms that carry no evidence write zeros into both.
+#
+# WHICH IS WHY THE DECODER IS A CONSTRUCTOR AND NOT A READER. Three
+# independent integers off a socket can spell combinations that
+# ``LeaseFinish`` has no room for -- that is what being outside the type
+# system means -- so ``leaseFinishFromWire`` re-establishes by hand what
+# the type establishes by construction everywhere else.
+
+proc leaseFinishFromWire*(kindRaw, exitCode, signal: uint32;
+                          finish: var LeaseFinish): string =
+  ## Build a ``LeaseFinish`` from the three integers a frame carries, or
+  ## say why those bytes are not one. ``finish`` is left untouched on
+  ## refusal.
+  ##
+  ## THIS NO LONGER CATCHES A MESSAGE A CORRECT CLIENT COULD CONSTRUCT.
+  ## It used to: ``finish`` took an outcome, an exit code, a signal and an
+  ## ``hardLimitOrOom`` flag as four independently defaulted parameters,
+  ## so "a kill beside exit status 0 and no signal" was one argument list
+  ## away on the public API and the daemon had to be the party that
+  ## refused it. ``LeaseFinish`` has no such argument list; every client
+  ## in the world now reaches a constructor that will not build one.
+  ##
+  ## WHAT IT CATCHES IS A MALFORMED FRAME. Bytes on a socket come from
+  ## whatever wrote them -- a peer speaking a different major version, a
+  ## fuzzer, a corrupted buffer -- and none of those went through a
+  ## constructor. Every clause below is therefore a statement about
+  ## BYTES, and the honest name for bytes that spell no value of this type
+  ## is "malformed", not "contradictory client".
+  ##
+  ## PURE, and separate from the daemon, as ``leaseObservationRefusal`` is:
+  ## the states it refuses are ones no client library can be asked to
+  ## produce, so the rule has to be assertable without one.
+  if kindRaw > uint32(ord(high(LeaseFinishKind))):
+    return "finish names no known outcome"
+  let kind = LeaseFinishKind(int(kindRaw))
+  case kind
+  of lfSucceeded:
+    if exitCode != 0'u32 or signal != 0'u32:
+      return "a successful finish carries an exit status or a signal"
+    finish = succeeded()
+  of lfFailed:
+    if signal != 0'u32:
+      return "a failed finish carries a signal, which is a crash"
+    if exitCode == 0'u32:
+      return "a failed finish carries exit status 0"
+    finish = failed(exitCode)
+  of lfCrashed:
+    if exitCode != 0'u32:
+      return "a crashed finish carries an exit status"
+    if signal == 0'u32:
+      return "a crashed finish names no signal"
+    finish = crashed(signal)
+  of lfOomKilled, lfTimedOut:
+    if exitCode != 0'u32 and signal != 0'u32:
+      return "a kill was reported by two kinds of evidence at once"
+    var kill: KillEvidence
+    if not killEvidence(exitCode, signal, kill):
+      return "a kill was reported beside exit status 0 and no signal"
+    finish =
+      if kind == lfOomKilled: oomKilled(kill) else: timedOut(kill)
+  of lfCancelled, lfLaunchFailed:
+    if exitCode != 0'u32 or signal != 0'u32:
+      return "work that never produced a verdict carries one"
+    finish = if kind == lfCancelled: cancelled() else: launchFailed()
+  ""
+
+type LeaseFinishedDecode* = enum
+  ## What came of reading a ``LeaseFinished`` payload.
+  ##
+  ## THREE OUTCOMES RATHER THAN A BOOLEAN, because the daemon owes the
+  ## middle one a COUNT. OS-2 requires a loss to be counted rather than
+  ## hidden, and "the peer sent bytes that spell no finish" is a loss of
+  ## exactly one execution row -- indistinguishable, in a boolean, from a
+  ## truncated frame that lost nothing anyone measured.
+  lfdOk
+  lfdMalformedPayload
+    ## Truncated, over-long, or an unreadable field. Nothing was lost
+    ## because nothing readable arrived.
+  lfdContradictoryFinish
+    ## Every field read, and the three that describe the finish spell no
+    ## value of ``LeaseFinish``.
+
 proc encodeLeaseFinished*(msg: LeaseFinishedMessage): string =
   var w = writer()
   w.writeU64(msg.sessionId.value)
   w.writeU64(msg.leaseId.value)
-  w.writeU32(uint32(ord(msg.outcome)))
-  w.writeU32(msg.exitCode)
-  w.writeU32(msg.signal)
+  w.writeU32(uint32(ord(msg.finish.kind)))
+  w.writeU32(msg.finish.wireExitCode)
+  w.writeU32(msg.finish.wireSignal)
   w.writeU64(msg.peakMemoryBytes)
   w.writeU32(msg.processCount)
   w.writeU64(msg.majorPageFaults)
   w.writeU32(msg.pressureEvents)
-  w.writeBool(msg.hardLimitOrOom)
   w.writeDiagnostic(msg.diagnostic)
   w.data
 
 proc decodeLeaseFinished*(payload: string;
-    msg: var LeaseFinishedMessage): bool =
+    msg: var LeaseFinishedMessage): LeaseFinishedDecode =
   var r = reader(payload)
   var sessionRaw: uint64
   var leaseRaw: uint64
-  var outcomeRaw: uint32
+  var kindRaw: uint32
   var exitCode: uint32
   var signal: uint32
   var peakMemoryBytes: uint64
   var processCount: uint32
   var majorPageFaults: uint64
   var pressureEvents: uint32
-  var hardLimitOrOom: bool
   var diagnostic: Diagnostic
-  if not r.readU64(sessionRaw): return false
-  if not r.readU64(leaseRaw): return false
-  if not r.readU32(outcomeRaw): return false
-  if outcomeRaw > uint32(ord(high(LeaseFinishOutcome))): return false
-  if not r.readU32(exitCode): return false
-  if not r.readU32(signal): return false
-  if not r.readU64(peakMemoryBytes): return false
-  if not r.readU32(processCount): return false
-  if not r.readU64(majorPageFaults): return false
-  if not r.readU32(pressureEvents): return false
-  if not r.readBool(hardLimitOrOom): return false
-  if not r.readDiagnostic(diagnostic): return false
-  if r.remaining != 0: return false
+  if not r.readU64(sessionRaw): return lfdMalformedPayload
+  if not r.readU64(leaseRaw): return lfdMalformedPayload
+  if not r.readU32(kindRaw): return lfdMalformedPayload
+  if not r.readU32(exitCode): return lfdMalformedPayload
+  if not r.readU32(signal): return lfdMalformedPayload
+  if not r.readU64(peakMemoryBytes): return lfdMalformedPayload
+  if not r.readU32(processCount): return lfdMalformedPayload
+  if not r.readU64(majorPageFaults): return lfdMalformedPayload
+  if not r.readU32(pressureEvents): return lfdMalformedPayload
+  if not r.readDiagnostic(diagnostic): return lfdMalformedPayload
+  if r.remaining != 0: return lfdMalformedPayload
+  var finish: LeaseFinish
+  if leaseFinishFromWire(kindRaw, exitCode, signal, finish).len > 0:
+    return lfdContradictoryFinish
   msg = LeaseFinishedMessage(
     sessionId: sessionId(sessionRaw),
     leaseId: leaseId(leaseRaw),
-    outcome: LeaseFinishOutcome(int(outcomeRaw)),
-    exitCode: exitCode,
-    signal: signal,
+    finish: finish,
     peakMemoryBytes: peakMemoryBytes,
     processCount: processCount,
     majorPageFaults: majorPageFaults,
     pressureEvents: pressureEvents,
-    hardLimitOrOom: hardLimitOrOom,
     diagnostic: diagnostic
   )
-  true
-
-# ---------------------------------------------------------------------------
-# The finish's own evidence has to reconcile before a row can be made of it
-# ---------------------------------------------------------------------------
-
-proc terminationContradiction(killClaimed, killClaimIsSuccess: bool;
-                              exitCode, signal: uint32): string =
-  ## The one rule, in the one place it is stated, shared by the leased and
-  ## the standalone finish shapes so the two cannot drift.
-  ##
-  ## ``reprobuild-specs/RunQuota-Observation-Store.md`` §"The Execution
-  ## Spine", the ``termination`` row: *a row MUST NOT carry a termination
-  ## its other columns contradict*, and *an unfalsifiable row is worse than
-  ## an absent one, because it reads as a measurement.*
-  ##
-  ## A KILL AND A CLEAN EXIT ARE THE PAIR THAT CANNOT BOTH BE TRUE. The
-  ## daemon derives ``oom_killed`` and ``timeout`` from fields that say
-  ## the supervisor ENDED this process; ``exit_status = 0`` with no signal
-  ## says it ended of its own accord, successfully. A row asserting both
-  ## is immutable (OS-3) and unfalsifiable, and no later reader can tell
-  ## it from a measurement.
-  if killClaimed and exitCode == 0'u32 and signal == 0'u32:
-    return "a kill was reported beside exit status 0 and no signal"
-  if killClaimIsSuccess:
-    return "a kill was reported as a successful finish"
-  ""
-
-proc leaseFinishedContradiction*(msg: LeaseFinishedMessage): string =
-  ## Why no execution row may be made of this finish, or "" when its
-  ## evidence reconciles.
-  ##
-  ## PURE, and separate from the daemon, exactly as
-  ## ``leaseObservationRefusal`` is: the states this refuses are ones a
-  ## well-behaved client library cannot be asked to produce, so the rule
-  ## has to be assertable without one.
-  ##
-  ## THE TWO KILL FIELDS ARE INDEPENDENT AND STAY THAT WAY.
-  ## ``hardLimitOrOom`` and ``outcome == leaseFinishResourceLimit`` are two
-  ## pieces of evidence for the same conclusion, not a field and its
-  ## checksum -- a supervisor that watched an ``ru_maxrss`` cross a hard
-  ## limit may set one, a runner reading its own cgroup may set the other,
-  ## and neither is obliged to set both. So this does NOT require them to
-  ## agree with each other. What it requires is that the CONCLUSION they
-  ## reach agrees with the exit the same message reports.
-  let claimsKill = msg.hardLimitOrOom or
-    msg.outcome == leaseFinishResourceLimit or
-    msg.outcome == leaseFinishTimedOut
-  terminationContradiction(claimsKill,
-    claimsKill and msg.outcome == leaseFinishSucceeded,
-    msg.exitCode, msg.signal)
+  lfdOk
 
 proc encodeLeaseFinishedAck*(msg: LeaseFinishedAckMessage): string =
   var w = writer()
@@ -969,20 +1012,32 @@ proc encodeDeferredObservations*(msg: DeferredObservationsMessage): string =
     w.writeBytes(record.commandStatsId)
     w.writeU64(record.startedAtUnixMillis)
     w.writeU64(record.finishedAtUnixMillis)
-    w.writeU32(record.exitStatus)
-    w.writeU32(record.signal)
-    w.writeU32(uint32(ord(record.outcome)))
+    w.writeU32(uint32(ord(record.finish.kind)))
+    w.writeU32(record.finish.wireExitCode)
+    w.writeU32(record.finish.wireSignal)
     w.writeU64(record.peakRssBytes)
     w.writeU32(record.processCount)
     w.writeU64(record.majorPageFaults)
   w.data
 
 proc decodeDeferredObservations*(payload: string;
-    msg: var DeferredObservationsMessage): bool =
+    msg: var DeferredObservationsMessage; contradictory: var int): bool =
   ## ALL OR NOTHING, like every other decoder here: ``msg`` is assigned once
   ## at the end from locals, so a payload that runs out in the middle of the
   ## seventh record leaves the caller's message untouched rather than
   ## holding six records and a claim about how many there were.
+  ##
+  ## EXCEPT FOR A RECORD WHOSE THREE FINISH INTEGERS SPELL NO
+  ## ``LeaseFinish``, WHICH IS DROPPED AND COUNTED IN ``contradictory``
+  ## RATHER THAN FAILING THE BATCH. Per record, not per batch, and that is
+  ## the difference between OS-4's smallest honest degradation and its
+  ## largest: a batch is one client's entire exit flush, and throwing a
+  ## hundred readable rows away because the hundred-and-first is malformed
+  ## is a bigger loss than the one the refusal exists to prevent. The
+  ## count is an out-parameter rather than a field of the message because
+  ## it is a fact about the BYTES, not about the flush the client made,
+  ## and the message is what the client said.
+  contradictory = 0
   var r = reader(payload)
   var tool: string
   var toolVersion: string
@@ -1001,19 +1056,23 @@ proc decodeDeferredObservations*(payload: string;
   var records: seq[DeferredExecutionRecord] = @[]
   for _ in 0 ..< int(count):
     var record: DeferredExecutionRecord
-    var outcomeRaw: uint32
+    var kindRaw, exitCode, signal: uint32
     if not r.readString(record.label): return false
     if not r.readBytes(record.commandStatsId): return false
     if not r.readU64(record.startedAtUnixMillis): return false
     if not r.readU64(record.finishedAtUnixMillis): return false
-    if not r.readU32(record.exitStatus): return false
-    if not r.readU32(record.signal): return false
-    if not r.readU32(outcomeRaw): return false
-    if outcomeRaw > uint32(ord(high(LeaseFinishOutcome))): return false
-    record.outcome = LeaseFinishOutcome(int(outcomeRaw))
+    if not r.readU32(kindRaw): return false
+    if not r.readU32(exitCode): return false
+    if not r.readU32(signal): return false
     if not r.readU64(record.peakRssBytes): return false
     if not r.readU32(record.processCount): return false
     if not r.readU64(record.majorPageFaults): return false
+    # READ WHOLE, THEN JUDGED. The record's remaining fields have to be
+    # consumed either way or the reader loses its place in the batch and
+    # every record after this one becomes garbage.
+    if leaseFinishFromWire(kindRaw, exitCode, signal, record.finish).len > 0:
+      contradictory += 1
+      continue
     records.add(record)
   if r.remaining != 0: return false
   msg = DeferredObservationsMessage(
@@ -1026,7 +1085,8 @@ proc decodeDeferredObservations*(payload: string;
   )
   true
 
-proc deferredObservationsRefusal*(msg: DeferredObservationsMessage): string =
+proc deferredObservationsRefusal*(msg: DeferredObservationsMessage;
+                                  contradictoryRecords = 0): string =
   ## Why a decoded flush is not recordable, or "" when it is.
   ##
   ## THE REFUSAL THIS MILESTONE TURNS ON. A standalone client's window was
@@ -1040,26 +1100,17 @@ proc deferredObservationsRefusal*(msg: DeferredObservationsMessage): string =
     return "a deferred batch may not claim a complete capture window"
   if msg.tool.len == 0:
     return "a deferred batch must say which tool produced it"
-  if msg.records.len == 0 and msg.droppedObservations == 0:
+  # ``contradictoryRecords`` IS WHAT THE DECODER THREW AWAY, and it is a
+  # parameter rather than a field of the message because it is a fact
+  # about the BYTES and the message is what the client said. Without it a
+  # flush whose every record was malformed would be refused below as
+  # "nothing in it", and the one number saying a loss happened would go
+  # with it -- OS-2 wants that number at the run's granularity, which
+  # means the ``runs`` row still has to be written for it to sit in.
+  if msg.records.len == 0 and msg.droppedObservations == 0 and
+      contradictoryRecords == 0:
     return "a deferred batch with nothing in it and nothing dropped"
   ""
-
-proc deferredRecordContradiction*(record: DeferredExecutionRecord): string =
-  ## The same rule ``leaseFinishedContradiction`` states, on the shape a
-  ## standalone client flushes at exit. The record carries no
-  ## ``hardLimitOrOom``, so ``outcome`` is the whole of its kill evidence.
-  ##
-  ## PER RECORD, NOT PER BATCH, which is why it is separate from
-  ## ``deferredObservationsRefusal`` above. A batch is one client's entire
-  ## exit flush; discarding a hundred honest rows because the hundred-and-
-  ## first contradicts itself is a larger loss than the one this rule
-  ## exists to prevent, and OS-4 asks for the smallest degradation that
-  ## keeps the store honest rather than the largest.
-  let claimsKill = record.outcome == leaseFinishResourceLimit or
-    record.outcome == leaseFinishTimedOut
-  terminationContradiction(claimsKill,
-    claimsKill and record.outcome == leaseFinishSucceeded,
-    record.exitStatus, record.signal)
 
 # ---------------------------------------------------------------------------
 # The extension WRITE path (M17): declaration, then rows.

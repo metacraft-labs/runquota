@@ -129,7 +129,7 @@ proc completeOneExecution(client: var RunQuotaClient; label: string) =
   doAssert lease.active
   lease.markStarting()
   lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
-  lease.finish(outcome = leaseFinishSucceeded, exitCode = 0'u32,
+  lease.finish(outcome = succeeded(),
     peakMemoryBytes = 1_234_567'u64, processCount = 3'u32,
     majorPageFaults = 11'u64)
   lease.release()
@@ -422,7 +422,7 @@ suite "observation_retention_scheduled":
 
       # AND ONLY NOW THE FINISH, which is allowed to wait: see the note
       # above on M13b's synchronous flush.
-      lease.finish(outcome = leaseFinishSucceeded, exitCode = 0'u32,
+      lease.finish(outcome = succeeded(),
         peakMemoryBytes = 1_234_567'u64, processCount = 3'u32,
         majorPageFaults = 11'u64)
       lease.release()
