@@ -71,6 +71,25 @@ bench-observation-write-path *args:
     mkdir -p bench-results test-logs
     bash scripts/run-m13-benchmark.sh {{args}} 2> >(tee test-logs/bench-observation-write-path.log >&2)
 
+# M1: the socket baseline -- what RunQuota's socket costs a REAL `repro`
+# build and a REAL parallel test run, broken down into admission versus
+# reporting. THE ONLY BENCHMARK HERE WHOSE CLIENT IS NOT SYNTHETIC: the M5
+# `ipc` and M13 write-path suites drive a real daemon from a tight loop, which
+# is the right shape for what they measure and the wrong shape for this. It
+# needs a built sibling `reprobuild` checkout and runs its subjects under that
+# checkout's dev shell.
+#
+#   just bench-socket-baseline calibrate      instrument check only, seconds
+#   just bench-socket-baseline tap-overhead   the relay's own cost
+#   just bench-socket-baseline client-cost    syscalls per round trip
+#   just bench-socket-baseline wide-build     65 parallel compile actions
+#   just bench-socket-baseline wide-build-capture-off   the same, store off
+#   just bench-socket-baseline test-run       reprobuild's own test suite
+#   just bench-socket-baseline all            everything above
+bench-socket-baseline *args:
+    mkdir -p bench-results test-logs
+    bash scripts/run-m1-benchmark.sh {{args}} 2> >(tee test-logs/bench-socket-baseline.log >&2)
+
 repomix *args:
     mkdir -p {{REPOMIX_OUT_DIR}}
     repomix \
