@@ -57,6 +57,24 @@ really exist, `ext_test_execution` and `ext_repro_action`, are M19 and M17;
 the mechanism was deliberately built and gated against a synthetic
 extension so that no one product's shape decided what it can express.
 
+**Attaching a row asks the database nothing.** Admitting a row needs two
+facts from `extension_registry` — that the extension is registered, and
+what schema version this database carries — and both were read out of the
+store for every row, which through the `sqlite3` command line is a
+subprocess spawn per observed execution, taken on the daemon thread under
+the daemon-wide lock. Measured at 21 ms per row on an Apple M3 Max, or
+1.4 seconds for a 64-action build. It was invisible from the outside
+because `rqExtensionRow` is one-way: the spawn appeared in no round-trip
+latency, and a build that sends its rows at the end — which is when a build
+system knows its output sizes — showed it only as the next request on that
+connection waiting behind the backlog. A declaration must precede any row
+and reads the registry authoritatively, so that read now furnishes the
+answer for every row that follows it; a row naming an extension this daemon
+has not seen declared still falls through to the database and is still
+refused. `extension_registry_reads` in the `observations` inspection
+subject counts the reads that reach the database, which is what makes "one
+per declaration" and "one per row" distinguishable from outside.
+
 **Two writers run against that one store, not one.** Both are background
 threads, and both exist so that nothing on the lease path waits for IO:
 
