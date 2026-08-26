@@ -291,6 +291,27 @@ proc estimateFor*(store: ObservationStore; statsKey: string;
       durationMillisMax: 0,
       peakRssBytesMax: 0))
 
+proc estimateForAt*(path: string; statsKey: string;
+                    span = spanSingleProfile;
+                    profileId = none(string)): StatsAnswer =
+  ## Path-addressed ``estimateFor``, for the aggregate publisher's
+  ## background thread: it must not touch the ``ObservationStore`` ref the
+  ## daemon thread owns, exactly as ``appendBatchAt`` must not.
+  ##
+  ## THE SAME CALL, NOT A SECOND ONE. The whole point of publishing what
+  ## ``estimateFor`` answers is that a table miss costs a round trip and
+  ## changes no number, so this delegates rather than reimplementing: a
+  ## divergent second aggregation here would turn the published table into
+  ## the second source of truth the specification forbids.
+  ##
+  ## An empty path is a store that is off, and answers ``statsUnknown``
+  ## like any other closed store.
+  if path.len == 0:
+    return StatsAnswer(statsKey: statsKey, span: span,
+      knowledge: statsUnknown, distributions: @[])
+  let handle = ObservationStore(path: path, status: ssOpen)
+  handle.estimateFor(statsKey, span, profileId)
+
 proc queryExecutions*(store: ObservationStore;
                       query: RowQuery): seq[ExecutionSummary] =
   ## The human surfaces' row read. Scoped to ``query.ownerUid`` unless the

@@ -16,15 +16,32 @@
 ## else — not the cost of a different client, and not the cost of a
 ## different workload.
 ##
+## THE LEASE CARRIES A STATS KEY, AND FOR A WHILE IT DID NOT — which made
+## every figure this suite published a figure about a path no real client
+## takes. `commandStatsId` is what a stats key travels in, and the daemon
+## skips a large part of its completion work when it is empty; every shipped
+## client sets it (`reprobuild`'s adapter sets it on every request), and this
+## benchmark did not, because `resourceRequest`'s first parameter is the
+## LABEL and the field has to be assigned separately. The suite therefore
+## reported 0.0012 ms for a write path whose expensive half never ran. A
+## measurement that cannot fail is not a measurement, so the keyed arm below
+## is now the headline.
+##
+## BOTH ARMS ARE CARRIED, keyed and keyless, because the difference between
+## them turned out to be the dominant term and a reader who sees only one of
+## them cannot tell which of the two numbers applies to their client. The
+## keyless pair is exactly what this suite used to report.
+##
 ## THE ARMS ARE INTERLEAVED, NOT RUN IN SEQUENCE, and this is the M11
 ## lesson applied to a different quantity. A single before/after pair on a
 ## workstation somebody is using measures the machine's mood as much as the
 ## code: M11 watched the host-wide busy figure wander between 56% and 88%
 ## over twenty consecutive one-second readings, and single repetitions of a
 ## known load ranged from -1.52 to 1.69 of it. Two daemons are therefore
-## alive at the same time and each round times ONE execution against each,
-## in alternating order, so the paired difference cancels drift on any
-## timescale longer than a round. The paired median is the headline; the
+## alive at the same time and each round times all four executions —
+## {capture, control} x {keyed, keyless} — in a ROTATING order, so the
+## paired difference cancels drift on any timescale longer than a round and
+## no arm is systematically first. The paired median is the headline; the
 ## pooled difference is reported beside it as a cross-check, exactly as
 ## M11 reports both.
 ##
@@ -51,6 +68,10 @@ const
     ## Discarded. The first executions of a run pay for lazily created
     ## threads, a cold SQLite file and a page cache that has not seen the
     ## store yet, and none of that is per-execution cost.
+  BenchStatsKey = "m13-bench-stats-key"
+    ## ONE KEY, REUSED, because that is what a build does: a stats key names
+    ## a kind of work, not an occurrence of it, so a fresh key per round
+    ## would measure a permanently cold aggregate nobody has.
 
 type
   BenchMetric = object
@@ -169,14 +190,19 @@ proc stopDaemon(daemon: var Process) =
     discard daemon.waitForExit(5000)
   daemon.close()
 
-proc timeOneExecution(session: var RunQuotaSession; label: string): float =
+proc timeOneExecution(session: var RunQuotaSession; label: string;
+                      statsKey: string): float =
   ## One whole execution, timed end to end. Nothing sleeps inside the
   ## window: a sleep would put a constant in both arms and shrink the
   ## RELATIVE difference the gate asks about without changing the absolute
   ## one, which is the classic way to make an overhead look small.
   let start = epochTime()
-  var lease = session.requestLease(resourceRequest(label, milliCpu(100),
-    bytes(1024 * 1024)))
+  var request = resourceRequest(label, milliCpu(100), bytes(1024 * 1024))
+  # ASSIGNED, NOT PASSED. `resourceRequest`'s first parameter is the label;
+  # the stats key is a separate field, and leaving it empty is what made
+  # this benchmark measure the wrong path for the whole of M13's life.
+  request.commandStatsId = statsKey
+  var lease = session.requestLease(request)
   if not lease.active:
     raise newException(ValueError, "benchmark lease was not granted")
   lease.markStarting()
@@ -207,9 +233,12 @@ proc runOverheadSuite(quick: bool): seq[BenchMetric] =
   var captureDaemon = startArmDaemon(captureSocket,
     captureState / "host-id", captureOn = true)
   var controlDaemon: Process = nil
-  var captureLatencies: seq[float] = @[]
-  var controlLatencies: seq[float] = @[]
-  var paired: seq[float] = @[]
+  var keyedCapture: seq[float] = @[]
+  var keyedControl: seq[float] = @[]
+  var keyedPaired: seq[float] = @[]
+  var keylessCapture: seq[float] = @[]
+  var keylessControl: seq[float] = @[]
+  var keylessPaired: seq[float] = @[]
   var storeRows = 0
   try:
     controlDaemon = startArmDaemon(controlSocket,
@@ -226,26 +255,43 @@ proc runOverheadSuite(quick: bool): seq[BenchMetric] =
       "0.1.0")
 
     for i in 0 ..< WarmupRounds:
-      discard timeOneExecution(captureSession, "warmup")
-      discard timeOneExecution(controlSession, "warmup")
+      discard timeOneExecution(captureSession, "warmup", BenchStatsKey)
+      discard timeOneExecution(captureSession, "warmup", "")
+      discard timeOneExecution(controlSession, "warmup", BenchStatsKey)
+      discard timeOneExecution(controlSession, "warmup", "")
 
+    # THE FOUR ARMS, and each round runs all four so every difference below
+    # is a paired one.
+    const
+      ArmCaptureKeyed = 0
+      ArmCaptureKeyless = 1
+      ArmControlKeyed = 2
+      ArmControlKeyless = 3
+      ArmCount = 4
     for i in 0 ..< rounds:
-      # ORDER ALTERNATES WITHIN THE ROUND as well as the arms alternating
+      # ORDER ROTATES WITHIN THE ROUND as well as the arms alternating
       # between rounds. Whichever execution runs first in a round pays for
       # whatever the scheduler did between rounds, and a fixed order would
       # hand that cost to the same arm every time.
-      if (i and 1) == 0:
-        let onMs = timeOneExecution(captureSession, "capture")
-        let offMs = timeOneExecution(controlSession, "control")
-        captureLatencies.add(onMs)
-        controlLatencies.add(offMs)
-        paired.add(onMs - offMs)
-      else:
-        let offMs = timeOneExecution(controlSession, "control")
-        let onMs = timeOneExecution(captureSession, "capture")
-        captureLatencies.add(onMs)
-        controlLatencies.add(offMs)
-        paired.add(onMs - offMs)
+      var round: array[ArmCount, float]
+      for step in 0 ..< ArmCount:
+        let arm = (i + step) mod ArmCount
+        round[arm] =
+          case arm
+          of ArmCaptureKeyed:
+            timeOneExecution(captureSession, "capture", BenchStatsKey)
+          of ArmCaptureKeyless:
+            timeOneExecution(captureSession, "capture", "")
+          of ArmControlKeyed:
+            timeOneExecution(controlSession, "control", BenchStatsKey)
+          else:
+            timeOneExecution(controlSession, "control", "")
+      keyedCapture.add(round[ArmCaptureKeyed])
+      keyedControl.add(round[ArmControlKeyed])
+      keyedPaired.add(round[ArmCaptureKeyed] - round[ArmControlKeyed])
+      keylessCapture.add(round[ArmCaptureKeyless])
+      keylessControl.add(round[ArmControlKeyless])
+      keylessPaired.add(round[ArmCaptureKeyless] - round[ArmControlKeyless])
 
     captureSession.closeSession()
     captureClient.close()
@@ -256,16 +302,19 @@ proc runOverheadSuite(quick: bool): seq[BenchMetric] =
     # path that wrote nothing is a benchmark of nothing, and a store that
     # silently degraded would report a flattering figure.
     let storePath = captureState / "observations.sqlite3"
+    # TWO ROWS PER ROUND: the capture arm runs a keyed and a keyless
+    # execution, and both are recorded.
+    let expectedRows = 2 * rounds
     for _ in 0 ..< 200:
       let store = openObservationStore(storePath)
       if store.captureEnabled:
         storeRows = store.readExecutions().len
-        if storeRows >= rounds:
+        if storeRows >= expectedRows:
           break
       sleep(50)
-    if storeRows < rounds:
+    if storeRows < expectedRows:
       raise newException(ValueError,
-        "capture arm recorded " & $storeRows & " of " & $rounds &
+        "capture arm recorded " & $storeRows & " of " & $expectedRows &
           " executions; the overhead figure would not be an overhead figure")
     if fileExists(controlState / "observations.sqlite3"):
       raise newException(ValueError,
@@ -277,31 +326,64 @@ proc runOverheadSuite(quick: bool): seq[BenchMetric] =
     if dirExists(root):
       removeDir(root)
 
-  let pairedMedian = median(paired)
-  let pooledDifference = median(captureLatencies) - median(controlLatencies)
-  let controlMedian = median(controlLatencies)
+  let keyedMedian = median(keyedPaired)
+  let keyedControlMedian = median(keyedControl)
+  let keylessMedian = median(keylessPaired)
+  let keylessControlMedian = median(keylessControl)
   let shape = "rounds=" & $rounds & "; warmup=" & $WarmupRounds &
-    "; rows=" & $storeRows & "; interleaved=paired"
+    "; rows=" & $storeRows & "; interleaved=paired; arms=4"
 
-  result.addMetric("observation write path added latency (paired median)",
-    "ms", pairedMedian, shape)
-  result.addMetric("observation write path added latency (paired mean)",
-    "ms", mean(paired), shape)
-  result.addMetric("observation write path added latency (pooled median)",
-    "ms", pooledDifference, shape)
-  result.addMetric("observation write path added latency (paired p95)",
-    "ms", percentile(paired, 0.95), shape)
-  result.addMetric("execution latency, capture ON p50", "ms",
-    median(captureLatencies), shape)
-  result.addMetric("execution latency, capture ON p95", "ms",
-    percentile(captureLatencies, 0.95), shape)
-  result.addMetric("execution latency, capture OFF (control) p50", "ms",
-    controlMedian, shape)
-  result.addMetric("execution latency, capture OFF (control) p95", "ms",
-    percentile(controlLatencies, 0.95), shape)
-  result.addMetric("observation write path added latency (relative)",
+  # THE HEADLINE IS THE KEYED PAIR, because every shipped client sets a
+  # stats key. The keyless pair is reported beside it, unrenamed in
+  # meaning but now explicitly labelled, so the two are never confused
+  # again.
+  result.addMetric(
+    "observation write path added latency, stats key set (paired median)",
+    "ms", keyedMedian, shape)
+  result.addMetric(
+    "observation write path added latency, stats key set (paired mean)",
+    "ms", mean(keyedPaired), shape)
+  result.addMetric(
+    "observation write path added latency, stats key set (pooled median)",
+    "ms", median(keyedCapture) - keyedControlMedian, shape)
+  result.addMetric(
+    "observation write path added latency, stats key set (paired p95)",
+    "ms", percentile(keyedPaired, 0.95), shape)
+  result.addMetric(
+    "observation write path added latency, NO stats key (paired median)",
+    "ms", keylessMedian, shape)
+  result.addMetric(
+    "observation write path added latency, NO stats key (paired p95)",
+    "ms", percentile(keylessPaired, 0.95), shape)
+  result.addMetric("execution latency, capture ON, stats key set p50", "ms",
+    median(keyedCapture), shape)
+  result.addMetric("execution latency, capture ON, stats key set p95", "ms",
+    percentile(keyedCapture, 0.95), shape)
+  result.addMetric("execution latency, capture ON, NO stats key p50", "ms",
+    median(keylessCapture), shape)
+  result.addMetric("execution latency, capture ON, NO stats key p95", "ms",
+    percentile(keylessCapture, 0.95), shape)
+  result.addMetric(
+    "execution latency, capture OFF (control), stats key set p50", "ms",
+    keyedControlMedian, shape)
+  result.addMetric(
+    "execution latency, capture OFF (control), stats key set p95", "ms",
+    percentile(keyedControl, 0.95), shape)
+  result.addMetric(
+    "execution latency, capture OFF (control), NO stats key p50", "ms",
+    keylessControlMedian, shape)
+  result.addMetric(
+    "observation write path added latency, stats key set (relative)",
     "percent",
-    (if controlMedian > 0.0: 100.0 * pairedMedian / controlMedian else: 0.0),
+    (if keyedControlMedian > 0.0: 100.0 * keyedMedian / keyedControlMedian
+     else: 0.0),
+    shape)
+  result.addMetric(
+    "observation write path added latency, NO stats key (relative)",
+    "percent",
+    (if keylessControlMedian > 0.0:
+       100.0 * keylessMedian / keylessControlMedian
+     else: 0.0),
     shape)
 
 proc main() =

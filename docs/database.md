@@ -450,11 +450,15 @@ observation is an in-memory append and is never blocked by a prune — the
 integration test takes a lease and records an in-flight report inside a real
 pass and pins both against the instants the daemon stamped the pass with.
 The *drain* is a different matter: the writer's batch waits on SQLite's
-five-second busy timeout while a pass holds the write lock, and
-`LeaseFinished` flushes that writer synchronously because M13b publishes the
-aggregate on that path. So a lease that finishes mid-prune waits for the
-prune. The idle preference is what keeps that overlap rare, and the busy
-timeout is what keeps it from becoming a dropped observation.
+five-second busy timeout while a pass holds the write lock. **`LeaseFinished`
+no longer waits for that**, and until recently it did: M13b published the
+aggregate on the completion path, which flushed the writer synchronously, so
+a lease that finished mid-prune waited for the prune. Publication is now
+deferred to a background thread, and the only threads that can wait on a
+pass are that one, the writer's own drain thread, and a client that has asked
+a `stats` question and is waiting for the answer anyway. The idle preference
+is what keeps the overlap rare, and the busy timeout is what keeps it from
+becoming a dropped observation.
 
 Only the first half is pinned by a test.
 `tests/integration/t_observation_retention_scheduled.nim` asserts that an
@@ -639,6 +643,19 @@ As implemented:
   157–381 ns per row across seven repetitions on an aarch64 macOS host whose
   load average was 66–90 at the time. Nothing on that path opens a file, and
   the database write happens on a drain thread in batches.
+
+  **Every figure in the paragraph below described a lease with NO STATS
+  KEY**, and that is not the lease any shipped client takes. The benchmark
+  built its requests with `resourceRequest(label, …)` — whose first
+  parameter is the label — and never assigned `commandStatsId`, so it took
+  an early return through the daemon's aggregate publication for the whole
+  of M13's life. With a stats key set, on the same host and the same
+  release build, the added latency was **53.6 ms**: publication ran
+  synchronously on the completion path and cost three `sqlite3` subprocess
+  spawns per finished action. Publication is now deferred to a background
+  thread and the figure is **0.0012 ms with a stats key and 0.0012 ms
+  without** — the two arms agree, which is the property worth having. The
+  benchmark carries both arms now, so the contrast cannot be lost again.
 
   **The socket write path's per-execution added latency is 1.2–1.9 µs with
   optimised daemons, and 0.7–1.9 µs with unoptimised ones** (median).

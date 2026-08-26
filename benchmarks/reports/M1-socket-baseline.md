@@ -187,31 +187,148 @@ Two further controls:
   store on against 750 with it off — **≈ 432 extra kernel syscalls per
   completion report**.
 
-**This does not reproduce from a synthetic driver.** The existing M13
+**This did not reproduce from a synthetic driver.** The existing M13
 write-path benchmark, same repository, same release build, same one-flag
-control, measures the store's added per-execution latency at **0.0012 ms**
+control, measured the store's added per-execution latency at **0.0012 ms**
 (3.5% relative). Against a real build it is **≈ 21.8 ms** — four orders of
-magnitude larger. Whatever makes the store expensive is a property of the
-conditions a build creates, and a tight loop does not create them. Which of
-those conditions is responsible was **not** determined here.
+magnitude larger. That was read here as a real difference between a tight
+loop and a build.
 
-**The two candidates differ in what they ask M22 to be**, which is why the
-question is worth settling before that milestone is designed rather than
-after:
+At the time this baseline was published, which of a build's conditions was
+responsible was **not** determined, and two candidates were offered: daemon-wide
+lock contention, and a per-row durable commit. **Both were wrong**, and so was
+the premise: the benchmark was not exercising the same code. Corrected, it
+reproduces the wide build's figure from a tight loop at concurrency 1 — 53.6 ms
+against this study's 21.9 ms, the same order. The answer is recorded below
+rather than quietly swapped in.
 
-- *Daemon-wide lock contention.* The synthetic driver runs at concurrency 1
-  and sees no cost, which is what this explanation predicts. If it holds,
-  taking observations off the request path removes those requests from the
-  lock and the win is most of the 2.4 s.
-- *Per-row durable commit.* 432 syscalls is real work, and an fsync on this
-  filesystem is milliseconds. If it holds, the cost is per-row and roughly
-  independent of concurrency: a ring stops the CLIENT waiting, but the daemon
-  still does the work, and commit batching is the actual repair.
+### The cause, determined after this baseline was published
 
-One measurement separates them — `LeaseFinished` latency with the store on at
-concurrency 1, 8, 32 and 64 on this same subject, counting `fsync` rather than
-syscalls in total. Flat says commit cost; rising says contention. It was not
-run here.
+**Neither candidate. The M13 benchmark did not drive the expensive code at
+all**, and the one condition that mattered was already named in this study's
+own list of unisolated variables: *"the real `commandStatsId` … a synthetic
+execution does not carry"*.
+
+`handleLeaseFinished` called `publishAggregate`, which refreshed the published
+aggregate for the finished lease's stats key **on the completion request path,
+under the daemon-wide lock**. Publishing meant a synchronous
+`flushObservationWriter()` — whose own docstring says *"for the read path,
+never for the write path"* — followed by `estimateFor`. The observation store
+is driven through the **`sqlite3` command-line tool**, so that is **three
+subprocess spawns per finished action**: one for the flush, and two for the
+query (the host-profile read and the aggregate itself).
+
+`publishAggregate` returned immediately when the stats key was empty. The M13
+benchmark built its requests with `resourceRequest(label, …)` — whose first
+parameter is the **label**, not the stats key — and never assigned
+`commandStatsId`, so for the whole of M13's life that early return was the only
+branch it ever took. `reprobuild` sets `commandStatsId` on every request, so a
+real build took the other one every time.
+
+Measured inside the daemon, per keyed completion, release build, M13's loop:
+
+| Step in `handleLeaseFinished` | p50 | p95 |
+|---|---|---|
+| `updateEstimateFromFinish` (in-memory) | 0.001 ms | 0.002 ms |
+| `captureObservation` (enqueue only) | 0.002 ms | 0.008 ms |
+| **`publishAggregate`** | **72.9 ms** | **193.4 ms** |
+| — of which `flushObservationWriter()` | 24.9 ms | 57.4 ms |
+| — of which `estimateFor` | 39.9 ms | 62.8 ms |
+
+The same daemon, same loop, with the stats key left empty: `publishAggregate`
+p50 **0.000 ms**. That is the ON/OFF split this report measured from outside,
+seen from inside.
+
+**Why both published candidates were wrong.** It is not a per-row durable
+commit: the row write is asynchronous and always was, and the cost is three
+process spawns rather than an fsync. It is not lock contention either — the
+work is genuinely done, at concurrency 1, and 72.9 ms of it. Contention is a
+*consequence*: the daemon-wide lock was held across all three spawns, so every
+other connection worker waited behind them. The proposed discriminating
+experiment (latency at concurrency 1, 8, 32, 64) would have answered a question
+neither of whose answers was the truth.
+
+**Fixed.** Aggregate publication now happens on a background thread: the
+completion path marks the key dirty and returns, and the thread does the flush,
+the query and the publication, coalescing repeated completions of one key into
+a single query. The flush moved rather than disappeared, so the published
+figure still includes the run that dirtied the key and is still byte-identical
+to what the socket answers.
+
+### After the fix
+
+**The M13 benchmark, corrected and re-run.** It now sets `commandStatsId` and
+carries both arms, because the difference between them turned out to be the
+dominant term. 400 rounds, interleaved, `-d:release`, same host:
+
+| Per-execution added latency (paired median) | before | after |
+|---|---|---|
+| **stats key set** — what every shipped client does | **53.60 ms** | **0.0012 ms** |
+| no stats key — what this suite used to measure | 0.014 ms | 0.0012 ms |
+| stats key set, paired p95 | 63.72 ms | 0.0088 ms |
+
+A factor of ~45 000. The two arms now agree, which is the point: a completion
+report costs the same whether or not it carries a stats key, because it no
+longer does the store's work.
+
+**There is an accident worth naming.** The corrected keyed figure is *also*
+0.0012 ms — the same number this report quoted as evidence that the synthetic
+driver saw nothing. That figure is now honest: it describes the path a real
+client takes, rather than an early return.
+
+The regression is held by
+`tests/integration/t_completion_report_does_not_wait_on_the_store.nim`, which
+asserts on a drain counter rather than on time, and by the benchmark's second
+arm.
+
+**And M1's own subject, re-run.** Same wide build, same harness, same host,
+`runquotad` `-d:release`. **Read the two columns as a comparison of the
+daemon, not of the machine or the engine** — see the caveats below.
+
+| Wide build, per invocation | before (2026-08-26) | after |
+|---|---|---|
+| **`LeaseFinished` p50** | **21 893 µs** | **41.6 µs** |
+| `LeaseStarting` p50 | 18.5 µs | 16.5 µs |
+| `LeaseRunning` p50 | 23.8 µs | 20.1 µs |
+| `ReleaseLease` p50 | 21.4 µs | 19.0 µs |
+| Completion reporting, per build | 2369 ms | **4.29 ms** |
+| Admission, per build | 5.7 ms | 5.75 ms |
+| Lifecycle start, per build | 3.7 ms | 3.4 ms |
+| Session, per build | 78.3 ms | 68.9 ms |
+| RunQuota IPC on the critical path | 2487 ms | **132 ms** |
+| **as a fraction of build wall time** | **2.5%** | **0.17%** |
+| daemon syscalls per build, over the control | ≈ 28 900 | ≈ 15 000 |
+
+`LeaseFinished` has rejoined the other three lifecycle round trips — 41.6 µs
+against 16–20 µs — which is the shape the original study said would exist if
+the store were not on that path. Everything that did **not** change is at
+least as informative: admission is 5.7 ms in both columns.
+
+**Where the remaining 132 ms is, which is a different place.** It is no longer
+per-execution at all. `CloseSession` is **51 256 µs** at the median and
+`DeclareExtension` **25 704 µs**, four of each per build; together they are
+about 90% of what RunQuota now costs this build, against 4.3 ms for all 268
+per-execution round trips combined. Those two are session-scoped and look like
+the same class of defect in a different handler. **Not investigated here**, and
+recorded so the next person starts from the measurement rather than from this
+one's conclusion.
+
+**Caveats on the "after" column, stated because they matter:**
+
+- **Two invocations per arm, not five.** Single-figure precision at best.
+- **`repro` was a DEBUG build** in the re-measurement and `-d:release` in the
+  original, so the *wall-time denominator is not comparable between the two
+  columns* and the fraction row should be read as an order of magnitude, not a
+  ratio of ratios. The per-message latencies do not depend on it. Both arms
+  within the re-measurement match, which is what the paired comparison needs.
+- **Wall time differed** (78.9 s after against 92.0 s before) for reasons that
+  include the engine's build mode and the host's other work; it is not a
+  RunQuota result in either direction.
+- Measured load in the re-measurement: wall/CPU **p50 1.00, p90 1.04, max
+  2.7** over 1970 units. Not oversubscribed, same as before.
+- The tap resolved **1480 frames → 673 paired round trips + 134 one-way
+  `ExtensionRow` sends**, on 5 connections, with no unpaired remainder beyond
+  those sends.
 
 ---
 
@@ -279,6 +396,28 @@ arm's window. The per-message table above is window-independent and unaffected.
   files"; the RunQuota arm, whose concurrency the lease authority bounds, did
   not. The subject is 66 actions so that both arms complete — which a paired
   A/B requires.
+
+## A defect in this harness, found while re-measuring
+
+**The warmup invocation ran the control arm, and that silently disarmed the
+tap for the whole study.** `runOnce` derives the subject's environment with
+`reproEnv(arm == "runquota", …)`, and the warmup's arm string is `"warmup"` —
+so the warmup ran with `REPROBUILD_NO_RUNQUOTA=1`. `repro-daemon` is a
+*persistent* process that the first invocation starts and every later one
+reuses, and it keeps the environment it was started with, so the build daemon
+spent the rest of the study refusing to talk to RunQuota at all. The tap then
+reported one `Hello` and nothing else: **the silent zero `reproEnv`'s own
+comment exists to prevent, arriving through a door that comment did not
+cover.**
+
+This is why the original study had to kill and restart `repro-daemon` by hand
+to see any lease traffic. The condition is `arm != "control"` now, so the
+warmup is a RunQuota arm — still run straight at the daemon rather than
+through the tap, so nothing it does can reach a percentile.
+
+**Check `tap.paired_round_trips` and `by_message_kind` in the emitted JSON
+before believing any run of this benchmark.** A study whose tap saw only
+`Hello` has measured nothing and looks exactly like a build that makes no IPC.
 
 ## A defect found on the way
 
