@@ -177,15 +177,24 @@ const StandaloneReportEnv* = "RUNQUOTA_REPORT_STANDALONE"
 proc standaloneUnixMillis(): uint64 =
   uint64(max(0'i64, int64(epochTime() * 1000.0)))
 
-proc standaloneOutcome(completion: ProcessCompletion): LeaseFinishOutcome =
-  if completion.cancelled or completion.timedOut:
-    leaseFinishCancelled
-  elif completion.signaled:
-    leaseFinishCrashed
-  elif completion.exited and completion.exitCode == 0:
-    leaseFinishSucceeded
+proc standaloneOutcome(completion: ProcessCompletion): LeaseFinish =
+  ## The same mapping ``runquota_exec.finishOutcome`` makes, and for the
+  ## same reasons -- including the signal test coming before the cancel
+  ## test, so a child killed by SIGTERM is named ``crashed`` and lands on
+  ## ``signalled`` rather than losing the signal to a ``cancelled`` that
+  ## has nowhere to carry it.
+  let signal =
+    if completion.signaled: uint32(max(completion.signal, 0)) else: 0'u32
+  if signal != 0'u32:
+    crashed(signal)
+  elif completion.cancelled or completion.timedOut:
+    cancelled()
+  elif completion.exited and completion.exitCode > 0:
+    failed(uint32(completion.exitCode))
+  elif completion.exited:
+    succeeded()
   else:
-    leaseFinishFailed
+    cancelled()
 
 proc runStandaloneAcquire(label, statsKey: string;
                           command: seq[string]): int =
@@ -222,11 +231,7 @@ proc runStandaloneAcquire(label, statsKey: string;
       commandStatsId = statsKey,
       startedAtUnixMillis = startedAt,
       finishedAtUnixMillis = standaloneUnixMillis(),
-      outcome = standaloneOutcome(completion),
-      exitStatus =
-        if completion.exited: uint32(max(completion.exitCode, 0)) else: 0'u32,
-      signal =
-        if completion.signaled: uint32(max(completion.signal, 0)) else: 0'u32,
+      finish = standaloneOutcome(completion),
       peakRssBytes = completion.peakResidentMemoryBytes,
       processCount = completion.processCount))
     exitCode =

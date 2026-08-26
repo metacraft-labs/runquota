@@ -196,198 +196,394 @@ suite "observation_write_path_rules":
     check observedCpuPct(1_600_000'u32) == 1600.0
 
   # -------------------------------------------------------------------------
-  # The finish's own evidence, and the termination vocabulary it reaches
+  # The finish, and the termination vocabulary it reaches
   # -------------------------------------------------------------------------
   #
-  # BOTH CLAUSES BELOW ARE REFUSALS, and the fixtures they need are ones a
-  # well-behaved client library cannot be asked to build: `RunQuotaLease
-  # .finish` takes `outcome` and `hardLimitOrOom` as two separate defaulted
-  # parameters and cross-validates neither, so "a finish that contradicts
-  # itself" is reachable from a real client but not from a sensible one.
-  # That is exactly the shape the campaign's conventions say goes vacuous
-  # when asserted from outside a running daemon, so it is asserted here on
-  # the pure predicate, at the values that straddle the boundary, with the
-  # accepting case beside every refusing one.
+  # THE FIRST CLAUSE BELOW IS A COMPILATION TEST, and that is the whole
+  # change this file records. There used to be a runtime predicate here
+  # refusing a finish that claimed a kill beside exit status 0 and no
+  # signal, because `RunQuotaLease.finish` took the conclusion and its
+  # evidence as four independently defaulted parameters and cross-validated
+  # none of them -- so the contradiction was one argument list away on the
+  # public API and only the daemon could catch it. `LeaseFinish` has no
+  # such argument list. The states are not refused, they are absent, and
+  # the assertion that they are absent is one the COMPILER makes.
+  #
+  # WHAT SURVIVES AS A RUNTIME RULE IS ABOUT BYTES. A frame arrives as
+  # three integers from whatever wrote them, and three integers can spell
+  # combinations `LeaseFinish` has no room for; `leaseFinishFromWire` is
+  # the constructor that re-establishes by hand what the type establishes
+  # by construction everywhere else. Its clauses are asserted below at the
+  # values that straddle each boundary, with an accepting case beside
+  # every refusing one.
 
-  proc finishOf(outcome: LeaseFinishOutcome; exitCode = 0'u32;
-                signal = 0'u32;
-                hardLimitOrOom = false): LeaseFinishedMessage =
-    LeaseFinishedMessage(
-      sessionId: sessionId(1),
-      leaseId: leaseId(7),
-      outcome: outcome,
-      exitCode: exitCode,
-      signal: signal,
-      peakMemoryBytes: 2_250_000_000'u64,
-      processCount: 3'u32,
-      majorPageFaults: 11'u64,
-      pressureEvents: 0'u32,
-      hardLimitOrOom: hardLimitOrOom,
-      diagnostic: okDiagnostic())
+  test "a finish that contradicts itself does not compile":
+    # POSITIVE CONTROLS FIRST, AND THEY ARE WHAT KEEPS THE REST FROM BEING
+    # VACUOUS. `compiles` answers false for a misspelt identifier as
+    # readily as for a type error, so a test made only of `not compiles`
+    # clauses goes green the day the type is deleted, the day a field is
+    # renamed, and the day somebody fat-fingers a constructor. Every
+    # negative below has an affirmative twin here that fails if the names
+    # stop meaning what the negative assumes.
+    check compiles(LeaseFinish(kind: lfFailed, exitCode: 1'u32))
+    check compiles(LeaseFinish(kind: lfCrashed, crashSignal: 11'u32))
+    check compiles(LeaseFinish(kind: lfOomKilled,
+      kill: KillEvidence(bySignal: true, signal: 9'u32)))
+    check compiles(KillEvidence(bySignal: true, signal: 9'u32))
+    check compiles(KillEvidence(bySignal: false, exitCode: 137'u32))
+    check compiles(oomKilled(killedBySignal(9'u32)))
+    check compiles(timedOut(killedWithExitCode(124'u32)))
 
-  proc recordOf(outcome: LeaseFinishOutcome; exitStatus = 0'u32;
-                signal = 0'u32): DeferredExecutionRecord =
-    DeferredExecutionRecord(
-      label: "probe",
-      commandStatsId: "probe-key",
-      startedAtUnixMillis: 1_700_000_000_000'u64,
-      finishedAtUnixMillis: 1_700_000_000_500'u64,
-      exitStatus: exitStatus,
-      signal: signal,
-      outcome: outcome,
-      peakRssBytes: 2_250_000_000'u64,
-      processCount: 3'u32,
-      majorPageFaults: 11'u64)
+    # A KILL CANNOT BE NAMED WITHOUT THE THING THAT EVIDENCES IT. There is
+    # no arity of these constructors that omits the evidence, and no other
+    # way to reach the kinds that carry it.
+    check not compiles(oomKilled())
+    check not compiles(timedOut())
+    check not compiles(crashed())
 
-  test "a finish claiming a kill beside a clean exit is refused":
+    # A SUCCESS CANNOT CARRY A KILL'S EVIDENCE, because `lfSucceeded` has
+    # no field to put one in. "A kill reported as a successful finish" was
+    # the second of the two states the daemon used to refuse; this is
+    # where it went.
+    check not compiles(LeaseFinish(kind: lfSucceeded, exitCode: 137'u32))
+    check not compiles(LeaseFinish(kind: lfSucceeded, crashSignal: 9'u32))
+    check not compiles(LeaseFinish(kind: lfSucceeded,
+      kill: KillEvidence(bySignal: true, signal: 9'u32)))
+    check not compiles(LeaseFinish(kind: lfCancelled, exitCode: 1'u32))
+    check not compiles(LeaseFinish(kind: lfLaunchFailed, crashSignal: 9'u32))
+
+    # AND THE TWO KINDS OF EVIDENCE CANNOT BOTH BE PRESENT, which is the
+    # refused state stated precisely: "exit status 0 AND signal 0" is a
+    # CONJUNCTION over two fields, and a variant that holds one or the
+    # other has no way to write the conjunction down at all.
+    check not compiles(KillEvidence(bySignal: true, signal: 9'u32,
+      exitCode: 137'u32))
+    check not compiles(LeaseFinish(kind: lfCrashed, exitCode: 1'u32))
+    check not compiles(LeaseFinish(kind: lfFailed, crashSignal: 9'u32))
+
+  test "the one hole a variant leaves is closed by the constructors":
+    # AN ARM HOLDING ONE INTEGER CAN STILL BE LEFT AT ZERO, and zero is
+    # the value that means "no evidence". The type cannot forbid it; the
+    # constructors can, and they are the only way in.
+    expect ValueError: discard killedBySignal(0'u32)
+    expect ValueError: discard killedWithExitCode(0'u32)
+    expect ValueError: discard crashed(0'u32)
+    # "Failed with exit status 0" is the same contradiction in a smaller
+    # costume: a failure whose evidence says the process succeeded.
+    expect ValueError: discard failed(0'u32)
+
+    # AND THE ACCEPTING CASES, so the clauses above are not satisfied by
+    # constructors that refuse everything.
+    check killedBySignal(9'u32).signal == 9'u32
+    check killedWithExitCode(137'u32).exitCode == 137'u32
+    check crashed(11'u32).crashSignal == 11'u32
+    check failed(1'u32).exitCode == 1'u32
+
+  test "a supervisor with no evidence is told so rather than guessing":
+    # THE DEGRADATION PATH, IN THE ONE PLACE EVERY CLIENT TAKES IT. A
+    # supervisor that cannot recover a signal or a status has nothing to
+    # evidence a kill with, and must say `cancelled()` instead of claiming
+    # a deadline it cannot support.
+    var kill: KillEvidence
+    check not killEvidence(0'u32, 0'u32, kill)
+    check killEvidence(0'u32, 9'u32, kill)
+    check kill.bySignal
+    check kill.signal == 9'u32
+    check killEvidence(137'u32, 0'u32, kill)
+    check not kill.bySignal
+    check kill.exitCode == 137'u32
+    # THE SIGNAL WINS WHEN BOTH ARE HELD: it is the kernel's own record of
+    # the kill, and a status integer is at best a convention over it.
+    check killEvidence(137'u32, 9'u32, kill)
+    check kill.bySignal
+    check kill.signal == 9'u32
+
+  test "bytes that spell no finish are refused, and honest bytes are not":
     # THE ACCEPTING CASES FIRST, and there are more of them than refusing
-    # ones on purpose. A predicate that refused everything would satisfy
-    # every clause below and empty the store instead of keeping it honest.
-    check leaseFinishedContradiction(finishOf(leaseFinishSucceeded)) == ""
-    check leaseFinishedContradiction(
-      finishOf(leaseFinishFailed, exitCode = 1'u32)) == ""
-    check leaseFinishedContradiction(finishOf(leaseFinishCancelled)) == ""
-    check leaseFinishedContradiction(finishOf(leaseFinishLaunchFailed)) == ""
+    # ones on purpose. A constructor that refused everything would satisfy
+    # every refusal clause below and empty the store instead of keeping it
+    # honest.
+    proc built(kind: LeaseFinishKind; exitCode = 0'u32;
+               signal = 0'u32): LeaseFinish =
+      check leaseFinishFromWire(uint32(ord(kind)), exitCode, signal,
+        result) == ""
 
-    # AN ORDINARY SIGNAL KILL IS UNTOUCHED, in both spellings. A signalled
-    # process has no exit status at all, so `exit_status = 0` beside
-    # `signalled` reads as "not applicable" rather than as a claim of
-    # success -- and a rule that refused it would discard every signalled
-    # row a real supervisor writes, which is a far larger loss than the
-    # one this rule exists to prevent.
-    check leaseFinishedContradiction(
-      finishOf(leaseFinishCrashed, signal = 11'u32)) == ""
-    check leaseFinishedContradiction(finishOf(leaseFinishCrashed)) == ""
+    proc refusal(kind: LeaseFinishKind; exitCode = 0'u32;
+                 signal = 0'u32): string =
+      var finish: LeaseFinish
+      leaseFinishFromWire(uint32(ord(kind)), exitCode, signal, finish)
 
-    # THE ROW THE SPECIFICATION NAMES. `oom_killed` beside `exit_status`
-    # 137 is evidence that reconciles; beside `exit_status` 0 with no
-    # signal it asserts both that the process was killed for exceeding
-    # memory and that it exited successfully.
-    check leaseFinishedContradiction(
-      finishOf(leaseFinishResourceLimit, exitCode = 137'u32)) == ""
-    check leaseFinishedContradiction(
-      finishOf(leaseFinishResourceLimit)).len > 0
-    check "exit status 0" in leaseFinishedContradiction(
-      finishOf(leaseFinishResourceLimit))
+    check built(lfSucceeded).kind == lfSucceeded
+    check built(lfFailed, exitCode = 1'u32).exitCode == 1'u32
+    check built(lfCrashed, signal = 11'u32).crashSignal == 11'u32
+    check built(lfCancelled).kind == lfCancelled
+    check built(lfLaunchFailed).kind == lfLaunchFailed
 
-    # EITHER KILL FIELD ALONE REACHES THE RULE. They are two independent
-    # pieces of evidence on the wire, set by different kinds of supervisor,
-    # and neither is required to agree with the other -- so the rule is
-    # stated against the exit they are reported beside, never against the
-    # other field.
-    check leaseFinishedContradiction(
-      finishOf(leaseFinishFailed, signal = 9'u32,
-        hardLimitOrOom = true)) == ""
-    check leaseFinishedContradiction(
-      finishOf(leaseFinishFailed, hardLimitOrOom = true)).len > 0
-    # And the flag alone still overrides nothing: an outcome that says the
-    # work SUCCEEDED cannot be reconciled with a kill however the exit
-    # reads, which is the one clause that is about the two fields.
-    check leaseFinishedContradiction(
-      finishOf(leaseFinishSucceeded, exitCode = 137'u32,
-        hardLimitOrOom = true)).len > 0
-    check "successful finish" in leaseFinishedContradiction(
-      finishOf(leaseFinishSucceeded, exitCode = 137'u32,
-        hardLimitOrOom = true))
+    # THE ROW THE SPECIFICATION NAMES. `oom_killed` beside exit status 137
+    # is evidence that reconciles, and so is `oom_killed` beside a signal;
+    # beside neither it asserts both that the process was killed for
+    # exceeding memory and that it exited successfully.
+    check built(lfOomKilled, exitCode = 137'u32).kill.exitCode == 137'u32
+    check built(lfOomKilled, signal = 9'u32).kill.signal == 9'u32
+    check refusal(lfOomKilled).len > 0
+    check "exit status 0 and no signal" in refusal(lfOomKilled)
 
-    # A DEADLINE KILL IS THE SAME SHAPE, so the member added to make
-    # `timeout` reachable does not arrive with the hole this closes.
-    check leaseFinishedContradiction(
-      finishOf(leaseFinishTimedOut, signal = 9'u32)) == ""
-    check leaseFinishedContradiction(
-      finishOf(leaseFinishTimedOut, exitCode = 124'u32)) == ""
-    check leaseFinishedContradiction(finishOf(leaseFinishTimedOut)).len > 0
+    # A DEADLINE KILL IS THE SAME SHAPE, so the kind that makes `timeout`
+    # reachable does not arrive with the hole this closes.
+    check built(lfTimedOut, signal = 9'u32).kill.signal == 9'u32
+    check built(lfTimedOut, exitCode = 124'u32).kill.exitCode == 124'u32
+    check refusal(lfTimedOut).len > 0
 
-  test "a standalone record carries the same rule, on its own fields":
-    check deferredRecordContradiction(recordOf(leaseFinishSucceeded)) == ""
-    check deferredRecordContradiction(
-      recordOf(leaseFinishFailed, exitStatus = 1'u32)) == ""
-    check deferredRecordContradiction(
-      recordOf(leaseFinishCrashed, signal = 11'u32)) == ""
-    check deferredRecordContradiction(recordOf(leaseFinishCrashed)) == ""
-    check deferredRecordContradiction(
-      recordOf(leaseFinishResourceLimit, exitStatus = 137'u32)) == ""
-    check deferredRecordContradiction(
-      recordOf(leaseFinishResourceLimit)).len > 0
-    check deferredRecordContradiction(
-      recordOf(leaseFinishTimedOut, signal = 9'u32)) == ""
-    check deferredRecordContradiction(recordOf(leaseFinishTimedOut)).len > 0
+    # BOTH KINDS OF EVIDENCE AT ONCE IS ALSO NOT A `KillEvidence`. The
+    # wire carries two integers where the type carries one field, so bytes
+    # can say what the type cannot hold -- and silently dropping one would
+    # make the decoder accept two different spellings of one message.
+    check refusal(lfOomKilled, exitCode = 137'u32, signal = 9'u32).len > 0
+    check refusal(lfTimedOut, exitCode = 124'u32, signal = 15'u32).len > 0
+
+    # A SUCCESS CARRYING EITHER, which no constructor can build and a
+    # version-1 peer's frame would.
+    check refusal(lfSucceeded, exitCode = 137'u32).len > 0
+    check refusal(lfSucceeded, signal = 9'u32).len > 0
+
+    # A FAILURE THAT NAMES A SIGNAL IS A CRASH, and a crash that names an
+    # exit status is not one. The old wire let a client send both and the
+    # daemon resolved the argument by testing the signal first; the two
+    # spellings are now one message each.
+    check refusal(lfFailed, exitCode = 1'u32, signal = 9'u32).len > 0
+    check refusal(lfFailed).len > 0
+    check refusal(lfCrashed).len > 0
+    check refusal(lfCrashed, exitCode = 139'u32, signal = 11'u32).len > 0
+
+    # WORK THAT PRODUCED NO VERDICT CANNOT CARRY ONE.
+    check refusal(lfCancelled, exitCode = 1'u32).len > 0
+    check refusal(lfLaunchFailed, signal = 9'u32).len > 0
+
+    # AND AN ORDINAL PAST THE LAST KIND. Casting it into the enum is
+    # undefined and could land anywhere, including on a kill.
+    var beyond: LeaseFinish
+    check leaseFinishFromWire(uint32(ord(high(LeaseFinishKind))) + 1'u32,
+      0'u32, 0'u32, beyond).len > 0
 
   test "every termination the schema names is reachable from a real finish":
     # A VALUE NO CODE CAN PRODUCE IS A CLAIM THE SCHEMA MAKES AND THE
-    # DAEMON CANNOT KEEP. `tTimeout` was exactly that: it appeared nowhere
-    # in runquota outside its own enum declaration, no `LeaseFinishOutcome`
-    # reached it, and a timed-out execution landed on the spine as
-    # `signalled` -- true, and useless to a reader asking why a test stopped.
+    # DAEMON CANNOT KEEP. `tTimeout` was exactly that: no outcome reached
+    # it, and a timed-out execution landed on the spine as `signalled` --
+    # true, and useless to a reader asking why a test stopped.
     #
-    # ENUMERATION, NOT EXISTENCE. The assertion is on the WHOLE SET the
-    # mapping can produce. A one-value expectation would have been
-    # satisfied by an implementation that reached four of the five and
-    # happened to reach the one somebody remembered to name.
-    var leased: set[Termination] = {}
-    for msg in [
-        finishOf(leaseFinishSucceeded),
-        finishOf(leaseFinishFailed, exitCode = 1'u32),
-        finishOf(leaseFinishCrashed, signal = 11'u32),
-        finishOf(leaseFinishResourceLimit, exitCode = 137'u32),
-        finishOf(leaseFinishTimedOut, signal = 9'u32),
-        finishOf(leaseFinishCancelled),
-        finishOf(leaseFinishLaunchFailed)]:
-      leased.incl(observationTermination(msg))
-    check leased == {tExited, tSignalled, tTimeout, tOomKilled, tRefused}
+    # ENUMERATION OVER THE WHOLE KIND SET, NOT A LIST SOMEBODY WROTE OUT.
+    # `LeaseFinishKind` is iterated, so an eighth kind added later cannot
+    # slip past this by being absent from a fixture list -- it has to be
+    # given evidence here and it has to land somewhere.
+    var reached: set[Termination] = {}
+    for kind in LeaseFinishKind:
+      # Each kind is given the evidence it requires and no more, which is
+      # the same discipline the type enforces on every caller.
+      let finish =
+        case kind
+        of lfSucceeded: succeeded()
+        of lfFailed: failed(1'u32)
+        of lfCrashed: crashed(11'u32)
+        of lfOomKilled: oomKilled(killedWithExitCode(137'u32))
+        of lfTimedOut: timedOut(killedBySignal(9'u32))
+        of lfCancelled: cancelled()
+        of lfLaunchFailed: launchFailed()
+      reached.incl(observationTermination(finish))
+    check reached == {tExited, tSignalled, tTimeout, tOomKilled, tRefused}
 
-    # THE STANDALONE PATH REACHES THE SAME FIVE. A word that exists on one
-    # of the two write paths and not the other would make "was this a
-    # timeout" answerable only for executions that happened to hold a
-    # lease.
-    var standalone: set[Termination] = {}
-    for record in [
-        recordOf(leaseFinishSucceeded),
-        recordOf(leaseFinishFailed, exitStatus = 1'u32),
-        recordOf(leaseFinishCrashed, signal = 11'u32),
-        recordOf(leaseFinishResourceLimit, exitStatus = 137'u32),
-        recordOf(leaseFinishTimedOut, signal = 9'u32),
-        recordOf(leaseFinishCancelled),
-        recordOf(leaseFinishLaunchFailed)]:
-      standalone.incl(deferredTermination(record))
-    check standalone == {tExited, tSignalled, tTimeout, tOomKilled, tRefused}
+    # AND EACH WORD IS THE ONE THE KIND MEANS, not merely some word. The
+    # set above is satisfied by any bijection; these are the mapping.
+    check observationTermination(succeeded()) == tExited
+    check observationTermination(failed(1'u32)) == tExited
+    check observationTermination(crashed(11'u32)) == tSignalled
+    check observationTermination(cancelled()) == tRefused
+    check observationTermination(launchFailed()) == tRefused
 
-    # AND THE DEADLINE SURVIVES THE SIGNAL IT WAS DELIVERED WITH. A timeout
-    # kill IS a signal kill, so a mapping that tested `signal` first would
-    # answer `signalled` and throw the deadline away -- which is what the
-    # daemon did before `leaseFinishTimedOut` existed, and what it would go
-    # back to doing if the two tests were reordered.
-    check observationTermination(
-      finishOf(leaseFinishTimedOut, signal = 9'u32)) == tTimeout
-    check deferredTermination(
-      recordOf(leaseFinishTimedOut, signal = 9'u32)) == tTimeout
-    # A memory kill delivered by the same signal still says WHAT FOR.
-    check observationTermination(
-      finishOf(leaseFinishFailed, signal = 9'u32,
-        hardLimitOrOom = true)) == tOomKilled
+    # THE DEADLINE SURVIVES THE SIGNAL IT WAS DELIVERED WITH. A timeout
+    # kill IS a signal kill, and the old mapping was a ladder in which a
+    # signal test placed above the deadline test would have answered
+    # `signalled` and thrown the deadline away. There is no ladder left to
+    # get wrong: the kind says which, and the signal is inside it.
+    check observationTermination(timedOut(killedBySignal(9'u32))) == tTimeout
+    check observationTermination(timedOut(killedWithExitCode(124'u32))) ==
+      tTimeout
+    # A memory kill delivered by the same signal still says WHAT FOR. This
+    # used to depend on an ordering between two overlapping tests, with a
+    # paragraph explaining which had to come first; a supervisor now
+    # states the conclusion and there is no second test to order it
+    # against.
+    check observationTermination(oomKilled(killedBySignal(9'u32))) ==
+      tOomKilled
+    check observationTermination(oomKilled(killedWithExitCode(137'u32))) ==
+      tOomKilled
 
-    # AND MEMORY PRECEDES THE DEADLINE, which is the half of the ordering
-    # the clauses above do NOT constrain: every fixture they use sets at
-    # most one kind of kill, so swapping the memory test and the deadline
-    # test past each other leaves them all green. Only a finish carrying
-    # BOTH -- a supervisor that watched an `ru_maxrss` cross a hard limit
-    # AND holds a deadline of its own -- can tell the two orders apart,
-    # and it is the case where the memory fact is the more specific one:
-    # `timeout` says the supervisor stopped waiting, `oom_killed` says
-    # WHAT the process did to earn it.
+  test "nothing that ran and was killed lands on the store's zero":
+    # THE COLUMN IS READ BY SQL, NOT BY THIS FILE. `exit_status` is one
+    # integer standing for two kinds of ending, and the reader it exists
+    # for compares it against 0. A row reading `termination = signalled`
+    # beside `exit_status = 0` asserts both that a signal ended this
+    # process and that it exited of its own accord, successfully --
+    # which is the pairing §"The Execution Spine" forbids by name, and
+    # the same defect this whole type exists to abolish, one layer down.
     #
-    # LEASED PATH ONLY, and not from an oversight. `DeferredExecutionRecord`
-    # carries no `hardLimitOrOom`, so `outcome` is the whole of its kill
-    # evidence and a standalone record cannot claim both kinds at once --
-    # the ordering is unobservable there rather than untested.
-    check observationTermination(
-      finishOf(leaseFinishTimedOut, signal = 9'u32,
-        hardLimitOrOom = true)) == tOomKilled
-    # The fixture above must be one the write path would actually accept,
-    # or the clause is about a row that never gets made.
-    check leaseFinishedContradiction(
-      finishOf(leaseFinishTimedOut, signal = 9'u32,
-        hardLimitOrOom = true)) == ""
+    # SO A SIGNALLED DEATH IS 128+N. Every shell, CI system and process
+    # supervisor already renders it that way, so a reader who knows
+    # nothing about RunQuota still reads 139 as "killed".
+    check crashed(11'u32).exitStatus == 139'u32
+    check oomKilled(killedBySignal(9'u32)).exitStatus == 137'u32
+    check timedOut(killedBySignal(15'u32)).exitStatus == 143'u32
+
+    # AND IT IS LOSSLESS, which is the other half of why it is not 0. The
+    # signal arrives on the wire and the store has NO SIGNAL COLUMN, so a
+    # zero discarded it with no way back.
+    for signal in [1'u32, 9'u32, 11'u32, 15'u32, 31'u32, 64'u32]:
+      check crashed(signal).exitStatus - SignalledExitStatusBase == signal
+      check crashed(signal).exitStatus != 0'u32
+
+    # A KILL EVIDENCED BY A STATUS KEEPS THAT STATUS UNCHANGED. It is
+    # already the number the supervisor saw; adding 128 to it would be
+    # inventing a signal nobody observed.
+    check oomKilled(killedWithExitCode(137'u32)).exitStatus == 137'u32
+    check timedOut(killedWithExitCode(124'u32)).exitStatus == 124'u32
+
+    # NOT 128+N FOR EVERYTHING, which is the mutation the clauses above
+    # would not catch on their own: an accessor that added the base
+    # unconditionally satisfies every assertion so far.
+    check succeeded().exitStatus == 0'u32
+    check failed(1'u32).exitStatus == 1'u32
+    check failed(3'u32).exitStatus == 3'u32
+    check failed(139'u32).exitStatus == 139'u32
+
+    # THE TWO ZEROES, TOLD APART. `lfSucceeded` is a measurement: the
+    # process ran and returned 0. `lfCancelled`/`lfLaunchFailed` produced
+    # no status at all, and their `termination` is `refused` -- the word
+    # for work that never ran -- so the column is making no claim about a
+    # process and the zero cannot be mistaken for one.
+    check succeeded().exitStatus == 0'u32
+    check observationTermination(succeeded()) == tExited
+    check cancelled().exitStatus == 0'u32
+    check launchFailed().exitStatus == 0'u32
+    check observationTermination(cancelled()) == tRefused
+    check observationTermination(launchFailed()) == tRefused
+
+    # AND EVERY KIND THAT DESCRIBES A PROCESS WHICH RAN AND WAS ENDED BY
+    # SOMETHING IS NON-ZERO. Enumerated over the kind set rather than
+    # listed, so a future kind has to be placed on one side or the other.
+    for kind in LeaseFinishKind:
+      let finish =
+        case kind
+        of lfSucceeded: succeeded()
+        of lfFailed: failed(1'u32)
+        of lfCrashed: crashed(11'u32)
+        of lfOomKilled: oomKilled(killedBySignal(9'u32))
+        of lfTimedOut: timedOut(killedBySignal(15'u32))
+        of lfCancelled: cancelled()
+        of lfLaunchFailed: launchFailed()
+      if observationTermination(finish) in {tSignalled, tOomKilled, tTimeout}:
+        check finish.exitStatus != 0'u32
+
+  test "the spine's column and the wire's fields are not the same number":
+    # THE WIRE CARRIES THE FINISH; THE SPINE CARRIES A RENDERING OF IT.
+    # One function for both would have to pick, and picking the spine's
+    # number breaks the codec while picking the wire's reintroduces the
+    # zero above -- so they are two functions and this is the clause that
+    # says they must stay two.
+    check crashed(11'u32).wireExitCode == 0'u32
+    check crashed(11'u32).wireSignal == 11'u32
+    check crashed(11'u32).exitStatus == 139'u32
+
+    # CONFLATING THEM IS CAUGHT RATHER THAN MERELY DISCOURAGED: a frame
+    # built from the spine's column does not decode, because "a crashed
+    # finish carries an exit status" is one of the malformed shapes.
+    var rebuilt: LeaseFinish
+    check leaseFinishFromWire(uint32(ord(lfCrashed)),
+      crashed(11'u32).exitStatus, crashed(11'u32).wireSignal, rebuilt).len > 0
+
+    # AND THE WIRE'S OWN FIELDS DO ROUND-TRIP, so the clause above is
+    # about the spine's number and not about a decoder that refuses
+    # everything.
+    check leaseFinishFromWire(uint32(ord(lfCrashed)),
+      crashed(11'u32).wireExitCode, crashed(11'u32).wireSignal,
+      rebuilt) == ""
+    check rebuilt.crashSignal == 11'u32
+
+  test "a standalone record's finish is refused on the same rule":
+    # ONE RULE, ONE PLACE, BOTH WRITE PATHS. The deferred flush used to
+    # carry its own copy of the contradiction check, over its own field
+    # names, kept in step with the leased one by hand. Both now carry a
+    # `LeaseFinish` and both are built by `leaseFinishFromWire`, so a
+    # standalone row and an admitted row cannot disagree about what is
+    # sayable.
+    #
+    # A CONTRADICTORY RECORD IS DROPPED AND COUNTED, NOT ALLOWED TO FAIL
+    # THE BATCH. A batch is one client's entire exit flush; discarding a
+    # hundred readable rows over the hundred-and-first is a larger loss
+    # than the one the refusal exists to prevent (OS-4).
+    proc recordOf(finish: LeaseFinish): DeferredExecutionRecord =
+      DeferredExecutionRecord(
+        label: "probe",
+        commandStatsId: "probe-key",
+        startedAtUnixMillis: 1_700_000_000_000'u64,
+        finishedAtUnixMillis: 1_700_000_000_500'u64,
+        finish: finish,
+        peakRssBytes: 2_250_000_000'u64,
+        processCount: 3'u32,
+        majorPageFaults: 11'u64)
+
+    let honest = DeferredObservationsMessage(
+      tool: "probe", toolVersion: "1", invocationKind: "standalone",
+      completeness: ccDegraded, droppedObservations: 0'u32,
+      records: @[recordOf(succeeded()),
+                 recordOf(oomKilled(killedWithExitCode(137'u32))),
+                 recordOf(failed(2'u32))])
+    var decoded: DeferredObservationsMessage
+    var contradictory = 0
+    check decodeDeferredObservations(encodeDeferredObservations(honest),
+      decoded, contradictory)
+    check contradictory == 0
+    check decoded.records.len == 3
+
+    # THE SAME BATCH WITH ONE RECORD'S KILL EVIDENCE ERASED ON THE WIRE.
+    # Forged rather than constructed, because no client can construct it:
+    # the middle record's three finish integers are rewritten in place to
+    # `oom_killed, 0, 0`.
+    var forged = encodeDeferredObservations(honest)
+    let marker = encodeDeferredObservations(DeferredObservationsMessage(
+      tool: "probe", toolVersion: "1", invocationKind: "standalone",
+      completeness: ccDegraded, droppedObservations: 0'u32,
+      records: @[recordOf(oomKilled(killedWithExitCode(137'u32)))]))
+    # The exit-status word of that record, found by the value only it
+    # carries, and zeroed.
+    var at = -1
+    for i in 0 .. forged.len - 4:
+      if forged[i] == char(137) and forged[i + 1] == '\0' and
+          forged[i + 2] == '\0' and forged[i + 3] == '\0':
+        at = i
+        break
+    check at >= 0
+    check marker.len > 0
+    for i in 0 ..< 4:
+      forged[at + i] = '\0'
+
+    var survivors: DeferredObservationsMessage
+    var dropped = 0
+    check decodeDeferredObservations(forged, survivors, dropped)
+    check dropped == 1
+    # THE OTHER TWO SURVIVED, which is what makes the drop a degradation
+    # rather than a batch failure.
+    check survivors.records.len == 2
+    check survivors.records[0].finish.kind == lfSucceeded
+    check survivors.records[1].finish.kind == lfFailed
+    # AND THE RUN STILL GETS WRITTEN, so the loss has a row to sit in:
+    # a flush whose every record was malformed is not "nothing in it".
+    check deferredObservationsRefusal(DeferredObservationsMessage(
+      tool: "probe", toolVersion: "1", invocationKind: "standalone",
+      completeness: ccDegraded, droppedObservations: 0'u32,
+      records: @[]), contradictoryRecords = 1) == ""
+    check deferredObservationsRefusal(DeferredObservationsMessage(
+      tool: "probe", toolVersion: "1", invocationKind: "standalone",
+      completeness: ccDegraded, droppedObservations: 0'u32,
+      records: @[]), contradictoryRecords = 0).len > 0
 
   # -------------------------------------------------------------------------
   # The crash exit for in-flight self-reports

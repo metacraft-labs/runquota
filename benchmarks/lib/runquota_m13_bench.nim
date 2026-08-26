@@ -174,7 +174,7 @@ proc timeOneExecution(session: var RunQuotaSession; label: string): float =
   lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
   lease.reportObservation(12_500'u32, 1_500_000_000'u64,
     uint64(unixMillisNow()))
-  lease.finish(outcome = leaseFinishSucceeded, exitCode = 0'u32,
+  lease.finish(outcome = succeeded(),
     peakMemoryBytes = 1_048_576'u64, processCount = 1'u32)
   lease.release()
   (epochTime() - start) * 1000.0

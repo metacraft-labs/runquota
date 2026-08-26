@@ -102,7 +102,7 @@ proc completeOneExecution(client: var RunQuotaClient; label: string) =
   doAssert lease.active
   lease.markStarting()
   lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
-  lease.finish(outcome = leaseFinishSucceeded, exitCode = 0'u32,
+  lease.finish(outcome = succeeded(),
     peakMemoryBytes = 1_000'u64, processCount = 1'u32,
     majorPageFaults = 0'u64)
   lease.release()

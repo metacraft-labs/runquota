@@ -111,7 +111,7 @@ proc completeOneExecution(session: var RunQuotaSession;
   result = lease.id.value
   lease.markStarting()
   lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
-  lease.finish(outcome = leaseFinishSucceeded, exitCode = 0'u32,
+  lease.finish(outcome = succeeded(),
     peakMemoryBytes = 1_000_000'u64, processCount = 1'u32)
   lease.release()
 

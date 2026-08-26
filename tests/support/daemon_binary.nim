@@ -9,11 +9,11 @@
 ## test file does not. Documenting the hazard is all any of them did.
 ##
 ## THE DEFECT THAT MOTIVATED THIS, and it is not hypothetical. A change
-## that spans the client and the daemon -- a new `LeaseFinishOutcome`
-## ordinal, say -- recompiles the test and the client library but leaves an
-## older `runquotad` in place. `decodeLeaseFinished` bounds the wire ordinal
-## by the RECEIVER's `high()`, so the old daemon refuses the new frame and
-## the lease strands. The test then reports a failure that belongs to the
+## that spans the client and the daemon -- a new `LeaseFinishKind`, say --
+## recompiles the test and the client library but leaves an older
+## `runquotad` in place. `leaseFinishFromWire` bounds the wire ordinal by
+## the RECEIVER's `high()`, so the old daemon refuses the new frame and the
+## lease strands. The test then reports a failure that belongs to the
 ## build, and the failure looks exactly like a defect in the code under
 ## test. It was misattributed as a pre-existing failure of an unrelated
 ## test before this check existed.
