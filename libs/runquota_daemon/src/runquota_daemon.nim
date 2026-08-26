@@ -904,6 +904,118 @@ proc observationCaptureEnabled(daemon: RunQuotaDaemon): bool =
   ## `host_id` to carry and OS-6 forbids writing them anyway.
   daemon.observationStore.captureEnabled and daemon.observationHostId.len > 0
 
+# ---------------------------------------------------------------------------
+# Aggregate publication, deferred.
+#
+# WHAT WAS WRONG. M13b published the aggregate for a stats key from inside
+# `LeaseFinished`, and publishing means a synchronous drain of the
+# observation writer's queue followed by `estimateFor` -- three `sqlite3`
+# subprocess spawns, measured at 25 ms and 40 ms respectively on the
+# completion path, all of it under the daemon-wide lock that every other
+# connection worker is waiting on. `flushObservationWriter`'s own contract
+# says "for the read path, never for the write path", and a completion
+# report IS the write path. M1 measured the consequence from outside: a
+# `LeaseFinished` round trip cost 21.9 ms with capture on and 47.8 us with
+# it off, 2.4 s of a 92 s build.
+#
+# WHAT REPLACED IT. The completion path now MARKS THE KEY DIRTY -- one
+# lock, one string compare per resident key, no IO -- and a background
+# thread does the flush, the query and the publication. Nobody is waiting
+# on that thread, which is what makes its flush legitimate under the same
+# contract that forbids the old one.
+#
+# WHAT DID NOT CHANGE IS THE NUMBER. The thread flushes before it queries,
+# so the aggregate it publishes still includes the run that dirtied the
+# key, and it publishes exactly what `estimateFor` answers -- the same call
+# `statsAnswer` makes, over the same rows, for the same profile. Only WHEN
+# a figure appears moved; WHAT appears is byte-identical, which is what
+# `t_stats_table_cache_control` measures and what keeps the table a cache
+# rather than a second source of truth.
+#
+# DIRTY KEYS COALESCE, and that is a second, larger win: a build that
+# finishes forty actions of one kind inside one interval publishes that
+# key ONCE. The old path queried per completion.
+#
+# NOTHING IS READ BACK, still. The publisher writes; the daemon's own
+# decisions are taken from `daemon.estimates`, its private learned table,
+# exactly as before. Deferring changed which thread writes the segment and
+# not who reads it, and nothing below ever consults it.
+# ---------------------------------------------------------------------------
+
+const
+  PublicationIntervalMillis = 25
+    ## The observation writer's own drain cadence. Matching it means a
+    ## publication almost always finds its rows already written and its
+    ## flush finds nothing to do.
+  MaxPendingPublications = 4096
+    ## BOUNDED, LIKE EVERY OTHER QUEUE HERE. A host whose distinct stats
+    ## keys arrive faster than they can be aggregated must lose
+    ## publications rather than memory: the published table is a cache, an
+    ## absent entry costs a round trip and no correctness, and an unbounded
+    ## list would turn a busy build into a growing daemon. The bound is far
+    ## above the segment's own slot count, so it is reached only by a
+    ## workload the table could not have held anyway.
+
+var
+  publicationLock: Lock
+  publicationLockReady = false
+  publicationThread: Thread[void]
+  publicationPending: seq[string] = @[]
+  publicationStop = false
+  publicationActive = false
+  publicationsRequested = 0'u64
+  publicationsCoalesced = 0'u64
+  publicationsCompleted = 0'u64
+  publicationsDropped = 0'u64
+
+proc ensurePublicationLock() =
+  if not publicationLockReady:
+    initLock(publicationLock)
+    publicationLockReady = true
+
+proc markAggregateDirty(daemon: var RunQuotaDaemon; statsKey: string) =
+  ## Records that one key's aggregate is out of date. NO IO, and none of
+  ## the three guards below have moved: they are the same conditions
+  ## `publishAggregate` used to apply before doing any work, applied in the
+  ## same place, so a daemon with no table, a lease with no stats key and a
+  ## daemon with capture off all still publish nothing at all.
+  if not daemon.statsPublisher.available: return
+  if statsKey.len == 0: return
+  if not daemon.observationCaptureEnabled: return
+  ensurePublicationLock()
+  acquire(publicationLock)
+  try:
+    inc publicationsRequested
+    for pending in publicationPending:
+      if pending == statsKey:
+        # ALREADY DIRTY. One publication answers both completions, because
+        # what is published is the aggregate as of the query, not a delta.
+        inc publicationsCoalesced
+        return
+    if publicationPending.len >= MaxPendingPublications:
+      # DROPPED AND COUNTED, never blocked: OS-1 says recording must not
+      # perturb the work being observed, and waiting here would perturb it
+      # exactly as the synchronous publication used to.
+      inc publicationsDropped
+      return
+    publicationPending.add(statsKey)
+  finally:
+    release(publicationLock)
+
+proc aggregatePublicationJson(): string =
+  "\"aggregate_publication\":{" &
+    "\"requested\":" & $publicationsRequested & "," &
+    "\"coalesced\":" & $publicationsCoalesced & "," &
+    "\"published\":" & $publicationsCompleted & "," &
+    "\"dropped\":" & $publicationsDropped & "," &
+    # THE COUNT THAT MAKES THE RULE TESTABLE. A synchronous drain per
+    # finished lease is the defect; a drain per query and a drain per
+    # publication batch are not. Only a counter can tell those apart from
+    # outside, and without one the regression is invisible in every
+    # functional assertion the suite makes.
+    "\"synchronous_drains\":" & $observationWriterFlushes() &
+  "}"
+
 proc retentionJson(intervalMillis: int): string =
   ## THE SCHEDULED PASS, READABLE FROM OUTSIDE THE DAEMON.
   ##
@@ -987,6 +1099,7 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
     "\"queued\":" & $observationsWritten() & "," &
     "\"dropped\":" & $observationsDropped() & "," &
     "\"write_failures\":" & $observationWriteFailures() & "," &
+    aggregatePublicationJson() & "," &
     retentionJson(daemon.config.retentionSweepIntervalMillis) &
   "}}"
 
@@ -1325,38 +1438,21 @@ proc effectiveResources(daemon: RunQuotaDaemon; sessionId: SessionId;
     if learned > result.memory.value:
       result.memory = bytes(learned)
 
-proc publishAggregate(daemon: var RunQuotaDaemon; statsKey: string) =
-  ## Publish the CURRENT aggregate for one stats key into the segment, as
-  ## the daemon folds in the run that just finished.
-  ##
+proc aggregatePayload(storePath, statsKey: string;
+                      profileId: Option[string]): PublishedEstimate =
   ## THE PUBLISHED FIGURE IS THE ONE THE SOCKET ANSWERS WITH, deliberately
-  ## and to the byte: ``estimateFor`` is the same call ``statsAnswer``
-  ## makes for ``statsSubjectDistribution``, over the same rows, for the
-  ## same profile. That equality is what makes the table a CACHE — a miss
-  ## costs a round trip and changes no number — and it is what
-  ## ``t_stats_table_cache_control.nim`` measures with the table emptied.
-  ## Publishing some other, better figure here would be the moment the
-  ## table quietly became a second source of truth.
+  ## and to the byte: ``estimateForAt`` delegates to ``estimateFor``, the
+  ## same call ``statsAnswer`` makes for ``statsSubjectDistribution``, over
+  ## the same rows, for the same profile. That equality is what makes the
+  ## table a CACHE — a miss costs a round trip and changes no number — and
+  ## it is what ``t_stats_table_cache_control.nim`` measures with the table
+  ## emptied. Publishing some other, better figure here would be the moment
+  ## the table quietly became a second source of truth.
   ##
-  ## NOTHING IS READ BACK. The publisher writes; the daemon's own decisions
-  ## are taken from ``daemon.estimates``, its private learned table, exactly
-  ## as before this milestone.
-  if not daemon.statsPublisher.available: return
-  if statsKey.len == 0: return
-  if not daemon.observationCaptureEnabled: return
-  let profileId =
-    if daemon.observationProfileId.len > 0:
-      some(daemon.observationProfileId)
-    else:
-      none(string)
-  # The row that has just been captured is still in the writer's queue, and
-  # an aggregate published without it would be one run stale from the moment
-  # it was written. This is the same flush `statsAnswer` performs before
-  # answering, for the same reason.
-  flushObservationWriter()
-  let answer = daemon.observationStore.estimateFor(statsKey, spanSingleProfile,
-    profileId)
-  var payload = PublishedEstimate(
+  ## PATH-ADDRESSED because the caller is a background thread and the
+  ## ``ObservationStore`` ref belongs to whoever holds the daemon lock.
+  let answer = estimateForAt(storePath, statsKey, spanSingleProfile, profileId)
+  result = PublishedEstimate(
     statsKey: statsKey,
     knowledge: statsTableUnknown,
     memoryBytes: 0'u64,
@@ -1365,12 +1461,11 @@ proc publishAggregate(daemon: var RunQuotaDaemon; statsKey: string) =
     updatedUnixMillis: nowUnixMillis())
   for entry in answer.distributions:
     if entry.knowledge == statsKnown:
-      payload.knowledge = statsTableKnown
-      payload.memoryBytes = uint64(max(0'i64, entry.peakRssBytesMax))
-      payload.recentPeakBytes = payload.memoryBytes
-      payload.sampleCount = uint64(max(0'i64, entry.sampleCount))
+      result.knowledge = statsTableKnown
+      result.memoryBytes = uint64(max(0'i64, entry.peakRssBytesMax))
+      result.recentPeakBytes = result.memoryBytes
+      result.sampleCount = uint64(max(0'i64, entry.sampleCount))
       break
-  discard daemon.statsPublisher.publishEstimate(statsKey, payload)
 
 proc updateEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
                               finish: LeaseFinishedMessage) =
@@ -2253,12 +2348,14 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     lease.pressureEvents = msg.pressureEvents
     daemon.updateEstimateFromFinish(lease, msg)
     daemon.captureObservation(lease, msg)
-    # M13b: AS IT FOLDS IN THIS RUN'S RESULTS, and after the row has been
-    # captured so the aggregate includes it. Ordered after
-    # `captureObservation` rather than beside `updateEstimateFromFinish`
-    # because publishing an aggregate that excludes the run that triggered
-    # it would make every published entry exactly one execution stale.
-    daemon.publishAggregate(lease.commandStatsId)
+    # M13b: THE KEY IS MARKED DIRTY, NOT PUBLISHED. Ordered after
+    # `captureObservation` because the aggregate must include the run that
+    # triggered it, and the publisher's flush is what makes that true; but
+    # the flush and the query themselves happen on a background thread,
+    # because doing them here made a completion report wait tens of
+    # milliseconds on `sqlite3` -- with every other connection worker
+    # waiting behind it on the daemon lock.
+    daemon.markAggregateDirty(lease.commandStatsId)
     daemon.endLeaseSelfReport(msg.leaseId)
     inc daemon.totalFinished
     daemon.leases[msg.leaseId.value] = lease
@@ -2409,6 +2506,123 @@ type
 
 var sharedDaemon: SharedDaemon
 var connectionQueue: ConnectionQueue
+
+# ---------------------------------------------------------------------------
+# The aggregate publication thread.
+#
+# HERE RATHER THAN BESIDE `markAggregateDirty` because publishing needs the
+# publisher, and the publisher lives in `sharedDaemon` — which is declared
+# above this line and below that one.
+#
+# TWO LOCKS, NEVER HELD TOGETHER, and the order they would have to be taken
+# in is why. `markAggregateDirty` runs on a connection worker, which is
+# already holding `sharedDaemon.lock`, and takes `publicationLock` inside
+# it. So this thread must never take `sharedDaemon.lock` while holding
+# `publicationLock`. It does not: the pending list is swapped out and the
+# lock released before anything else happens, and each publication takes
+# the daemon lock on its own.
+#
+# THE EXPENSIVE PART IS OUTSIDE BOTH LOCKS. `flushObservationWriter` and
+# `estimateForAt` spawn `sqlite3`; holding the daemon-wide lock across
+# either of them is what the old code did, and it stalled every other
+# connection worker for the duration.
+# ---------------------------------------------------------------------------
+
+proc publishDirtyAggregates() {.gcsafe.} =
+  {.cast(gcsafe).}:
+    var keys: seq[string] = @[]
+    ensurePublicationLock()
+    acquire(publicationLock)
+    try:
+      keys = publicationPending
+      publicationPending = @[]
+    finally:
+      release(publicationLock)
+    if keys.len == 0:
+      return
+    # THE FLUSH, ON THE RIGHT THREAD. `flushObservationWriter`'s contract
+    # is "the path of somebody who has just asked a question and is waiting
+    # for the answer anyway" — this thread is exactly that and no client is
+    # behind it. Once per batch, not once per key: one drain writes every
+    # queued row, so a second would find nothing.
+    flushObservationWriter()
+    var storePath = ""
+    var profileId = none(string)
+    acquire(sharedDaemon.lock)
+    try:
+      storePath = sharedDaemon.daemon.observationStore.path
+      if sharedDaemon.daemon.observationProfileId.len > 0:
+        profileId = some(sharedDaemon.daemon.observationProfileId)
+    finally:
+      release(sharedDaemon.lock)
+    for key in keys:
+      let payload = aggregatePayload(storePath, key, profileId)
+      acquire(sharedDaemon.lock)
+      try:
+        discard sharedDaemon.daemon.statsPublisher.publishEstimate(key, payload)
+        inc publicationsCompleted
+      finally:
+        release(sharedDaemon.lock)
+
+proc publicationMain() {.thread, gcsafe.} =
+  ## A FAILURE HERE MUST NOT TAKE THE HOST'S LEASE AUTHORITY WITH IT, for
+  ## the reason `connectionWorker` gives at length: an unhandled exception
+  ## on a Nim thread ends the process, and this one is host-wide. A
+  ## publication that cannot be computed leaves the table one run stale,
+  ## which is a condition the readers already tolerate by specification.
+  while true:
+    sleep(PublicationIntervalMillis)
+    try:
+      publishDirtyAggregates()
+    except CatchableError:
+      discard
+    var stopping = false
+    {.cast(gcsafe).}:
+      acquire(publicationLock)
+      try:
+        stopping = publicationStop
+      finally:
+        release(publicationLock)
+    if stopping:
+      # THE LAST KEYS ARE STILL PUBLISHED. Without this drain a key whose
+      # final execution landed in the last interval would be absent from
+      # the table for as long as the segment outlives the daemon — and a
+      # stale table is specified to be readable, so it would be read.
+      try:
+        publishDirtyAggregates()
+      except CatchableError:
+        discard
+      break
+
+proc startAggregatePublisher() =
+  ensurePublicationLock()
+  acquire(publicationLock)
+  try:
+    if publicationActive:
+      return
+    publicationStop = false
+    publicationActive = true
+  finally:
+    release(publicationLock)
+  createThread(publicationThread, publicationMain)
+
+proc stopAggregatePublisher() =
+  ensurePublicationLock()
+  var running = false
+  acquire(publicationLock)
+  try:
+    running = publicationActive
+    publicationStop = true
+  finally:
+    release(publicationLock)
+  if not running:
+    return
+  joinThread(publicationThread)
+  acquire(publicationLock)
+  try:
+    publicationActive = false
+  finally:
+    release(publicationLock)
 
 proc connectionWorkerCount(): int =
   max(4, min(32, countProcessors()))
@@ -2588,6 +2802,10 @@ proc serve*(config: DaemonConfig): int =
   # AFTER the rendezvous directory exists and has been verified, because the
   # published table lives in it and is discovered the same way the socket is.
   sharedDaemon.daemon.startStatsPublisher()
+  # AFTER the publisher exists, because the thread's whole job is to write
+  # into it, and before any connection is accepted, because a key marked
+  # dirty with nobody draining it would never reach the table.
+  startAggregatePublisher()
   # THE DEGRADATION IS SAID OUT LOUD, and it is appended to the listening
   # line rather than printed on one of its own: the startup output is a
   # FIXED number of lines that readers consume by count, and a fourth line
@@ -2664,6 +2882,11 @@ proc serve*(config: DaemonConfig): int =
     stopConnectionQueue()
     for i in 0 ..< threads.len:
       joinThread(threads[i])
+    # BEFORE the daemon lock is taken below, and before the writer is
+    # stopped: this thread takes that lock itself, so joining it from
+    # inside would deadlock, and its final drain needs the observation
+    # writer still alive to flush.
+    stopAggregatePublisher()
     acquire(sharedDaemon.lock)
     try:
       sharedDaemon.daemon.state = dsStopping

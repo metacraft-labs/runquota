@@ -752,7 +752,19 @@ proc runOnce(s: var Study; arm: string; index: int;
 
   let daemonBefore = pidUnixSyscallCount(s.daemonPid)
   let args = s.cfg.subjectArgs
-  let env = s.reproEnv(arm == "runquota", socket)
+  # THE WARMUP IS A RUNQUOTA ARM, and it has to be, for a reason that is not
+  # about warming anything. `repro-daemon` is a PERSISTENT process that the
+  # first invocation starts and every later one reuses, and it keeps the
+  # environment it was started with -- so a warmup that ran with
+  # `REPROBUILD_NO_RUNQUOTA=1` left a build daemon that would not talk to
+  # RunQuota AT ALL for the rest of the study, and the tap then reported a
+  # `Hello` and nothing else. That is precisely the SILENT ZERO
+  # `reproEnv`'s own comment warns about, arriving through a door it did not
+  # cover; `arm == "runquota"` is false for the string "warmup". The warmup
+  # is still run STRAIGHT AT THE DAEMON rather than through the tap -- the
+  # caller passes `s.daemonSocket` -- so nothing it does can reach a
+  # percentile.
+  let env = s.reproEnv(arm != "control", socket)
   let tStart = monoNs()
   var child = startProcess(s.cfg.reproBin, workingDir = s.cfg.subjectDir,
     args = args, env = env, options = {poStdErrToStdOut})

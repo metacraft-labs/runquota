@@ -33,6 +33,14 @@ var
   writerWritten = 0'i64
   writerStop = false
   writerActive = false
+  writerFlushes = 0'i64
+    ## HOW MANY TIMES SOMEBODY DRAINED THIS QUEUE ON THEIR OWN THREAD.
+    ## Counted because the rule below — read path only, never the write
+    ## path — was broken once and nothing could see it: a synchronous drain
+    ## on the completion path is invisible in every functional assertion
+    ## the suite makes and shows up only as latency. A count turns "the
+    ## completion path does not wait on the store" into something a test
+    ## can assert instead of time.
 
 proc ensureWriterLock() =
   if not writerLockReady:
@@ -198,6 +206,15 @@ proc flushObservationWriter*() =
   ## path of somebody who has just asked a question and is waiting for the
   ## answer anyway.
   ##
+  ## "NOBODY IS WAITING" IS THE REAL TEST, and it is what admits the
+  ## aggregate publisher's background thread as well as a query: that
+  ## thread flushes so the aggregate it is about to compute includes the
+  ## run that dirtied the key, and no client's reply is behind it. What the
+  ## rule excludes is a caller who is holding up work that has already
+  ## finished — a completion report did exactly that for the whole of
+  ## M13b, at a cost of tens of milliseconds per finished action, and the
+  ## count below exists so a test can say so.
+  ##
   ## Safe to call concurrently with the drain thread: the queue swap is
   ## under the same lock, so at worst one of the two callers finds nothing
   ## to write.
@@ -205,11 +222,25 @@ proc flushObservationWriter*() =
   var running = false
   acquire(writerLock)
   try:
+    writerFlushes += 1
     running = writerActive
   finally:
     release(writerLock)
   if running:
     drainOnce()
+
+proc observationWriterFlushes*(): int64 =
+  ## Synchronous drains taken so far, by anybody, on any thread.
+  ##
+  ## THE POINT IS THAT IT MUST NOT SCALE WITH COMPLETED WORK. One drain per
+  ## query and one per publication batch are expected; one per finished
+  ## lease is the defect this counter was added to make visible.
+  ensureWriterLock()
+  acquire(writerLock)
+  try:
+    writerFlushes
+  finally:
+    release(writerLock)
 
 proc observationsDropped*(): int64 =
   ensureWriterLock()
