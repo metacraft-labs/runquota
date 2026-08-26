@@ -7,13 +7,11 @@ import runquota_client
 import runquota_core
 import runquota_protocol
 from runquota_ipc import endpointDirectoryPermissions
+import daemon_binary
 
 const HelperModeEnv = "RUNQUOTA_E2E_CRASH_MODE"
 
 var daemonCounter = 0
-
-proc daemonPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquotad"
 
 proc testRequest(label: string): ResourceRequest =
   resourceRequest(

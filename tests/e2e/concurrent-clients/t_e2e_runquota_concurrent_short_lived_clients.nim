@@ -3,12 +3,7 @@ import std/[os, osproc, unittest]
 import runquota_client
 import runquota_protocol
 from runquota_ipc import endpointDirectoryPermissions
-
-proc daemonPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquotad"
-
-proc cliPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquota"
+import daemon_binary
 
 proc truePath(): string =
   for path in ["/usr/bin/true", "/bin/true"]:

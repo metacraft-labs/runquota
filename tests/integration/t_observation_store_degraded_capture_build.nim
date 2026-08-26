@@ -16,6 +16,7 @@ import std/[nativesockets, options, os, osproc, streams, strutils, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_observation_store
+import daemon_binary
 
 proc scratchDir(name: string): string =
   # Short on purpose. Nim's `Sockaddr_un_path_length` is 92 on macOS, and
@@ -35,12 +36,6 @@ proc scratchDir(name: string): string =
   # kind of host and red on the other. Fixture only; the modes themselves
   # are asserted in tests/unit/t_shared_endpoint_rules.nim.
   setFilePermissions(result, endpointDirectoryPermissions())
-
-proc daemonPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquotad"
-
-proc cliPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquota"
 
 proc waitForSocket(socketPath: string) =
   for _ in 0 ..< 200:

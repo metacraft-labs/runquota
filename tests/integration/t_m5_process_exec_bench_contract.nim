@@ -9,6 +9,7 @@ import runquota_core
 import runquota_core/child_process
 import runquota_exec
 import runquota_process
+import daemon_binary
 
 const FixtureOutput = "--m5-fixture-output"
 const FixtureCwdEnv = "--m5-fixture-cwd-env"
@@ -68,12 +69,6 @@ if commandLineParams().len == 1 and commandLineParams()[0] == FixtureSleep:
 
 if commandLineParams().len == 1 and commandLineParams()[0] == FixtureExit7:
   quit 7
-
-proc daemonPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquotad"
-
-proc cliPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquota"
 
 proc waitForDaemon(socketPath: string) =
   putEnv("RUNQUOTA_SOCKET", socketPath)

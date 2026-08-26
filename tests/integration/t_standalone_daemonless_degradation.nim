@@ -64,6 +64,7 @@ import runquota_core
 import runquota_observation_store
 import runquota_process
 import runquota_protocol
+import daemon_binary
 
 const
   HonestRoleEnv = "RUNQUOTA_M14_HONEST_ROLE"
@@ -217,8 +218,6 @@ proc rendezvousDir(root: string): string =
   createDir(result)
   setFilePermissions(result, endpointDirectoryPermissions())
 
-proc cliPath(): string = getCurrentDir() / "build" / "bin" / "runquota"
-proc daemonPath(): string = getCurrentDir() / "build" / "bin" / "runquotad"
 proc selfPath(): string = getAppFilename()
 
 # ---------------------------------------------------------------------------

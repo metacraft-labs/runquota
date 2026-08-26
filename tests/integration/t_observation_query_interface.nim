@@ -32,6 +32,7 @@ import runquota_core
 import runquota_observation_store
 from runquota_observation_store/extensions as extensions import nil
 import runquota_protocol
+import daemon_binary
 
 const
   RealKey = "m13a-real-socket-exec"
@@ -91,9 +92,6 @@ proc hostStateDir(root: string): string =
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
-
-proc daemonPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquotad"
 
 proc socketIsBound(path: string): bool =
   var info: Stat

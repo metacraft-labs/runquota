@@ -45,11 +45,9 @@
 import std/[options, os, osproc, posix, strutils, tables, times, unittest]
 
 import runquota_observation_store
+import daemon_binary
 
 const probeSource = "tests/support/rendezvous_probe.nim"
-
-proc daemonPath(): string = getCurrentDir() / "build" / "bin" / "runquotad"
-proc cliPath(): string = getCurrentDir() / "build" / "bin" / "runquota"
 
 proc modeOf(path: string): int =
   var info: Stat

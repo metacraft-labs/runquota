@@ -30,6 +30,7 @@ import runquota_core
 import runquota_ipc
 import runquota_observation_store
 import runquota_protocol
+import daemon_binary
 
 proc groupOf(path: string): int64 =
   var info: Stat
@@ -69,12 +70,6 @@ proc scratchDir(name: string): string =
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
   pinRendezvousGroup(result)
-
-proc daemonPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquotad"
-
-proc cliPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquota"
 
 proc modeOf(path: string): int =
   var info: Stat
