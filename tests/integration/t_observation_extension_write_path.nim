@@ -34,6 +34,7 @@ import runquota_codec
 import runquota_core
 import runquota_observation_store
 import runquota_protocol
+import daemon_binary
 
 const
   ProbeExtension = "m17_probe"
@@ -67,8 +68,6 @@ proc hostStateDir(root: string): string =
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
-
-proc daemonPath(): string = getCurrentDir() / "build" / "bin" / "runquotad"
 
 proc socketIsBound(path: string): bool =
   var info: Stat

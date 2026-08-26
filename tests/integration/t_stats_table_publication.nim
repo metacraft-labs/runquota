@@ -39,6 +39,7 @@ import runquota_protocol
 import runquota_stats_table
 
 from shm_lease/syscount import syscallCountAvailable, unixSyscallCount
+import daemon_binary
 
 const
   MiB = 1024'u64 * 1024'u64
@@ -61,8 +62,6 @@ proc hostStateDir(root: string): string =
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
-
-proc daemonPath(): string = getCurrentDir() / "build" / "bin" / "runquotad"
 
 proc socketIsBound(path: string): bool =
   var info: Stat

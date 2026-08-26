@@ -132,3 +132,10 @@ switch("path", "libs/runquota_daemon/src")
 switch("path", "libs/runquota_cli_support/src")
 switch("path", "libs/runquota_partition/src")
 switch("path", "libs/runquota_stats_table/src")
+
+# Shared test support. `tests/support/daemon_binary` resolves `build/bin`
+# paths and refuses a binary older than the sources it is built from --
+# every integration and e2e file that starts `runquotad` or shells out to
+# `runquota` takes those binaries as INPUTS, so a stale one turns a green
+# run into a wrong answer rather than a missing one.
+switch("path", "tests/support")

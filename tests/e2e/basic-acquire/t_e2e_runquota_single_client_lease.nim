@@ -3,9 +3,7 @@ import std/[os, osproc, unittest]
 import runquota_client
 import runquota_core
 from runquota_ipc import endpointDirectoryPermissions
-
-proc daemonPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquotad"
+import daemon_binary
 
 proc waitForDaemon(socketPath: string) =
   putEnv("RUNQUOTA_SOCKET", socketPath)

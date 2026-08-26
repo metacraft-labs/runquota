@@ -30,6 +30,7 @@
 import std/[os, osproc, posix, streams, strutils, unittest]
 
 import runquota_observation_store
+import daemon_binary
 
 proc scratchDir(name: string): string =
   # Short on purpose: Nim's `Sockaddr_un_path_length` is 92 on macOS and
@@ -41,8 +42,6 @@ proc scratchDir(name: string): string =
   removeDir(result)
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
-
-proc daemonPath(): string = getCurrentDir() / "build" / "bin" / "runquotad"
 
 proc modeOf(path: string): int =
   var info: Stat

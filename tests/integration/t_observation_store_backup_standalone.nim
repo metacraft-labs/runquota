@@ -39,6 +39,7 @@ import runquota_client
 import runquota_core
 import runquota_observation_store
 import runquota_protocol
+import daemon_binary
 
 # ---------------------------------------------------------------------------
 # Daemon plumbing
@@ -61,9 +62,6 @@ proc hostStateDir(root: string): string =
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
-
-proc daemonPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquotad"
 
 proc socketIsBound(path: string): bool =
   var info: Stat

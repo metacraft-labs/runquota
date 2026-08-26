@@ -8,6 +8,7 @@ import runquota_client
 import runquota_core
 import runquota_exec
 import runquota_process
+import daemon_binary
 
 # Regression coverage for forking leased actions. A forking action's leader
 # (here a shell) exits quickly but leaves a backgrounded `sleep` that inherits
@@ -17,9 +18,6 @@ import runquota_process
 # arrives, the supervisor blocks forever and never emits LeaseFinished. This
 # mirrors real forking tools (e.g. `cc` spawning `cc1`/`as`, or a
 # process-monitor shim's helpers).
-
-proc daemonPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquotad"
 
 proc waitForDaemon(socketPath: string) =
   putEnv("RUNQUOTA_SOCKET", socketPath)

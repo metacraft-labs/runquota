@@ -31,6 +31,7 @@ import std/[os, osproc, streams, strutils, unittest]
 
 import runquota_ipc
 import runquota_observation_store
+import daemon_binary
 
 proc scratchDir(name: string): string =
   # Short on purpose. Nim's `Sockaddr_un_path_length` is 92 on macOS, and
@@ -79,12 +80,6 @@ proc containsMintedHostId(text: string): bool =
     if isOpaqueId(text[at ..< stop], hostIdPrefix):
       return true
     start = at + 1
-
-proc daemonPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquotad"
-
-proc cliPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquota"
 
 proc waitForSocket(socketPath: string) =
   for _ in 0 ..< 200:
@@ -364,7 +359,6 @@ suite "host_identity_provisioning":
     # The INSTALL, not just the reference.
     check "rendezvous directory" in darwin
     check "-m ${hostState.endpointDirectoryMode}" in darwin
-
 
     # The flake exposes them, so `imports = [ ... ]` can reach them.
     let flakeText = contents(flake)

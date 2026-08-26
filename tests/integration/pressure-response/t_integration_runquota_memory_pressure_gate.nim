@@ -9,6 +9,7 @@ import runquota_host_macos
 import runquota_process
 import runquota_protocol
 from runquota_ipc import endpointDirectoryPermissions
+import daemon_binary
 
 const FixtureArg = "--pressure-fixture"
 
@@ -35,9 +36,6 @@ if commandLineParams().len == 1 and commandLineParams()[0] == FixtureArg:
   sleep(30_000)
   doAssert ballast.len > 0
   quit 0
-
-proc daemonPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquotad"
 
 proc waitForDaemon(socketPath: string) =
   putEnv("RUNQUOTA_SOCKET", socketPath)

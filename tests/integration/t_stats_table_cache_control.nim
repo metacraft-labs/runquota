@@ -40,6 +40,7 @@ import runquota_client
 import runquota_core
 import runquota_protocol
 import runquota_stats_table
+import daemon_binary
 
 const
   MiB = 1024'u64 * 1024'u64
@@ -61,9 +62,6 @@ proc hostStateDir(root: string): string =
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
-
-proc daemonPath(): string = getCurrentDir() / "build" / "bin" / "runquotad"
-proc cliPath(): string = getCurrentDir() / "build" / "bin" / "runquota"
 
 proc socketIsBound(path: string): bool =
   var info: Stat

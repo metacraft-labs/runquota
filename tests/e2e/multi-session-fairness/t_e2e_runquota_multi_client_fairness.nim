@@ -6,12 +6,7 @@ import runquota_core
 import runquota_core/child_process
 import runquota_ipc except connectDefault
 import runquota_protocol
-
-proc daemonPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquotad"
-
-proc cliPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquota"
+import daemon_binary
 
 proc waitForDaemon(socketPath: string) =
   putEnv("RUNQUOTA_SOCKET", socketPath)
