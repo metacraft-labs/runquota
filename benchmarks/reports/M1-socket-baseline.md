@@ -175,8 +175,14 @@ Two further controls:
 
 - **Nothing is on the wire during those 21.9 ms.** In **335 of 335**
   `LeaseFinished` round trips, zero frames in either direction were observed
-  between the request and its acknowledgement. It is not queueing behind other
-  traffic; it is the daemon, working.
+  between the request and its acknowledgement. **Read this narrowly**: it is a
+  per-connection observation, so it rules out the client waiting behind other
+  traffic *on its own connection*. It does **not** rule out the daemon
+  serializing this request against other clients' — every request is handled
+  under one daemon-wide lock, and at 64 concurrent actions that is a live
+  possibility rather than a remote one. The time is spent inside the daemon;
+  whether it is spent working or waiting for the lock is exactly what this
+  control cannot tell you.
 - **The daemon's own syscall count moves with it**: 29 682 per build with the
   store on against 750 with it off — **≈ 432 extra kernel syscalls per
   completion report**.
@@ -188,6 +194,24 @@ control, measures the store's added per-execution latency at **0.0012 ms**
 magnitude larger. Whatever makes the store expensive is a property of the
 conditions a build creates, and a tight loop does not create them. Which of
 those conditions is responsible was **not** determined here.
+
+**The two candidates differ in what they ask M22 to be**, which is why the
+question is worth settling before that milestone is designed rather than
+after:
+
+- *Daemon-wide lock contention.* The synthetic driver runs at concurrency 1
+  and sees no cost, which is what this explanation predicts. If it holds,
+  taking observations off the request path removes those requests from the
+  lock and the win is most of the 2.4 s.
+- *Per-row durable commit.* 432 syscalls is real work, and an fsync on this
+  filesystem is milliseconds. If it holds, the cost is per-row and roughly
+  independent of concurrency: a ring stops the CLIENT waiting, but the daemon
+  still does the work, and commit batching is the actual repair.
+
+One measurement separates them — `LeaseFinished` latency with the store on at
+concurrency 1, 8, 32 and 64 on this same subject, counting `fsync` rather than
+syscalls in total. Flat says commit cost; rising says contention. It was not
+run here.
 
 ---
 
