@@ -31,12 +31,17 @@ case "${suite}" in
 esac
 
 mkdir -p bench-results build/bin build/nimcache test-logs
-if [ ! -x build/bin/runquotad ] || [ ! -x build/bin/runquota ]; then
-  ./scripts/build_apps.sh
-fi
+
+# RELEASE BY DEFAULT -- see scripts/lib/build_mode.sh for why a benchmark's
+# default differs from the rest of the repository's.
+# shellcheck source=scripts/lib/build_mode.sh
+. "$(dirname "$0")/lib/build_mode.sh"
+resolve_build_mode release
+ensure_apps_built_in_mode "${RUNQUOTA_RESOLVED_BUILD_MODE}"
 
 nim c \
   --threads:on \
+  ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
   --nimcache:"${nimcache}" \
   --out:"${bench_bin}" \
   benchmarks/lib/runquota_m5_bench.nim >/dev/null

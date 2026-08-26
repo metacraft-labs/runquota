@@ -18,12 +18,18 @@ bench_bin="build/bin/runquota_m13_bench"
 nimcache="build/nimcache/runquota_m13_bench"
 
 mkdir -p bench-results build/bin build/nimcache test-logs
-if [ ! -x build/bin/runquotad ]; then
-  ./scripts/build_apps.sh
-fi
+
+# RELEASE BY DEFAULT. A measurement is meaningless from a Nim debug build
+# (`opt: none`), and the arm this one is compared against -- `nim-shm-lease`'s
+# preemption study -- is `-d:release` throughout. See scripts/lib/build_mode.sh.
+# shellcheck source=scripts/lib/build_mode.sh
+. "$(dirname "$0")/lib/build_mode.sh"
+resolve_build_mode release
+ensure_apps_built_in_mode "${RUNQUOTA_RESOLVED_BUILD_MODE}"
 
 nim c \
   --threads:on \
+  ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
   --nimcache:"${nimcache}" \
   --out:"${bench_bin}" \
   benchmarks/lib/runquota_m13_bench.nim >/dev/null
