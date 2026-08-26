@@ -235,6 +235,13 @@ type
     deferredExecutionsRecorded*: uint64
       ## Rows written out of accepted batches, so "the flush landed" and
       ## "the flush arrived empty" are distinguishable from outside.
+    connectionsFailed*: uint64
+      ## Connections whose handling raised instead of completing. The daemon
+      ## survives each one — it is host-wide, and a single client must not be
+      ## able to stop it — so this is the only place such a failure is
+      ## visible. A non-zero value with a healthy lease count is usually
+      ## peers that connect and vanish; a value tracking the lease count is
+      ## a real defect in the connection path.
     observationsContradictory*: uint64
       ## Executions whose finish carried a termination its own exit could
       ## not support — a resource-limit or deadline kill reported beside a
