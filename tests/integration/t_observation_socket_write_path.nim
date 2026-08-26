@@ -24,7 +24,8 @@
 ## are refusals or degradations, and each is reached by doing something a
 ## client library cannot be asked to do.
 
-import std/[json, options, os, osproc, posix, streams, strutils, unittest]
+import std/[json, options, os, osproc, posix, streams, strutils, tables,
+  unittest]
 
 from runquota_ipc import endpointDirectoryPermissions, sendFrame, receiveFrame
 import runquota_client
@@ -173,6 +174,35 @@ proc completeOneExecution(client: var RunQuotaClient; label: string;
   lease.release()
   session.closeSession()
 
+proc finishOneExecution(client: var RunQuotaClient; label, key: string;
+                        outcome: LeaseFinishOutcome; exitCode = 0'u32;
+                        signal = 0'u32; hardLimitOrOom = false) =
+  ## The same whole execution, with the FINISH spelled out by the caller.
+  ##
+  ## THIS IS A REAL CLIENT DOING SOMETHING A SENSIBLE ONE WOULD NOT.
+  ## ``RunQuotaLease.finish`` takes ``outcome`` and ``hardLimitOrOom`` as
+  ## two independent defaulted parameters and cross-validates neither, so
+  ## a finish that contradicts itself needs no forged frame and no fixture
+  ## — it is one argument list away on the public API, which is why the
+  ## daemon has to be the one that refuses it.
+  var session = client.registerSession("m13-" & label, "0.2.0")
+  # THE STATS KEY IS SET EXPLICITLY. `resourceRequest` leaves
+  # `commandStatsId` empty, and four executions sharing one empty key would
+  # make the rows below indistinguishable from each other — which is the
+  # whole of what this test reads them for.
+  var request = resourceRequest(label, milliCpu(1000),
+    bytes(256'u64 * 1024'u64 * 1024'u64))
+  request.commandStatsId = key
+  var lease = session.requestLease(request)
+  doAssert lease.active
+  lease.markStarting()
+  lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
+  lease.finish(outcome = outcome, exitCode = exitCode, signal = signal,
+    peakMemoryBytes = 1_234_567'u64, processCount = 3'u32,
+    majorPageFaults = 11'u64, hardLimitOrOom = hardLimitOrOom)
+  lease.release()
+  session.closeSession()
+
 suite "observation_socket_write_path":
 
   # -------------------------------------------------------------------------
@@ -258,6 +288,120 @@ suite "observation_socket_write_path":
     # here would be indistinguishable from a measured zero.
     check row.cpuUserMillis.isNone
     check row.ioReadBytes.isNone
+
+  # -------------------------------------------------------------------------
+  # A ROW MUST NOT CARRY A TERMINATION ITS OTHER COLUMNS CONTRADICT
+  # -------------------------------------------------------------------------
+  #
+  # AGAINST THE DAEMON BINARY, and it has to be. The refusal lives in
+  # `captureObservation`, which runs in `runquotad`; a mutation that only
+  # recompiled this file would leave `build/bin/runquotad` in place and
+  # read green, which is the trap M10 and M11 both recorded.
+  #
+  # THE FOURTH PROBE IS THE POINT, and the first three are what make its
+  # absence mean something: three honest finishes of three different shapes
+  # produce three rows through the same code path, so "no fourth row" is a
+  # statement about the refusal rather than about a daemon that recorded
+  # nothing.
+
+  test "a finish whose own evidence disagrees writes no row, and says so":
+    const
+      ExitedKey = "m13-contra-exited"
+      OomKey = "m13-contra-oom"
+      TimeoutKey = "m13-contra-timeout"
+      ContradictoryKey = "m13-contra-impossible"
+
+    let root = scratchRoot("contra")
+    defer: removeDir(root)
+    let socketPath = rendezvousDir(root) / "d.sock"
+    let state = hostStateDir(root)
+    let identityFile = state / "host-id"
+    let expectedDb = state / "observations.sqlite3"
+    check fileExists(daemonPath())
+
+    putEnv("RUNQUOTA_SOCKET", socketPath)
+    var daemon = startDaemon(socketPath, ["--host-identity-file", identityFile])
+    var rows: seq[ExecutionRow] = @[]
+    var settled: seq[ExecutionRow] = @[]
+    var reported: JsonNode = nil
+    var status = DaemonStatusMessage()
+    try:
+      var client = connectDefault()
+
+      # (1) NEITHER KILL FIELD: an ordinary non-zero exit.
+      client.finishOneExecution("contra-exited", ExitedKey,
+        leaseFinishFailed, exitCode = 1'u32)
+      # (2) THE OUTCOME ENUM ALONE, beside the exit status a real OOM kill
+      #     leaves behind. Two facts that reconcile.
+      client.finishOneExecution("contra-oom", OomKey,
+        leaseFinishResourceLimit, exitCode = 137'u32)
+      # (3) A DEADLINE, delivered by the signal a deadline is delivered by.
+      #     Before `leaseFinishTimedOut` existed this row said `signalled`
+      #     and the deadline was not recoverable from the store at all.
+      client.finishOneExecution("contra-timeout", TimeoutKey,
+        leaseFinishTimedOut, signal = 9'u32)
+      # (4) THE FLAG ALONE, beside exit status 0 and no signal: an
+      #     immutable row asserting both that this process was killed for
+      #     exceeding memory and that it exited successfully.
+      client.finishOneExecution("contra-impossible", ContradictoryKey,
+        leaseFinishFailed, hardLimitOrOom = true)
+
+      rows = waitForExecutions(expectedDb, 3)
+      # A WHOLE SECOND FOR A FOURTH ROW TO SHOW UP LATE. Without it "three
+      # rows" could be a statement about when the reader looked rather than
+      # about what the daemon refused.
+      sleep(1000)
+      settled = openObservationStore(expectedDb).readExecutions()
+      reported = client.observations()
+      status = client.daemonStatus()
+      client.close()
+    finally:
+      daemon.stop()
+
+    # EVERY LEASE WAS GRANTED AND FINISHED, INCLUDING THE FOURTH. This is
+    # the half that makes the refusal a degradation rather than a failure:
+    # `finish` raises when the daemon does not acknowledge, so reaching
+    # here at all means the contradictory finish was acknowledged — and had
+    # it not been, the lease would sit in `running` and hold capacity
+    # nothing is using, which is a worse outcome than an absent row.
+    check status.totalGranted == 4'u64
+    check status.totalFinished == 4'u64
+
+    var byKey = initTable[string, ExecutionRow]()
+    for row in settled:
+      byKey[row.commandStatsId] = row
+    check settled.len == 3
+    check byKey.len == 3
+
+    # THE THREE HONEST SHAPES, each recorded as the word its own evidence
+    # supports.
+    check byKey[ExitedKey].termination == tExited
+    check byKey[ExitedKey].exitStatus == 1
+    check byKey[OomKey].termination == tOomKilled
+    check byKey[OomKey].exitStatus == 137
+    # THE DEADLINE SURVIVED THE SIGNAL IT WAS DELIVERED WITH, over the real
+    # wire and out of the real database.
+    check byKey[TimeoutKey].termination == tTimeout
+
+    # AND THE FOURTH PRODUCED NOTHING. Not a row with a repaired verdict,
+    # not a row with a NULL termination: no row.
+    check not byKey.hasKey(ContradictoryKey)
+
+    # COUNTED, NOT HIDDEN (OS-2). The client was acknowledged and believes
+    # it reported an execution the store does not hold, so this counter is
+    # the only place that loss is visible.
+    check reported != nil
+    check reported["executions_contradictory"].getInt() == 1
+    # AND THE HONEST THREE COST NOTHING: a refusal that fired on everything
+    # would satisfy the clause above and empty the store.
+    #
+    # SEVEN ROWS QUEUED: one `runs` row per registered session (four) plus
+    # one `executions` row per accepted finish (three). Eight would mean the
+    # contradictory row reached the writer and was lost somewhere later,
+    # which is a different defect from the one this test is about.
+    check reported["queued"].getInt() == 7
+    check reported["dropped"].getInt() == 0
+    check reported["write_failures"].getInt() == 0
 
   # -------------------------------------------------------------------------
   # THE GATE: --no-write-stats disables it

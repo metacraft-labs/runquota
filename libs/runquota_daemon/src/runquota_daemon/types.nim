@@ -236,6 +236,20 @@ type
     deferredExecutionsRecorded*: uint64
       ## Rows written out of accepted batches, so "the flush landed" and
       ## "the flush arrived empty" are distinguishable from outside.
+    observationsContradictory*: uint64
+      ## Executions whose finish carried a termination its own exit could
+      ## not support — a resource-limit or deadline kill reported beside a
+      ## clean exit — and which therefore produced NO row.
+      ##
+      ## A SEPARATE COUNTER FROM ``observationsRejected``, which is about
+      ## in-flight self-reports and about nothing else. These are whole
+      ## executions the store does not hold and the client believes it
+      ## reported, so a reader deciding whether a window is thinned needs
+      ## them counted apart from a refused sample of a live one.
+      ##
+      ## Counted rather than reported, for the reason ``captureObservation``
+      ## gives: the alternative is failing a ``LeaseFinished``, which
+      ## strands the lease.
     statsPublisher*: StatsPublisher
       ## M13b's published aggregate table. WRITE-ONLY FROM HERE: nothing in
       ## the daemon ever reads it back, and no daemon decision depends on

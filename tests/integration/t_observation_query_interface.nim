@@ -328,6 +328,13 @@ suite "observation_query_interface":
         check not (entry.durationMillisMin == 100'u64 and
           entry.durationMillisMax == 920'u64)
 
+      # THE WIDENING IS ANNOUNCED TOO, and this is the half without which
+      # the pair below is satisfied by a daemon that hardcodes
+      # `profileSpanWireSingle` into every answer it sends. `spanApplied`
+      # exists so a reader can tell "one host has data" from "I only asked
+      # about one host", and a field that is constant tells it neither.
+      check spanned.spanApplied == profileSpanWireAll
+
       # Narrow by default: the caller that did not ask for cross-host data
       # does not get it.
       let narrow = client.queryStats(statsSubjectDistribution, HistoryKey)

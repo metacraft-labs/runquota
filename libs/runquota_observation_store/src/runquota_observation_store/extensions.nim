@@ -78,7 +78,7 @@ type
     migrations*: seq[string]
 
   ExtensionOutcome* = enum
-    ## The result of declaring an extension. Four acceptances and four
+    ## The result of declaring an extension. Four acceptances and five
     ## refusals, distinguished because "refused" and "accepted an older
     ## client" must never be told apart by their side effects alone.
     eoCreated = "created"
@@ -90,6 +90,7 @@ type
     eoRefusedUnstorableVersion = "refused-unstorable-version"
     eoRefusedShape = "refused-shape"
     eoRefusedMigrationFailed = "refused-migration-failed"
+    eoRefusedOwner = "refused-owner"
 
   ExtensionWrite* = enum
     ## The result of writing one extension row.
@@ -377,6 +378,20 @@ proc declareExtension*(store: ObservationStore;
     return eoCreated
 
   let registered = existing.get
+  # THE OWNER IS WRITTEN ONCE AND CHECKED EVERY TIME AFTER. It was
+  # previously written at first registration and never compared again, so a
+  # second client declaring the same id under a different owner was
+  # silently accepted and wrote into the first one's table -- which is what
+  # a forked copy of a shared extension constant looks like from here, and
+  # exactly what OS-8 asks two runners NOT to do accidentally. Two runners
+  # that legitimately share one generic extension share one owner constant
+  # precisely so that this comparison holds for them; a runner that spelled
+  # its own would be the case this refuses.
+  #
+  # REFUSED BEFORE ANYTHING RUNS, so the store is left exactly as it was:
+  # a declaration that fails must roll back to the state before it.
+  if declaration.owner != registered.owner:
+    return eoRefusedOwner
   if not store.extensionTableExists(tableName):
     # The registry claims a table that is not there. Creating it now would
     # mean guessing which of the client's steps the missing table was built

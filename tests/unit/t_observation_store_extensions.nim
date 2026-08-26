@@ -397,6 +397,73 @@ suite "observation_store_extensions":
     check store.readExtensionRegistry().len == 1
     check store.captureEnabled
 
+  test "a second owner cannot declare somebody else's extension":
+    # THE OWNER WAS WRITE-ONCE AND NEVER READ AGAIN. It was recorded at
+    # first registration and compared against nothing afterwards, so a
+    # runner that had forked the shared extension constant instead of
+    # importing it declared the same id under its own name, was accepted,
+    # and wrote into the first product's table. M20 caught that class of
+    # mistake with a SOURCE SCAN, which is evidence about one repository at
+    # one moment rather than a property of the store.
+    let dir = scratchDir("extowner")
+    defer: removeDir(dir)
+    let path = dir / "o.sqlite"
+    let store = openObservationStore(path)
+    check store.captureEnabled
+    seedSpine(store, "host-a")
+    check store.insertExecution(execution("host-a", "exec-a", 1000))
+
+    check store.declareExtension(probeV1()) == eoCreated
+    check store.insertExtensionRow(probeV1(),
+      probeRow("host-a", "exec-a", "alpha", 3)) == ewWritten
+
+    var forked = probeV1()
+    forked.owner = probeOwner & "-fork"
+    check store.declareExtension(forked) == eoRefusedOwner
+
+    # A MIGRATION UNDER THE WRONG OWNER IS REFUSED TOO, which is the
+    # dangerous one: an accepted version bump would rewrite the first
+    # product's table shape on the strength of a second product's ladder.
+    var forkedNewer = probeV2()
+    forkedNewer.owner = probeOwner & "-fork"
+    check store.declareExtension(forkedNewer) == eoRefusedOwner
+    # THE LENGTH BEFORE THE SUBSCRIPT, and that ordering is the clause
+    # rather than a style note. The failure this whole test exists to
+    # exclude -- M20's, where a declaration that fails inside `begin
+    # immediate` leaves EVERY table reading as empty -- makes this registry
+    # read return nothing, and an unguarded `[0]` turns that into an
+    # `IndexDefect` several clauses before the one written to report it.
+    # The test is red either way; only this way does it say WHAT went
+    # wrong.
+    check store.readExtensionRegistry().len == 1
+    check store.readExtensionRegistry()[0].schemaVersion == 1
+    check "probe_weight" notin store.tableSql("ext_m12_probe")
+
+    # AND AN EMPTY OWNER IS NOT A WILDCARD. Declaring with no owner at all
+    # is the shape a client gets by forgetting the field, and matching
+    # anything would make the check satisfiable by omission.
+    var anonymous = probeV1()
+    anonymous.owner = ""
+    check store.declareExtension(anonymous) == eoRefusedOwner
+
+    # THE REFUSALS LEFT EVERYTHING AS IT WAS. A declaration that fails must
+    # roll back to the state before it, and the failure this repo has
+    # already seen is a refused declaration leaving EVERY table reading as
+    # empty -- so the spine and the extension are both read back here.
+    check store.readExtensionRegistry().len == 1
+    check store.readExtensionRegistry()[0].owner == probeOwner
+    check store.readExtensionColumns(probeId, ["probe_label"]) == @[@["alpha"]]
+    check store.readExecutions().len == 1
+    check store.captureEnabled
+
+    # THE CONVERSE, without which every clause above is satisfied by a
+    # store that refuses every re-declaration: the RIGHT owner still
+    # declares, and still migrates.
+    check store.declareExtension(probeV1()) == eoUpToDate
+    check store.declareExtension(probeV2()) == eoMigrated
+    check store.readExtensionRegistry()[0].schemaVersion == 2
+    check "probe_weight" in store.tableSql("ext_m12_probe")
+
   test "the extension migrates while the spine stands still":
     let dir = scratchDir("extmove")
     defer: removeDir(dir)

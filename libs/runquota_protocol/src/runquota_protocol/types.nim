@@ -193,12 +193,30 @@ type
     leaseId*: LeaseId
 
   LeaseFinishOutcome* = enum
+    ## Why an execution ended, as the supervising client saw it.
+    ##
+    ## ``leaseFinishTimedOut`` IS HERE BECAUSE THE SPINE HAS NOWHERE ELSE
+    ## TO LEARN IT. The observation store's ``termination`` column names
+    ## ``timeout`` as one of its five kinds, and until this member existed
+    ## no value of this enum and no other field of ``LeaseFinishedMessage``
+    ## could produce it: a deadline is a POLICY THE CLIENT HOLDS, RunQuota
+    ## imposes none, and every fact that reaches the daemon about a
+    ## timed-out execution -- a non-zero exit, a kill signal -- is
+    ## indistinguishable from an ordinary kill. A timed-out execution
+    ## therefore landed on the spine as ``signalled``, which is true and
+    ## useless, and the schema carried a value no code could ever write.
+    ##
+    ## APPENDED, NEVER INSERTED. ``decodeLeaseFinished`` bounds the wire
+    ## ordinal by ``high(LeaseFinishOutcome)``, so an older peer's five
+    ## values keep their meanings and a newer peer's sixth is simply one
+    ## an older daemon would refuse rather than misread.
     leaseFinishSucceeded
     leaseFinishFailed
     leaseFinishCrashed
     leaseFinishResourceLimit
     leaseFinishCancelled
     leaseFinishLaunchFailed
+    leaseFinishTimedOut
 
   LeaseFinishedMessage* = object
     sessionId*: SessionId

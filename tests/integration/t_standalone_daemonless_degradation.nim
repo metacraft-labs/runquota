@@ -701,6 +701,91 @@ suite "standalone_daemonless_degradation":
     finally:
       daemon.stop()
 
+  test "one self-contradicting record is dropped, and the rest of its batch is not":
+    # THE SAME RULE THE LEASED PATH APPLIES, on the shape a standalone
+    # client flushes. It is asserted here as well as on the pure predicate
+    # because the DAEMON is what decides how much of a batch a single bad
+    # record costs, and the answer -- one record, not the batch -- is not
+    # visible from the predicate at all.
+    #
+    # ANOTHER HAND-BUILT FRAME. `StandaloneCapture` composes its records
+    # from what it measured, so a record whose outcome and exit disagree is
+    # not something the client library can be asked for.
+    const ContradictoryKey = "m14-contradiction-key"
+    const HonestKey = "m14-honest-key"
+    let root = scratchRoot("t")
+    defer: removeDir(root)
+    let socketPath = rendezvousDir(root) / "d.sock"
+    let dbPath = root / "observations.sqlite3"
+    var daemon = startDaemon(socketPath, dbPath, root / "host-id")
+    try:
+      check daemon.startupLines[1].contains("capture enabled")
+      let now = uint64(max(0'i64, unixMillisNow()))
+
+      proc record(key: string; outcome: LeaseFinishOutcome;
+                  exitStatus, signal: uint32): DeferredExecutionRecord =
+        deferredRecord(label = "m14-mixed", commandStatsId = key,
+          startedAtUnixMillis = now, finishedAtUnixMillis = now + 5'u64,
+          outcome = outcome, exitStatus = exitStatus, signal = signal,
+          peakRssBytes = 1_000_000'u64, processCount = 1'u32)
+
+      putEnv("RUNQUOTA_SOCKET", socketPath)
+      var client = connectDefault()
+      let msg = DeferredObservationsMessage(
+        tool: "m14-mixed", toolVersion: "0.1.0", invocationKind: "standalone",
+        completeness: ccDegraded, droppedObservations: 2'u32,
+        records: @[
+          record(HonestKey, leaseFinishSucceeded, 0'u32, 0'u32),
+          # A memory kill beside a successful exit: `oom_killed` and
+          # "exited successfully" in one immutable row.
+          record(ContradictoryKey, leaseFinishResourceLimit, 0'u32, 0'u32),
+          record(HonestKey, leaseFinishResourceLimit, 137'u32, 0'u32)])
+      client.connection.sendFrame(encodeFrame(rqDeferredObservations,
+        FrameFlagRequest, 9_100'u64, encodeDeferredObservations(msg)))
+      sleep(300)
+      let after = observationsJson(socketPath)
+      client.close()
+
+      # THE BATCH WAS ACCEPTED. One bad record is not a reason to discard
+      # a client's whole exit flush -- the smallest degradation that keeps
+      # the store honest, not the largest.
+      check after["deferred_batches_accepted"].getInt == 1
+      check after["deferred_batches_refused"].getInt == 0
+      # TWO OF THREE RECORDED, and the count says two rather than three.
+      check after["deferred_executions_recorded"].getInt == 2
+      check after["executions_contradictory"].getInt == 1
+
+      check waitForExecutionRows(dbPath, 2) >= 2
+      let store = openObservationStore(dbPath)
+      var mixedRun: RunRow
+      var found = false
+      for row in store.readRuns():
+        if row.tool == "m14-mixed":
+          mixedRun = row
+          found = true
+      check found
+      if found:
+        # THE LOSS REACHED THE RUN'S OWN COLUMN. `runs` is immutable once
+        # written (OS-3), so the drop had to be counted before the row was
+        # composed: two the client declared, plus the one this pass refused.
+        check mixedRun.droppedObservations == 3
+
+        var keys: seq[string] = @[]
+        for row in store.readExecutions():
+          if row.runId == mixedRun.runId:
+            keys.add(row.commandStatsId)
+        check keys.len == 2
+        # THE HONEST OOM RECORD SURVIVED, which is what makes the missing
+        # one a statement about the contradiction rather than about the
+        # outcome enum it used.
+        check keys == @[HonestKey, HonestKey]
+        check ContradictoryKey notin keys
+        for row in store.readExecutions():
+          if row.runId == mixedRun.runId and row.exitStatus == 137:
+            check row.termination == tOomKilled
+    finally:
+      daemon.stop()
+
   # -------------------------------------------------------------------------
   # 6. Unavailable rather than faked
   # -------------------------------------------------------------------------

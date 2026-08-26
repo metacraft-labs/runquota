@@ -196,6 +196,200 @@ suite "observation_write_path_rules":
     check observedCpuPct(1_600_000'u32) == 1600.0
 
   # -------------------------------------------------------------------------
+  # The finish's own evidence, and the termination vocabulary it reaches
+  # -------------------------------------------------------------------------
+  #
+  # BOTH CLAUSES BELOW ARE REFUSALS, and the fixtures they need are ones a
+  # well-behaved client library cannot be asked to build: `RunQuotaLease
+  # .finish` takes `outcome` and `hardLimitOrOom` as two separate defaulted
+  # parameters and cross-validates neither, so "a finish that contradicts
+  # itself" is reachable from a real client but not from a sensible one.
+  # That is exactly the shape the campaign's conventions say goes vacuous
+  # when asserted from outside a running daemon, so it is asserted here on
+  # the pure predicate, at the values that straddle the boundary, with the
+  # accepting case beside every refusing one.
+
+  proc finishOf(outcome: LeaseFinishOutcome; exitCode = 0'u32;
+                signal = 0'u32;
+                hardLimitOrOom = false): LeaseFinishedMessage =
+    LeaseFinishedMessage(
+      sessionId: sessionId(1),
+      leaseId: leaseId(7),
+      outcome: outcome,
+      exitCode: exitCode,
+      signal: signal,
+      peakMemoryBytes: 2_250_000_000'u64,
+      processCount: 3'u32,
+      majorPageFaults: 11'u64,
+      pressureEvents: 0'u32,
+      hardLimitOrOom: hardLimitOrOom,
+      diagnostic: okDiagnostic())
+
+  proc recordOf(outcome: LeaseFinishOutcome; exitStatus = 0'u32;
+                signal = 0'u32): DeferredExecutionRecord =
+    DeferredExecutionRecord(
+      label: "probe",
+      commandStatsId: "probe-key",
+      startedAtUnixMillis: 1_700_000_000_000'u64,
+      finishedAtUnixMillis: 1_700_000_000_500'u64,
+      exitStatus: exitStatus,
+      signal: signal,
+      outcome: outcome,
+      peakRssBytes: 2_250_000_000'u64,
+      processCount: 3'u32,
+      majorPageFaults: 11'u64)
+
+  test "a finish claiming a kill beside a clean exit is refused":
+    # THE ACCEPTING CASES FIRST, and there are more of them than refusing
+    # ones on purpose. A predicate that refused everything would satisfy
+    # every clause below and empty the store instead of keeping it honest.
+    check leaseFinishedContradiction(finishOf(leaseFinishSucceeded)) == ""
+    check leaseFinishedContradiction(
+      finishOf(leaseFinishFailed, exitCode = 1'u32)) == ""
+    check leaseFinishedContradiction(finishOf(leaseFinishCancelled)) == ""
+    check leaseFinishedContradiction(finishOf(leaseFinishLaunchFailed)) == ""
+
+    # AN ORDINARY SIGNAL KILL IS UNTOUCHED, in both spellings. A signalled
+    # process has no exit status at all, so `exit_status = 0` beside
+    # `signalled` reads as "not applicable" rather than as a claim of
+    # success -- and a rule that refused it would discard every signalled
+    # row a real supervisor writes, which is a far larger loss than the
+    # one this rule exists to prevent.
+    check leaseFinishedContradiction(
+      finishOf(leaseFinishCrashed, signal = 11'u32)) == ""
+    check leaseFinishedContradiction(finishOf(leaseFinishCrashed)) == ""
+
+    # THE ROW THE SPECIFICATION NAMES. `oom_killed` beside `exit_status`
+    # 137 is evidence that reconciles; beside `exit_status` 0 with no
+    # signal it asserts both that the process was killed for exceeding
+    # memory and that it exited successfully.
+    check leaseFinishedContradiction(
+      finishOf(leaseFinishResourceLimit, exitCode = 137'u32)) == ""
+    check leaseFinishedContradiction(
+      finishOf(leaseFinishResourceLimit)).len > 0
+    check "exit status 0" in leaseFinishedContradiction(
+      finishOf(leaseFinishResourceLimit))
+
+    # EITHER KILL FIELD ALONE REACHES THE RULE. They are two independent
+    # pieces of evidence on the wire, set by different kinds of supervisor,
+    # and neither is required to agree with the other -- so the rule is
+    # stated against the exit they are reported beside, never against the
+    # other field.
+    check leaseFinishedContradiction(
+      finishOf(leaseFinishFailed, signal = 9'u32,
+        hardLimitOrOom = true)) == ""
+    check leaseFinishedContradiction(
+      finishOf(leaseFinishFailed, hardLimitOrOom = true)).len > 0
+    # And the flag alone still overrides nothing: an outcome that says the
+    # work SUCCEEDED cannot be reconciled with a kill however the exit
+    # reads, which is the one clause that is about the two fields.
+    check leaseFinishedContradiction(
+      finishOf(leaseFinishSucceeded, exitCode = 137'u32,
+        hardLimitOrOom = true)).len > 0
+    check "successful finish" in leaseFinishedContradiction(
+      finishOf(leaseFinishSucceeded, exitCode = 137'u32,
+        hardLimitOrOom = true))
+
+    # A DEADLINE KILL IS THE SAME SHAPE, so the member added to make
+    # `timeout` reachable does not arrive with the hole this closes.
+    check leaseFinishedContradiction(
+      finishOf(leaseFinishTimedOut, signal = 9'u32)) == ""
+    check leaseFinishedContradiction(
+      finishOf(leaseFinishTimedOut, exitCode = 124'u32)) == ""
+    check leaseFinishedContradiction(finishOf(leaseFinishTimedOut)).len > 0
+
+  test "a standalone record carries the same rule, on its own fields":
+    check deferredRecordContradiction(recordOf(leaseFinishSucceeded)) == ""
+    check deferredRecordContradiction(
+      recordOf(leaseFinishFailed, exitStatus = 1'u32)) == ""
+    check deferredRecordContradiction(
+      recordOf(leaseFinishCrashed, signal = 11'u32)) == ""
+    check deferredRecordContradiction(recordOf(leaseFinishCrashed)) == ""
+    check deferredRecordContradiction(
+      recordOf(leaseFinishResourceLimit, exitStatus = 137'u32)) == ""
+    check deferredRecordContradiction(
+      recordOf(leaseFinishResourceLimit)).len > 0
+    check deferredRecordContradiction(
+      recordOf(leaseFinishTimedOut, signal = 9'u32)) == ""
+    check deferredRecordContradiction(recordOf(leaseFinishTimedOut)).len > 0
+
+  test "every termination the schema names is reachable from a real finish":
+    # A VALUE NO CODE CAN PRODUCE IS A CLAIM THE SCHEMA MAKES AND THE
+    # DAEMON CANNOT KEEP. `tTimeout` was exactly that: it appeared nowhere
+    # in runquota outside its own enum declaration, no `LeaseFinishOutcome`
+    # reached it, and a timed-out execution landed on the spine as
+    # `signalled` -- true, and useless to a reader asking why a test stopped.
+    #
+    # ENUMERATION, NOT EXISTENCE. The assertion is on the WHOLE SET the
+    # mapping can produce. A one-value expectation would have been
+    # satisfied by an implementation that reached four of the five and
+    # happened to reach the one somebody remembered to name.
+    var leased: set[Termination] = {}
+    for msg in [
+        finishOf(leaseFinishSucceeded),
+        finishOf(leaseFinishFailed, exitCode = 1'u32),
+        finishOf(leaseFinishCrashed, signal = 11'u32),
+        finishOf(leaseFinishResourceLimit, exitCode = 137'u32),
+        finishOf(leaseFinishTimedOut, signal = 9'u32),
+        finishOf(leaseFinishCancelled),
+        finishOf(leaseFinishLaunchFailed)]:
+      leased.incl(observationTermination(msg))
+    check leased == {tExited, tSignalled, tTimeout, tOomKilled, tRefused}
+
+    # THE STANDALONE PATH REACHES THE SAME FIVE. A word that exists on one
+    # of the two write paths and not the other would make "was this a
+    # timeout" answerable only for executions that happened to hold a
+    # lease.
+    var standalone: set[Termination] = {}
+    for record in [
+        recordOf(leaseFinishSucceeded),
+        recordOf(leaseFinishFailed, exitStatus = 1'u32),
+        recordOf(leaseFinishCrashed, signal = 11'u32),
+        recordOf(leaseFinishResourceLimit, exitStatus = 137'u32),
+        recordOf(leaseFinishTimedOut, signal = 9'u32),
+        recordOf(leaseFinishCancelled),
+        recordOf(leaseFinishLaunchFailed)]:
+      standalone.incl(deferredTermination(record))
+    check standalone == {tExited, tSignalled, tTimeout, tOomKilled, tRefused}
+
+    # AND THE DEADLINE SURVIVES THE SIGNAL IT WAS DELIVERED WITH. A timeout
+    # kill IS a signal kill, so a mapping that tested `signal` first would
+    # answer `signalled` and throw the deadline away -- which is what the
+    # daemon did before `leaseFinishTimedOut` existed, and what it would go
+    # back to doing if the two tests were reordered.
+    check observationTermination(
+      finishOf(leaseFinishTimedOut, signal = 9'u32)) == tTimeout
+    check deferredTermination(
+      recordOf(leaseFinishTimedOut, signal = 9'u32)) == tTimeout
+    # A memory kill delivered by the same signal still says WHAT FOR.
+    check observationTermination(
+      finishOf(leaseFinishFailed, signal = 9'u32,
+        hardLimitOrOom = true)) == tOomKilled
+
+    # AND MEMORY PRECEDES THE DEADLINE, which is the half of the ordering
+    # the clauses above do NOT constrain: every fixture they use sets at
+    # most one kind of kill, so swapping the memory test and the deadline
+    # test past each other leaves them all green. Only a finish carrying
+    # BOTH -- a supervisor that watched an `ru_maxrss` cross a hard limit
+    # AND holds a deadline of its own -- can tell the two orders apart,
+    # and it is the case where the memory fact is the more specific one:
+    # `timeout` says the supervisor stopped waiting, `oom_killed` says
+    # WHAT the process did to earn it.
+    #
+    # LEASED PATH ONLY, and not from an oversight. `DeferredExecutionRecord`
+    # carries no `hardLimitOrOom`, so `outcome` is the whole of its kill
+    # evidence and a standalone record cannot claim both kinds at once --
+    # the ordering is unobservable there rather than untested.
+    check observationTermination(
+      finishOf(leaseFinishTimedOut, signal = 9'u32,
+        hardLimitOrOom = true)) == tOomKilled
+    # The fixture above must be one the write path would actually accept,
+    # or the clause is about a row that never gets made.
+    check leaseFinishedContradiction(
+      finishOf(leaseFinishTimedOut, signal = 9'u32,
+        hardLimitOrOom = true)) == ""
+
+  # -------------------------------------------------------------------------
   # The crash exit for in-flight self-reports
   # -------------------------------------------------------------------------
 

@@ -738,6 +738,56 @@ proc decodeLeaseFinished*(payload: string;
   )
   true
 
+# ---------------------------------------------------------------------------
+# The finish's own evidence has to reconcile before a row can be made of it
+# ---------------------------------------------------------------------------
+
+proc terminationContradiction(killClaimed, killClaimIsSuccess: bool;
+                              exitCode, signal: uint32): string =
+  ## The one rule, in the one place it is stated, shared by the leased and
+  ## the standalone finish shapes so the two cannot drift.
+  ##
+  ## ``reprobuild-specs/RunQuota-Observation-Store.md`` §"The Execution
+  ## Spine", the ``termination`` row: *a row MUST NOT carry a termination
+  ## its other columns contradict*, and *an unfalsifiable row is worse than
+  ## an absent one, because it reads as a measurement.*
+  ##
+  ## A KILL AND A CLEAN EXIT ARE THE PAIR THAT CANNOT BOTH BE TRUE. The
+  ## daemon derives ``oom_killed`` and ``timeout`` from fields that say
+  ## the supervisor ENDED this process; ``exit_status = 0`` with no signal
+  ## says it ended of its own accord, successfully. A row asserting both
+  ## is immutable (OS-3) and unfalsifiable, and no later reader can tell
+  ## it from a measurement.
+  if killClaimed and exitCode == 0'u32 and signal == 0'u32:
+    return "a kill was reported beside exit status 0 and no signal"
+  if killClaimIsSuccess:
+    return "a kill was reported as a successful finish"
+  ""
+
+proc leaseFinishedContradiction*(msg: LeaseFinishedMessage): string =
+  ## Why no execution row may be made of this finish, or "" when its
+  ## evidence reconciles.
+  ##
+  ## PURE, and separate from the daemon, exactly as
+  ## ``leaseObservationRefusal`` is: the states this refuses are ones a
+  ## well-behaved client library cannot be asked to produce, so the rule
+  ## has to be assertable without one.
+  ##
+  ## THE TWO KILL FIELDS ARE INDEPENDENT AND STAY THAT WAY.
+  ## ``hardLimitOrOom`` and ``outcome == leaseFinishResourceLimit`` are two
+  ## pieces of evidence for the same conclusion, not a field and its
+  ## checksum -- a supervisor that watched an ``ru_maxrss`` cross a hard
+  ## limit may set one, a runner reading its own cgroup may set the other,
+  ## and neither is obliged to set both. So this does NOT require them to
+  ## agree with each other. What it requires is that the CONCLUSION they
+  ## reach agrees with the exit the same message reports.
+  let claimsKill = msg.hardLimitOrOom or
+    msg.outcome == leaseFinishResourceLimit or
+    msg.outcome == leaseFinishTimedOut
+  terminationContradiction(claimsKill,
+    claimsKill and msg.outcome == leaseFinishSucceeded,
+    msg.exitCode, msg.signal)
+
 proc encodeLeaseFinishedAck*(msg: LeaseFinishedAckMessage): string =
   var w = writer()
   w.writeU64(msg.sessionId.value)
@@ -993,6 +1043,23 @@ proc deferredObservationsRefusal*(msg: DeferredObservationsMessage): string =
   if msg.records.len == 0 and msg.droppedObservations == 0:
     return "a deferred batch with nothing in it and nothing dropped"
   ""
+
+proc deferredRecordContradiction*(record: DeferredExecutionRecord): string =
+  ## The same rule ``leaseFinishedContradiction`` states, on the shape a
+  ## standalone client flushes at exit. The record carries no
+  ## ``hardLimitOrOom``, so ``outcome`` is the whole of its kill evidence.
+  ##
+  ## PER RECORD, NOT PER BATCH, which is why it is separate from
+  ## ``deferredObservationsRefusal`` above. A batch is one client's entire
+  ## exit flush; discarding a hundred honest rows because the hundred-and-
+  ## first contradicts itself is a larger loss than the one this rule
+  ## exists to prevent, and OS-4 asks for the smallest degradation that
+  ## keeps the store honest rather than the largest.
+  let claimsKill = record.outcome == leaseFinishResourceLimit or
+    record.outcome == leaseFinishTimedOut
+  terminationContradiction(claimsKill,
+    claimsKill and record.outcome == leaseFinishSucceeded,
+    record.exitStatus, record.signal)
 
 # ---------------------------------------------------------------------------
 # The extension WRITE path (M17): declaration, then rows.
