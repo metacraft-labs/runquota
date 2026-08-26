@@ -974,6 +974,10 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
     # acknowledged -- it had to be, or the lease would strand -- so this
     # is the only place the loss is visible at all.
     "\"executions_contradictory\":" & $daemon.observationsContradictory & "," &
+    # A CONNECTION THAT DIED RATHER THAN BEING SERVED. This used to be
+    # unobservable for the simplest of reasons: it killed the daemon, so
+    # there was nothing left to ask.
+    "\"connections_failed\":" & $daemon.connectionsFailed & "," &
     # M17: same reasoning as ``rejected`` above. ``rqExtensionRow`` is
     # one-way, so a client is never told its row was refused, and this is
     # the only place the loss can be counted.
@@ -2493,11 +2497,56 @@ proc handleSharedConnection(accepted: AcceptedConnection) {.thread, gcsafe.} =
       localConnection.close()
 
 proc connectionWorker() {.thread, gcsafe.} =
-  while true:
+  ## ONE CONNECTION MUST NOT BE ABLE TO TAKE THE HOST'S LEASE AUTHORITY WITH
+  ## IT, and until this `try` existed it could.
+  ##
+  ## `handleSharedConnection` was called bare. An unhandled exception on a Nim
+  ## thread terminates the PROCESS, and `runquotad` is host-wide -- one per
+  ## machine, serving every user -- so any client that provoked one ended
+  ## every build on the box. It did not take a malicious client: a peer that
+  ## connects and closes before the daemon finishes accepting makes
+  ## `newSocket`'s `setsockopt` fail with EINVAL, which is a race any port
+  ## scanner, health probe or aborted client wins. Three lines of Python
+  ## reproduce it, and it was found because a `repro build` hung.
+  ##
+  ## THE ISOLATION IS THE FIX, NOT THE EINVAL. Repairing only the socket
+  ## option would leave the class open -- every future line in a connection's
+  ## lifetime would be one more way to kill the daemon, and the property
+  ## worth having is that NONE of them can. So the boundary is drawn once,
+  ## here, where a connection's whole lifetime is contained.
+  ##
+  ## `Defect` is deliberately NOT caught: an IndexDefect or a failed
+  ## assertion means this process's own invariants are broken, and a daemon
+  ## that keeps handing out leases in that state is worse than one that
+  ## stops.
+  {.cast(gcsafe).}:
+   while true:
     var accepted: AcceptedConnection
     if not dequeueConnection(accepted):
       break
-    handleSharedConnection(accepted)
+    try:
+      handleSharedConnection(accepted)
+    except CatchableError as error:
+      # The descriptor is ours to release: `handleSharedConnection` closes
+      # its `LocalConnection` on every path it reaches, so anything arriving
+      # here either never built one or died holding a wrapper that closing
+      # again would not help.
+      accepted.close()
+      acquire(sharedDaemon.lock)
+      try:
+        inc sharedDaemon.daemon.connectionsFailed
+        # SAID ONCE, THEN COUNTED. A daemon whose connections are failing is
+        # something an operator must be able to see, but a client that can
+        # provoke one failure can provoke a million, and an unbounded log is
+        # the same denial of service by another route. The first is printed
+        # with its reason; the rest are readable as `connections_failed`
+        # through the status subject.
+        if sharedDaemon.daemon.connectionsFailed == 1'u64:
+          echo "runquota connection handling failed: " & error.msg &
+            " (this is counted as connections_failed and not printed again)"
+          flushFile(stdout)
+      finally:
+        release(sharedDaemon.lock)
 
 const endpointRefusedExitCode* = 3
   ## `serve` returns this when the rendezvous directory is not trustworthy.
@@ -2573,8 +2622,43 @@ proc serve*(config: DaemonConfig): int =
     threads.add(default(Thread[void]))
     createThread(threads[^1], connectionWorker)
   try:
+    # A FAILED ACCEPT IS USUALLY THE HOST TALKING, NOT THE LISTENER DYING.
+    # `accept` reports the peer's problems as well as its own: ECONNABORTED
+    # when a client goes away between connect and accept, EMFILE/ENFILE when
+    # the machine is out of descriptors. None of those mean this daemon
+    # should stop serving the leases it already granted — and EMFILE in
+    # particular is reachable in exactly the conditions RunQuota exists for:
+    # a wide build ran this host out of descriptors while these very numbers
+    # were being measured.
+    #
+    # BUT A LISTENER THAT IS REALLY GONE MUST STILL END THE LOOP, or the
+    # daemon spins hot on an fd that will never yield a connection again.
+    # Consecutive failures are what distinguish the two: transient errors are
+    # interleaved with successful accepts, a dead listener fails every time.
+    const MaxConsecutiveAcceptFailures = 64
+    var consecutiveFailures = 0
     while true:
-      let accepted = listener.acceptNativeConnection()
+      var accepted: AcceptedConnection
+      try:
+        accepted = listener.acceptNativeConnection()
+        consecutiveFailures = 0
+      except CatchableError as error:
+        inc consecutiveFailures
+        acquire(sharedDaemon.lock)
+        try:
+          inc sharedDaemon.daemon.connectionsFailed
+          if sharedDaemon.daemon.connectionsFailed == 1'u64:
+            echo "runquota accept failed: " & error.msg &
+              " (this is counted as connections_failed and not printed again)"
+            flushFile(stdout)
+        finally:
+          release(sharedDaemon.lock)
+        if consecutiveFailures >= MaxConsecutiveAcceptFailures:
+          echo "runquota endpoint stopped accepting after " &
+            $consecutiveFailures & " consecutive failures: " & error.msg
+          flushFile(stdout)
+          break
+        continue
       enqueueConnection(accepted)
   finally:
     stopConnectionQueue()

@@ -1048,6 +1048,29 @@ proc localConnection*(accepted: AcceptedConnection): LocalConnection =
   else:
     raise newException(OSError, "unsupported accepted connection")
 
+proc close*(accepted: AcceptedConnection) =
+  ## Release a just-accepted handle that never became a `LocalConnection`.
+  ##
+  ## `localConnection` can fail -- `newSocket` sets socket options, and a peer
+  ## that has already gone away makes that fail with EINVAL -- which leaves
+  ## the accepted descriptor owned by nobody. On a HOST-WIDE daemon that is
+  ## not a leak in the ordinary sense: descriptors are the resource an accept
+  ## loop needs most, so losing one per aborted connection converts a client
+  ## that connects and vanishes into a way to take the machine's lease
+  ## authority offline. Never raises, because the only caller is an error
+  ## path.
+  case accepted.kind
+  of endpointUnixSocket:
+    if accepted.handle != osInvalidSocket:
+      discard posix.close(cint(accepted.handle))
+  of endpointNamedPipe:
+    when defined(windows):
+      discard closeHandleW(WinHandle(accepted.pipeHandle))
+    else:
+      discard
+  else:
+    discard
+
 when defined(windows):
   proc readPeerSidFromHandle(pipe: WinHandle; identity: var PeerIdentity) =
     # Windows: best-effort peer identity. We open the client's process for
