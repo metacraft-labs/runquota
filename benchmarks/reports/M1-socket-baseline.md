@@ -304,14 +304,18 @@ against 16–20 µs — which is the shape the original study said would exist i
 the store were not on that path. Everything that did **not** change is at
 least as informative: admission is 5.7 ms in both columns.
 
-**Where the remaining 132 ms is, which is a different place.** It is no longer
-per-execution at all. `CloseSession` is **51 256 µs** at the median and
-`DeclareExtension` **25 704 µs**, four of each per build; together they are
-about 90% of what RunQuota now costs this build, against 4.3 ms for all 268
-per-execution round trips combined. Those two are session-scoped and look like
-the same class of defect in a different handler. **Not investigated here**, and
-recorded so the next person starts from the measurement rather than from this
-one's conclusion.
+**Where the remaining 132 ms is, which is a different place.** `CloseSession`
+is **51 256 µs** at the median and `DeclareExtension` **25 704 µs**, two of
+each per build; together they are about 90% of what this table prices, against
+4.3 ms for all 268 per-execution round trips combined.
+
+> **This paragraph originally read "four of each per build", called the two
+> messages session-scoped, and concluded that the remaining cost is "no longer
+> per-execution at all". The count was wrong — four across the two measured
+> invocations, two per build — and so was the conclusion. `CloseSession` was
+> not doing anything; it was waiting behind a per-execution cost this table
+> does not contain. See the section below, which was written after the cause
+> was found.**
 
 **Caveats on the "after" column, stated because they matter:**
 
@@ -330,6 +334,107 @@ one's conclusion.
   `ExtensionRow` sends**, on 5 connections, with no unpaired remainder beyond
   those sends.
 
+### What `CloseSession` was waiting for
+
+**A one-way message, priced at zero by construction.** The 134 `ExtensionRow`
+sends in the line above are excluded from every percentile in this report,
+because the tap resolves latency by pairing a request with its reply and an
+`ExtensionRow` has none. They were not free. Each one cost the daemon a
+`sqlite3` subprocess.
+
+The evidence is in this study's own event stream —
+`bench-results/runquota-m1-wide-build-events.csv`, the file the table above was
+derived from, read a second time. **Every slow `CloseSession` is immediately
+preceded on its own connection by a burst of `ExtensionRow` frames, and its
+latency is a function of how many:**
+
+| connection | one-way rows sent just before it | `CloseSession` |
+|---|---|---|
+| 1 | 1 | 8 903 µs |
+| 2 | 66 | 68 812 µs |
+| 3 | 1 | 8 666 µs |
+| 4 | 66 | 51 257 µs |
+
+**And the client was paced while sending them.** The 66-row bursts span 348 ms
+and 272 ms, in a shape nothing about the client explains: a median inter-frame
+gap of **3 µs**, a p90 of **23 ms**, and stalls of 16–41 ms after every fourth
+or fifth row. That is a sender blocked on a socket being drained one process
+spawn at a time. Priced end to end — last `ReleaseLease` acknowledged to
+`SessionClosed` acknowledged — the close of a session costs **450 ms and
+349 ms** in the two invocations, against the **132 ms** this report attributes
+to RunQuota for the entire build.
+
+**So the remaining cost was per-execution after all, and it did scale with
+build width.** One row per action, one spawn per row.
+
+### The cause, and the fix
+
+`admitExtensionRow` read `extension_registry` out of the database for every
+row, to establish two things: that the extension is registered, and what schema
+version the registry carries. Neither can change while a client is sending rows
+for an extension it has already declared — and a declaration is mandatory
+before any row, is request/response, and reads the registry authoritatively.
+The per-row read was asking a question that had already been answered, at the
+price of a process, on the daemon thread, under the daemon-wide lock every
+other connection is waiting on.
+
+Measured directly against the release daemon over a real socket with the
+shipped client, same host, one session, rows sent the way a build sends them:
+
+| | before | after |
+|---|---|---|
+| next round trip after **0** one-way rows | 0.036 ms | 0.030 ms |
+| next round trip after **64** one-way rows | **1759.6 ms** | **0.11 ms** |
+| `CloseSession` after **64** one-way rows | **1431.5 ms** | **0.06 ms** |
+| the regression test's 40-row burst | **837.1 ms** | **0.07 ms** |
+| `DeclareExtension`, registry up to date | 37.8 ms | 34.3 ms |
+| `StatusRequest` — the transport's own floor | 0.007 ms | 0.015 ms |
+
+**21 ms per row**, which is what a `sqlite3` spawn costs on this host; the M5
+process benchmark independently puts a null spawn at 20.8 ms here.
+
+The declaration's read stays, and that is the point rather than an omission:
+it is what makes answering the row path from memory sound. `DeclareExtension`
+is therefore still two spawns — the registry read and the "does the table the
+registry claims actually exist" check — and still about 35 ms, twice per build.
+It does not scale with anything, and both spawns are doing work the row path
+was doing redundantly.
+
+**Three rows of the before column are deliberately not quoted**: bursts of 1, 4
+and 16 rows measured 143 ms, 429 ms and 484 ms, which is more than 21 ms a row.
+The aggregate publisher's own spawns were in flight during those bursts and
+every spawn in the daemon passes through one guard, so those three figures
+price the contention as well as the row. The 64-row and 40-row bursts are long
+enough for that to wash out.
+
+Held by `tests/integration/t_extension_rows_do_not_query_the_registry.nim`,
+which asserts on a read counter rather than on a stopwatch.
+
+### What this says about the transport, which is what M1 exists to inform
+
+A `StatusRequest` round trip on this socket costs **7–15 µs**. The four
+per-execution round trips cost 16–42 µs each. Every large number this study
+has produced — 21.9 ms per completion, 21 ms per extension row, 35 ms per
+declaration — has turned out to be a `sqlite3` process behind the socket, and
+none of them was the socket. After both fixes, RunQuota's whole cost to this
+66-action build is roughly **4.3 ms of per-execution round trips plus ~70 ms of
+process spawns in two declarations**, on a build of 79–92 seconds.
+
+**M22 and M23 are both premised on the socket being expensive. On this
+evidence it is not.** That is not an argument against either milestone — a ring
+and a shared-memory admission path may earn their keep at a width this subject
+does not reach, and neither claim is tested here — but the case for them cannot
+rest on this baseline, and the number to beat is tens of microseconds rather
+than tens of milliseconds.
+
+**The 4.3 ms + 70 ms figure above is a projection, not a measurement.** The
+wide build was NOT re-run after this fix: the per-message figures come from
+driving the release daemon directly, and the end-to-end total adds them up.
+What was measured end to end is the mechanism the build was waiting on, and
+that is daemon-side — the same daemon, socket and client library a build uses,
+differing only in which process sends the frames. A third pass over the wide
+build would settle the addition and is the obvious next measurement.
+
 ---
 
 ## What is missing
@@ -339,6 +444,9 @@ one's conclusion.
   shape; it does not carry a gate figure of its own.
 - **Oversubscription.** Measured load was ~1.0×. These figures do NOT describe
   the ≥2× oversubscribed condition M8's gate names.
+- **A third pass over the wide build**, after the extension-row fix. The
+  "after" column above still contains the row path's cost, spread between a
+  `CloseSession` percentile and 134 frames priced at zero.
 - **Linux.** Nothing here is claimed for it.
 - **The build worker's total syscall count**, which would be the denominator
   for "what share of the build's syscalls are RunQuota's". The RQSP frames come

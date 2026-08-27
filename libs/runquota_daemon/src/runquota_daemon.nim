@@ -1096,6 +1096,14 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
     "\"extension_rows\":" & $daemon.observationExtensionRows & "," &
     "\"extension_rows_refused\":" &
       $daemon.observationExtensionRowsRefused & "," &
+    # THE COUNT THAT MAKES THE ROW PATH'S RULE TESTABLE, for the same
+    # reason `synchronous_drains` exists below. Reading the extension
+    # registry out of the database once per declaration is the design;
+    # reading it once per ROW is a subprocess spawn per observed execution,
+    # and both write byte-identical stores. Nothing but a count can tell
+    # them apart from outside.
+    "\"extension_registry_reads\":" &
+      $daemon.observationStore.registryReads & "," &
     "\"queued\":" & $observationsWritten() & "," &
     "\"dropped\":" & $observationsDropped() & "," &
     "\"write_failures\":" & $observationWriteFailures() & "," &

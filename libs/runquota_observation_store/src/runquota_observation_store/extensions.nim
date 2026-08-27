@@ -39,7 +39,7 @@
 ##   carry. That is the extension-level form of the refusal the spine
 ##   already makes at ``openObservationStore``.
 
-import std/[options, strutils]
+import std/[options, strutils, tables]
 
 import ./ids, ./schema, ./sqlite_cli, ./store, ./types
 
@@ -308,10 +308,49 @@ proc extensionRegistryEntry*(store: ObservationStore;
     extensionId: string): Option[ExtensionRegistryRow] =
   ## What the DATABASE says about this extension, which is the only thing
   ## that decides what it can store.
+  ##
+  ## WHATEVER IT FINDS IS REMEMBERED, so that the row path below can ask
+  ## the same question without spawning `sqlite3` again. The remembering
+  ## happens here, on the authoritative read, and nowhere else: an entry
+  ## this process has not read out of the database never enters the map.
   for row in store.readExtensionRegistry():
+    store.knownExtensions[row.extensionId] = row
     if row.extensionId == extensionId:
-      return some(row)
-  none(ExtensionRegistryRow)
+      result = some(row)
+
+proc rememberExtension*(store: ObservationStore;
+                        row: ExtensionRegistryRow) =
+  ## Records what a registry row became after this process WROTE it.
+  ##
+  ## Registration and migration are the two statements that change the
+  ## registry, and both know exactly what they left behind. Re-reading the
+  ## database to discover it would be one more spawn to learn something
+  ## already in hand.
+  store.knownExtensions[row.extensionId] = row
+
+proc knownExtensionRegistryEntry*(store: ObservationStore;
+    extensionId: string): Option[ExtensionRegistryRow] =
+  ## The registry entry for one extension, answered FROM MEMORY when this
+  ## process has already established it, and from the database when it has
+  ## not.
+  ##
+  ## WHY THIS IS SOUND, AND IT RESTS ON TWO FACTS RATHER THAN ON LUCK.
+  ## `runquotad` is one per host and is the only sanctioned writer of this
+  ## store, so `extension_registry` changes only where this file changes
+  ## it — and every one of those places records what it did, immediately
+  ## above. And a row may not be written for an extension that was never
+  ## declared: `declareExtension` runs first, over the socket, and its read
+  ## is the authoritative one that fills this map. So an entry served from
+  ## memory is an entry this process read or wrote, not a guess about a
+  ## database somebody else may have moved underneath it.
+  ##
+  ## A MISS STILL ASKS THE DATABASE, which is what keeps every refusal
+  ## reachable. A row naming an extension nobody declared finds nothing
+  ## here, falls through to the real read, and is refused as
+  ## `ewNotRegistered` exactly as before.
+  if store.knownExtensions.hasKey(extensionId):
+    return some(store.knownExtensions[extensionId])
+  store.extensionRegistryEntry(extensionId)
 
 proc extensionTableExists*(store: ObservationStore;
                            tableName: string): bool =
@@ -352,7 +391,14 @@ proc declareExtension*(store: ObservationStore;
     return eoRefusedUnstorableVersion
 
   let tableName = extensionTableName(declaration.extensionId)
+  # THE AUTHORITATIVE READ, AND IT STAYS ONE. This is the read that fills
+  # `knownExtensions`, so the row path below can be answered from memory
+  # only because this one was answered from the database. It happens once
+  # per declaration -- once per client, per session -- and not once per
+  # observed execution, which is the distinction the whole arrangement
+  # exists to draw.
   let existing = store.extensionRegistryEntry(declaration.extensionId)
+  let registeredAt = unixMillisNow()
 
   if existing.isNone:
     if not ladderCovers(declaration, declaration.schemaVersion):
@@ -366,7 +412,7 @@ proc declareExtension*(store: ObservationStore;
       encodeText(declaration.extensionId) & ", " &
       encodeInt(declaration.schemaVersion) & ", " &
       encodeText(declaration.owner) & ", " & encodeText(tableName) & ", " &
-      encodeInt(unixMillisNow()) & ");\n")
+      encodeInt(registeredAt) & ");\n")
     sql.add("commit;\n")
     if not store.runStatement(sql):
       # The shape gate and a failing migration step are told apart by what
@@ -375,6 +421,12 @@ proc declareExtension*(store: ObservationStore;
       # says its DDL did not run.
       return if extensionShapeConstraint in store.lastError: eoRefusedShape
              else: eoRefusedMigrationFailed
+    store.rememberExtension(ExtensionRegistryRow(
+      extensionId: declaration.extensionId,
+      schemaVersion: declaration.schemaVersion,
+      owner: declaration.owner,
+      tableName: tableName,
+      registeredAtUnixMillis: registeredAt))
     return eoCreated
 
   let registered = existing.get
@@ -416,6 +468,9 @@ proc declareExtension*(store: ObservationStore;
   if not store.runStatement(sql):
     return if extensionShapeConstraint in store.lastError: eoRefusedShape
            else: eoRefusedMigrationFailed
+  var migrated = registered
+  migrated.schemaVersion = declaration.schemaVersion
+  store.rememberExtension(migrated)
   eoMigrated
 
 # ---------------------------------------------------------------------------
@@ -455,7 +510,22 @@ proc admitExtensionRow*(store: ObservationStore;
     if not isStorableIdentifier(name) or
         name == keyHostColumn or name == keyExecutionColumn:
       return (ewRefusedRow, "")
-  let existing = store.extensionRegistryEntry(declaration.extensionId)
+  # FROM MEMORY WHEN THIS PROCESS ALREADY KNOWS, and that is the whole of
+  # the difference between a row costing microseconds and a row costing a
+  # `sqlite3` process.
+  #
+  # THE DEFECT THIS REPLACES. Every admitted row read the registry out of
+  # the database to learn two things -- that the extension is registered,
+  # and what version the registry carries -- neither of which can change
+  # while a client is sending rows for an extension it has already
+  # declared. Rows arrive one per observed execution and are ONE-WAY, so
+  # the spawn was invisible to the sender and to every latency figure
+  # derived from round trips; it surfaced only as the next request on the
+  # connection waiting behind the backlog, which in a real build is
+  # `CloseSession`. Measured at 21 ms per row on the development host, or
+  # 1.4 seconds for a 64-action build, all of it under the daemon-wide
+  # lock every other connection is waiting on.
+  let existing = store.knownExtensionRegistryEntry(declaration.extensionId)
   if existing.isNone:
     return (ewNotRegistered, "")
   if declaration.schemaVersion > existing.get.schemaVersion:

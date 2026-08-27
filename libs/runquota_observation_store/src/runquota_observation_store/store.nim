@@ -18,7 +18,7 @@
 ##   trigger that aborts. There is deliberately no update entry point, and
 ##   the trigger holds even for a client using ``sqlite3`` directly.
 
-import std/[options, os, strutils]
+import std/[options, os, strutils, tables]
 
 import ./hardware, ./ids, ./schema, ./sqlite_cli, ./types
 
@@ -38,6 +38,22 @@ type
     lastError*: string
       ## The most recent rejected write. A rejected row is the caller's
       ## problem; it does not turn capture off.
+    registryReads*: int64
+      ## How many times the extension registry has been read FROM THE
+      ## DATABASE, which means how many `sqlite3` processes were spawned to
+      ## answer "what does this store know about this extension".
+      ##
+      ## IT IS A COUNTER BECAUSE THE DEFECT IT BOUNDS IS INVISIBLE
+      ## OTHERWISE. Reading the registry once per declaration is the design;
+      ## reading it once per extension ROW is a subprocess spawn per
+      ## observed execution, and the two produce byte-identical stores. Only
+      ## a count can tell them apart from outside the daemon, and the
+      ## regression test asserts on this rather than on a stopwatch.
+    knownExtensions*: Table[string, ExtensionRegistryRow]
+      ## What THIS PROCESS has established about the registry, by reading
+      ## it. Not a cache in front of the database in general: see
+      ## `knownExtensionRegistryEntry` for the one question it answers and
+      ## why answering it from memory is sound.
 
 proc libraryInfo*(): LibraryInfo =
   LibraryInfo(name: libraryName)
@@ -595,6 +611,9 @@ proc runQuery*(store: ObservationStore; sql: string): seq[seq[string]] =
 
 proc readExtensionRegistry*(store: ObservationStore):
     seq[ExtensionRegistryRow] =
+  ## The registry, read from the database. ALWAYS a `sqlite3` spawn, and
+  ## counted as one.
+  inc store.registryReads
   let sql = "select " & [
     selectText("extension_id"), selectInt("schema_version"),
     selectText("owner"), selectText("table_name"),
