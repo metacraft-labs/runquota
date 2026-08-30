@@ -50,15 +50,24 @@
 ## no tear occurred, and the consequence is an admission decision made on the
 ## wrong work's history, which is worse than a miss.
 
-import std/[algorithm, os, posix, strutils, times]
+import std/[algorithm, os, strutils, times]
 
 import ./types
 export types
 
-from shm_lease/anchor import bootId, processStartTime
-from shm_lease/waitword import pageSize
-
 const statsPublisherSupported* = defined(linux) or defined(macosx)
+
+# The publisher's write path is a POSIX shared-memory + mmap seqlock and only
+# builds on Linux/macOS. Keep its platform-only imports -- std/posix and the
+# shm_lease modules -- behind that guard so this module still COMPILES on
+# Windows, where it is an inert stub. Unconditional imports broke the Windows
+# build with `cannot open file: shm_lease/anchor` (and would fail on std/posix
+# too), first surfaced by reprobuild's windows-x86_64 release leg. Every use of
+# these symbols below is already inside `when statsPublisherSupported`.
+when statsPublisherSupported:
+  import std/posix
+  from shm_lease/anchor import bootId, processStartTime
+  from shm_lease/waitword import pageSize
 
 type
   StatsPublisher* = object
