@@ -1062,7 +1062,14 @@ proc close*(accepted: AcceptedConnection) =
   case accepted.kind
   of endpointUnixSocket:
     if accepted.handle != osInvalidSocket:
-      discard posix.close(cint(accepted.handle))
+      # Close portably. `nativesockets.close` (already imported) issues
+      # `closesocket` on Windows and `close(2)` on POSIX. The previous
+      # `posix.close` named the `std/posix` module, which is imported only
+      # `when defined(posix)`, so on Windows this compiled to
+      # "undeclared identifier: 'posix'" -- even though the unix-socket arm is
+      # reachable there (AF_UNIX is supported on Windows 10+ and `newSocket(...
+      # AF_UNIX ...)` above is unguarded).
+      nativesockets.close(accepted.handle)
   of endpointNamedPipe:
     when defined(windows):
       discard closeHandleW(WinHandle(accepted.pipeHandle))
