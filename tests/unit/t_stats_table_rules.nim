@@ -77,16 +77,32 @@ proc codeOnly(text: string): string =
     lines.add(line[0 ..< cut])
   lines.join("\n")
 
+proc toSlash(path: string): string =
+  ## The path with the HOST's separator turned into a slash.
+  ##
+  ## Every prefix and substring test below is written with slashes --
+  ## ``"/tests/"``, ``"libs/runquota_daemon/"`` -- while ``walkDirRec``
+  ## yields the host's ``DirSep``. On a host where those differ, none of
+  ## them matched: the sweeps below then swept an EMPTY set and the
+  ## `notin`-shaped gates passed by finding nothing, which is the one
+  ## failure mode a gate must not have.
+  when DirSep == '/':
+    path
+  else:
+    path.replace(DirSep, '/')
+
 proc shippedSources(): seq[string] =
   for root in ["libs", "apps"]:
     for path in walkDirRec(repoRoot / root):
       if not path.endsWith(".nim"): continue
-      if "/tests/" in path: continue
+      if "/tests/" in toSlash(path): continue
       result.add(path)
   result.sort()
 
 proc relativeToRepo(path: string): string =
-  if path.startsWith(repoRoot & "/"): path[repoRoot.len + 1 .. ^1] else: path
+  let root = toSlash(repoRoot)
+  let slashed = toSlash(path)
+  if slashed.startsWith(root & "/"): slashed[root.len + 1 .. ^1] else: slashed
 
 proc writesTheTable(source: string): bool =
   ## What makes a file a WRITER of the published table: it names the

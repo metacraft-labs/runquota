@@ -322,6 +322,22 @@
               pkgs.pre-commit
               pkgs.shellcheck
               pkgs.shfmt
+              # THE `sqlite3` TOOL, which is a RUNTIME dependency of the
+              # observation store and of `runquota_persistence`: both reach
+              # SQLite by spawning the command-line tool rather than by
+              # linking a library, precisely so that its absence is a
+              # catchable condition (OS-4, "degrade, never fail") instead of
+              # a load-time abort. `findExe "sqlite3"` is the whole test.
+              #
+              # Its absence from this list is what made that degradation the
+              # DEFAULT in CI: `nix develop --command just test` ran with no
+              # tool on PATH, every store opened as
+              # `degraded-no-sqlite-tool`, and roughly half the suite
+              # asserted against a store that had refused to exist. A green
+              # run then meant "the tool is missing", not "the store works".
+              # The `bin` output is `pkgs.sqlite`'s first, so this is the
+              # CLI and not just the library.
+              pkgs.sqlite
               pkgs.typos
             ];
             SHM_LEASE_SRC = shmLeaseSrc;

@@ -17,8 +17,12 @@
 #   * everything touching `std/posix`, a unix socket, or a live daemon -- the
 #     platform-specific half, covered on the Linux/macOS legs;
 #   * the `t_observation_store_*` files -- they are platform-neutral in
-#     principle but need an `sqlite3` on PATH, which neither the Windows
-#     runner nor (today) the Nix dev shell provides;
+#     principle but need an `sqlite3` on PATH, which the Windows runner does
+#     not provide. The Nix dev shell DOES provide it (`pkgs.sqlite` in
+#     `devShells.default`); it did not when this file was written, and that
+#     sentence read as though the tool were missing everywhere. It is
+#     missing on this job only, so the Linux and macOS legs are where these
+#     files are actually exercised;
 #   * `tests/unit/t_windows_compile_gate.nim` -- it cross-checks
 #     `--os:windows` FROM a POSIX host, so running it on Windows would be a
 #     native check pretending to be a cross one.
