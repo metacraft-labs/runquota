@@ -1,0 +1,19 @@
+# actionlint configuration.
+#
+# actionlint validates `runs-on` against GitHub's HOSTED runner labels. Every
+# label below belongs to a Metacraft self-hosted pool, so actionlint cannot
+# know it and would otherwise report each one as unknown -- which in practice
+# means the runner-label check gets ignored wholesale, and a typo'd pool name
+# stops being an error. Declaring the pools here keeps that check ON: a label
+# not on this list is still a failure.
+self-hosted-runner:
+  labels:
+    - eph-linux-x64
+    - eph-linux-arm64
+    - eph-macos-arm64
+    # The Windows pools. `eph-win-x64` is where ci.yml's
+    # `windows-compile-gate` runs -- see the comment on that job for why
+    # runquota needs a Windows leg at all; both appear in the
+    # ci-reprobuild.yml build matrix.
+    - eph-win-x64
+    - eph-win-arm64

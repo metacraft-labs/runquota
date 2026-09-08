@@ -80,3 +80,191 @@ jobs:
           name: build-logs-${{ matrix.runner }}
           path: test-logs/
           retention-days: 30
+
+  windows-compile-gate:
+    name: Windows compile gate
+    # THE JOB THIS REPOSITORY DID NOT HAVE WHEN IT NEEDED IT. Two Windows-only
+    # compile errors reached `dev` within two days of each other -- an
+    # unguarded `posix.close` in `runquota_ipc` (16184d1) and unguarded
+    # `std/posix` + `shm_lease/*` imports in `runquota_stats_table`'s publisher
+    # (fee60f4) -- and BOTH were found by a DOWNSTREAM consumer's Windows leg
+    # rather than here, because `lint`, `test` and `nix-build` all run on
+    # [eph-linux-x64, eph-linux-arm64, eph-macos-arm64] and nothing in this
+    # file had ever compiled the tree for Windows.
+    #
+    # SCOPE, DELIBERATELY NARROWER THAN "run the suite". runquota's tests are
+    # POSIX-only by construction -- unix sockets, `std/posix`, a real
+    # `runquotad` -- so a Windows leg of `just test` would be mostly skips: a
+    # job that passes by doing nothing, which is worse than no job at all.
+    # What this one does instead is what would have caught both defects, and
+    # more: a real native `nim c` of every entrypoint, a `nim check` of every
+    # library, a smoke of the binaries it just produced, and the subset of the
+    # suite that is genuinely platform-neutral, compiled and RUN.
+    #
+    # WHY IT IS NOT MERELY THE CROSS-CHECK. `tests/unit/t_windows_compile_gate`
+    # runs `nim check --os:windows` from the Linux/macOS legs and catches the
+    # same two defects far more cheaply -- but it type-checks against the HOST
+    # stdlib and never invokes a C compiler or a linker. This job is where the
+    # generated C actually gets compiled, linked and executed on Windows.
+    #
+    # NO NIX. `flake.nix` declares four systems and none of them is Windows, so
+    # there is no `nix build` story here; inventing one would be a different
+    # project. The toolchain comes from `setup-dev-env`, the same way
+    # reprobuild's Windows job gets it.
+    #
+    # ITS OWN REQUIRED JOB RATHER THAN A MATRIX LEG: an unavailable Windows
+    # service then leaves this gate queued or pending, not green. There is no
+    # skip-as-pass branch.
+    runs-on: eph-win-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mint installation token for Windows dev environment
+        id: ci_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Setup Windows dev environment
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        with:
+          env-flavor: windows-diy
+          gh-token: ${{ steps.ci_token.outputs.token }}
+
+      # THE CHECKOUT IS DELIBERATELY BARE. No sibling repositories and no
+      # `SHM_LEASE_SRC`, so `config.nims` resolves neither -- which is exactly
+      # the environment fee60f4's defect was found in, and the reason this job
+      # sees it. If a Windows build ever legitimately needs `nim-shm-lease`,
+      # this step fails and the fix is to provide it here, not to weaken the
+      # gate.
+      - name: Build every entrypoint natively
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force build/bin, build/nimcache | Out-Null
+          $rows = @(Get-Content -LiteralPath apps/entrypoints.txt |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -ne '' -and -not $_.StartsWith('#') })
+          # A manifest this job failed to parse would otherwise sweep nothing
+          # and report success. The floor is the count in the tree today; it
+          # cannot be lowered without editing this file on purpose.
+          if ($rows.Count -lt 2) {
+            throw "apps/entrypoints.txt yielded $($rows.Count) rows; refusing to pass on an empty sweep"
+          }
+          foreach ($row in $rows) {
+            $fields = $row -split '\s+'
+            $name = $fields[0]
+            $path = $fields[1]
+            Write-Host "== nim c $path"
+            & nim c `
+              --threads:on `
+              --hints:off `
+              --nimcache:"build/nimcache/$name" `
+              --out:"build/bin/$name.exe" `
+              $path
+            if ($LASTEXITCODE -ne 0) {
+              throw "nim c failed for $path with exit code $LASTEXITCODE"
+            }
+          }
+
+      - name: Type-check every library natively
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $libs = @(Get-Content -LiteralPath libs/libraries.txt |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -ne '' -and -not $_.StartsWith('#') } |
+            ForEach-Object { ($_ -split '\s+')[0] })
+          # The libraries are NOT redundant with the entrypoints above:
+          # `runquota_c` is a `--app:staticlib` surface that no entrypoint and
+          # no other library imports, so nothing else in this job type-checks
+          # it. (`runquota_host_macos` IS in the entrypoints' import closure --
+          # `runquota_process` and `runquota_daemon` import it -- so it is
+          # covered either way; it is only absent from the generated C.)
+          #
+          # Same floor rule as the entrypoints above, and for the same reason:
+          # the count in the tree today, so a manifest this job failed to parse
+          # cannot sweep a subset and still report success. Dropping a library
+          # from the manifest means editing this file too. At a floor lower
+          # than the real count, deleting the last four rows would silently
+          # stop checking `runquota_stats_table` -- the very library whose
+          # unguarded POSIX imports this job exists to catch.
+          if ($libs.Count -lt 19) {
+            throw "libs/libraries.txt yielded $($libs.Count) rows; refusing to pass on an empty sweep"
+          }
+          $failed = @()
+          foreach ($lib in $libs) {
+            Write-Host "== nim check $lib"
+            & nim check `
+              --threads:on `
+              --hints:off `
+              --nimcache:"build/nimcache/check-$lib" `
+              "libs/$lib/src/$lib.nim"
+            # Every library is checked before the job fails, so one broken
+            # module does not hide the rest of the tree's Windows state.
+            if ($LASTEXITCODE -ne 0) { $failed += $lib }
+          }
+          if ($failed.Count -gt 0) {
+            throw "libraries that do not compile for Windows: $($failed -join ', ')"
+          }
+
+      # The binaries built above, actually executed. `nim c` linking is not the
+      # same claim as a process that starts: a Windows-only defect in module
+      # initialisation produces an executable that links and then dies.
+      - name: Smoke the built binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rows = @(Get-Content -LiteralPath apps/entrypoints.txt |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -ne '' -and -not $_.StartsWith('#') })
+          foreach ($row in $rows) {
+            $name = ($row -split '\s+')[0]
+            $exe = "build/bin/$name.exe"
+            if (-not (Test-Path -LiteralPath $exe)) { throw "missing $exe" }
+            $output = @(& $exe --version)
+            if ($LASTEXITCODE -ne 0) {
+              throw "$exe --version exited $LASTEXITCODE"
+            }
+            # First line only, and `@(...)` above so a single-line result is
+            # still an array: `-notmatch` on a bare array FILTERS rather than
+            # testing, which would make this comparison always look true.
+            $firstLine = if ($output.Count -gt 0) { $output[0] } else { '' }
+            if ($firstLine -notmatch "^$name ") {
+              throw "$exe --version printed '$firstLine', expected it to start with '$name '"
+            }
+            Write-Host "== $exe --version -> $firstLine"
+          }
+
+      - name: Run the platform-neutral tests natively
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force build/test-bin | Out-Null
+          $tests = @(Get-Content -LiteralPath tests/windows/portable_tests.txt |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -ne '' -and -not $_.StartsWith('#') })
+          # See the header of that manifest for what belongs in it and why the
+          # rest of the suite does not. The floor is what makes shrinking the
+          # list a deliberate act: a job whose test list quietly emptied would
+          # still be green.
+          if ($tests.Count -lt 4) {
+            throw "tests/windows/portable_tests.txt yielded $($tests.Count) rows; refusing to pass on an empty sweep"
+          }
+          $failed = @()
+          foreach ($test in $tests) {
+            $name = [System.IO.Path]::GetFileNameWithoutExtension($test)
+            Write-Host "== nim c -r $test"
+            & nim c -r `
+              --threads:on `
+              --hints:off `
+              --nimcache:"build/nimcache/$name" `
+              --out:"build/test-bin/$name.exe" `
+              $test
+            if ($LASTEXITCODE -ne 0) { $failed += $test }
+          }
+          if ($failed.Count -gt 0) {
+            throw "platform-neutral tests failing on Windows: $($failed -join ', ')"
+          }

@@ -1,0 +1,34 @@
+# Test files the `windows-compile-gate` CI job COMPILES AND RUNS natively on
+# Windows.
+#
+# runquota's suite is POSIX-only by construction: of the files
+# `scripts/run_tests.sh` discovers, roughly a third import `std/posix`
+# directly and rather more than that drive a unix socket or a real
+# `runquotad`. A Windows job that claimed to "run the suite" would either be
+# a lie or a pile of skips, and a job full of skips passes by doing nothing --
+# which is the failure this whole gate exists to prevent.
+#
+# So this file is the honest subset: the test files that are about behaviour
+# that is NOT platform-specific, and that therefore have something to say on
+# Windows. Each one was verified to compile and pass on a native Windows
+# checkout with no sibling repositories and no Nix.
+#
+# Excluded on purpose, and worth knowing why:
+#   * everything touching `std/posix`, a unix socket, or a live daemon -- the
+#     platform-specific half, covered on the Linux/macOS legs;
+#   * the `t_observation_store_*` files -- they are platform-neutral in
+#     principle but need an `sqlite3` on PATH, which neither the Windows
+#     runner nor (today) the Nix dev shell provides;
+#   * `tests/unit/t_windows_compile_gate.nim` -- it cross-checks
+#     `--os:windows` FROM a POSIX host, so running it on Windows would be a
+#     native check pretending to be a cross one.
+#
+# Adding a row means asserting the file passes on Windows. The job's floor
+# check refuses to run a shorter list than this one without the workflow
+# being edited too, so shrinking it is a deliberate act rather than a
+# silent one.
+
+tests/compatibility/t_c_abi_layout.nim
+tests/compatibility/t_protocol_codec.nim
+tests/unit/t_version.nim
+tests/unit/t_standalone_capture_rules.nim

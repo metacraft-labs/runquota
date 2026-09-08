@@ -11,7 +11,16 @@ RunQuota implements the Metacraft repository requirements locally through:
 - `scripts/check_static_helpers.sh` for the ARC/staticlib and no-`ref` helper
   library gate.
 - `.github/workflows/ci.yml` for parallel lint, test, and Nix build jobs with
-  preserved logs.
+  preserved logs, plus the `windows-compile-gate` job: runquota's tests are
+  POSIX-only by construction, so the Windows leg builds every entrypoint,
+  type-checks every library, smoke-runs the binaries it produced and runs the
+  platform-neutral subset listed in `tests/windows/portable_tests.txt` rather
+  than pretending to run the suite. Its Linux-side counterpart is
+  `tests/unit/t_windows_compile_gate.nim`, which cross-checks the same
+  manifests with `nim check --os:windows`.
+- `.github/actionlint.yaml` declaring the self-hosted runner pools, so
+  actionlint's runner-label check stays enabled rather than being drowned in
+  unknown-label reports.
 - `AGENTS.md` as the canonical agent instruction file, with per-tool symlinks.
 
 Workspace source dependencies must be selected by workspace locks. This
