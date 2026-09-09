@@ -127,11 +127,13 @@
           };
           staticHelperGatePath = pkgs.lib.makeBinPath [
             pkgs.bash
+            pkgs.clang
             pkgs.coreutils
             pkgs.findutils
             pkgs.gawk
             pkgs.gnugrep
             pkgs.gnused
+            pkgs.llvmPackages.llvm
             pkgs.nim2
             pkgs.stdenv.cc
           ];

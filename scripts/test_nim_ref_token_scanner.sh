@@ -158,9 +158,8 @@ case "${source_root}" in
 /nix/store/*) ;;
 *) fail "authoritative source root is not an immutable Nix store snapshot" ;;
 esac
-if find "${source_root}" -perm -0222 -print -quit | grep -q .; then
-  fail "authoritative source snapshot contains a writable path"
-fi
+bash "${source_root}/scripts/check_immutable_source.sh" "${source_root}" ||
+  fail "authoritative source snapshot validation failed"
 
 expected_authority="$(
   printf 'nim=%s\nsource=%s\npath=%s\ngate=%s\n' \

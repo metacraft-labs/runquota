@@ -45,9 +45,8 @@ case "${source_root}" in
 /nix/store/*) ;;
 *) fail "source root is mutable; the authoritative gate requires a Nix store snapshot" ;;
 esac
-if find "${source_root}" -perm -0222 -print -quit | grep -q .; then
-  fail "immutable source snapshot contains a writable path: ${source_root}"
-fi
+bash "${source_root}/scripts/check_immutable_source.sh" "${source_root}" ||
+  fail "immutable source snapshot validation failed: ${source_root}"
 
 gate_wrapper="$(realpath -e -- "${gate_wrapper_argument}" 2>/dev/null)" ||
   fail "gate wrapper does not exist: ${gate_wrapper_argument}"
