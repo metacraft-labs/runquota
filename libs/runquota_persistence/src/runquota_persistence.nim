@@ -19,6 +19,8 @@ var writerDbPath = ""
 var writerCapacity = 0
 var writerPending: seq[LearnedEstimateRow] = @[]
 var writerThread: Thread[void]
+var writerFailedBatches = 0'u64
+var writerFailedRows = 0'u64
 
 proc ensureWriterLock() =
   if not writerReady:
@@ -31,43 +33,87 @@ proc nowUnixMillis*(): uint64 =
 proc sqlQuote(value: string): string =
   "'" & value.replace("'", "''") & "'"
 
-proc runSqlite*(path, sqlText: string): string =
-  ## Run ``sqlText`` against the estimate store and return what ``sqlite3``
-  ## put on stdout.
+type
+  SqliteRun* = object
+    ## What one ``sqlite3`` invocation left behind.
+    ##
+    ## ``ok`` means the tool ran to completion and exited zero. It is NOT a
+    ## synonym for "``failure`` is empty": a tool that started fine and then
+    ## rejected the SQL has an empty ``failure`` and ``ok == false``, and that
+    ## is exactly the case ``discard runSqlite(...)`` used to lose.
+    ok*: bool
+    output*: string
+      ## What ``sqlite3`` put on stdout, and only that. Every caller here
+      ## parses it as rows.
+    failure*: string
+      ## Why the tool could not be RUN at all -- an absent binary, a spawn
+      ## that would not start. Empty when the child ran, whatever it exited
+      ## with. This is not the child's stderr; see ``runSqlite``.
+
+proc runSqlite*(path, sqlText: string): SqliteRun =
+  ## Run ``sqlText`` against the estimate store and report what happened.
   ##
-  ## This used to be `execProcess(..., options = {poUsePath})`, and the
-  ## explicit `options` is the whole defect. `execProcess`'s body loops on
-  ## `outputStream` and reads no other stream; its *default* options include
-  ## `poStdErrToStdOut`, which folds stderr into the stream it does read, so
-  ## in the default shape the omission is invisible. Passing `options`
-  ## explicitly replaces that default wholesale, and stderr gets a pipe of its
-  ## own that nobody will ever read.
+  ## THE STATEMENTS GO IN OVER STDIN, NOT AS AN ARGUMENT, and that is the
+  ## defect this shape exists for. `writeBatch` builds one `insert` per queued
+  ## row -- about 800 bytes each -- and handed the whole batch to `execve` as a
+  ## SINGLE argv element. Linux caps one argument at `MAX_ARG_STRLEN`, 131_072
+  ## bytes, independently of the much larger limit on the argument block as a
+  ## whole: measured on the development host with a bare `execv`, an argument
+  ## of 131_071 bytes spawns and one of 131_072 fails with `E2BIG`. A batch
+  ## past roughly 160 rows therefore never reached `sqlite3` AT ALL, while a
+  ## shorter one committed -- a size-dependent failure with no natural test to
+  ## catch it, and one that does not exist on macOS, which has no
+  ## per-argument cap. `runquota_observation_store/sqlite_cli` had already met
+  ## this and already moved to stdin; this is the same move for the same
+  ## reason.
   ##
-  ## `writeBatch` hands a whole batch of `insert`s over as a single argv
-  ## argument, which is ~800 bytes per queued row. `sqlite3` echoes the
-  ## statement text back when it cannot prepare it, so the size of the
-  ## diagnostic tracks the size of the batch: a batch a few hundred rows long
-  ## produces more than the 65_536 bytes a pipe holds, `sqlite3` blocks in
-  ## write(2), never exits, and `execProcess`'s loop -- which only breaks when
-  ## the child stops running -- spins forever. That runs on the estimate
-  ## store's WRITER THREAD, and `stopEstimateStore` joins it.
+  ## AND THE FAILURE IS RETURNED RATHER THAN DROPPED. This proc used to end in
+  ## `.output`, which threw `failure` away, and its one write-side caller then
+  ## `discard`ed even that. A batch that never ran was therefore
+  ## indistinguishable here from a batch that committed. Whether a lost write
+  ## may be ignored is a decision the caller has to take out loud, and
+  ## `writerMain` now takes it.
   ##
-  ## `runCapturedProcess` services both output streams at once, closes stdin,
-  ## and takes the spawn guard so this thread and the observation store's
-  ## writer cannot hand each other's pipes to their children.
+  ## `-batch` and `-bail` keep stdin behaving the way argv did: no interactive
+  ## prompting whatever stdin turns out to be, and stop at the first statement
+  ## that fails rather than running the rest of a batch whose `begin immediate`
+  ## has already gone wrong. `-noheader` because every reader here parses
+  ## stdout as rows and a column header would be read as an estimate.
+  ##
+  ## `runCapturedProcess` services stdin, stdout and stderr AT ONCE, closes
+  ## stdin, and takes the spawn guard so this thread and the observation
+  ## store's writer cannot hand each other's pipes to their children. It
+  ## replaced `execProcess(..., options = {poUsePath})`, whose body loops on
+  ## `outputStream` and reads no other stream: passing `options` explicitly
+  ## replaces the default `poStdErrToStdOut` wholesale, stderr gets a pipe of
+  ## its own that nobody will ever read, and a `sqlite3` with more than the
+  ## 65_536 bytes a pipe holds to say blocks in write(2) while the parent
+  ## spins waiting for a child that can no longer exit. That runs on the
+  ## estimate store's WRITER THREAD, which `stopEstimateStore` joins.
   ##
   ## Exported so the regression test can drive it in its production shape.
-  ## stderr is deliberately still discarded rather than returned: every caller
-  ## here parses stdout as rows, and a diagnostic mixed into that stream would
-  ## be read as an estimate.
+  ## The child's stderr is deliberately still discarded rather than folded
+  ## into ``output``: every caller here parses ``output`` as rows, and a
+  ## diagnostic mixed into that stream would be read as an estimate.
   let parent = parentDir(path)
   if parent.len > 0 and not dirExists(parent):
     createDir(parent)
-  runCapturedProcess(
-    "sqlite3", args = [path, sqlText], options = {poUsePath}).output
+  let captured = runCapturedProcess(
+    "sqlite3",
+    args = ["-batch", "-noheader", "-bail", path],
+    input = sqlText & "\n",
+    options = {poUsePath})
+  SqliteRun(
+    ok: captured.failure.len == 0 and captured.ok,
+    output: captured.output,
+    failure: captured.failure)
 
-proc initEstimateSchema(path: string) =
-  discard runSqlite(path, """
+proc initEstimateSchema(path: string): bool =
+  ## Whether the schema is there to be written to. A store whose schema could
+  ## not be created cannot take a batch either, so the caller folds this into
+  ## the same reported failure rather than pressing on into a write it already
+  ## knows cannot land.
+  runSqlite(path, """
     create table if not exists learned_estimates (
       scope text not null,
       command_stats_id text not null,
@@ -81,20 +127,28 @@ proc initEstimateSchema(path: string) =
     );
     pragma journal_mode = WAL;
     pragma synchronous = NORMAL;
-  """)
+  """).ok
 
 proc loadLearnedEstimates*(path: string): seq[LearnedEstimateRow] =
   if path.len == 0 or not fileExists(path):
     return @[]
-  initEstimateSchema(path)
-  let output = runSqlite(path, """
+  discard initEstimateSchema(path)
+  let run = runSqlite(path, """
     select scope, command_stats_id, conservative_memory_bytes,
            recent_peak_memory_bytes, sample_count, last_outcome,
            updated_unix_millis
       from learned_estimates
      where schema_version = """ & $EstimateSchemaVersion & """;
   """)
-  for line in output.splitLines():
+  # A STORE THAT WOULD NOT ANSWER YIELDS NO ESTIMATES, not a partial set.
+  # `-bail` stops at the failing statement, so anything already on stdout
+  # belongs to an interrupted read, and presenting it would be a truncated
+  # answer wearing a complete one's clothes. No learned estimates is the
+  # state every machine starts in and every caller here already handles,
+  # which is what OS-4's "degrade" means at this seam.
+  if not run.ok:
+    return @[]
+  for line in run.output.splitLines():
     if line.len > 0:
       let row = line.split('|')
       if row.len == 7:
@@ -108,9 +162,10 @@ proc loadLearnedEstimates*(path: string): seq[LearnedEstimateRow] =
           updatedUnixMillis: parseUInt(row[6])
         ))
 
-proc writeBatch(path: string; rows: seq[LearnedEstimateRow]) =
+proc writeBatch(path: string; rows: seq[LearnedEstimateRow]): bool =
+  ## Commits ``rows``. Returns whether they actually landed.
   if rows.len == 0:
-    return
+    return true
   var sqlText = "begin immediate;\n"
   for row in rows:
     sqlText.add("""
@@ -135,7 +190,58 @@ proc writeBatch(path: string; rows: seq[LearnedEstimateRow]) =
           updated_unix_millis = excluded.updated_unix_millis;
     """)
   sqlText.add("commit;\n")
-  discard runSqlite(path, sqlText)
+  runSqlite(path, sqlText).ok
+
+proc noteEstimateWriteFailure(rows: int) =
+  ## A DROPPED BATCH IS COUNTED AND SAID ONCE -- NEVER SWALLOWED.
+  ##
+  ## The two obvious alternatives are both wrong here. Raising would put a
+  ## cache's problem on the writer thread `stopEstimateStore` joins, and a
+  ## learned estimate IS a cache: OS-4 is "degrade, never fail", and a daemon
+  ## that stopped granting leases because it could not remember how much
+  ## memory a command used last time has failed at its actual job.
+  ## Discarding is what was here before, and it is how a whole batch could
+  ## vanish on Linux for want of an argument shorter than `MAX_ARG_STRLEN`
+  ## with nothing anywhere saying so. So: counted where a test and an
+  ## operator can both read it, and the first one printed with its size.
+  ##
+  ## Said once for the same reason the daemon's connection counter is said
+  ## once: a store that is failing fails on every batch, and an unbounded log
+  ## is an outage of its own.
+  var first = false
+  acquire(writerLock)
+  try:
+    writerFailedBatches += 1
+    writerFailedRows += uint64(rows)
+    first = writerFailedBatches == 1'u64
+  finally:
+    release(writerLock)
+  if first:
+    echo "runquota estimate store dropped a batch of " & $rows &
+      " learned estimates (counted as estimateWriteFailures and not " &
+      "printed again)"
+    flushFile(stdout)
+
+proc estimateWriteFailures*(): uint64 =
+  ## Batches the estimate writer could not commit. Zero is the only value a
+  ## healthy store produces; a value that tracks the batch count is a store
+  ## writing nothing at all.
+  ensureWriterLock()
+  acquire(writerLock)
+  try:
+    writerFailedBatches
+  finally:
+    release(writerLock)
+
+proc estimateWriteFailedRows*(): uint64 =
+  ## Rows inside those batches, reported separately because one dropped batch
+  ## is not one dropped estimate.
+  ensureWriterLock()
+  acquire(writerLock)
+  try:
+    writerFailedRows
+  finally:
+    release(writerLock)
 
 proc writerMain() {.thread.} =
   {.cast(gcsafe).}:
@@ -153,8 +259,15 @@ proc writerMain() {.thread.} =
         finally:
           release(writerLock)
         if batch.len > 0 and writerDbPath.len > 0:
-          initEstimateSchema(writerDbPath)
-          writeBatch(writerDbPath, batch)
+          # THE RESULT IS CHECKED. `discard writeBatch(...)` is the second
+          # half of the defect above: it is the line that made a whole batch
+          # failing to reach `sqlite3` look exactly like a batch that
+          # committed.
+          let landed =
+            initEstimateSchema(writerDbPath) and
+            writeBatch(writerDbPath, batch)
+          if not landed:
+            noteEstimateWriteFailure(batch.len)
         if shouldStop:
           break
     finally:

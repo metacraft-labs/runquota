@@ -2676,6 +2676,42 @@ proc stopConnectionQueue() =
   finally:
     release(connectionQueue.lock)
 
+proc noteConnectionFailure(message: string) {.gcsafe.} =
+  ## THE ONE PLACE A FAILED CONNECTION IS COUNTED.
+  ##
+  ## `connections_failed` used to be incremented only from `except
+  ## CatchableError` arms, so it counted connections whose handling RAISED and
+  ## nothing else. That is not the population the counter is for, and its own
+  ## documentation already said so: "a non-zero value with a healthy lease
+  ## count is usually peers that connect and vanish". A peer that connects and
+  ## drops before sending `Hello` provokes NO exception at all -- the accept
+  ## succeeds, the first `receiveFrame` reports end of input, and the handler
+  ## returns normally -- so fifty of them left the counter reading zero and an
+  ## operator with no way to see a connection path that was failing.
+  ##
+  ## The population is therefore stated positively: a connection that ended
+  ## WITHOUT EVER COMPLETING A HELLO never became a session and was never
+  ## served, whether it vanished, spoke nonsense, was refused, or exploded. A
+  ## connection that got past `Hello` counts only if its handling raised,
+  ## which is what the worker's `except` arm below is for.
+  ##
+  ## SAID ONCE, THEN COUNTED, which is why this is a proc rather than four
+  ## copies of it. A daemon whose connections are failing is something an
+  ## operator must be able to see, but a client that can provoke one failure
+  ## can provoke a million, and an unbounded log is the same denial of service
+  ## by another route. The first is printed with its reason; the rest are
+  ## readable as `connections_failed` through the status subject.
+  {.cast(gcsafe).}:
+    acquire(sharedDaemon.lock)
+    try:
+      inc sharedDaemon.daemon.connectionsFailed
+      if sharedDaemon.daemon.connectionsFailed == 1'u64:
+        echo message &
+          " (this is counted as connections_failed and not printed again)"
+        flushFile(stdout)
+    finally:
+      release(sharedDaemon.lock)
+
 proc handleSharedConnection(accepted: AcceptedConnection) {.thread, gcsafe.} =
   {.cast(gcsafe).}:
     var localConnection = accepted.localConnection()
@@ -2692,6 +2728,14 @@ proc handleSharedConnection(accepted: AcceptedConnection) {.thread, gcsafe.} =
     )
     var frame: RqspFrame
     if not localConnection.receiveFrameOrDiagnostic(frame):
+      # THE PATH THAT RAISES NOTHING, and the one the counter was missing. A
+      # peer that connects and drops before it says anything reaches exactly
+      # here: `receiveFrame` reports end of input, not an error, and every
+      # line from the accept to this return succeeds. It is still a
+      # connection this daemon never served.
+      noteConnectionFailure(
+        "runquota connection ended before Hello: " &
+        "the peer sent no readable frame")
       localConnection.close()
       return
     acquire(sharedDaemon.lock)
@@ -2701,6 +2745,13 @@ proc handleSharedConnection(accepted: AcceptedConnection) {.thread, gcsafe.} =
       finally:
         release(sharedDaemon.lock)
     if not helloOk:
+      # A REFUSED HELLO IS A FAILED CONNECTION TOO. The peer was answered
+      # with a diagnostic, so it is not silent, but no session exists and
+      # nothing further will be served on this connection -- the same
+      # population as the arm above, reached by a different route.
+      noteConnectionFailure(
+        "runquota connection refused at Hello: " &
+        "the peer's opening frame was rejected")
       localConnection.close()
       return
     try:
@@ -2754,21 +2805,11 @@ proc connectionWorker() {.thread, gcsafe.} =
       # here either never built one or died holding a wrapper that closing
       # again would not help.
       accepted.close()
-      acquire(sharedDaemon.lock)
-      try:
-        inc sharedDaemon.daemon.connectionsFailed
-        # SAID ONCE, THEN COUNTED. A daemon whose connections are failing is
-        # something an operator must be able to see, but a client that can
-        # provoke one failure can provoke a million, and an unbounded log is
-        # the same denial of service by another route. The first is printed
-        # with its reason; the rest are readable as `connections_failed`
-        # through the status subject.
-        if sharedDaemon.daemon.connectionsFailed == 1'u64:
-          echo "runquota connection handling failed: " & error.msg &
-            " (this is counted as connections_failed and not printed again)"
-          flushFile(stdout)
-      finally:
-        release(sharedDaemon.lock)
+      # Counted through the one helper, which also carries the "said once"
+      # rule. This arm covers a connection that DID get past `Hello` and then
+      # exploded; the two pre-Hello arms inside `handleSharedConnection` cover
+      # the ones that never got that far and raise nothing at all.
+      noteConnectionFailure("runquota connection handling failed: " & error.msg)
 
 const endpointRefusedExitCode* = 3
   ## `serve` returns this when the rendezvous directory is not trustworthy.
@@ -2870,15 +2911,7 @@ proc serve*(config: DaemonConfig): int =
         consecutiveFailures = 0
       except CatchableError as error:
         inc consecutiveFailures
-        acquire(sharedDaemon.lock)
-        try:
-          inc sharedDaemon.daemon.connectionsFailed
-          if sharedDaemon.daemon.connectionsFailed == 1'u64:
-            echo "runquota accept failed: " & error.msg &
-              " (this is counted as connections_failed and not printed again)"
-            flushFile(stdout)
-        finally:
-          release(sharedDaemon.lock)
+        noteConnectionFailure("runquota accept failed: " & error.msg)
         if consecutiveFailures >= MaxConsecutiveAcceptFailures:
           echo "runquota endpoint stopped accepting after " &
             $consecutiveFailures & " consecutive failures: " & error.msg

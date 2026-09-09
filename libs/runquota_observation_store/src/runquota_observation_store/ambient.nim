@@ -489,7 +489,12 @@ var
   samplerFlushSamples = defaultAmbientFlushSamples
   samplerCapacity = 0
   samplerQueue: seq[AmbientSampleRow] = @[]
-  samplerReports: seq[SelfReport] = @[]
+    ## Grown and emptied ONLY on the sampler thread -- `takeAmbientSample`
+    ## appends and `flushAmbientQueue` drains, and both run there. That is
+    ## what keeps it an ordinary `seq` while the live report set below cannot
+    ## be one: `startAmbientSampler` resets it from another thread, and the
+    ## reset is safe only because `samplerMain` ends with a flush that leaves
+    ## the payload empty. See the note above `reportSlots`.
   samplerTicks = 0'i64
   samplerTaken = 0'i64
   samplerWritten = 0'i64
@@ -510,6 +515,166 @@ proc ensureSamplerLock() =
   if not samplerLockReady:
     initLock(samplerLock)
     samplerLockReady = true
+
+# ---------------------------------------------------------------------------
+# The live self-report set, and why it is not a `seq`
+# ---------------------------------------------------------------------------
+#
+# THIS SET OUTLIVES THE THREADS THAT WRITE INTO IT, and under Nim's ORC
+# allocator that is not something a lock can make safe.
+#
+# Every thread gets its OWN allocator region -- `var allocator
+# {.rtlThreadVar.}: MemRegion` in `system/mmdisp.nim`, which is the region
+# `system/alloc.nim`'s `instantiateForRegion` is instantiated with under
+# ORC -- and every allocated chunk records the region that owns it.
+# Freeing a chunk from a DIFFERENT thread is supported:
+# `rawDealloc` hands it back through `addToSharedFreeList`, which dereferences
+# `chunk.owner`. But that is sound only while the owner still EXISTS, and a
+# thread's region lives in its thread-local storage and goes away with the
+# thread. A block allocated on one thread and freed after that thread has
+# exited therefore dereferences a dead region. The lock is not the issue and
+# never was: it serialises ACCESS, and this is a question of OWNERSHIP.
+#
+# The set is written by whichever thread serves the client that reports -- in
+# `runquotad`, a connection worker, from `applyLeaseObservation` -- and emptied
+# by `stopAmbientSampler`, which `serve` calls on the shutting-down thread
+# AFTER those workers have been joined. As a `seq[SelfReport]` its payload and
+# its id strings were owned by threads that no longer existed when they were
+# freed. `t_ambient_sample_atomicity` reproduced it as a SIGSEGV inside
+# `addToSharedFreeList`, reached from `clearSelfReportedExecutions`; the same
+# binary built `-d:useMalloc` -- one process-wide arena, no owning thread --
+# passes, which is what identifies the mechanism rather than guessing at it.
+#
+# So the set is taken off the thread-owned heap. The slot array and the id
+# bytes come from the C allocator, which has one arena for the whole process
+# and no notion of an owner, so WHICH thread frees them, and WHEN, stops
+# mattering. Nim's `allocShared` is NOT that allocator under ORC:
+# `allocSharedImpl` is `allocImpl` verbatim there, with exactly the same
+# per-thread ownership, which is why `malloc` is reached for directly.
+#
+# What crosses this boundary as ordinary Nim values is unaffected and stays
+# that way: `liveSelfReports` and the sampler's snapshot build a fresh
+# `seq[SelfReport]` on the CALLING thread, which then allocates and frees it
+# itself.
+
+proc cMalloc(size: csize_t): pointer {.importc: "malloc",
+  header: "<stdlib.h>".}
+proc cRealloc(p: pointer; size: csize_t): pointer {.importc: "realloc",
+  header: "<stdlib.h>".}
+proc cFree(p: pointer) {.importc: "free", header: "<stdlib.h>".}
+
+type
+  SelfReportSlot = object
+    ## One live report, in storage the PROCESS owns rather than a thread.
+    ##
+    ## The ids are kept as bytes plus a length rather than as NUL-terminated
+    ## strings because every operation on this set is a lookup by id: a length
+    ## check and an `equalMem` allocate nothing, where converting a `cstring`
+    ## back would allocate on the reporting thread once per slot scanned.
+    executionId: ptr UncheckedArray[char]
+    executionIdLen: int
+    ownerKey: ptr UncheckedArray[char]
+    ownerKeyLen: int
+    cpuPct: float64
+    rssBytes: int64
+
+var
+  reportSlots: ptr UncheckedArray[SelfReportSlot] = nil
+  reportSlotsLen = 0
+  reportSlotsCap = 0
+
+# Every proc in this section requires `samplerLock` to be held. Process-owned
+# storage answers ownership; it does not answer mutual exclusion, and both
+# have to be answered.
+
+proc adoptBytes(value: string; field: var ptr UncheckedArray[char];
+                fieldLen: var int): bool =
+  ## Replaces ``field`` with a C-heap copy of ``value``. Returns false, and
+  ## leaves ``field`` exactly as it was, when the allocator has nothing to
+  ## give.
+  if value.len == 0:
+    if field != nil:
+      cFree(field)
+    field = nil
+    fieldLen = 0
+    return true
+  let fresh = cast[ptr UncheckedArray[char]](cMalloc(csize_t(value.len)))
+  if fresh == nil:
+    return false
+  copyMem(fresh, unsafeAddr value[0], value.len)
+  if field != nil:
+    cFree(field)
+  field = fresh
+  fieldLen = value.len
+  true
+
+proc sameBytes(field: ptr UncheckedArray[char]; fieldLen: int;
+               value: string): bool =
+  if fieldLen != value.len:
+    return false
+  if fieldLen == 0:
+    return true
+  equalMem(field, unsafeAddr value[0], fieldLen)
+
+proc asNimString(field: ptr UncheckedArray[char]; fieldLen: int): string =
+  result = newString(fieldLen)
+  if fieldLen > 0:
+    copyMem(addr result[0], field, fieldLen)
+
+proc releaseSlot(slot: var SelfReportSlot) =
+  if slot.executionId != nil:
+    cFree(slot.executionId)
+    slot.executionId = nil
+  if slot.ownerKey != nil:
+    cFree(slot.ownerKey)
+    slot.ownerKey = nil
+  slot.executionIdLen = 0
+  slot.ownerKeyLen = 0
+
+proc reserveSlots(needed: int): bool =
+  if needed <= reportSlotsCap:
+    return true
+  var capacity = max(8, reportSlotsCap)
+  while capacity < needed:
+    capacity = capacity * 2
+  let grown = cRealloc(reportSlots, csize_t(capacity * sizeof(SelfReportSlot)))
+  if grown == nil:
+    return false
+  reportSlots = cast[ptr UncheckedArray[SelfReportSlot]](grown)
+  reportSlotsCap = capacity
+  true
+
+proc dropSlotAt(index: int) =
+  ## Removes one slot, keeping the rest in order. Order is not load-bearing
+  ## for the sums, but ``liveSelfReports`` is a public view, and a set that
+  ## reshuffled itself on every removal would make that view depend on
+  ## reclamation history.
+  releaseSlot(reportSlots[index])
+  for i in index ..< reportSlotsLen - 1:
+    reportSlots[i] = reportSlots[i + 1]
+  reportSlotsLen -= 1
+
+proc clearSelfReportSlots() =
+  for i in 0 ..< reportSlotsLen:
+    releaseSlot(reportSlots[i])
+  reportSlotsLen = 0
+  if reportSlots != nil:
+    cFree(reportSlots)
+    reportSlots = nil
+  reportSlotsCap = 0
+
+proc snapshotSelfReports(): seq[SelfReport] =
+  ## The set as ordinary Nim values, allocated on the CALLING thread and so
+  ## freed by it too.
+  result = newSeqOfCap[SelfReport](reportSlotsLen)
+  for i in 0 ..< reportSlotsLen:
+    result.add(SelfReport(
+      executionId: asNimString(reportSlots[i].executionId,
+        reportSlots[i].executionIdLen),
+      cpuPct: reportSlots[i].cpuPct,
+      rssBytes: reportSlots[i].rssBytes,
+      ownerKey: asNimString(reportSlots[i].ownerKey,
+        reportSlots[i].ownerKeyLen)))
 
 proc setAmbientLiveLeaseCount*(count: int) =
   ## How many leases the daemon currently holds live. SAMPLING IS GATED ON
@@ -556,14 +721,31 @@ proc reportSelfExecution*(executionId: string; cpuPct: float64;
   ensureSamplerLock()
   acquire(samplerLock)
   try:
-    for i in 0 ..< samplerReports.len:
-      if samplerReports[i].executionId == executionId:
-        samplerReports[i].cpuPct = cpuPct
-        samplerReports[i].rssBytes = rssBytes
-        samplerReports[i].ownerKey = ownerKey
+    for i in 0 ..< reportSlotsLen:
+      if sameBytes(reportSlots[i].executionId, reportSlots[i].executionIdLen,
+                   executionId):
+        reportSlots[i].cpuPct = cpuPct
+        reportSlots[i].rssBytes = rssBytes
+        discard adoptBytes(ownerKey, reportSlots[i].ownerKey,
+          reportSlots[i].ownerKeyLen)
         return
-    samplerReports.add(SelfReport(executionId: executionId, cpuPct: cpuPct,
-      rssBytes: rssBytes, ownerKey: ownerKey))
+    # THE ONE CONDITION THIS SET CANNOT RECORD ITS WAY OUT OF is the machine
+    # having no memory left to record in. The report is dropped rather than
+    # raised: it would be raised on the thread serving a client, and an
+    # unrecorded report only understates ``self_*`` -- the direction this
+    # module already errs in on purpose, as the doc comment above says.
+    if not reserveSlots(reportSlotsLen + 1):
+      return
+    var slot = SelfReportSlot(
+      executionId: nil, executionIdLen: 0,
+      ownerKey: nil, ownerKeyLen: 0,
+      cpuPct: cpuPct, rssBytes: rssBytes)
+    if not adoptBytes(executionId, slot.executionId, slot.executionIdLen) or
+       not adoptBytes(ownerKey, slot.ownerKey, slot.ownerKeyLen):
+      releaseSlot(slot)
+      return
+    reportSlots[reportSlotsLen] = slot
+    reportSlotsLen += 1
   finally:
     release(samplerLock)
 
@@ -574,9 +756,10 @@ proc endSelfReportedExecution*(executionId: string) =
   ensureSamplerLock()
   acquire(samplerLock)
   try:
-    for i in 0 ..< samplerReports.len:
-      if samplerReports[i].executionId == executionId:
-        samplerReports.delete(i)
+    for i in 0 ..< reportSlotsLen:
+      if sameBytes(reportSlots[i].executionId, reportSlots[i].executionIdLen,
+                   executionId):
+        dropSlotAt(i)
         return
   finally:
     release(samplerLock)
@@ -600,14 +783,19 @@ proc endSelfReportsForOwner*(ownerKey: string): int {.discardable.} =
   ensureSamplerLock()
   acquire(samplerLock)
   try:
-    var kept: seq[SelfReport] = @[]
-    for report in samplerReports:
-      if report.ownerKey == ownerKey:
+    # Compacted in place, which keeps the survivors in order and hands the
+    # swept slots' bytes straight back to the C allocator.
+    var kept = 0
+    for i in 0 ..< reportSlotsLen:
+      if sameBytes(reportSlots[i].ownerKey, reportSlots[i].ownerKeyLen,
+                   ownerKey):
+        releaseSlot(reportSlots[i])
         inc result
       else:
-        kept.add(report)
-    if result > 0:
-      samplerReports = kept
+        if kept != i:
+          reportSlots[kept] = reportSlots[i]
+        inc kept
+    reportSlotsLen = kept
   finally:
     release(samplerLock)
 
@@ -615,7 +803,7 @@ proc liveSelfReports*(): seq[SelfReport] =
   ensureSamplerLock()
   acquire(samplerLock)
   try:
-    samplerReports
+    snapshotSelfReports()
   finally:
     release(samplerLock)
 
@@ -623,7 +811,7 @@ proc clearSelfReportedExecutions*() =
   ensureSamplerLock()
   acquire(samplerLock)
   try:
-    samplerReports = @[]
+    clearSelfReportSlots()
   finally:
     release(samplerLock)
 
@@ -659,7 +847,7 @@ proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
     #
     # `foreign_* = host total - sum(self_*)` is a subtraction of two
     # measurements, and it only means anything if both describe the SAME
-    # instant. Taking the host reading here and reading `samplerReports`
+    # instant. Taking the host reading here and reading the live set
     # later let a `reportSelfExecution` land between them: the row then
     # carried a timestamp from before the report and a `self_*` from after
     # it. Where the late figures exceeded the earlier host total -- a burst
@@ -678,7 +866,7 @@ proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
     try:
       samplerTicks += 1
       current = readHostLoad()
-      reports = samplerReports
+      reports = snapshotSelfReports()
     finally:
       release(samplerLock)
     if not current.available:
@@ -755,7 +943,7 @@ proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
     acquire(samplerLock)
     try:
       # `reports` is the snapshot taken WITH the reading above, not
-      # `samplerReports` as it stands now: re-reading it here is precisely
+      # the live set as it stands NOW: re-reading it here is precisely
       # the skew this proc exists to avoid.
       row = attributeAmbientSample(samplerHostId, previous, current, reports)
       # `(host_id, sampled_at_unix_millis)` is the primary key, so two
@@ -828,7 +1016,7 @@ proc startAmbientSampler*(path, hostId: string;
     samplerFlushSamples = max(1, flushSamples)
     samplerCapacity = max(1, capacity)
     samplerQueue = @[]
-    samplerReports = @[]
+    clearSelfReportSlots()
     samplerTicks = 0
     samplerTaken = 0
     samplerWritten = 0
@@ -974,7 +1162,7 @@ proc stopAmbientSampler*() =
     samplerActive = false
     samplerPath = ""
     samplerHostId = ""
-    samplerReports = @[]
+    clearSelfReportSlots()
     samplerLiveLeases = 0
     samplerLeaseCovered = false
   finally:

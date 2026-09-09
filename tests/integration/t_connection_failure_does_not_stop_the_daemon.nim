@@ -172,3 +172,53 @@ suite "connection_failure_does_not_stop_the_daemon":
       # released, not about the daemon holding a fixed number. The live
       # client above legitimately holds one.
       check descriptorsAfter - descriptorsBefore < AbortedConnections div 2
+
+  test "a peer refused at Hello is counted too, and the daemon keeps serving":
+    ## THE OTHER PRE-HELLO EXIT. A connection can also end before a session
+    ## exists by being REFUSED: the daemon answers the opening frame with a
+    ## diagnostic and closes. Like the vanishing peer above, that path raises
+    ## nothing, so a counter fed only from `except` arms reads zero through it
+    ## as well -- and unlike the vanishing peer, this one is a client that is
+    ## still there to be told, which is exactly the case an operator chasing
+    ## "why is nothing connecting" needs to see counted.
+    ##
+    ## The refusal is provoked the cheapest honest way: a well-formed frame
+    ## that is not a `Hello`. `handleHello`'s first branch rejects it, which
+    ## is the same arm every other refusal below it returns through.
+    const RefusedConnections = 7
+
+    let root = scratchRoot("connrefuse")
+    defer: removeDir(root)
+    let socketPath = root / "d.sock"
+
+    var daemon = startDaemon(socketPath)
+    defer: daemon.stop()
+    check socketIsBound(socketPath)
+
+    for i in 0 ..< RefusedConnections:
+      var connection = connectEndpoint(
+        Endpoint(kind: endpointUnixSocket, path: socketPath))
+      connection.sendFrame(encodeFrame(rqStatusRequest, 0'u16,
+        uint64(i + 1), ""))
+      # The daemon's diagnostic is read rather than ignored: leaving it
+      # unread would close this end while the daemon is still writing, and
+      # the test would then be measuring an EPIPE it created itself.
+      var response: RqspFrame
+      var diagnostic = okDiagnostic()
+      discard connection.receiveFrame(response, diagnostic)
+      connection.close()
+    sleep(250)
+
+    check daemon.process.running
+    check failedConnectionCount(socketPath) == RefusedConnections
+
+    # STILL SERVING, on the same socket, after the refusals.
+    var client = connect(Endpoint(kind: endpointUnixSocket, path: socketPath))
+    var session = client.registerSession("connrefuse", "0.1.0")
+    var request = resourceRequest("connrefuse-probe", milliCpu(1000),
+      bytes(64'u64 * MiB))
+    var lease = session.requestLease(request)
+    check lease.active
+    lease.markStarting()
+    lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
+    lease.finish(outcome = succeeded(), processCount = 1'u32)

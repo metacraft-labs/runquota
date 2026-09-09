@@ -236,12 +236,19 @@ type
       ## Rows written out of accepted batches, so "the flush landed" and
       ## "the flush arrived empty" are distinguishable from outside.
     connectionsFailed*: uint64
-      ## Connections whose handling raised instead of completing. The daemon
-      ## survives each one — it is host-wide, and a single client must not be
-      ## able to stop it — so this is the only place such a failure is
-      ## visible. A non-zero value with a healthy lease count is usually
-      ## peers that connect and vanish; a value tracking the lease count is
-      ## a real defect in the connection path.
+      ## Connections that never became a session: one that ended before its
+      ## ``Hello`` completed — the peer vanished, or its opening frame was
+      ## refused — or one that got past ``Hello`` and then raised instead of
+      ## completing. The daemon survives each — it is host-wide, and a single
+      ## client must not be able to stop it — so this is the only place such
+      ## a failure is visible. A non-zero value with a healthy lease count is
+      ## usually peers that connect and vanish; a value tracking the lease
+      ## count is a real defect in the connection path.
+      ##
+      ## THE PRE-HELLO HALF IS WHY THIS IS NOT "raised". A peer that connects
+      ## and drops provokes no exception anywhere, so a counter fed only from
+      ## ``except`` arms read zero through exactly the population the sentence
+      ## above describes.
     observationsContradictory*: uint64
       ## Executions whose finish carried a termination its own exit could
       ## not support — a resource-limit or deadline kill reported beside a

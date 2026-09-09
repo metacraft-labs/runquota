@@ -100,6 +100,13 @@ const
   ## report set at all.
   MinDistinctSelfValues = 5
 
+  ## Slots reserved for the step log, comfortably above the most a run at one
+  ## step per `StepMillis` over `RunMillis` can produce (a step also costs a
+  ## `reportSelfExecution`, so the observed yield is a few hundred). See the
+  ## note on `Stepper`: the point of a fixed size is that the MAIN thread
+  ## allocates the payload.
+  StepCapacity = 4 * (RunMillis div StepMillis)
+
 type
   StepRecord = object
     beforeMillis: int64
@@ -107,8 +114,26 @@ type
     value: float64
 
   Stepper = object
+    ## THE STEP LOG IS PREALLOCATED BY THE MAIN THREAD AND NEVER GROWN BY THE
+    ## STEPPER, which is a memory-ownership requirement and not a performance
+    ## one.
+    ##
+    ## Under ORC each thread has its own allocator region and every chunk
+    ## records the region that owns it; freeing a chunk after its owning
+    ## thread has exited dereferences a region that no longer exists. A
+    ## `steps.add` on the stepper thread makes this seq's payload
+    ## stepper-owned, and the payload is then freed at program exit, on the
+    ## main thread, long after `joinThread`. That crashed in
+    ## `addToSharedFreeListBigChunks` -- the same mechanism as the defect this
+    ## file exists to catch, in this file's own scaffolding, and it surfaced
+    ## the moment the product-side one stopped killing the process first.
+    ##
+    ## `steps` is therefore sized once on the main thread, which owns the
+    ## payload for the whole run, and the stepper only writes into slots that
+    ## already exist. `stepCount` says how many it filled.
     stop: Atomic[bool]
     steps: seq[StepRecord]
+    stepCount: int
 
   Spinner = object
     stop: Atomic[bool]
@@ -131,14 +156,16 @@ proc stepProbe(state: ptr Stepper) {.thread.} =
   # `ambient` casts for the same reason on the sampler side.
   {.cast(gcsafe).}:
     var index = 0
-    while not state.stop.load():
+    while not state.stop.load() and state.stepCount < state.steps.len:
       inc index
       let value = float64(index) * 0.01
       let before = unixMillisNow()
       reportSelfExecution(ProbeId, value, ProbeRss)
       let after = unixMillisNow()
-      state.steps.add(StepRecord(
-        beforeMillis: before, afterMillis: after, value: value))
+      # Written into a slot the main thread already allocated; see `Stepper`.
+      state.steps[state.stepCount] = StepRecord(
+        beforeMillis: before, afterMillis: after, value: value)
+      state.stepCount += 1
       sleep(StepMillis)
 
 proc churnLock(state: ptr Churn) {.thread.} =
@@ -202,6 +229,13 @@ suite "ambient sample atomicity":
     let spinnerCount = max(4, min(MaxSpinners, countProcessors() * 4))
     for i in 0 ..< spinnerCount:
       createThread(spinnerThreads[i], burnCpu, addr spinners[i])
+    # SIZED HERE, ON THIS THREAD, and before the stepper can touch it. The
+    # cadence is one step per `StepMillis` over `RunMillis`, so the run
+    # cannot produce more than this many; a stepper that somehow reached the
+    # end simply stops recording, and `steps.len > 100` below still refuses a
+    # run that recorded nothing.
+    stepper.steps = newSeq[StepRecord](StepCapacity)
+    stepper.stepCount = 0
     createThread(stepperThread, stepProbe, addr stepper)
 
     sleep(RunMillis)
@@ -220,6 +254,9 @@ suite "ambient sample atomicity":
     clearSelfReportedExecutions()
 
     let rows = store.readAmbientSamples()
+    # Trimmed to what was actually written. The trim is a shrink, so it does
+    # not reallocate and the payload stays owned by this thread.
+    stepper.steps.setLen(stepper.stepCount)
     let steps = stepper.steps
 
     # The driver has to have actually driven something.
