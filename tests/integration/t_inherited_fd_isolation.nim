@@ -41,6 +41,11 @@ import runquota_ipc
 import runquota_process
 
 when defined(posix):
+  proc fixtureTool(name: string): string =
+    # Multicall tools select their command from the invoked symlink name.
+    result = findExe(name, followSymlinks = false)
+    doAssert result.len > 0, "required fixture tool is not on PATH: " & name
+
   const
     HighFdBase = 20'i32
       ## Fixture descriptors are parked well above anything a freshly exec'd
@@ -105,9 +110,10 @@ suite "inherited_fd_isolation":
           check not isCloseOnExec(fd)
 
         # 1. The child's own view of its descriptor table.
-        var lister = launchProcess(commandSpec(["/bin/ls", fdDir]))
+        var lister = launchProcess(commandSpec([fixtureTool("ls"), fdDir]))
         let listing = lister.waitForCompletion(10_000)
         lister.close()
+        checkpoint listing.stderr
         check listing.exited
         check listing.exitCode == 0
         let seenByChild = reportedFds(listing.stdout)
@@ -123,7 +129,7 @@ suite "inherited_fd_isolation":
         # sentinel bytes.
         let fileFdPath = fdDir & "/" & $fixtures[0]
         var reader = launchProcess(commandSpec(
-          ["/bin/sh", "-c", "cat " & fileFdPath]))
+          [fixtureTool("sh"), "-c", "cat " & fileFdPath]))
         let readBack = reader.waitForCompletion(10_000)
         reader.close()
         check not readBack.stdout.contains(sentinel)
@@ -158,10 +164,12 @@ suite "inherited_fd_isolation":
         let marker = parkHigh(held[^1])
         check not isCloseOnExec(marker)
 
-        var lister = launchProcess(commandSpec(["/bin/ls", fdDir]))
+        var lister = launchProcess(commandSpec([fixtureTool("ls"), fdDir]))
         let listing = lister.waitForCompletion(10_000)
         lister.close()
+        checkpoint listing.stderr
         check listing.exited
+        check listing.exitCode == 0
         let seenByChild = reportedFds(listing.stdout)
         check seenByChild.len >= 3
         # Every one of the 600 would show up here if the walk stopped after the
@@ -182,7 +190,7 @@ suite "inherited_fd_isolation":
       # lease. Another lease starting concurrently must not pick them up, and
       # the guarantee has to come from the descriptor's own flags rather than
       # from the fork-time sweep -- otherwise the sweep could never be cheap.
-      var child = launchProcess(commandSpec(["/bin/sh", "-c", "sleep 1"]))
+      var child = launchProcess(commandSpec([fixtureTool("sh"), "-c", "sleep 1"]))
       check child.stdoutFd >= 0
       check child.stderrFd >= 0
       check isCloseOnExec(cint(child.stdoutFd))
