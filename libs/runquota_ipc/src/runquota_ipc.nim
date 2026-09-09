@@ -1312,7 +1312,9 @@ proc readExactSocket(socket: Socket; size: int; data: var string;
 proc sendFrame*(connection: var LocalConnection; frame: string) =
   case connection.kind
   of endpointUnixSocket:
-    connection.socket.send(frame)
+    # A frame must be delivered or fail. SafeDisconn suppresses EPIPE and can
+    # leave std/net.send retrying a closed peer without making progress.
+    connection.socket.send(frame, flags = {})
   of endpointNamedPipe:
     when defined(windows):
       if not winWriteAll(WinHandle(connection.pipeHandle), frame):
