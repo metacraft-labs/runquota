@@ -1,4 +1,5 @@
-import std/[algorithm, cpuinfo, locks, options, os, strutils, tables, times]
+import std/[algorithm, atomics, cpuinfo, locks, options, os, strutils,
+  tables, times]
 
 when defined(posix):
   # `getuid` for the host-state-directory ownership check below.
@@ -7,6 +8,7 @@ when defined(posix):
 import runquota_daemon/types as daemonTypes
 import runquota_codec
 import runquota_core
+import runquota_core/process_owned
 import runquota_host
 import runquota_host_macos
 when defined(windows):
@@ -956,11 +958,35 @@ const
     ## above the segment's own slot count, so it is reached only by a
     ## workload the table could not have held anyway.
 
+# THE PENDING SET IS NOT A `seq[string]`, and under ORC it cannot be.
+#
+# It is written by CONNECTION WORKERS -- `markAggregateDirty` is reached from
+# `LeaseFinished`, served by whichever worker picked the connection up -- and
+# it is drained by `publishDirtyAggregates`, whose LAST call is the one
+# `stopAggregatePublisher` provokes. `serve` joins every connection worker
+# before it stops the publisher, so that final drain frees a payload and a
+# set of key strings that were allocated by threads which no longer exist.
+#
+# Under ORC every thread has its own allocator region (`var allocator
+# {.rtlThreadVar.}: MemRegion`, `system/mmdisp.nim`) and every chunk records
+# the region that owns it; `rawDealloc` hands a foreign chunk back through
+# `addToSharedFreeList` / `addToSharedFreeListBigChunks`, both of which
+# DEREFERENCE `chunk.owner`. That is sound while the owner thread exists and
+# undefined once it does not, because the region lives in the thread's TLS.
+# `publicationLock` is not the answer and never was: it serialises ACCESS,
+# and this is a question of OWNERSHIP. Nor is `allocShared`, which under ORC
+# is `allocImpl` verbatim with exactly the same per-thread ownership.
+#
+# `OwnedStrings` holds the keys in the C allocator instead -- one arena for
+# the whole process, no notion of an owning thread -- so WHICH thread frees
+# them, and WHEN, stops mattering. `runquota_observation_store/ambient` took
+# the same medicine for its live self-report set; this is that pattern, and
+# the module carries the full argument.
 var
   publicationLock: Lock
   publicationLockReady = false
   publicationThread: Thread[void]
-  publicationPending: seq[string] = @[]
+  publicationPending: OwnedStrings
   publicationStop = false
   publicationActive = false
   publicationsRequested = 0'u64
@@ -973,21 +999,22 @@ proc ensurePublicationLock() =
     initLock(publicationLock)
     publicationLockReady = true
 
-proc markAggregateDirty(daemon: var RunQuotaDaemon; statsKey: string) =
-  ## Records that one key's aggregate is out of date. NO IO, and none of
-  ## the three guards below have moved: they are the same conditions
-  ## `publishAggregate` used to apply before doing any work, applied in the
-  ## same place, so a daemon with no table, a lease with no stats key and a
-  ## daemon with capture off all still publish nothing at all.
-  if not daemon.statsPublisher.available: return
-  if statsKey.len == 0: return
-  if not daemon.observationCaptureEnabled: return
+proc notePendingKey(statsKey: string) =
+  ## The queue itself: coalescing, the bound, and the counters that describe
+  ## both. Separated from `markAggregateDirty`'s three guards because THE
+  ## QUEUE IS THE PART WITH A LIFETIME PROBLEM -- it is written by connection
+  ## workers and drained after they have been joined -- and a property about
+  ## which thread owns its storage has to be drivable without also standing
+  ## up a publisher, a store and a lease.
+  ##
+  ## `libs/runquota_daemon/tests/t_publication_queue_ownership.nim` drives
+  ## exactly this proc and `takePendingKeys` below.
   ensurePublicationLock()
   acquire(publicationLock)
   try:
     inc publicationsRequested
-    for pending in publicationPending:
-      if pending == statsKey:
+    for i in 0 ..< publicationPending.len:
+      if publicationPending.equalsAt(i, statsKey):
         # ALREADY DIRTY. One publication answers both completions, because
         # what is published is the aggregate as of the query, not a delta.
         inc publicationsCoalesced
@@ -998,9 +1025,36 @@ proc markAggregateDirty(daemon: var RunQuotaDaemon; statsKey: string) =
       # exactly as the synchronous publication used to.
       inc publicationsDropped
       return
-    publicationPending.add(statsKey)
+    if not publicationPending.add(statsKey):
+      # THE ONE CONDITION A QUEUE CANNOT RECORD ITS WAY OUT OF is the machine
+      # having no memory to record in. Folded into the same counter as the
+      # bound above, and for the same reason: an unpublished key costs a
+      # round trip and no correctness.
+      inc publicationsDropped
   finally:
     release(publicationLock)
+
+proc takePendingKeys(): seq[string] =
+  ## Empties the queue, handing the keys back as ordinary Nim strings
+  ## allocated on the CALLING thread. The one drain, used by the publisher
+  ## thread's interval pass and by its final pass at shutdown.
+  ensurePublicationLock()
+  acquire(publicationLock)
+  try:
+    publicationPending.takeAll()
+  finally:
+    release(publicationLock)
+
+proc markAggregateDirty(daemon: var RunQuotaDaemon; statsKey: string) =
+  ## Records that one key's aggregate is out of date. NO IO, and none of
+  ## the three guards below have moved: they are the same conditions
+  ## `publishAggregate` used to apply before doing any work, applied in the
+  ## same place, so a daemon with no table, a lease with no stats key and a
+  ## daemon with capture off all still publish nothing at all.
+  if not daemon.statsPublisher.available: return
+  if statsKey.len == 0: return
+  if not daemon.observationCaptureEnabled: return
+  notePendingKey(statsKey)
 
 proc aggregatePublicationJson(): string =
   "\"aggregate_publication\":{" &
@@ -1086,7 +1140,9 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
     # acknowledged -- it had to be, or the lease would strand -- so this
     # is the only place the loss is visible at all.
     "\"executions_contradictory\":" & $daemon.observationsContradictory & "," &
-    # A CONNECTION THAT DIED RATHER THAN BEING SERVED. This used to be
+    # A CONNECTION THAT DIED RATHER THAN BEING SERVED -- or one this daemon
+    # never managed to accept; `noteConnectionFailure` states the whole
+    # population, which is wider than "a connection". This used to be
     # unobservable for the simplest of reasons: it killed the daemon, so
     # there was nothing left to ask.
     "\"connections_failed\":" & $daemon.connectionsFailed & "," &
@@ -1107,6 +1163,25 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
     "\"queued\":" & $observationsWritten() & "," &
     "\"dropped\":" & $observationsDropped() & "," &
     "\"write_failures\":" & $observationWriteFailures() & "," &
+    # THE LEARNED-ESTIMATE STORE'S OWN LOSSES, for exactly the reason
+    # `connections_failed` above is here. `noteEstimateWriteFailure` counts
+    # every dropped batch and prints the FIRST one -- said once, because a
+    # store that is failing fails on every batch and an unbounded log is an
+    # outage of its own -- and until this line the count had no consumer
+    # outside its own module. An operator therefore got one line of stdout,
+    # printed at the first failure, for a store that may have been dropping
+    # every batch since.
+    #
+    # THE POLICY IS UNCHANGED and deliberately so: not raising is correct
+    # (OS-4), because a learned estimate is a cache and a daemon that
+    # stopped granting leases because it forgot how much memory a command
+    # used last time has failed at its actual job. What changes here is only
+    # that the number can be RETRIEVED.
+    #
+    # BATCHES AND ROWS SEPARATELY, because one dropped batch is not one
+    # dropped estimate and a reader cannot derive either from the other.
+    "\"estimate_write_failures\":" & $estimateWriteFailures() & "," &
+    "\"estimate_write_failed_rows\":" & $estimateWriteFailedRows() & "," &
     aggregatePublicationJson() & "," &
     retentionJson(daemon.config.retentionSweepIntervalMillis) &
   "}}"
@@ -2538,14 +2613,10 @@ var connectionQueue: ConnectionQueue
 
 proc publishDirtyAggregates() {.gcsafe.} =
   {.cast(gcsafe).}:
-    var keys: seq[string] = @[]
-    ensurePublicationLock()
-    acquire(publicationLock)
-    try:
-      keys = publicationPending
-      publicationPending = @[]
-    finally:
-      release(publicationLock)
+    # THE KEYS COME BACK AS THIS THREAD'S OWN STRINGS. `takePendingKeys`
+    # copies them out of process-owned storage, so what is freed at the end
+    # of this proc was allocated here; see the note beside `publicationPending`.
+    let keys = takePendingKeys()
     if keys.len == 0:
       return
     # THE FLUSH, ON THE RIGHT THREAD. `flushObservationWriter`'s contract
@@ -2689,11 +2760,24 @@ proc noteConnectionFailure(message: string) {.gcsafe.} =
   ## returns normally -- so fifty of them left the counter reading zero and an
   ## operator with no way to see a connection path that was failing.
   ##
-  ## The population is therefore stated positively: a connection that ended
-  ## WITHOUT EVER COMPLETING A HELLO never became a session and was never
-  ## served, whether it vanished, spoke nonsense, was refused, or exploded. A
-  ## connection that got past `Hello` counts only if its handling raised,
-  ## which is what the worker's `except` arm below is for.
+  ## The population is therefore stated positively, and WIDER THAN A
+  ## CONNECTION. Three things reach here:
+  ##
+  ## * a connection that ended WITHOUT EVER COMPLETING A HELLO -- it never
+  ##   became a session and was never served, whether it vanished, spoke
+  ##   nonsense, or was refused;
+  ## * a connection whose handling RAISED, anywhere in its lifetime. The
+  ##   worker's `except` arm below does not draw the line at `Hello` and
+  ##   never did: it wraps the whole of `handleSharedConnection`, so a raise
+  ##   out of `localConnection()`, out of the FIRST
+  ##   `receiveFrameOrDiagnostic`, or out of `handleHello` itself lands there
+  ##   too, and each of those is before Hello completes;
+  ## * an `accept` that FAILED, from `serve`'s loop -- a connection this
+  ##   daemon never got as far as having, counted because a listener that has
+  ##   stopped accepting is the same operator-visible fault by another route.
+  ##
+  ## What is NOT in it is a connection that was served and closed normally,
+  ## which is the distinction the counter exists to draw.
   ##
   ## SAID ONCE, THEN COUNTED, which is why this is a proc rather than four
   ## copies of it. A daemon whose connections are failing is something an
@@ -2806,10 +2890,143 @@ proc connectionWorker() {.thread, gcsafe.} =
       # again would not help.
       accepted.close()
       # Counted through the one helper, which also carries the "said once"
-      # rule. This arm covers a connection that DID get past `Hello` and then
-      # exploded; the two pre-Hello arms inside `handleSharedConnection` cover
-      # the ones that never got that far and raise nothing at all.
+      # rule. THIS ARM IS NOT LIMITED TO POST-HELLO FAILURES: it wraps the
+      # whole of `handleSharedConnection`, so a raise out of
+      # `localConnection()`, out of the first `receiveFrameOrDiagnostic` or
+      # out of `handleHello` arrives here as well. The two arms inside
+      # `handleSharedConnection` cover the pre-Hello endings that raise
+      # NOTHING AT ALL -- a peer that says nothing, and a Hello that was
+      # answered with a refusal -- which is the case an `except` cannot see.
       noteConnectionFailure("runquota connection handling failed: " & error.msg)
+
+# ---------------------------------------------------------------------------
+# SIGTERM, and the orderly shutdown it now reaches.
+#
+# WHAT WAS WRONG. `serve`'s `finally` -- the block that joins the connection
+# workers, lets the aggregate publisher publish its last keys, stops the
+# ambient sampler and the retention sweeper, drains the observation writer
+# and closes the published table -- runs ONLY when the accept loop breaks.
+# Nothing anywhere in `apps/` or `libs/runquota_daemon/` installed a signal
+# handler, so SIGTERM took its default disposition and ended the process
+# where it stood: threads unjoined, queues undrained, and the observations of
+# everything that had just finished lost. That is how a supervisor stops a
+# daemon, and it was the one shutdown this daemon could not perform.
+#
+# THE ORDER THIS LANDED IN IS NOT AN ACCIDENT. A SIGTERM handler makes the
+# shutdown path REACHABLE, and that path frees, on the shutting-down thread,
+# state the connection workers allocated. Until those queues were moved into
+# process-owned storage, adding this handler would have turned a latent
+# cross-thread free into one an operator could provoke with `kill`. It is
+# here because they were.
+#
+# WHAT RUNS IN SIGNAL CONTEXT IS ONE ATOMIC STORE AND ONE `write`. A handler
+# may call only async-signal-safe functions; joining threads, draining a
+# queue and spawning `sqlite3` are none of those. So the handler records the
+# request and wakes somebody, and the thread that was always going to do the
+# shutdown does the shutdown.
+#
+# WAKING A BLOCKING `accept` IS THE WHOLE DIFFICULTY, and it is why there is
+# a thread here at all. The accept loop is parked in `accept(2)`; a flag it
+# cannot see is a flag it will never act on. The signal itself does not help:
+# the kernel delivers it to an ARBITRARY thread that is not blocking it,
+# which on a daemon with a worker pool is usually not the acceptor -- and
+# installing the handler without `SA_RESTART`, to make the delivery show up
+# as `EINTR`, would instead interrupt whichever worker happened to be reading
+# from a client. So the endpoint is DIALLED: a waker thread parked on a pipe
+# wakes when the handler writes to it, and opens one connection to this
+# daemon's own socket. `accept` returns it, the loop sees the flag, closes it
+# and breaks into the `finally` that was always there.
+# ---------------------------------------------------------------------------
+
+when defined(posix):
+  var
+    shutdownRequested: Atomic[bool]
+    shutdownPipe: array[0 .. 1, cint] = [cint(-1), cint(-1)]
+    shutdownWakerThread: Thread[void]
+    shutdownWakerRunning = false
+    shutdownEndpointPath = ""
+      ## Written once, before the waker exists, and read only by it.
+
+  proc onShutdownSignal(sig: cint) {.noconv.} =
+    ## THE WHOLE OF WHAT RUNS IN SIGNAL CONTEXT.
+    shutdownRequested.store(true, moRelease)
+    if shutdownPipe[1] >= 0:
+      var token = '\0'
+      discard write(shutdownPipe[1], addr token, 1)
+
+  proc shutdownWasRequested(): bool =
+    shutdownRequested.load(moAcquire)
+
+  proc dialOwnEndpoint(path: string) =
+    ## One connection to our own socket, opened and dropped. It carries no
+    ## frames and is never served: its only job is to make `accept` return
+    ## so the loop can look at the flag.
+    ##
+    ## Every failure here is ignored on purpose. The dial is a WAKE-UP and
+    ## not a request: if it cannot be made, the accept loop stays parked
+    ## until the next connection arrives and then shuts down, which is the
+    ## behaviour of the daemon before this existed and no worse than it.
+    if path.len == 0 or path.len >= Sockaddr_un_path_length:
+      return
+    let handle = socket(cint(AF_UNIX), cint(SOCK_STREAM), 0.cint)
+    if cint(handle) < 0:
+      return
+    var address: Sockaddr_un
+    address.sun_family = TSa_Family(AF_UNIX)
+    copyMem(addr address.sun_path[0], unsafeAddr path[0], path.len)
+    discard connect(handle, cast[ptr SockAddr](addr address),
+      SockLen(sizeof(address)))
+    discard close(handle)
+
+  proc shutdownWakerMain() {.thread.} =
+    {.cast(gcsafe).}:
+      var token: char
+      while true:
+        let got = read(shutdownPipe[0], addr token, 1)
+        if got != -1:
+          break
+        if errno != EINTR:
+          break
+      dialOwnEndpoint(shutdownEndpointPath)
+
+  proc installShutdownHandler(endpointPath: string) =
+    ## Arms SIGTERM. Called after the endpoint is bound, because the waker
+    ## has to have something to dial.
+    shutdownRequested.store(false, moRelease)
+    shutdownEndpointPath = endpointPath
+    if pipe(shutdownPipe) != 0:
+      # NO PIPE, NO WAKER, AND THEREFORE NO HANDLER. A handler that set a
+      # flag nobody could act on would turn an immediate stop into a hang,
+      # which is strictly worse than the default disposition it replaced.
+      shutdownPipe = [cint(-1), cint(-1)]
+      return
+    createThread(shutdownWakerThread, shutdownWakerMain)
+    shutdownWakerRunning = true
+    signal(SIGTERM, onShutdownSignal)
+
+  proc uninstallShutdownHandler() =
+    ## Disarms SIGTERM and joins the waker, including on the paths where the
+    ## accept loop ended for some other reason -- a dead listener, a test
+    ## closing the endpoint -- and the waker is still parked on a pipe
+    ## nobody would otherwise write to.
+    if shutdownPipe[1] >= 0:
+      signal(SIGTERM, SIG_DFL)
+      var token = '\0'
+      discard write(shutdownPipe[1], addr token, 1)
+    if shutdownWakerRunning:
+      joinThread(shutdownWakerThread)
+      shutdownWakerRunning = false
+    for i in 0 .. 1:
+      if shutdownPipe[i] >= 0:
+        discard close(shutdownPipe[i])
+        shutdownPipe[i] = cint(-1)
+else:
+  # Windows has no SIGTERM; `runquotad` is stopped there by other means and
+  # the named-pipe listener is a different shape entirely. The declarations
+  # exist so `serve` reads the same on both platforms.
+  proc installShutdownHandler(endpointPath: string) = discard
+  proc uninstallShutdownHandler() = discard
+  proc shutdownWasRequested(): bool = false
 
 const endpointRefusedExitCode* = 3
   ## `serve` returns this when the rendezvous directory is not trustworthy.
@@ -2884,6 +3101,10 @@ proc serve*(config: DaemonConfig): int =
   echo sharedDaemon.daemon.observationStore.report
   echo sharedDaemon.daemon.observationIdentityReport
   flushFile(stdout)
+  # AFTER the endpoint is bound, because the waker has a socket to dial, and
+  # before any worker exists, because the shutdown this arms is the one that
+  # joins them.
+  installShutdownHandler(config.endpoint.path)
   var threads: seq[Thread[void]] = @[]
   for _ in 0 ..< connectionWorkerCount():
     threads.add(default(Thread[void]))
@@ -2905,11 +3126,24 @@ proc serve*(config: DaemonConfig): int =
     const MaxConsecutiveAcceptFailures = 64
     var consecutiveFailures = 0
     while true:
+      # SIGTERM LEAVES BY THE SAME DOOR AS A DEAD LISTENER: it breaks the
+      # loop, and everything below `finally` then happens exactly as it does
+      # for every other way of ending. The flag is checked three times
+      # because there are three places the signal can land relative to a
+      # blocking `accept`.
+      if shutdownWasRequested():
+        break
       var accepted: AcceptedConnection
       try:
         accepted = listener.acceptNativeConnection()
         consecutiveFailures = 0
       except CatchableError as error:
+        if shutdownWasRequested():
+          # NOT A FAILURE AND NOT COUNTED AS ONE. An accept that failed
+          # while this daemon was already stopping says nothing about the
+          # health of the connection path, and `connections_failed` is read
+          # by operators as if it did.
+          break
         inc consecutiveFailures
         noteConnectionFailure("runquota accept failed: " & error.msg)
         if consecutiveFailures >= MaxConsecutiveAcceptFailures:
@@ -2918,8 +3152,21 @@ proc serve*(config: DaemonConfig): int =
           flushFile(stdout)
           break
         continue
+      if shutdownWasRequested():
+        # Either the waker's own connection or a real client that arrived in
+        # the same instant. Neither will be served: closing it is what the
+        # peer needs, and a peer that connected during a shutdown has to
+        # retry against the next daemon whatever this one does.
+        accepted.close()
+        break
       enqueueConnection(accepted)
   finally:
+    # FIRST, so the handler is disarmed and the waker joined before the
+    # shutdown does anything else. A second SIGTERM arriving mid-shutdown
+    # then takes the default disposition, which is the right answer: an
+    # operator who signals twice is asking for the stop to stop being
+    # polite.
+    uninstallShutdownHandler()
     stopConnectionQueue()
     for i in 0 ..< threads.len:
       joinThread(threads[i])

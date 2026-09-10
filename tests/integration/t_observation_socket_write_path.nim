@@ -86,6 +86,55 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
+proc scratchEntryCount(root: string): int =
+  ## How many entries are under ``root`` right now. A fingerprint, not an
+  ## inventory: all it has to do is CHANGE when a file appears.
+  try:
+    for _ in walkDirRec(root, yieldFilter = {pcFile, pcDir, pcLinkToFile,
+        pcLinkToDir}):
+      result += 1
+  except OSError:
+    # A directory that cannot be walked cannot be observed settling either;
+    # the caller's bounded wait then simply expires and it removes what it
+    # can, which is what it would have done before this proc existed.
+    discard
+
+proc removeScratchRoot(root: string) =
+  ## TEARDOWN WAITS FOR THE DAEMON'S FILES TO SETTLE.
+  ##
+  ## `defer: removeDir(root)` is registered before the daemon starts, so it
+  ## runs after `daemon.stop()` -- and `stop()` waits for the DAEMON, not for
+  ## the `sqlite3` children the daemon spawned. SIGTERM ends the daemon
+  ## outright; a child of its writer can still be finishing a transaction,
+  ## recreating `-wal` and `-shm` beside a database `removeDir` has already
+  ## walked past. `removeDir` then raises `Directory not empty` AFTER the
+  ## test itself has passed, which reports a fixture's timing as the
+  ## product's failure. It was seen failing once here and passing on
+  ## re-runs, which is the signature.
+  ##
+  ## THE WAIT IS ON THE CONDITION, NOT A RETRY OF THE REMOVAL: two
+  ## consecutive identical samples mean nothing is still appearing, which is
+  ## the thing that was actually wrong. It costs one sampling interval on a
+  ## quiet tree and returns as soon as the tree is quiet, so it does not
+  ## trade a flake for a fixed delay.
+  ##
+  ## The bound exists because a wait that can never end is worse than the
+  ## race: past it the removal is attempted anyway, and a directory that
+  ## really will not empty raises exactly as it did before.
+  const
+    SettleStepMillis = 25
+    SettleBudgetMillis = 2000
+  var previous = -1
+  var waited = 0
+  while waited <= SettleBudgetMillis:
+    let current = scratchEntryCount(root)
+    if current == previous:
+      break
+    previous = current
+    sleep(SettleStepMillis)
+    waited += SettleStepMillis
+  removeDir(root)
+
 proc rendezvousDir(root: string): string =
   result = root / "ep"
   createDir(result)
@@ -247,7 +296,7 @@ suite "observation_socket_write_path":
 
   test "with NO capture flag a real run produces complete, correct spine rows":
     let root = scratchRoot("on")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
@@ -356,7 +405,7 @@ suite "observation_socket_write_path":
       ContradictoryKey = "m13-contra-impossible"
 
     let root = scratchRoot("contra")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
@@ -472,7 +521,7 @@ suite "observation_socket_write_path":
 
   test "--no-write-stats writes nothing at all, and the daemon serves anyway":
     let root = scratchRoot("off")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
@@ -533,7 +582,7 @@ suite "observation_socket_write_path":
     # goes, so the only evidence of which rule fired is WHAT THE DAEMON
     # SAYS and WHETHER IT TOUCHED THE FILE.
     let root = scratchRoot("precedence")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
@@ -627,7 +676,7 @@ suite "observation_socket_write_path":
     setFilePermissions(locked, {fpUserRead, fpUserExec})
     defer:
       setFilePermissions(locked, {fpUserRead, fpUserWrite, fpUserExec})
-      removeDir(root)
+      removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let identityFile = locked / "nostate" / "host-id"
     let expectedDb = locked / "nostate" / "observations.sqlite3"
@@ -686,7 +735,7 @@ suite "observation_socket_write_path":
     # replace. M13c-fix refuses the identity in that case; M13 is what
     # makes the pair reachable without any flag naming a database.
     let root = scratchRoot("untrusted")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = root / "state"
     createDir(state)
@@ -749,7 +798,7 @@ suite "observation_socket_write_path":
     # `foreign_*` — invisibly, because the arithmetic stays self-consistent
     # and the clamp absorbs the overshoot.
     let root = scratchRoot("own")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
 
@@ -896,7 +945,7 @@ suite "observation_socket_write_path":
 
   test "a damaged or oversized report is refused entirely, leaving no half-state":
     let root = scratchRoot("bad")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
 
@@ -1024,7 +1073,7 @@ suite "observation_socket_write_path":
     # understating every later `foreign_*` until the clamp pinned it to
     # zero. Nothing about that is visible in the data.
     let root = scratchRoot("kill")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let expectedDb = state / "observations.sqlite3"
@@ -1116,7 +1165,7 @@ suite "observation_socket_write_path":
     # the work being observed, so the client's execution has to complete
     # normally with nobody telling it anything went wrong.
     let root = scratchRoot("ro")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"

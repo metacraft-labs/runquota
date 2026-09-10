@@ -1,6 +1,7 @@
 import std/[locks, os, osproc, strutils, times]
 
 import runquota_core/child_process
+import runquota_core/process_owned
 
 import runquota_persistence/types
 
@@ -17,7 +18,36 @@ var writerReady = false
 var writerStop = false
 var writerDbPath = ""
 var writerCapacity = 0
-var writerPending: seq[LearnedEstimateRow] = @[]
+# THE PENDING QUEUE IS NOT A `seq[LearnedEstimateRow]`, and under ORC it
+# cannot be.
+#
+# `enqueueEstimateWrite` is reached from `updateEstimateFromFinish`, which
+# `handleRequest` calls when a client reports a lease finished -- so a row is
+# allocated on a CONNECTION WORKER. It is freed by `writerMain`'s drain, and
+# `serve` calls `stopEstimateStore` (which joins that writer) only AFTER every
+# connection worker has been joined. A row still queued at that moment is
+# therefore freed by a thread that did not allocate it, after the thread that
+# did has ceased to exist.
+#
+# The window is narrower than the publisher's -- the drain runs every 50 ms --
+# but it is open, and it is open exactly when it matters: each pass spawns
+# `sqlite3`, so anything reported while a pass is in flight is still queued
+# when the workers go away. An earlier report of this queue called it
+# unreachable; it is not.
+#
+# Under ORC each thread has its own allocator region and every chunk records
+# the region that owns it; freeing a foreign chunk dereferences `chunk.owner`,
+# which lives in the owning thread's TLS and dies with it. `writerLock`
+# serialises ACCESS and cannot help with OWNERSHIP; neither can `allocShared`,
+# which under ORC is `allocImpl` verbatim. `OwnedStrings` puts the rows in the
+# C allocator -- one arena for the whole process, no owning thread -- so which
+# thread frees them, and when, stops mattering.
+#
+# The rows are held ENCODED, one blob each, because the queue's only lookup is
+# by (scope, command_stats_id): `encodePending` puts that pair in front as a
+# length-prefixed key, so `startsWithAt` answers the lookup with a byte
+# compare and no allocation at all.
+var writerPending: OwnedStrings
 var writerThread: Thread[void]
 var writerFailedBatches = 0'u64
 var writerFailedRows = 0'u64
@@ -243,6 +273,47 @@ proc estimateWriteFailedRows*(): uint64 =
   finally:
     release(writerLock)
 
+proc pendingKey(scope, commandStatsId: string): string =
+  ## The identity the queue deduplicates on, LENGTH-PREFIXED so that no pair
+  ## can spell another pair's key: without the lengths a scope ending in the
+  ## separator would collide with the next field, and a queue that replaced
+  ## the wrong row would publish one command's estimate under another's name.
+  $scope.len & ":" & scope & ":" & $commandStatsId.len & ":" &
+    commandStatsId & ":"
+
+proc encodePending(row: LearnedEstimateRow): string =
+  ## The key, then the five numbers. Written and read in this module only.
+  pendingKey(row.scope, row.commandStatsId) &
+    $row.conservativeMemoryBytes & "," & $row.recentPeakMemoryBytes & "," &
+    $row.sampleCount & "," & $row.lastOutcome & "," & $row.updatedUnixMillis
+
+proc decodePending(encoded: string): LearnedEstimateRow =
+  ## Inverse of ``encodePending``. Total on anything ``encodePending``
+  ## produced, which is the only thing that ever reaches it.
+  var at = 0
+  var fields: array[2, string]
+  for f in 0 ..< 2:
+    let colon = encoded.find(':', at)
+    let width = parseInt(encoded[at ..< colon])
+    fields[f] = encoded[colon + 1 ..< colon + 1 + width]
+    at = colon + 1 + width + 1
+  let numbers = encoded[at .. ^1].split(',')
+  LearnedEstimateRow(
+    scope: fields[0],
+    commandStatsId: fields[1],
+    conservativeMemoryBytes: parseUInt(numbers[0]),
+    recentPeakMemoryBytes: parseUInt(numbers[1]),
+    sampleCount: uint32(parseUInt(numbers[2])),
+    lastOutcome: uint32(parseUInt(numbers[3])),
+    updatedUnixMillis: parseUInt(numbers[4]))
+
+proc takePendingRows(): seq[LearnedEstimateRow] =
+  ## Empties the queue. REQUIRES ``writerLock``. The rows come back as
+  ## ordinary Nim values allocated on the CALLING thread, so the batch the
+  ## writer then hands to ``sqlite3`` is owned by the thread that frees it.
+  for encoded in writerPending.takeAll():
+    result.add(decodePending(encoded))
+
 proc writerMain() {.thread.} =
   {.cast(gcsafe).}:
     try:
@@ -254,8 +325,7 @@ proc writerMain() {.thread.} =
         try:
           shouldStop = writerStop
           if writerPending.len > 0:
-            batch = writerPending
-            writerPending = @[]
+            batch = takePendingRows()
         finally:
           release(writerLock)
         if batch.len > 0 and writerDbPath.len > 0:
@@ -282,7 +352,7 @@ proc startEstimateStore*(path: string; queueCapacity = 128): EstimateStore =
     writerDbPath = path
     writerCapacity = max(1, queueCapacity)
     writerStop = false
-    writerPending = @[]
+    writerPending.clear()
   finally:
     release(writerLock)
   createThread(writerThread, writerMain)
@@ -291,16 +361,24 @@ proc startEstimateStore*(path: string; queueCapacity = 128): EstimateStore =
 proc enqueueEstimateWrite*(store: EstimateStore; row: LearnedEstimateRow): bool =
   if store.isNil or store.mode != pmSqlite:
     return true
+  # ENCODED OUTSIDE THE LOCK, on the thread that will free the intermediate
+  # string. This is the observation path, and OS-1 says it must not perturb
+  # the work being observed; a lock held across a formatting call is a lock
+  # every other connection worker waits behind.
+  let key = pendingKey(row.scope, row.commandStatsId)
+  let encoded = encodePending(row)
   acquire(writerLock)
   try:
-    for i, pending in writerPending:
-      if pending.scope == row.scope and pending.commandStatsId == row.commandStatsId:
-        writerPending[i] = row
-        return true
+    for i in 0 ..< writerPending.len:
+      if writerPending.startsWithAt(i, key):
+        # SAME PAIR: the newer figures replace the older ones rather than
+        # queueing a second write of the same row.
+        result = writerPending.setAt(i, encoded)
+        return
     if writerPending.len >= writerCapacity:
-      writerPending.delete(0)
-    writerPending.add(row)
-    true
+      # THE OLDEST GOES, which is why `removeAt` keeps order.
+      writerPending.removeAt(0)
+    result = writerPending.add(encoded)
   finally:
     release(writerLock)
 

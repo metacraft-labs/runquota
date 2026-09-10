@@ -390,6 +390,20 @@ proc registerExtension*(store: ObservationStore;
   store.execute(insertStatement("extension_registry", extensionColumns,
     extensionValues(row)))
 
+proc runInsertStatement*(row: RunRow): string =
+  ## One run's insert, on its own. ``insert or ignore`` because several
+  ## executions share a run and the row may already exist.
+  ##
+  ## Exposed per-row because the background writer's queue holds BYTES rather
+  ## than rows -- see the note at the head of ``writer.nim`` -- so the
+  ## statement is composed on the thread that recorded the observation.
+  "insert or ignore into runs (" & runColumns.join(", ") & ") values (" &
+    runValues(row).join(", ") & ");"
+
+proc executionInsertStatement*(row: ExecutionRow): string =
+  ## One execution's insert. Same reason as ``runInsertStatement``.
+  insertStatement("executions", executionColumns, executionValues(row))
+
 proc batchStatement*(runs: openArray[RunRow];
                      executions: openArray[ExecutionRow];
                      extensionInserts: openArray[string] = []): string =
@@ -408,11 +422,9 @@ proc batchStatement*(runs: openArray[RunRow];
   ## procedure appends them and does not read them.
   result = "begin immediate;\n"
   for row in runs:
-    result.add("insert or ignore into runs (" & runColumns.join(", ") &
-      ") values (" & runValues(row).join(", ") & ");\n")
+    result.add(runInsertStatement(row) & "\n")
   for row in executions:
-    result.add(insertStatement("executions", executionColumns,
-      executionValues(row)) & "\n")
+    result.add(executionInsertStatement(row) & "\n")
   for statement in extensionInserts:
     result.add(statement & "\n")
   result.add("commit;\n")
@@ -425,6 +437,25 @@ proc appendBatchAt*(path: string; runs: openArray[RunRow];
   if runs.len == 0 and executions.len == 0 and extensionInserts.len == 0:
     return SqliteOutcome(ok: true, exitCode: 0, output: "", error: "")
   runSqlite(path, batchStatement(runs, executions, extensionInserts))
+
+proc appendStatementsAt*(path: string;
+                         statements: openArray[string]): SqliteOutcome =
+  ## Path-addressed batch append for statements the caller composed itself.
+  ##
+  ## ``appendBatchAt`` above is the same thing for callers that still hold
+  ## rows. The background writer does not: its queue is process-owned storage
+  ## that holds BYTES, for the ownership reason set out at the head of
+  ## ``writer.nim``, and the ORDER of the statements it hands over is already
+  ## the order ``batchStatement`` would have put them in -- runs, then
+  ## executions, then extension rows, which is load-bearing because an
+  ## extension row carries a foreign key to its execution.
+  if statements.len == 0:
+    return SqliteOutcome(ok: true, exitCode: 0, output: "", error: "")
+  var sql = "begin immediate;\n"
+  for statement in statements:
+    sql.add(statement & "\n")
+  sql.add("commit;\n")
+  runSqlite(path, sql)
 
 proc ambientBatchStatement*(rows: openArray[AmbientSampleRow]): string =
   ## One transaction for a drained run of ambient samples.

@@ -13,10 +13,39 @@
 ##
 ## Single-writer-per-process, like the learned-estimate writer next to it:
 ## the state below is module-level so no ``ref`` crosses a thread boundary.
+##
+## THE QUEUES HOLD BYTES, NOT ROWS, and under ORC they have to.
+##
+## ``enqueueRunRow``, ``enqueueExecutionRow`` and ``enqueueExtensionInsert``
+## are called on a CONNECTION WORKER -- that is where an observation is
+## recorded. The queues are drained by ``drainOnce``, which runs on the
+## writer's own thread, on the aggregate publisher's thread through
+## ``flushObservationWriter``, and on whichever thread has just asked a
+## question. ``serve`` joins the connection workers first and stops this
+## writer last, so a row still queued when the workers go away is freed by a
+## thread that did not allocate it, after the thread that did has ceased to
+## exist.
+##
+## Under ORC every thread has its own allocator region and every chunk
+## records the region that owns it; freeing a foreign chunk dereferences
+## ``chunk.owner``, which lives in the owning thread's TLS and dies with it.
+## ``writerLock`` serialises ACCESS and cannot answer OWNERSHIP, and
+## ``allocShared`` is ``allocImpl`` verbatim under ORC, with the same
+## per-thread ownership. So the queues are ``OwnedStrings``: the C
+## allocator, one arena for the whole process, no owning thread.
+##
+## THE ROW BECOMES ITS STATEMENT AT THE ENQUEUE, on the recording thread.
+## That is what lets one storage shape serve all three queues, and it is
+## work this path was going to do anyway -- pure string formatting, no IO, no
+## lock held across it. ``drainOnce`` then concatenates the three in the
+## order ``batchStatement`` always used: runs, executions, extension rows.
+## That order is load-bearing, because an extension row carries a foreign key
+## to its execution.
 
 import std/[locks, os]
 
 import ./store, ./types
+import runquota_core/process_owned
 
 var
   writerLock: Lock
@@ -24,9 +53,9 @@ var
   writerThread: Thread[void]
   writerPath = ""
   writerCapacity = 0
-  writerRuns: seq[RunRow] = @[]
-  writerExecutions: seq[ExecutionRow] = @[]
-  writerExtensionInserts: seq[string] = @[]
+  writerRuns: OwnedStrings
+  writerExecutions: OwnedStrings
+  writerExtensionInserts: OwnedStrings
   writerDropped = 0'i64
   writerFailures = 0'i64
   writerQueued = 0'i64
@@ -49,38 +78,36 @@ proc ensureWriterLock() =
 
 proc drainOnce() {.gcsafe.} =
   {.cast(gcsafe).}:
-    var runs: seq[RunRow] = @[]
-    var executions: seq[ExecutionRow] = @[]
-    var extensionInserts: seq[string] = @[]
+    # THE STATEMENTS COME BACK AS THIS THREAD'S OWN STRINGS. ``takeAll``
+    # copies them out of process-owned storage, so what this proc frees on
+    # its way out is what this proc allocated; see the head of this module.
+    var statements: seq[string] = @[]
     var path = ""
     acquire(writerLock)
     try:
       path = writerPath
-      if writerRuns.len > 0:
-        runs = writerRuns
-        writerRuns = @[]
-      if writerExecutions.len > 0:
-        executions = writerExecutions
-        writerExecutions = @[]
-      if writerExtensionInserts.len > 0:
-        extensionInserts = writerExtensionInserts
-        writerExtensionInserts = @[]
+      # RUNS, THEN EXECUTIONS, THEN EXTENSION ROWS. The order is the one
+      # `batchStatement` has always emitted and it is load-bearing: an
+      # extension row's foreign key names its execution, and `foreign_keys`
+      # is on, so a row placed before its parent aborts the transaction and
+      # takes the parent with it.
+      statements = writerRuns.takeAll()
+      for statement in writerExecutions.takeAll():
+        statements.add(statement)
+      for statement in writerExtensionInserts.takeAll():
+        statements.add(statement)
     finally:
       release(writerLock)
-    if path.len == 0 or
-        (runs.len == 0 and executions.len == 0 and
-         extensionInserts.len == 0):
+    if path.len == 0 or statements.len == 0:
       return
-    let outcome = appendBatchAt(path, runs, executions, extensionInserts)
+    let outcome = appendStatementsAt(path, statements)
     acquire(writerLock)
     try:
       if outcome.ok:
-        writerWritten += int64(runs.len + executions.len +
-          extensionInserts.len)
+        writerWritten += int64(statements.len)
       else:
         writerFailures += 1
-        writerDropped += int64(runs.len + executions.len +
-          extensionInserts.len)
+        writerDropped += int64(statements.len)
     finally:
       release(writerLock)
 
@@ -110,9 +137,9 @@ proc startObservationWriter*(path: string; capacity = 1024) =
       return
     writerPath = path
     writerCapacity = max(1, capacity)
-    writerRuns = @[]
-    writerExecutions = @[]
-    writerExtensionInserts = @[]
+    writerRuns.clear()
+    writerExecutions.clear()
+    writerExtensionInserts.clear()
     writerStop = false
     writerDropped = 0
     writerFailures = 0
@@ -137,6 +164,11 @@ proc enqueueRunRow*(row: RunRow): bool {.discardable.} =
   ## Returns false when the row was dropped (writer inactive or queue
   ## full). Never blocks on IO.
   ensureWriterLock()
+  # COMPOSED OUTSIDE THE LOCK, on the thread that will free the intermediate
+  # string. OS-1 forbids the recording path from perturbing the work being
+  # observed, and a lock held across a formatting call is a lock every other
+  # connection worker waits behind.
+  let statement = runInsertStatement(row)
   acquire(writerLock)
   try:
     if not writerActive or
@@ -145,7 +177,11 @@ proc enqueueRunRow*(row: RunRow): bool {.discardable.} =
       # as lost as one offered to a full queue, and OS-2 wants the number.
       writerDropped += 1
       return false
-    writerRuns.add(row)
+    if not writerRuns.add(statement):
+      # The allocator refused. A row nobody can store is as lost as one
+      # offered to a full queue, and is counted the same way.
+      writerDropped += 1
+      return false
     writerQueued += 1
     true
   finally:
@@ -153,6 +189,8 @@ proc enqueueRunRow*(row: RunRow): bool {.discardable.} =
 
 proc enqueueExecutionRow*(row: ExecutionRow): bool {.discardable.} =
   ensureWriterLock()
+  # Composed outside the lock; see `enqueueRunRow`.
+  let statement = executionInsertStatement(row)
   acquire(writerLock)
   try:
     if not writerActive or
@@ -161,7 +199,9 @@ proc enqueueExecutionRow*(row: ExecutionRow): bool {.discardable.} =
       # as lost as one offered to a full queue, and OS-2 wants the number.
       writerDropped += 1
       return false
-    writerExecutions.add(row)
+    if not writerExecutions.add(statement):
+      writerDropped += 1
+      return false
     writerQueued += 1
     true
   finally:
@@ -189,7 +229,9 @@ proc enqueueExtensionInsert*(statement: string): bool {.discardable.} =
           writerCapacity:
       writerDropped += 1
       return false
-    writerExtensionInserts.add(statement)
+    if not writerExtensionInserts.add(statement):
+      writerDropped += 1
+      return false
     writerQueued += 1
     true
   finally:
