@@ -108,30 +108,71 @@ proc unixEndpoint*(path: string): Endpoint =
   Endpoint(kind: endpointUnixSocket, path: path)
 
 when defined(windows):
-  # Windows: build the spec-defined named-pipe path. We sanitise the user
-  # name so the path stays well-formed regardless of locale or special chars.
   proc namedPipeEndpoint*(path: string): Endpoint =
     Endpoint(kind: endpointNamedPipe, path: path)
 
-  proc sanitiseUserToken(token: string): string =
-    result = newStringOfCap(token.len)
-    for ch in token:
-      if ch.isAlphaNumeric or ch == '-' or ch == '_' or ch == '.':
-        result.add(ch)
-      else:
-        result.add('_')
-
-  proc currentUserToken(): string =
-    # Windows: prefer USERNAME but fall back to a literal "default" so the
-    # daemon still has a usable per-process endpoint even in stripped envs.
-    let username = getEnv("USERNAME")
-    if username.len > 0:
-      sanitiseUserToken(username)
-    else:
-      "default"
+  const windowsHostWideEndpointPath* = r"\\.\pipe\runquota\runquotad"
+    ## THE FIXED HOST-WIDE NAMED PIPE, AND NOTHING CALLER-DERIVED IN IT.
+    ##
+    ## This used to be `\\.\pipe\runquota-$USERNAME`, and the `$USERNAME`
+    ## is the whole defect -- the SAME defect the POSIX arm records under
+    ## `hostWideEndpointDir`, for the same reason and in the same words.
+    ## User B did not fail to reach user A's daemon, B COMPUTED A
+    ## DIFFERENT PATH, found nothing, and started a second daemon. Two
+    ## daemons then admitted against their own view of one machine's
+    ## budget, which is RunQuota's primary mission failing in the case it
+    ## was built for -- and it failed SILENTLY, because both users saw a
+    ## working system.
+    ##
+    ## On Windows the same defect also made the SHIPPED SERVICE unusable
+    ## rather than merely wrong, which is how it was found. The MSI
+    ## registers `runquotad` under LocalSystem; LocalSystem's `USERNAME`
+    ## is not any human's, so the service created a pipe no interactive
+    ## user could name and every `runquota status` on the machine
+    ## reported no daemon at all.
+    ##
+    ## The NPFS subdirectory (`pipe\runquota\runquotad`) mirrors the
+    ## POSIX rendezvous (`/run/runquota/runquotad.sock`) deliberately:
+    ## one name that reads the same in both places, and room for a second
+    ## endpoint later without a second naming convention.
+    ##
+    ## WHAT THIS DOES NOT DO, stated rather than implied, AND MEASURED.
+    ## The POSIX endpoint is `0660` and gated on `runquota` group
+    ## membership, and that gate IS the admission boundary for "may you
+    ## participate in the managed-resource system on this host". A named
+    ## pipe created with a NULL security descriptor gets NPFS's default
+    ## DACL instead, which is not that boundary and is not equivalent to
+    ## it. Giving the Windows endpoint an explicit security descriptor is
+    ## a real design decision about who may hold leases on a Windows
+    ## host, and this constant does not make it.
+    ##
+    ## THE DEFAULT IS NOT PERMISSIVE, IT IS ADMIN-ONLY -- which is the
+    ## opposite of the reading a NULL SD invites, so it is written down
+    ## here as a measurement rather than left to intuition. Read off the
+    ## running service installed by the shipped MSI
+    ## (`GetNamedSecurityInfoW` on the live pipe):
+    ##
+    ##   O:BA G:SY D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BA)(A;;FR;;;WD)(A;;FR;;;AN)
+    ##
+    ## SYSTEM and Administrators get FILE_ALL_ACCESS; Everyone and
+    ## Anonymous get FILE_GENERIC_READ and nothing more. RQSP is
+    ## request/response, so a client must open the pipe for
+    ## GENERIC_READ|GENERIC_WRITE -- which `FR` does not permit. Measured
+    ## consequence: under the MSI's LocalSystem service, `runquota
+    ## status` from an ordinary UAC-filtered, medium-integrity token
+    ## fails with `CreateFileW failed ...: Windows error 5`, while the
+    ## same command from an elevated token succeeds.
+    ##
+    ## So a HOST-WIDE NAME IS NECESSARY AND NOT SUFFICIENT. This constant
+    ## fixes the half of the defect in which no user could COMPUTE the
+    ## service's endpoint; the half in which an ordinary user may not
+    ## OPEN it is still open, and closing it means choosing the Windows
+    ## admission boundary and building the SD that expresses it. Until
+    ## then the shipped service is usable by administrators only, and the
+    ## packaging runbook records that where an operator will meet it.
 
   proc defaultWindowsPipePath(): string =
-    r"\\.\pipe\runquota-" & currentUserToken()
+    windowsHostWideEndpointPath
 
   proc windowsPipeToken(path: string): string =
     ## A stable, short, pipe-name-safe token derived from `path` (FNV-1a over
@@ -746,7 +787,10 @@ proc defaultEndpoint*(): Endpoint =
     unixEndpoint(hostWideEndpointDir / endpointSocketName)
   elif defined(windows):
     # Windows: named pipes don't need a parent directory and live in the
-    # NPFS namespace, so just return the canonical per-user path.
+    # NPFS namespace, so just return the canonical HOST-WIDE path. (This
+    # comment said "per-user" until the defect above was removed, and a
+    # stale comment beside a fixed constant is how the next reader learns
+    # the wrong rule -- see `windowsHostWideEndpointPath`.)
     namedPipeEndpoint(defaultWindowsPipePath())
   else:
     Endpoint(kind: endpointUnsupported, path: "")

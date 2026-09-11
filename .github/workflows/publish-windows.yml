@@ -1,0 +1,174 @@
+name: Publish (Windows)
+
+# TAG-DRIVEN. Pushing a `v*` tag fans this workflow out alongside
+# `publish-linux.yml`; a `workflow_dispatch` run is the documented
+# fallback for re-running one leg without re-cutting a tag. The shape of
+# the trigger and of the two inputs is fixed by
+# `codetracer-specs/Repo-Requirements.md` §2.5.4 and is deliberately
+# identical across every publish workflow in the organisation.
+#
+# WHAT THIS LEG PRODUCES: the MSI -- an installer that registers
+# `runquotad` as a Windows service through the SCM -- and the Scoop
+# manifest plus the archive it describes. They are the two ways of
+# installing on Windows and they are not equivalent: Scoop unpacks an
+# archive into its own app directory and has no mechanism for a service,
+# so a Scoop install of RunQuota gives an operator two binaries and no
+# lease authority. The packaging runbook says so; this workflow builds
+# both so the runbook is describing artifacts that exist.
+#
+# NO PROMPT FEEDBACK IS ASSUMED. This organisation's Windows pool is two
+# slots wide and has run deep behind its queue; every job below carries
+# its own `timeout-minutes` ceiling, nothing here polls for another
+# job's result, and the release upload is idempotent so a re-run after a
+# queue-starved timeout is safe.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semver to publish (overrides tag for manual runs)'
+        required: true
+        default: '0.1.0'
+      dry_run:
+        description: 'Build the artifact but skip the upload'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  # One publish per tag. A re-run of the same tag supersedes the one in
+  # flight; two different tags are two different releases and must not
+  # cancel each other.
+  group: publish-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: MSI + Scoop
+    runs-on: eph-win-x64
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mint installation token for the Windows dev environment
+        id: ci_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Setup dev env (reprobuild flavor)
+        # `reprobuild`, not `windows-diy`, and the difference is the whole
+        # reason this job can exist: packaging goes through reprobuild's
+        # packaging layer, so the job needs `repro` itself. `windows-diy`
+        # furnishes `nim` and `gcc` from `env.ps1` and no `repro`;
+        # `ci.yml`'s `windows-compile-gate` uses that flavor because
+        # compiling is all it does.
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        with:
+          env-flavor: reprobuild
+          gh-token: ${{ steps.ci_token.outputs.token }}
+
+      - name: Resolve the version
+        id: version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF}" != "${GITHUB_REF#refs/tags/v}" ]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse a tag the tree does not carry
+        # THE TAG AND THE TREE MUST AGREE. `just bump-version` rewrites
+        # four version sources and `tests/unit/t_packaging_contract`
+        # refuses a tree in which they disagree with each other -- but
+        # nothing there knows what the tag says. A `v0.2.0` tag on a tree
+        # that still says 0.1.0 would publish `runquota-0.1.0-1-x64.msi`
+        # under a 0.2.0 release, and the mismatch would be discovered by
+        # whoever installed it.
+        shell: bash
+        run: |
+          declared="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' runquota.nimble)"
+          if [ "${declared}" != "${{ steps.version.outputs.version }}" ]; then
+            echo "runquota.nimble declares ${declared}, this run publishes ${{ steps.version.outputs.version }}" >&2
+            echo "run 'just bump-version ${{ steps.version.outputs.version }}' and commit before tagging" >&2
+            exit 1
+          fi
+
+      - name: Build the shipping binaries
+        # The ROOT project's two `nim.c` edges, which are what
+        # `apps/entrypoints.txt` names and what `scripts/build_apps.sh`
+        # builds by hand. `packaging/repro.nim` is a separate project and
+        # consumes these as staged files -- see its header for why the
+        # two cannot be one project.
+        run: dev-exec repro build .#apps
+
+      - name: Build the MSI
+        run: dev-exec just build-package msi
+
+      - name: Verify the MSI
+        # Two arms, both over the shipped bytes: the MSI's own tables
+        # through WindowsInstaller (product identity, the shipped files,
+        # the ServiceInstall/ServiceControl rows, an EMPTY Arguments
+        # column) and a scrubbed launch of every staged executable with
+        # the environment rebuilt from empty. See
+        # `scripts/verify_windows_package.ps1` and
+        # `scripts/check_windows_scrubbed_launch.ps1`.
+        run: dev-exec just verify-package msi
+
+      - name: Build the Scoop manifest and its archive
+        run: dev-exec just build-package scoop
+
+      - name: Verify the Scoop manifest
+        run: dev-exec just verify-package scoop
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publish-windows-logs
+          path: test-logs/
+          retention-days: 30
+
+      - name: Upload the artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runquota-windows-${{ steps.version.outputs.version }}
+          path: |
+            packaging/build/dist/*.msi
+            packaging/build/dist/*.json
+            packaging/build/dist/*.tar.gz
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Attach the artifacts to the GitHub Release
+        # THE ONLY PUBLISH STEP THAT NEEDS NO REGISTRY SECRET, which is
+        # why it is the one this repository has today. `GITHUB_TOKEN`
+        # with `contents: write` is enough, and `gh release upload
+        # --clobber` is idempotent, so a re-run after a queue-starved
+        # timeout republishes rather than failing on a name collision.
+        #
+        # The Scoop BUCKET is a different matter: pushing the manifest to
+        # `metacraft-labs/scoop-runquota` needs a deploy key that does not
+        # exist yet, and the manifest this job produces still carries the
+        # producer's `@SCOOP_URL@`/`@SCOOP_SHA256@` tokens for that step
+        # to substitute. See the runbook's §1 and §3 -- the gap is
+        # recorded rather than papered over with a plausible URL.
+        if: startsWith(github.ref, 'refs/tags/v') && !inputs.dry_run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "v${{ steps.version.outputs.version }}" \
+            packaging/build/dist/*.msi \
+            packaging/build/dist/*.tar.gz \
+            --clobber

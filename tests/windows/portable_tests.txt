@@ -36,3 +36,4 @@ tests/compatibility/t_c_abi_layout.nim
 tests/compatibility/t_protocol_codec.nim
 tests/unit/t_version.nim
 tests/unit/t_standalone_capture_rules.nim
+tests/unit/t_packaging_contract.nim

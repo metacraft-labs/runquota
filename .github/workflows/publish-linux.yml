@@ -1,0 +1,164 @@
+name: Publish (Linux)
+
+# TAG-DRIVEN, with the trigger and the two inputs fixed by
+# `codetracer-specs/Repo-Requirements.md` §2.5.4 and deliberately
+# identical to `publish-windows.yml`.
+#
+# WHAT THIS LEG PRODUCES: the `.deb`, the `.rpm`, the pacman package and
+# the relocatable tarball. All four carry the same systemd SYSTEM unit,
+# generated from the one `ServiceDef` in `packaging/runquota_dist.nim`
+# that the MSI's `ServiceInstall` row is generated from.
+#
+# NOT ENABLED AT INSTALL. `startAtBoot` is false and the reason is in the
+# `ServiceDef`: `defaultDaemonConfig` GUESSES this host's capacity, and a
+# daemon started on the first reboot after installation would begin
+# governing a machine's build capacity against a budget nobody chose.
+# The runbook's post-install step is where an operator makes that second
+# decision.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semver to publish (overrides tag for manual runs)'
+        required: true
+        default: '0.1.0'
+      dry_run:
+        description: 'Build the artifact but skip the upload'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: publish-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: deb + rpm + pacman + tarball (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [eph-linux-x64, eph-linux-arm64]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mint installation token for cross-repo sibling clones
+        id: ci_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Setup dev env (reprobuild flavor)
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        with:
+          env-flavor: reprobuild
+          gh-token: ${{ steps.ci_token.outputs.token }}
+
+      - name: Resolve the version
+        id: version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF}" != "${GITHUB_REF#refs/tags/v}" ]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse a tag the tree does not carry
+        shell: bash
+        run: |
+          declared="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' runquota.nimble)"
+          if [ "${declared}" != "${{ steps.version.outputs.version }}" ]; then
+            echo "runquota.nimble declares ${declared}, this run publishes ${{ steps.version.outputs.version }}" >&2
+            echo "run 'just bump-version ${{ steps.version.outputs.version }}' and commit before tagging" >&2
+            exit 1
+          fi
+
+      - name: Build the shipping binaries
+        run: dev-exec repro build .#apps
+
+      - name: Build and verify the deb
+        run: dev-exec just build-package deb && dev-exec just verify-package deb
+
+      - name: Build and verify the rpm
+        run: dev-exec just build-package rpm && dev-exec just verify-package rpm
+
+      - name: Build and verify the pacman package
+        run: dev-exec just build-package arch && dev-exec just verify-package arch
+
+      - name: Build and verify the tarball
+        run: dev-exec just build-package tarball && dev-exec just verify-package tarball
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publish-linux-logs-${{ matrix.runner }}
+          path: test-logs/
+          retention-days: 30
+
+      - name: Upload the artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runquota-linux-${{ matrix.runner }}-${{ steps.version.outputs.version }}
+          path: |
+            packaging/build/dist/*.deb
+            packaging/build/dist/*.rpm
+            packaging/build/dist/*.pkg.tar.*
+            packaging/build/dist/*.tar.gz
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Attach the artifacts to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') && !inputs.dry_run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "v${{ steps.version.outputs.version }}" \
+            packaging/build/dist/*.deb \
+            packaging/build/dist/*.rpm \
+            packaging/build/dist/*.pkg.tar.* \
+            packaging/build/dist/*.tar.gz \
+            --clobber
+
+      - name: Publish to the apt and yum repositories
+        # GATED ON THE SECRET BEING PRESENT, and it EXITS ZERO with a
+        # warning when it is not. That is `Repo-Requirements.md` §2.5.4's
+        # rule and it is the right one here for a specific reason:
+        # RunQuota has no R2 bucket yet. The org's CodeTracer products
+        # publish to `deb.codetracer.com` / `rpm.codetracer.com` through
+        # `CODETRACER_DEB_BUCKET_*` secrets, and the org-wide guideline
+        # names `deb.metacraft-labs.com` / `rpm.metacraft-labs.com` for
+        # everything else; RunQuota is the second kind and the bucket
+        # does not exist. The runbook's §1.4 records that as an open
+        # prerequisite rather than letting this step fail every release
+        # until someone creates it.
+        #
+        # A step that FAILED here would make every tag red for a reason
+        # that has nothing to do with the tag; a step that silently did
+        # nothing would make the missing bucket invisible. A warning is
+        # the only shape that is honest about both.
+        if: startsWith(github.ref, 'refs/tags/v') && !inputs.dry_run
+        shell: bash
+        env:
+          BUCKET_KEY_ID: ${{ secrets.RUNQUOTA_DEB_BUCKET_ACCESS_KEY_ID }}
+        run: |
+          if [ -z "${BUCKET_KEY_ID}" ]; then
+            echo "::warning title=Repository publish skipped::RUNQUOTA_DEB_BUCKET_ACCESS_KEY_ID is not set; the .deb and .rpm are attached to the GitHub Release only. See runbooks/packaging/runquota.md §1.4."
+            exit 0
+          fi
+          echo "::error title=Repository publish not implemented::the bucket secret is present but no upload step exists yet"
+          exit 1

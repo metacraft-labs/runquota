@@ -49,6 +49,28 @@ fmt: format
 bump-version version:
     bash scripts/bump_version.sh {{version}}
 
+# ONE DISTRIBUTION CHANNEL'S ARTIFACT, for this host. The channel
+# vocabulary is msi / scoop / deb / rpm / arch / tarball / nix and is
+# recorded in `codetracer-specs/runbooks/packaging/runquota.md` §3.
+#
+# A channel this host cannot produce is a REFUSAL and never a skip: the
+# MSI producer's tools are Windows-native PE executables and the Linux
+# producers stage through patchelf and an ELF closure walk, so
+# `build-package msi` on a Linux runner must stop rather than report
+# success having produced no installer.
+build-package channel:
+    mkdir -p test-logs
+    bash scripts/build_package.sh {{channel}} 2>&1 | tee test-logs/build-package-{{channel}}.log
+
+# The same artifact, read back OVER THE SHIPPED BYTES -- the MSI's own
+# tables through WindowsInstaller, the archive's own member list, the
+# .deb's own control fields. Never the intermediate files the producer
+# generated: a check over those could only establish that the renderer
+# agrees with itself.
+verify-package channel:
+    mkdir -p test-logs
+    bash scripts/verify_package.sh {{channel}} 2>&1 | tee test-logs/verify-package-{{channel}}.log
+
 bench *args:
     mkdir -p bench-results test-logs
     bash scripts/collect-benchmark-metrics.sh {{args}} > bench-results/benchmark_results.json 2> >(tee test-logs/bench.log >&2)

@@ -3,6 +3,11 @@ result
 result-*
 
 build/
+# The packaging payload, staged from `build/bin` by
+# `scripts/stage_package_payload.sh`. It is a COPY of build output and
+# must never be committed: a checked-in binary here would be what every
+# package shipped, silently, regardless of what the tree compiles to.
+packaging/prebuilt/
 nimcache/
 htmldocs/
 *.nimble-link

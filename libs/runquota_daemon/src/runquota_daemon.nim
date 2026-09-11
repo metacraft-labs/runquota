@@ -6,6 +6,11 @@ when defined(posix):
   import std/posix
 
 import runquota_daemon/types as daemonTypes
+# The Service Control Manager host. Imported unconditionally -- the POSIX
+# arm of that module answers "not a service" to every question -- so `serve`
+# below reads the same on both platforms and the contract is compiled on
+# every leg rather than only on the one that uses it.
+import runquota_daemon/windows_service
 import runquota_codec
 import runquota_core
 import runquota_core/process_owned
@@ -16,6 +21,10 @@ when defined(windows):
   # below can route to GlobalMemoryStatusEx instead of the macOS stub (which
   # always returns "unavailable" off-macOS).
   import runquota_host_windows
+  # `createFileW` for the stop wake -- the named-pipe analogue of the POSIX
+  # arm's `connect` to its own socket. See the Windows branch of the
+  # shutdown-handler triple below.
+  import std/winlean
 import runquota_ipc
 import runquota_observation_store
 import runquota_persistence
@@ -23,6 +32,12 @@ import runquota_protocol
 import runquota_stats_table/publisher as statsPublisherLib
 
 export daemonTypes
+# Re-exported so `apps/runquotad` can adopt the SCM protocol through the
+# one library it already imports. `serve` owns the RUNNING report and the
+# stop watch; the entry point owns the dispatcher connection and the
+# stdio redirection, because both have to happen before `serve` prints
+# its first line.
+export windows_service
 
 const libraryName* = "runquota_daemon"
 
@@ -3130,12 +3145,91 @@ when defined(posix):
       joinThread(shutdownWakerThread)
       shutdownWakerRunning = false
 else:
-  # Windows has no SIGTERM; `runquotad` is stopped there by other means and
-  # the named-pipe listener is a different shape entirely. The declarations
-  # exist so `serve` reads the same on both platforms.
-  proc installShutdownHandler(endpointPath: string) = discard
-  proc uninstallShutdownHandler() = discard
-  proc shutdownWasRequested(): bool = false
+  # WINDOWS HAS NO SIGTERM, AND THAT IS NOT THE SAME AS HAVING NO STOP.
+  #
+  # `runquotad` is a Windows SERVICE under the shipped MSI, so the stop
+  # request arrives through the Service Control Manager: the control handler
+  # in `runquota_daemon/windows_service` sets an integer flag on an SCM
+  # thread. Everything below is the Windows half of the same mechanism the
+  # POSIX arm implements -- observe the request, and WAKE THE BLOCKING
+  # ACCEPT so the loop can act on it.
+  #
+  # The wake is the whole difficulty here exactly as it is on POSIX, and the
+  # answer is the same one: dial our own endpoint. The accept loop is parked
+  # in `ConnectNamedPipe`, which returns when any client opens the pipe, so
+  # one `CreateFileW` against our own pipe name -- opened, then closed,
+  # carrying no frames -- is what lets the loop look at the flag.
+  #
+  # A WATCHER THREAD RATHER THAN A CALLBACK. The SCM handler runs on a
+  # thread Nim did not start; it must touch no Nim heap object and must
+  # return promptly, so it cannot dial anything itself. It sets an integer;
+  # this thread, an ordinary Nim thread, is what turns that integer into a
+  # connection. The poll interval is what bounds the delay between `sc stop`
+  # and the accept returning, and 50 ms is far inside the SCM's 20-second
+  # re-armed grace.
+  #
+  # THE WATCHER EXISTS ONLY UNDER THE SCM. A console run has nothing to
+  # watch -- `windowsServiceStopRequested` is permanently false there -- so
+  # arming one would be a thread that sleeps for the life of the daemon and
+  # a join to wait for at shutdown, both for a flag that cannot change.
+  var
+    shutdownRequested: Atomic[bool]
+    shutdownWatcherThread: Thread[void]
+    shutdownWatcherRunning = false
+    shutdownWatcherStop: Atomic[bool]
+    shutdownEndpointPath = ""
+      ## Written once, before the watcher exists, and read only by it.
+
+  proc shutdownWasRequested(): bool =
+    shutdownRequested.load(moAcquire)
+
+  proc dialOwnEndpoint(path: string) =
+    ## One connection to our own named pipe, opened and dropped. It carries
+    ## no frames and is never served: its only job is to make
+    ## `ConnectNamedPipe` return so the loop can look at the flag.
+    ##
+    ## Every failure is ignored on purpose, for the reason the POSIX arm
+    ## gives: the dial is a WAKE-UP and not a request. If it cannot be made
+    ## the accept loop stays parked until the next real connection arrives
+    ## and then shuts down, which is the behaviour of the daemon before this
+    ## existed and no worse than it.
+    if path.len == 0:
+      return
+    {.cast(gcsafe).}:
+      let handle = createFileW(newWideCString(path),
+        GENERIC_READ or GENERIC_WRITE, 0, nil, OPEN_EXISTING, 0, Handle(0))
+      if handle != INVALID_HANDLE_VALUE:
+        discard closeHandle(handle)
+
+  proc shutdownWatcherMain() {.thread.} =
+    {.cast(gcsafe).}:
+      while not shutdownWatcherStop.load(moAcquire):
+        if windowsServiceStopRequested():
+          shutdownRequested.store(true, moRelease)
+          dialOwnEndpoint(shutdownEndpointPath)
+          return
+        sleep(50)
+
+  proc installShutdownHandler(endpointPath: string) =
+    ## Arms the SCM stop watch. Called after the endpoint is bound, because
+    ## the watcher has to have something to dial.
+    shutdownRequested.store(false, moRelease)
+    shutdownWatcherStop.store(false, moRelease)
+    shutdownEndpointPath = endpointPath
+    if not runningAsWindowsService():
+      return
+    createThread(shutdownWatcherThread, shutdownWatcherMain)
+    shutdownWatcherRunning = true
+
+  proc uninstallShutdownHandler() =
+    ## Stops the watcher and joins it, including on the paths where the
+    ## accept loop ended for some other reason -- a dead listener, a test
+    ## closing the endpoint -- and the watcher is still sleeping between
+    ## polls. The join therefore costs at most one poll interval.
+    if shutdownWatcherRunning:
+      shutdownWatcherStop.store(true, moRelease)
+      joinThread(shutdownWatcherThread)
+      shutdownWatcherRunning = false
 
 const endpointRefusedExitCode* = 3
   ## `serve` returns this when the rendezvous directory is not trustworthy.
@@ -3218,6 +3312,19 @@ proc serve*(config: DaemonConfig): int =
   for _ in 0 ..< connectionWorkerCount():
     threads.add(default(Thread[void]))
     createThread(threads[^1], connectionWorker)
+  # SERVICE_RUNNING IS REPORTED HERE AND NOWHERE EARLIER. The endpoint is
+  # bound, the rendezvous directory has been verified, the store has been
+  # opened or has said why it could not, and a worker pool exists to serve
+  # what the loop below accepts -- so this is the first moment at which
+  # "running" is true. Reporting it from the dispatcher thread instead would
+  # make `sc start runquotad` succeed for a daemon that then refused its
+  # endpoint and exited 3, which is precisely the class of failure the SCM
+  # protocol exists to stop hiding.
+  #
+  # A no-op on POSIX and in any console run, which is why it needs no
+  # `when`: `windows_service`'s POSIX arm and its not-a-service path both
+  # answer nothing.
+  reportWindowsServiceRunning()
   try:
     # A FAILED ACCEPT IS USUALLY THE HOST TALKING, NOT THE LISTENER DYING.
     # `accept` reports the peer's problems as well as its own: ECONNABORTED
@@ -3270,8 +3377,16 @@ proc serve*(config: DaemonConfig): int =
         break
       enqueueConnection(accepted)
   finally:
-    # FIRST, so the handler is disarmed and the waker joined before the
-    # shutdown does anything else. A second SIGTERM arriving mid-shutdown
+    # THE SCM'S STOP GRACE IS RE-ARMED BEFORE THE LONG PART BEGINS. What
+    # follows joins a worker pool, stops four background threads and lets a
+    # retention pass and an observation-store drain finish; under load that
+    # is seconds, and the SCM kills a service that stops answering. The
+    # control handler's own 20 s is measured from the STOP control, not from
+    # here, so a shutdown that started late would otherwise inherit whatever
+    # was left of it. A no-op in a console run and on POSIX.
+    reportWindowsServiceStopping()
+    # FIRST OF THE SHUTDOWN PROPER, so the handler is disarmed and the waker
+    # joined before the shutdown does anything else. A second SIGTERM arriving mid-shutdown
     # then takes the default disposition, which is the right answer: an
     # operator who signals twice is asking for the stop to stop being
     # polite.

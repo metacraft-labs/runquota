@@ -283,7 +283,7 @@ jobs:
           # rest of the suite does not. The floor is what makes shrinking the
           # list a deliberate act: a job whose test list quietly emptied would
           # still be green.
-          if ($tests.Count -lt 4) {
+          if ($tests.Count -lt 5) {
             throw "tests/windows/portable_tests.txt yielded $($tests.Count) rows; refusing to pass on an empty sweep"
           }
           $failed = @()

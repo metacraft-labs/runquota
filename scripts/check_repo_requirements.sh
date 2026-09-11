@@ -59,7 +59,7 @@ require_contains flake.nix "static-helpers"
 require_contains flake.nix "git-hooks.lib"
 require_contains flake.nix "shellHook = pre-commit-check.shellHook"
 
-for recipe in build test lint format fmt t bump-version bench bench-quick bench-runquota-process-execution bench-runquota-ipc repomix check-repo-requirements check-static-helpers; do
+for recipe in build test lint format fmt t bump-version build-package verify-package bench bench-quick bench-runquota-process-execution bench-runquota-ipc repomix check-repo-requirements check-static-helpers; do
   just --summary | tr ' ' '\n' | grep -Fxq "${recipe}" || fail "missing Justfile recipe ${recipe}"
 done
 
@@ -100,6 +100,24 @@ require_contains scripts/run_tests.sh "kill-after="
 # pinned so that removing one fails the lint.
 require_contains scripts/run_tests.sh "RUNQUOTA_ALLOW_MISSING_SQLITE"
 
+# THE PACKAGING SURFACE, PINNED. The `Distribution` is the one source of
+# truth every package format is produced from, and the two scripts below
+# are what turn `just build-package` / `just verify-package` into
+# something other than names in a Justfile. The contract test is what
+# stops the packaging recipe -- which is compiled by `repro build` with
+# none of `libs/` on its path, and so cannot import anything it asserts
+# about -- from drifting away from the product it packages.
+require_file packaging/repro.nim
+require_file packaging/runquota_dist.nim
+require_file scripts/stage_package_payload.sh
+require_file scripts/build_package.sh
+require_file scripts/verify_package.sh
+require_file scripts/verify_windows_package.ps1
+require_file scripts/check_windows_scrubbed_launch.ps1
+require_file tests/unit/t_packaging_contract.nim
+require_file .github/workflows/publish-windows.yml
+require_file .github/workflows/publish-linux.yml
+
 # EVERY JOB CARRIES ITS OWN CEILING. `runs-on:` appears exactly once per job,
 # which is what makes this a per-job count rather than a grep for the key
 # somewhere in the file: adding a job without `timeout-minutes` fails here.
@@ -112,6 +130,25 @@ fi
 if [ "${ci_ceilings}" -lt "${ci_jobs}" ]; then
   fail "ci.yml has ${ci_jobs} jobs but only ${ci_ceilings} timeout-minutes"
 fi
+
+# THE SAME CEILING RULE, APPLIED TO THE PUBLISH WORKFLOWS. The rule above
+# predates them and named `ci.yml` literally, so the two workflows added
+# for packaging were carrying their ceilings by the author's care rather
+# than by anything that would notice their absence. A publish job that
+# hung would hold one of this organisation's two Windows slots until the
+# repository-wide 6h default expired -- which is the failure the ceiling
+# exists to bound, and it is worse here than in `ci.yml` because a
+# publish runs on a tag nobody is watching.
+for wf in .github/workflows/publish-windows.yml .github/workflows/publish-linux.yml; do
+  wf_jobs="$(grep -cE '^    runs-on:' "${wf}" || true)"
+  wf_ceilings="$(grep -cE '^    timeout-minutes: [0-9]+$' "${wf}" || true)"
+  if [ "${wf_jobs}" -lt 1 ]; then
+    fail "${wf} yielded ${wf_jobs} jobs; refusing to pass on an empty sweep"
+  fi
+  if [ "${wf_ceilings}" -lt "${wf_jobs}" ]; then
+    fail "${wf} has ${wf_jobs} jobs but only ${wf_ceilings} timeout-minutes"
+  fi
+done
 
 for pattern in "repomix/" "bench-results/" "nimcache/" "result"; do
   require_contains .gitignore "${pattern}"

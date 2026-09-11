@@ -48,7 +48,62 @@ proc parseMachineSpec(config: var DaemonConfig; spec: string): bool =
   )
   true
 
+const
+  windowsServiceName* = "runquotad"
+    ## The SCM name this image answers to, and the same string the
+    ## packaging layer's `ServiceDef.name` carries into the MSI's
+    ## `ServiceInstall` row. `packaging/runquota_dist.nim` is the one
+    ## place it is written for the package; this is the one place it is
+    ## written for the binary, and `tests/unit/t_packaging_contract`
+    ## refuses a drift between them.
+
+  windowsServiceLogFile* = r"C:\ProgramData\runquota-logs\runquotad.log"
+    ## Where a service run's stdout and stderr go.
+    ##
+    ## A SIBLING OF THE HOST-WIDE STATE DIRECTORY, NOT A CHILD OF IT, and
+    ## the distinction is the whole reason this constant is spelled out
+    ## rather than derived from `hostWideStateDir`.
+    ##
+    ## `redirectStdioToFile` creates the log file's parent directory,
+    ## because a process opening its own log is entitled to. It is NOT
+    ## entitled to create `C:\ProgramData\runquota`:
+    ## `resolveHostIdentity` refuses to create that directory on purpose
+    ## ("a path any caller can create is a path any caller can create
+    ## DIFFERENTLY, with whatever owner and mode the first starter
+    ## happened to have"), and a log file placed inside it would perform
+    ## exactly that provisioning as a side effect of opening a stream --
+    ## silently, with the ACL of whoever started the daemon first. The
+    ## host state directory is provisioned by the install step and by
+    ## nothing else; see `docs`/the packaging runbook for the one command
+    ## that does it on Windows.
+    ##
+    ## Spelled as a literal rather than through `%ProgramData%`: this
+    ## string is used by the binary itself, but its POSIX-shaped cousin
+    ## (`ServiceDef.execArgs`) is passed through verbatim by every service
+    ## renderer, and a habit of writing environment references in
+    ## service-visible paths is how `--root=%ProgramData%...` becomes a
+    ## directory literally called `%ProgramData%` (reprobuild's M1 N22).
+
 when isMainModule:
+  # THE SCM CONNECTION IS MADE BEFORE ANYTHING IS PRINTED, and the order
+  # is load-bearing rather than tidy.
+  #
+  # A Windows service inherits no standard handles. Nim's `File` write
+  # RAISES when the underlying write does not complete, so the `echo` in
+  # the `--version` arm below -- and `serve`'s three fixed startup lines,
+  # and every usage error -- would abort the process rather than print.
+  # Under the SCM that is indistinguishable from a daemon that crashed.
+  #
+  # `beginWindowsServiceHost` answers `false` for an ordinary console run
+  # (the SCM's `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT`, 1063) and on
+  # POSIX, where the whole module is a set of stubs. Nothing below
+  # changes shape in that case: no redirection, no status reports, and
+  # the argument parser is untouched either way, so a flag means the same
+  # thing under the SCM as it does at a prompt.
+  let runningAsService = beginWindowsServiceHost(windowsServiceName)
+  if runningAsService:
+    discard redirectStdioToFile(windowsServiceLogFile)
+
   let args = commandLineParams()
   if args.len == 1 and args[0] in ["--version", "-V"]:
     echo "runquotad " & versionString()
@@ -214,4 +269,12 @@ when isMainModule:
       echo "unknown runquotad argument: " & args[i]
       quit 2
 
-  quit serve(config)
+  # `serve` reports SERVICE_RUNNING once it is bound and serving, and
+  # watches for the SCM's stop; this is the other end of that handshake.
+  # The exit code is handed back so `serviceMain` reports SERVICE_STOPPED
+  # with it -- a process that merely exits leaves the SCM to infer the
+  # stop from process death, which it logs as an error even for a clean
+  # one. A no-op in a console run and on POSIX.
+  let exitCode = serve(config)
+  endWindowsServiceHost(exitCode)
+  quit exitCode
