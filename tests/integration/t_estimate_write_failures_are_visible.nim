@@ -33,6 +33,7 @@ import runquota_client
 import runquota_core
 import runquota_protocol
 import daemon_binary
+import scratch_root
 
 const
   MiB = 1024'u64 * 1024'u64
@@ -133,7 +134,12 @@ suite "estimate_write_failures_are_visible":
 
   test "a store that cannot be written reports its dropped batches and rows":
     let root = scratchRoot("bad")
-    defer: removeDir(root)
+    # NOT `removeDir`. This case points `--estimate-db` at a directory so
+    # that every batch the writer sends FAILS at the tool, which means a
+    # `sqlite3` child is being spawned and dying for the whole of the test
+    # -- exactly the population that can still be touching the scratch tree
+    # when `daemon.stop()` returns. See `tests/support/scratch_root`.
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     # A DIRECTORY, which `sqlite3` cannot open as a database. Every batch
@@ -183,7 +189,7 @@ suite "estimate_write_failures_are_visible":
 
   test "a healthy store reports zero, so a non-zero count means something":
     let root = scratchRoot("good")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let estimateDb = root / "estimates.sqlite3"

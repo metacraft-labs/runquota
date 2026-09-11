@@ -220,6 +220,17 @@ suite "stats_table_cache_control":
       completeOneExecution(client, CacheKey, ObservedPeakBytes)
 
       # Wait for the publication, so the RESIDENT state is really resident.
+      #
+      # THIS PROBE IS INCOMPLETE, recorded rather than repaired. `stlHit`
+      # says a SLOT bound to this key was found; it does not say the entry
+      # in it is KNOWN. An entry published with `knowledge == unknown` is a
+      # hit, so `resident` can be true over an entry that asserts nothing,
+      # and every comparison below would then be against a vacuous state.
+      # That is not hypothetical: an aggregate computed over rows that had
+      # not committed published exactly that, until
+      # `flushObservationWriter` was given a contract that says every row
+      # queued before a flush is committed when it returns. The complete
+      # condition is `stlHit` AND `estimate.knowledge == statsTableKnown`.
       var table = openPublishedTable()
       var estimate: PublishedEstimate
       var resident = false

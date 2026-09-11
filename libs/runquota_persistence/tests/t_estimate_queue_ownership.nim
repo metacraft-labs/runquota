@@ -23,6 +23,20 @@
 ## producer count is chosen to push glibc's 40 MiB thread-stack cache over
 ## its ceiling so the dead regions are really `munmap`ped rather than merely
 ## recycled, which is what turns silent corruption into a SIGSEGV.
+##
+## NO `ref` CROSSES A THREAD BOUNDARY HERE, AND THAT IS DELIBERATE.
+## `EstimateStore` is a `ref object` and ORC's reference counts are NOT
+## atomic. Handing one handle to 64 threads works today for a reason that is
+## a property of the CALL and not of this file: a non-`sink`, non-`var`
+## parameter is a borrow, so `enqueueEstimateWrite(store, row)` performs no
+## refcount traffic at all. One `let mine = state.store` inside the producer
+## would put 64 threads on one non-atomic counter, in a file whose entire
+## subject is what happens when a heap cell and its owning thread disagree,
+## and nothing would say so. So each producer builds its own handle out of
+## the three value fields that describe one: the queue it appends to is
+## process-wide module state, and `enqueueEstimateWrite` reads `mode` and
+## nothing else, so these are the same store by every meaning this test
+## depends on.
 
 import std/[os, strutils, tempfiles, unittest]
 
@@ -37,7 +51,8 @@ const
 
 type Producer = object
   id: int
-  store: EstimateStore
+  dbPath: string
+  queueCapacity: int
 
 proc statsIdFor(producer, index: int): string =
   ## Unique content AND unique length: `enqueueEstimateWrite` scans the queue
@@ -48,8 +63,12 @@ proc statsIdFor(producer, index: int): string =
 
 proc fillQueue(state: ptr Producer) {.thread.} =
   {.cast(gcsafe).}:
+    # THIS THREAD'S OWN HANDLE, allocated and freed here; see the head of
+    # the module for why it is not the main thread's.
+    let store = EstimateStore(mode: pmSqlite, dbPath: state.dbPath,
+      queueCapacity: state.queueCapacity)
     for i in 0 ..< PerProducer:
-      discard enqueueEstimateWrite(state.store, LearnedEstimateRow(
+      discard enqueueEstimateWrite(store, LearnedEstimateRow(
         scope: "ownership-scope-" & $state.id,
         commandStatsId: statsIdFor(state.id, i),
         conservativeMemoryBytes: 1024'u64,
@@ -70,10 +89,11 @@ suite "estimate queue ownership":
       # A STORE PER ROUND, so each round ends with the shutdown drain the
       # daemon performs: `stopEstimateStore` joins the writer, and the
       # writer's last pass frees whatever the dead producers left queued.
-      let store = startEstimateStore(dir / ("estimates-" & $round & ".sqlite3"),
-        queueCapacity = Producers * PerProducer)
+      let dbPath = dir / ("estimates-" & $round & ".sqlite3")
+      let capacity = Producers * PerProducer
+      let store = startEstimateStore(dbPath, queueCapacity = capacity)
       for i in 0 ..< Producers:
-        producers[i] = Producer(id: i, store: store)
+        producers[i] = Producer(id: i, dbPath: dbPath, queueCapacity: capacity)
         createThread(producerThreads[i], fillQueue, addr producers[i])
       for i in 0 ..< Producers:
         joinThread(producerThreads[i])

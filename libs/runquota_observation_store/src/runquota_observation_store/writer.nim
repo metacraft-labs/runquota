@@ -41,6 +41,14 @@
 ## order ``batchStatement`` always used: runs, executions, extension rows.
 ## That order is load-bearing, because an extension row carries a foreign key
 ## to its execution.
+##
+## A FLUSH MEANS "EVERY ROW QUEUED BEFORE THIS CALL IS COMMITTED", and
+## for a while it meant "the queue was empty when I looked". The two differ
+## for exactly as long as a drain pass takes, because ``drainOnce`` swaps
+## the queues under ``writerLock`` and then spawns ``sqlite3`` OUTSIDE it:
+## in that window the queue is EMPTY and the rows are UNWRITTEN, and a
+## second drainer arriving found nothing and returned. ``writerQueued`` and
+## ``writerSettled`` close it -- see ``flushObservationWriter``.
 
 import std/[locks, os]
 
@@ -49,6 +57,9 @@ import runquota_core/process_owned
 
 var
   writerLock: Lock
+  writerSettledCond: Cond
+    ## Broadcast whenever a drain pass has recorded the outcome of the rows
+    ## it took. Waited on only by ``flushObservationWriter``; see there.
   writerLockReady = false
   writerThread: Thread[void]
   writerPath = ""
@@ -62,6 +73,23 @@ var
   writerWritten = 0'i64
   writerStop = false
   writerActive = false
+  writerEpoch = 0'i64
+    ## Incremented by every ``startObservationWriter``. A flush that is
+    ## waiting when the writer is stopped and started again is waiting for
+    ## a target belonging to a queue that no longer exists; the epoch is
+    ## what lets it notice instead of waiting forever. Nothing in the
+    ## daemon does that -- ``serve`` stops the writer only after every
+    ## thread that could flush has been joined -- but "the shutdown order
+    ## happens to save us" is not a property a waiting thread should
+    ## depend on.
+  writerSettled = 0'i64
+    ## ROWS THAT HAVE LEFT THE QUEUE AND HAD AN OUTCOME RECORDED, written
+    ## or failed. The partner of ``writerQueued``, which counts rows
+    ## ACCEPTED into the queue: every accepted row settles exactly once, so
+    ## ``writerSettled >= n`` means every one of the first ``n`` rows
+    ## has reached the database or definitively has not. A row REFUSED at
+    ## the door never enters either count, which is what keeps a flush's
+    ## wait finite when the queue is overflowing.
   writerFlushes = 0'i64
     ## HOW MANY TIMES SOMEBODY DRAINED THIS QUEUE ON THEIR OWN THREAD.
     ## Counted because the rule below — read path only, never the write
@@ -72,8 +100,20 @@ var
     ## can assert instead of time.
 
 proc ensureWriterLock() =
+  ## NOT ITSELF THREAD-SAFE, AND NOT REPAIRED HERE. ``writerLockReady`` is a
+  ## plain ``bool``: two threads reaching this before anybody had armed the
+  ## writer would both initialise, and the loser's lock would be the one
+  ## every later caller failed to take. It is sound in the daemon for a
+  ## lifecycle reason rather than a locking one -- ``startObservationWriter``
+  ## runs on the main thread before a connection worker exists, so the first
+  ## call here is always single-threaded -- and the honest repair is an
+  ## explicit initialisation at start-up rather than a lazy guard that stays
+  ## lazy. Recorded because the condition variable added beside the lock
+  ## widened what this guard is responsible for without changing what it
+  ## can promise.
   if not writerLockReady:
     initLock(writerLock)
+    initCond(writerSettledCond)
     writerLockReady = true
 
 proc drainOnce() {.gcsafe.} =
@@ -98,7 +138,21 @@ proc drainOnce() {.gcsafe.} =
         statements.add(statement)
     finally:
       release(writerLock)
-    if path.len == 0 or statements.len == 0:
+    if statements.len == 0:
+      return
+    if path.len == 0:
+      # TAKEN OUT OF THE QUEUE WITH NOWHERE TO PUT THEM. Unreachable while
+      # the writer is running -- an enqueue needs ``writerActive`` and the
+      # path is cleared only after the drain thread has been joined -- but
+      # these rows are gone either way, and a flush waiting on an outcome
+      # that has already happened must not wait for it forever.
+      acquire(writerLock)
+      try:
+        writerDropped += int64(statements.len)
+        writerSettled += int64(statements.len)
+        broadcast(writerSettledCond)
+      finally:
+        release(writerLock)
       return
     let outcome = appendStatementsAt(path, statements)
     acquire(writerLock)
@@ -108,6 +162,11 @@ proc drainOnce() {.gcsafe.} =
       else:
         writerFailures += 1
         writerDropped += int64(statements.len)
+      # EVERY ROW TAKEN ABOVE NOW HAS AN OUTCOME. Counted and announced
+      # under the same lock that holds the counters, so a waiter cannot see
+      # the wake without the count that justifies it.
+      writerSettled += int64(statements.len)
+      broadcast(writerSettledCond)
     finally:
       release(writerLock)
 
@@ -145,6 +204,11 @@ proc startObservationWriter*(path: string; capacity = 1024) =
     writerFailures = 0
     writerQueued = 0
     writerWritten = 0
+    writerSettled = 0
+    # A NEW QUEUE, AND ANY WAITER IS WAITING FOR THE OLD ONE. Bumped and
+    # announced under the lock that holds the counters it invalidates.
+    writerEpoch += 1
+    broadcast(writerSettledCond)
     if path.len == 0:
       return
     writerActive = true
@@ -257,19 +321,58 @@ proc flushObservationWriter*() =
   ## M13b, at a cost of tens of milliseconds per finished action, and the
   ## count below exists so a test can say so.
   ##
-  ## Safe to call concurrently with the drain thread: the queue swap is
-  ## under the same lock, so at worst one of the two callers finds nothing
-  ## to write.
+  ## THE CONTRACT IS "EVERY ROW QUEUED BEFORE THIS CALL IS COMMITTED", and
+  ## it used to be "the queue was empty when I looked". ``drainOnce`` swaps
+  ## the queues under ``writerLock`` and then spawns ``sqlite3`` OUTSIDE it,
+  ## so for the length of that spawn the queue is EMPTY and the rows are
+  ## UNWRITTEN. A second drainer arriving in that window found nothing and
+  ## returned, and the writer's own thread is always a second drainer.
+  ##
+  ## WHAT THAT COST. ``publishDirtyAggregates`` flushes and then computes an
+  ## aggregate, so it computed one over a row that had not committed -- and
+  ## the wrong figure was PERMANENT, not late: the key was consumed by the
+  ## drain that published it and nothing re-dirties it. ``statsAnswer`` has
+  ## the same exposure on the read path, where a client would be told its
+  ## own execution never happened.
+  ##
+  ## HOW IT IS ANSWERED. Every accepted enqueue increments ``writerQueued``;
+  ## every row a pass takes settles exactly once into ``writerSettled``.
+  ## A flush reads ``writerQueued``, drains whatever is still queued itself,
+  ## and then waits for ``writerSettled`` to catch up with what it read.
+  ## Rows queued AFTER the call are none of its business, which is what
+  ## bounds the wait.
+  ##
+  ## WHY NOT HOLD ``writerLock`` ACROSS THE SPAWN. That is the other way to
+  ## make the queue and the database agree, and it puts every connection
+  ## worker's ``enqueueRunRow`` behind a 25-40 ms batch -- the hot-path
+  ## perturbation OS-1 forbids, and the one M13b was spent removing.
+  ##
+  ## WHAT THE WAIT COSTS. At most one batch write, which is what this caller
+  ## would have paid had it been the thread that took those rows: the two
+  ## cases are "I spawn ``sqlite3``" and "I wait for the ``sqlite3`` somebody
+  ## else spawned a moment ago". There is no new worst case, and in the
+  ## ordinary case -- nothing in flight -- there is no wait at all.
   ensureWriterLock()
   var running = false
+  var target = 0'i64
+  var epoch = 0'i64
   acquire(writerLock)
   try:
     writerFlushes += 1
     running = writerActive
+    target = writerQueued
+    epoch = writerEpoch
   finally:
     release(writerLock)
-  if running:
-    drainOnce()
+  if not running:
+    return
+  drainOnce()
+  acquire(writerLock)
+  try:
+    while writerSettled < target and writerEpoch == epoch:
+      wait(writerSettledCond, writerLock)
+  finally:
+    release(writerLock)
 
 proc observationWriterFlushes*(): int64 =
   ## Synchronous drains taken so far, by anybody, on any thread.

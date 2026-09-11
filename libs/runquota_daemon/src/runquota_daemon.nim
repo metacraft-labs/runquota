@@ -2622,8 +2622,20 @@ proc publishDirtyAggregates() {.gcsafe.} =
     # THE FLUSH, ON THE RIGHT THREAD. `flushObservationWriter`'s contract
     # is "the path of somebody who has just asked a question and is waiting
     # for the answer anyway" — this thread is exactly that and no client is
-    # behind it. Once per batch, not once per key: one drain writes every
-    # queued row, so a second would find nothing.
+    # behind it. Once per batch and not once per key, because a flush now
+    # means every row queued before it is COMMITTED, so a second would have
+    # nothing left to wait for.
+    #
+    # THIS COMMENT USED TO READ "one drain writes every queued row, so a
+    # second would find nothing", and that was the defect. This thread was
+    # never the only drainer: `drainOnce` swaps the queues under
+    # `writerLock` and spawns `sqlite3` outside it, so the writer's own
+    # thread leaves a window in which the queue is empty and the rows are
+    # unwritten. A flush landing in it returned at once, the aggregate below
+    # was computed over a row that had not committed, and the wrong figure
+    # was PERMANENT: the key is consumed by the drain that published it and
+    # nothing re-dirties it. The wait that closes the window lives in
+    # `flushObservationWriter`; see the contract there.
     flushObservationWriter()
     var storePath = ""
     var profileId = none(string)
@@ -2957,6 +2969,74 @@ when defined(posix):
   proc shutdownWasRequested(): bool =
     shutdownRequested.load(moAcquire)
 
+  proc ensureShutdownPipe(): bool =
+    ## THE PIPE IS CREATED ONCE AND NEVER CLOSED, and that is the whole of
+    ## the fix for a write to a stale descriptor.
+    ##
+    ## `onShutdownSignal` runs on whichever thread the kernel picked, which
+    ## may be a different one from the thread running
+    ## `uninstallShutdownHandler`. It loads `shutdownPipe[1]`, finds it
+    ## non-negative, and writes one byte to it. The old uninstall disarmed
+    ## the signal and then CLOSED that descriptor, so a handler already past
+    ## its load wrote its byte into whatever the process opened next -- a
+    ## client socket, a `sqlite3` pipe, the observation database. Clearing
+    ## the variable before closing only narrows the window; nothing can be
+    ## closed at all while a handler may still hold the number it read.
+    ##
+    ## Keeping the pair for the life of the process closes the window
+    ## outright: the numbers are never free, so they can never be handed to
+    ## anything else, and a late handler's byte lands in a pipe that the
+    ## next arming drains. Two descriptors, for a daemon that arms SIGTERM
+    ## once, is not a trade worth a race.
+    ##
+    ## THE WRITE END IS NON-BLOCKING, so nothing in `onShutdownSignal` can
+    ## block. A pipe holds 64 KiB and the handler writes one byte, so it
+    ## takes an absurd number of signals to fill -- but the alternative is
+    ## a blocking `write` IN SIGNAL CONTEXT, which is the one thing the
+    ## handler was carved down to one store and one `write` to avoid. The
+    ## failure mode it replaces costs nothing: a write refused for want of
+    ## room means the pipe already HAS a byte in it, so the waker has
+    ## already been woken and the wake this call was making is redundant.
+    if shutdownPipe[0] >= 0 and shutdownPipe[1] >= 0:
+      return true
+    if pipe(shutdownPipe) != 0:
+      shutdownPipe = [cint(-1), cint(-1)]
+      return false
+    let flags = fcntl(shutdownPipe[1], F_GETFL)
+    if flags != -1:
+      discard fcntl(shutdownPipe[1], F_SETFL, flags or O_NONBLOCK)
+    true
+
+  proc drainShutdownPipe() =
+    ## A WAKE TOKEN OUTLIVES THE ARMING THAT PRODUCED IT, and with a pipe
+    ## that is never closed it would outlive it INTO THE NEXT ONE.
+    ##
+    ## `uninstallShutdownHandler` always writes a token, because it must
+    ## also wake a waker that is parked on a pipe nobody signalled. On the
+    ## path where a signal DID arrive, the waker has already left on the
+    ## handler's token and the uninstall's token stays in the pipe. A later
+    ## arming would then find its fresh waker woken at once: it would dial,
+    ## exit, and leave the accept loop with nothing to wake it -- the hang
+    ## this mechanism exists to prevent, reintroduced by its own tidying.
+    ##
+    ## Called from the ARMING and nowhere else, which is the only moment a
+    ## leftover matters: it is the instant before a fresh waker parks on
+    ## the pipe, and no waker is running then, so this is the pipe's only
+    ## reader while it runs. Draining at the disarm as well would tidy the
+    ## ordinary leftover a little sooner and cover nothing this does not --
+    ## a byte from a handler stranded past the disarm arrives after it.
+    if shutdownPipe[0] < 0:
+      return
+    let flags = fcntl(shutdownPipe[0], F_GETFL)
+    if flags == -1:
+      return
+    if fcntl(shutdownPipe[0], F_SETFL, flags or O_NONBLOCK) == -1:
+      return
+    var scratch: array[64, char]
+    while read(shutdownPipe[0], addr scratch[0], scratch.len) > 0:
+      discard
+    discard fcntl(shutdownPipe[0], F_SETFL, flags)
+
   proc dialOwnEndpoint(path: string) =
     ## One connection to our own socket, opened and dropped. It carries no
     ## frames and is never served: its only job is to make `accept` return
@@ -2966,10 +3046,33 @@ when defined(posix):
     ## not a request: if it cannot be made, the accept loop stays parked
     ## until the next connection arrives and then shuts down, which is the
     ## behaviour of the daemon before this existed and no worse than it.
+    ##
+    ## THE CONNECT IS NON-BLOCKING, AND THAT IS NOT AN OPTIMISATION. This
+    ## thread is joined by `uninstallShutdownHandler`, which runs inside
+    ## `serve`'s shutdown and is followed by `listener.close()`. A BLOCKING
+    ## `connect` to an AF_UNIX socket whose backlog is full does not fail --
+    ## it WAITS for room, and the room is made by the accept loop, which at
+    ## that moment is inside the shutdown waiting for this join. The join
+    ## never returns, the listener is never closed, and a SIGTERM leaves a
+    ## wedged process instead of a stopped one. It needs `SOMAXCONN`
+    ## unaccepted connections at the instant of the signal, which is rare;
+    ## a hang is worse to diagnose than a crash, and this is the path
+    ## `kill -TERM` now takes.
+    ##
+    ## With `O_NONBLOCK` a full backlog is an immediate `EAGAIN` instead,
+    ## and no wake is owed in that case: a backlog with no room has
+    ## connections waiting, so `accept` returns without any help from here.
+    ## A socket that cannot be put in non-blocking mode is not dialled at
+    ## all -- the degraded behaviour the paragraph above already accepts,
+    ## preferred over a call that might not come back.
     if path.len == 0 or path.len >= Sockaddr_un_path_length:
       return
     let handle = socket(cint(AF_UNIX), cint(SOCK_STREAM), 0.cint)
     if cint(handle) < 0:
+      return
+    let flags = fcntl(cint(handle), F_GETFL)
+    if flags == -1 or fcntl(cint(handle), F_SETFL, flags or O_NONBLOCK) == -1:
+      discard close(handle)
       return
     var address: Sockaddr_un
     address.sun_family = TSa_Family(AF_UNIX)
@@ -2994,12 +3097,13 @@ when defined(posix):
     ## has to have something to dial.
     shutdownRequested.store(false, moRelease)
     shutdownEndpointPath = endpointPath
-    if pipe(shutdownPipe) != 0:
+    if not ensureShutdownPipe():
       # NO PIPE, NO WAKER, AND THEREFORE NO HANDLER. A handler that set a
       # flag nobody could act on would turn an immediate stop into a hang,
       # which is strictly worse than the default disposition it replaced.
-      shutdownPipe = [cint(-1), cint(-1)]
       return
+    # NOTHING LEFT OVER FROM THE LAST ARMING; see `drainShutdownPipe`.
+    drainShutdownPipe()
     createThread(shutdownWakerThread, shutdownWakerMain)
     shutdownWakerRunning = true
     signal(SIGTERM, onShutdownSignal)
@@ -3009,6 +3113,14 @@ when defined(posix):
     ## accept loop ended for some other reason -- a dead listener, a test
     ## closing the endpoint -- and the waker is still parked on a pipe
     ## nobody would otherwise write to.
+    ##
+    ## THE DESCRIPTORS ARE NOT CLOSED HERE, and `ensureShutdownPipe` says
+    ## why: closing them is what let a handler running concurrently on
+    ## another thread write its byte into an unrelated descriptor. The
+    ## token written below may therefore be left unread -- on the path
+    ## where the waker had already gone on a signal's token, nobody is
+    ## there to take it -- and it is the next ARMING that empties the pipe,
+    ## which is the only moment an unread byte could do any harm.
     if shutdownPipe[1] >= 0:
       signal(SIGTERM, SIG_DFL)
       var token = '\0'
@@ -3016,10 +3128,6 @@ when defined(posix):
     if shutdownWakerRunning:
       joinThread(shutdownWakerThread)
       shutdownWakerRunning = false
-    for i in 0 .. 1:
-      if shutdownPipe[i] >= 0:
-        discard close(shutdownPipe[i])
-        shutdownPipe[i] = cint(-1)
 else:
   # Windows has no SIGTERM; `runquotad` is stopped there by other means and
   # the named-pipe listener is a different shape entirely. The declarations
