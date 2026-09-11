@@ -12,6 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
+    # A CEILING ON THE JOB, BESIDE THE RUNNER'S CEILING ON EACH TEST.
+    # `scripts/run_tests.sh` bounds every test binary, which is where a wedge
+    # actually happens; this bounds everything the runner does not own -- a
+    # `nix develop` that never resolves, a `nim c` that will not finish, and
+    # the Windows job below, which does not use that runner at all. Without
+    # it a wedged job runs to GitHub's six-hour default, and this
+    # organisation's Windows pool is two slots wide: one such job holds half
+    # of it for six hours. The numbers are several times the longest healthy
+    # run of each job and are not a performance budget.
+    timeout-minutes: 45
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -37,6 +47,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
+    timeout-minutes: 90
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -62,6 +73,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
+    timeout-minutes: 60
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -115,6 +127,7 @@ jobs:
     # ITS OWN REQUIRED JOB RATHER THAN A MATRIX LEG: an unavailable Windows
     # service then leaves this gate queued or pending, not green. There is no
     # skip-as-pass branch.
+    timeout-minutes: 90
     runs-on: eph-win-x64
     steps:
       - uses: actions/checkout@v4

@@ -369,7 +369,6 @@ proc describe*(policy: RetentionPolicy): string =
 
 var
   sweeperLock: Lock
-  sweeperLockReady = false
   sweeperThread: Thread[void]
   sweeperPath = ""
   sweeperHostId = ""
@@ -393,10 +392,27 @@ var
   sweeperStop = false
   sweeperActive = false
 
-proc ensureSweeperLock() =
-  if not sweeperLockReady:
-    initLock(sweeperLock)
-    sweeperLockReady = true
+# ARMED AT MODULE INITIALISATION, for the reason ``writer.nim`` sets out at
+# length over the same line. The lazy `ensure` proc that stood here was a
+# plain ``bool`` gating an ``initLock``, and the argument written over it --
+# that this module has three lifecycle entry points on the main thread and
+# publishes no counter a status query reads -- was FALSE OF THIS FILE AS IT
+# STANDS. The ``sweeperReader`` template below defines THIRTEEN exported
+# counter readers, and ``runquota_daemon``'s ``retentionJson`` calls every
+# one of them from ``observationsJson``, which ``inspect observations``
+# reaches with NO capture gate -- it merely prints ``capture_enabled`` as a
+# field -- on a connection worker, of which the daemon starts at least four.
+#
+# AND THE SWEEPER IS GATED MORE TIGHTLY THAN THE WRITER WAS.
+# ``startRetentionSweeper`` sits inside ``initDaemon``'s
+# ``ensureHostRow`` arm AND inside ``if retentionSweepIntervalMillis > 0``,
+# so on a capture-disabled daemon -- or merely one with retention turned off
+# -- nothing in start-up touches ``sweeperLock`` at all, and two concurrent
+# ``inspect observations`` requests are this module's first touch. Both would
+# have run ``initLock`` on a mutex the other may already hold.
+#
+# Module initialisation runs inside ``NimMain``, before any thread exists.
+initLock(sweeperLock)
 
 proc sweepOnce(store: var ObservationStore; path, hostId: string;
                policy: RetentionPolicy) {.gcsafe.} =
@@ -520,7 +536,6 @@ proc startRetentionSweeper*(path, hostId: string; policy: RetentionPolicy;
   ## store, an unidentified host and an operator who turned retention off
   ## are all represented, exactly as the ambient sampler represents the
   ## same three states.
-  ensureSweeperLock()
   acquire(sweeperLock)
   try:
     if sweeperActive:
@@ -560,7 +575,6 @@ proc startRetentionSweeper*(path, hostId: string; policy: RetentionPolicy;
 
 template sweeperReader(name: untyped; field: untyped; kind: typedesc): untyped =
   proc name*(): kind =
-    ensureSweeperLock()
     acquire(sweeperLock)
     try:
       field
@@ -590,7 +604,6 @@ proc stopRetentionSweeper*() =
   ## Signals the sweeper and joins it. A pass already in flight finishes;
   ## it is one transaction and interrupting it would buy nothing that
   ## crash-safety does not already provide.
-  ensureSweeperLock()
   var running = false
   acquire(sweeperLock)
   try:

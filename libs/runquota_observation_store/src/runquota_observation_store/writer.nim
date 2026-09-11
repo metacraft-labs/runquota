@@ -60,7 +60,6 @@ var
   writerSettledCond: Cond
     ## Broadcast whenever a drain pass has recorded the outcome of the rows
     ## it took. Waited on only by ``flushObservationWriter``; see there.
-  writerLockReady = false
   writerThread: Thread[void]
   writerPath = ""
   writerCapacity = 0
@@ -99,22 +98,45 @@ var
     ## completion path does not wait on the store" into something a test
     ## can assert instead of time.
 
-proc ensureWriterLock() =
-  ## NOT ITSELF THREAD-SAFE, AND NOT REPAIRED HERE. ``writerLockReady`` is a
-  ## plain ``bool``: two threads reaching this before anybody had armed the
-  ## writer would both initialise, and the loser's lock would be the one
-  ## every later caller failed to take. It is sound in the daemon for a
-  ## lifecycle reason rather than a locking one -- ``startObservationWriter``
-  ## runs on the main thread before a connection worker exists, so the first
-  ## call here is always single-threaded -- and the honest repair is an
-  ## explicit initialisation at start-up rather than a lazy guard that stays
-  ## lazy. Recorded because the condition variable added beside the lock
-  ## widened what this guard is responsible for without changing what it
-  ## can promise.
-  if not writerLockReady:
-    initLock(writerLock)
-    initCond(writerSettledCond)
-    writerLockReady = true
+# ARMED HERE, AT MODULE INITIALISATION, AND NEVER LAZILY.
+#
+# This was a lazy `ensure` proc called from the top of every proc below and
+# guarded by a plain ``bool``. The guard could not do the job it was given:
+# two threads reaching it before anybody had armed the writer would BOTH run
+# ``initLock``, and the loser's lock would be the one every later caller
+# failed to take. ``initLock`` on a mutex another thread may already hold is
+# undefined, and the ``initCond`` beside it raised the consequence from an
+# unsynchronised counter to a waiter parked on a condition variable nobody
+# will ever signal.
+#
+# THE LIFECYCLE ARGUMENT THAT STOOD HERE WAS NOT TRUE OF EVERY REACHABLE
+# CONFIGURATION. It said ``startObservationWriter`` runs on the main thread
+# before a connection worker exists, so the first call is always
+# single-threaded. ``initDaemon`` calls ``startObservationWriter`` only in
+# the arm it takes when the store has a host identity AND ``ensureHostRow``
+# succeeds; on every capture-disabled path -- no identity, an unwritable
+# host row, ``--no-write-stats``, a store that would not open -- it is never
+# called at all.
+#
+# THE ENQUEUES ARE NOT THE DOOR THAT LEAVES OPEN, and it is worth being
+# exact about which is: ``openObservationRun`` and its siblings all return
+# early on ``observationCaptureEnabled``. What is NOT gated is the READ
+# side. ``statsAnswer`` calls ``flushObservationWriter`` unconditionally so
+# that a query sees what the daemon has recorded, and the status JSON reads
+# ``observationWriterFlushes``, ``observationsWritten``,
+# ``observationsDropped`` and ``observationWriteFailures`` unconditionally.
+# Both run on a CONNECTION WORKER, of which the daemon starts several, so on
+# a capture-disabled daemon two concurrent ``stats`` or ``status`` requests
+# were this module's first touch -- and both would have armed it.
+#
+# Module initialisation runs inside ``NimMain``, before ``main`` and
+# therefore before this process has created any thread, so the invariant is
+# structural rather than a lifecycle argument to be re-checked whenever the
+# daemon's start-up order changes: EVERY ``acquire(writerLock)`` below runs
+# against a lock that was initialised single-threaded.
+# ``runquota_core/spawn_guard`` arms its process-wide lock the same way.
+initLock(writerLock)
+initCond(writerSettledCond)
 
 proc drainOnce() {.gcsafe.} =
   {.cast(gcsafe).}:
@@ -154,6 +176,15 @@ proc drainOnce() {.gcsafe.} =
       finally:
         release(writerLock)
       return
+    # THE SETTLE BELOW IS NOT IN A ``try``/``finally``, AND THAT IS A
+    # COUPLING RATHER THAN AN OVERSIGHT. These rows have already left the
+    # queue; if this call could raise, they would never settle and every
+    # flush waiting on them would park until the epoch changed. It cannot:
+    # ``appendStatementsAt`` reaches SQLite through ``runSqlite``, which
+    # documents "never raises" and honours it -- a tool that will not even
+    # start comes back as ``ok == false`` with the reason in ``error``. If
+    # that ever stops being true, ``writerSettled`` and its broadcast have
+    # to move into a ``finally`` before the raise is allowed.
     let outcome = appendStatementsAt(path, statements)
     acquire(writerLock)
     try:
@@ -189,7 +220,6 @@ proc startObservationWriter*(path: string; capacity = 1024) =
   ## Starts the drain thread for ``path``. Passing an empty path leaves the
   ## writer inactive, which is how a degraded or disabled store is
   ## represented: every enqueue then becomes a counted no-op.
-  ensureWriterLock()
   acquire(writerLock)
   try:
     if writerActive:
@@ -217,7 +247,6 @@ proc startObservationWriter*(path: string; capacity = 1024) =
   createThread(writerThread, writerMain)
 
 proc observationWriterActive*(): bool =
-  ensureWriterLock()
   acquire(writerLock)
   try:
     writerActive
@@ -227,7 +256,6 @@ proc observationWriterActive*(): bool =
 proc enqueueRunRow*(row: RunRow): bool {.discardable.} =
   ## Returns false when the row was dropped (writer inactive or queue
   ## full). Never blocks on IO.
-  ensureWriterLock()
   # COMPOSED OUTSIDE THE LOCK, on the thread that will free the intermediate
   # string. OS-1 forbids the recording path from perturbing the work being
   # observed, and a lock held across a formatting call is a lock every other
@@ -252,7 +280,6 @@ proc enqueueRunRow*(row: RunRow): bool {.discardable.} =
     release(writerLock)
 
 proc enqueueExecutionRow*(row: ExecutionRow): bool {.discardable.} =
-  ensureWriterLock()
   # Composed outside the lock; see `enqueueRunRow`.
   let statement = executionInsertStatement(row)
   acquire(writerLock)
@@ -285,7 +312,6 @@ proc enqueueExtensionInsert*(statement: string): bool {.discardable.} =
   ## The queue is shared with runs and executions and bounded by the same
   ## capacity, so an extension row can be dropped like any other
   ## observation, and is counted like one.
-  ensureWriterLock()
   acquire(writerLock)
   try:
     if not writerActive or statement.len == 0 or
@@ -347,12 +373,22 @@ proc flushObservationWriter*() =
   ## worker's ``enqueueRunRow`` behind a 25-40 ms batch -- the hot-path
   ## perturbation OS-1 forbids, and the one M13b was spent removing.
   ##
-  ## WHAT THE WAIT COSTS. At most one batch write, which is what this caller
-  ## would have paid had it been the thread that took those rows: the two
-  ## cases are "I spawn ``sqlite3``" and "I wait for the ``sqlite3`` somebody
-  ## else spawned a moment ago". There is no new worst case, and in the
-  ## ordinary case -- nothing in flight -- there is no wait at all.
-  ensureWriterLock()
+  ## WHAT THE WAIT COSTS. In the ordinary case one batch write, which is what
+  ## this caller would have paid had it been the thread that took those rows:
+  ## the two cases are "I spawn ``sqlite3``" and "I wait for the ``sqlite3``
+  ## somebody else spawned a moment ago", and with nothing in flight there is
+  ## no wait at all.
+  ##
+  ## ONE BATCH IS NOT A CEILING, and this comment used to say it was. Several
+  ## drainers can be in flight against ONE SQLite file -- the writer's own
+  ## thread, the aggregate publisher, and every thread that has just asked a
+  ## question -- and SQLite serialises writers, so under the ``.timeout 5000``
+  ## in ``sqlite_cli``'s preamble each of those batches waits for the one
+  ## ahead of it. A flush's target can therefore settle only after several
+  ## batches have run IN SEQUENCE. That is a latency nuance and not a defect:
+  ## the wait is still finite, because ``writerQueued`` is read ONCE and rows
+  ## queued after that reading are none of this call's business, and every
+  ## caller on this path is a reader who is already waiting for an answer.
   var running = false
   var target = 0'i64
   var epoch = 0'i64
@@ -380,7 +416,6 @@ proc observationWriterFlushes*(): int64 =
   ## THE POINT IS THAT IT MUST NOT SCALE WITH COMPLETED WORK. One drain per
   ## query and one per publication batch are expected; one per finished
   ## lease is the defect this counter was added to make visible.
-  ensureWriterLock()
   acquire(writerLock)
   try:
     writerFlushes
@@ -388,7 +423,6 @@ proc observationWriterFlushes*(): int64 =
     release(writerLock)
 
 proc observationsDropped*(): int64 =
-  ensureWriterLock()
   acquire(writerLock)
   try:
     writerDropped
@@ -396,7 +430,6 @@ proc observationsDropped*(): int64 =
     release(writerLock)
 
 proc observationsWritten*(): int64 =
-  ensureWriterLock()
   acquire(writerLock)
   try:
     writerWritten
@@ -404,7 +437,6 @@ proc observationsWritten*(): int64 =
     release(writerLock)
 
 proc observationWriteFailures*(): int64 =
-  ensureWriterLock()
   acquire(writerLock)
   try:
     writerFailures
@@ -413,7 +445,6 @@ proc observationWriteFailures*(): int64 =
 
 proc stopObservationWriter*() =
   ## Flushes what is queued and joins the drain thread.
-  ensureWriterLock()
   var running = false
   acquire(writerLock)
   try:

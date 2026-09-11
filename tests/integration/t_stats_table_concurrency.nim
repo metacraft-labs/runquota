@@ -266,6 +266,42 @@ suite "stats_table_concurrency":
     # THE ASSERTION THAT MAKES THE REST OF THIS TEST EVIDENCE. If the three
     # mappings coincided, "correct at different virtual bases" would have
     # been asserted against one base.
+    #
+    # KNOWN TO FAIL ON SOME HOSTS, AND NOT BECAUSE OF A RACE. The middle
+    # clause is an ASSUMPTION ABOUT ADDRESS LAYOUT: it requires the writer
+    # PROCESS and this one to have been handed different bases for an
+    # anonymous mapping of the same size. Nothing in the stats table arranges
+    # that -- it is the kernel's placement plus ASLR, and two runs of the
+    # same driver binary under the same libc on a host with weak or disabled
+    # mmap randomisation land on the same base. Measured on one WSL2 host in
+    # September 2026: FIVE isolated runs, five failures, every one of them
+    # identically on the middle clause below -- `Check failed:
+    # uint(writerBase) != localBase` -- with the other clauses of this case
+    # passing. 0/5 green, and deterministic rather than intermittent. A sixth
+    # run, this one inside a full suite on the SAME host under load average
+    # 11.5, failed identically and printed the reason in this case's own
+    # `bases:` line:
+    #
+    #     writer=00007FFFF7E28000  reader=00007FFFF7AFE000
+    #     local =00007FFFF7E28000
+    #
+    # The writer process and this one were handed the SAME base, byte for
+    # byte, while the `MAP_FIXED` reader -- the only one of the three whose
+    # address the test chooses -- was elsewhere. It is therefore NOT
+    # load-sensitive and NOT flaky; any note describing it as either is
+    # wrong, and "on a quiet host it passes" is not true of this host. It is
+    # in the known-failing set at `10147ac` and is not a regression.
+    #
+    # WHAT THE REPAIR WOULD BE, recorded rather than attempted here: this
+    # case has to MAKE the bases differ instead of hoping for it. The
+    # third-process arm already does exactly that with `MAP_FIXED`
+    # (`read-at`), and the writer arm could take the same treatment -- or the
+    # clause could be narrowed to the two mappings the test actually
+    # controls, `writerBase != readerBase` and `readerBase != localBase`,
+    # with the uncontrolled pair dropped. Left alone deliberately: changing
+    # what this case asserts is a separate change from the one this commit
+    # makes, and silently weakening a clause to get a green is how a suite
+    # stops meaning anything.
     check writerBase != readerBase
     check uint(writerBase) != localBase
     check uint(readerBase) != localBase

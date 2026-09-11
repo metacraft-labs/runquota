@@ -84,6 +84,35 @@ require_file tests/windows/portable_tests.txt
 require_file tests/unit/t_windows_compile_gate.nim
 require_file .github/actionlint.yaml
 
+# NOTHING IN THIS REPOSITORY BOUNDED A HANGING TEST, and the shape is easy
+# to lose again: the bound lives in two ordinary-looking lines of shell and
+# one key per CI job. Both are pinned here so that dropping either fails the
+# lint rather than surfacing as a six-hour job months later.
+require_file scripts/run_tests.sh
+require_contains scripts/run_tests.sh "RUNQUOTA_TEST_TIMEOUT"
+require_contains scripts/run_tests.sh "kill-after="
+
+# THE OTHER HALF OF THE SAME RULE: the runner refuses both of the two ways a
+# run can report something that is not about this tree -- unbounded (a wedge
+# nobody catches) and without `sqlite3` (three tests reddening on
+# `store.captureEnabled` for a reason that is in the environment). Both
+# refusals are overridable BY VALUE and never by inference, and both are
+# pinned so that removing one fails the lint.
+require_contains scripts/run_tests.sh "RUNQUOTA_ALLOW_MISSING_SQLITE"
+
+# EVERY JOB CARRIES ITS OWN CEILING. `runs-on:` appears exactly once per job,
+# which is what makes this a per-job count rather than a grep for the key
+# somewhere in the file: adding a job without `timeout-minutes` fails here.
+# `grep -c` exits non-zero on no match, and this script runs under `set -e`.
+ci_jobs="$(grep -cE '^    runs-on:' .github/workflows/ci.yml || true)"
+ci_ceilings="$(grep -cE '^    timeout-minutes: [0-9]+$' .github/workflows/ci.yml || true)"
+if [ "${ci_jobs}" -lt 4 ]; then
+  fail "ci.yml yielded ${ci_jobs} jobs; refusing to pass on an empty sweep"
+fi
+if [ "${ci_ceilings}" -lt "${ci_jobs}" ]; then
+  fail "ci.yml has ${ci_jobs} jobs but only ${ci_ceilings} timeout-minutes"
+fi
+
 for pattern in "repomix/" "bench-results/" "nimcache/" "result"; do
   require_contains .gitignore "${pattern}"
 done

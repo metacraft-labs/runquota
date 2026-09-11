@@ -53,6 +53,30 @@ var writerFailedBatches = 0'u64
 var writerFailedRows = 0'u64
 
 proc ensureWriterLock() =
+  ## THE SAME SHAPE AS THE GUARD ``runquota_observation_store/writer`` NO
+  ## LONGER HAS -- a plain ``bool`` gating an ``initLock`` -- AND LEFT AS IT
+  ## IS, because the reachability that condemned that one does not exist
+  ## here.
+  ##
+  ## Every caller is on the main thread before any other thread exists.
+  ## ``startEstimateStore`` is called UNCONDITIONALLY from ``initDaemon``,
+  ## with no capture-enabled arm to miss, so the only other two callers --
+  ## ``estimateWriteFailures`` and ``estimateWriteFailedRows``, reached from
+  ## the status JSON on a connection worker -- cannot be the first. Both
+  ## tests that drive this module (``t_estimate_queue_ownership``,
+  ## ``t_estimate_store_sqlite_streams``) call ``startEstimateStore`` before
+  ## they create a thread.
+  ##
+  ## ``enqueueEstimateWrite`` AND ``stopEstimateStore`` take ``writerLock``
+  ## without calling this, and neither needs to: BOTH return early unless
+  ## ``store.mode == pmSqlite``, and ``startEstimateStore`` -- which does call
+  ## this, on the main thread -- is the only thing in the module that produces
+  ## such a store. Holding a ``pmSqlite`` handle is therefore proof the lock
+  ## was already armed.
+  ##
+  ## If a second unconditional entry point is ever added to this module, the
+  ## repair is the one the observation writer took: arm the lock at module
+  ## initialisation, where no thread exists yet, and delete this guard.
   if not writerReady:
     initLock(writerLock)
     writerReady = true

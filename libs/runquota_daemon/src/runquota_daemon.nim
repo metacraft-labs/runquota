@@ -984,7 +984,6 @@ const
 # the module carries the full argument.
 var
   publicationLock: Lock
-  publicationLockReady = false
   publicationThread: Thread[void]
   publicationPending: OwnedStrings
   publicationStop = false
@@ -994,10 +993,16 @@ var
   publicationsCompleted = 0'u64
   publicationsDropped = 0'u64
 
-proc ensurePublicationLock() =
-  if not publicationLockReady:
-    initLock(publicationLock)
-    publicationLockReady = true
+# ARMED AT MODULE INITIALISATION, for the reason ``writer.nim`` sets out at
+# length over the same line. The lazy `ensure` proc that stood here was a
+# plain ``bool`` gating an ``initLock``, and while ``serve`` does call
+# ``startAggregatePublisher`` on the main thread before it accepts a
+# connection, that is a lifecycle argument and not an invariant: the FIRST
+# statement of `libs/runquota_daemon/tests/t_publication_queue_ownership.nim`
+# creates sixty-four threads that all call ``notePendingKey``, so this
+# module's first touch really is concurrent in code that ships in this repo.
+# Module initialisation runs inside ``NimMain``, before any thread exists.
+initLock(publicationLock)
 
 proc notePendingKey(statsKey: string) =
   ## The queue itself: coalescing, the bound, and the counters that describe
@@ -1009,7 +1014,6 @@ proc notePendingKey(statsKey: string) =
   ##
   ## `libs/runquota_daemon/tests/t_publication_queue_ownership.nim` drives
   ## exactly this proc and `takePendingKeys` below.
-  ensurePublicationLock()
   acquire(publicationLock)
   try:
     inc publicationsRequested
@@ -1038,7 +1042,6 @@ proc takePendingKeys(): seq[string] =
   ## Empties the queue, handing the keys back as ordinary Nim strings
   ## allocated on the CALLING thread. The one drain, used by the publisher
   ## thread's interval pass and by its final pass at shutdown.
-  ensurePublicationLock()
   acquire(publicationLock)
   try:
     publicationPending.takeAll()
@@ -2686,7 +2689,6 @@ proc publicationMain() {.thread, gcsafe.} =
       break
 
 proc startAggregatePublisher() =
-  ensurePublicationLock()
   acquire(publicationLock)
   try:
     if publicationActive:
@@ -2698,7 +2700,6 @@ proc startAggregatePublisher() =
   createThread(publicationThread, publicationMain)
 
 proc stopAggregatePublisher() =
-  ensurePublicationLock()
   var running = false
   acquire(publicationLock)
   try:

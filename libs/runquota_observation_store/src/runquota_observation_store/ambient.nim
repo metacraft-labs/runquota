@@ -481,7 +481,6 @@ const
 
 var
   samplerLock: Lock
-  samplerLockReady = false
   samplerThread: Thread[void]
   samplerPath = ""
   samplerHostId = ""
@@ -511,10 +510,16 @@ var
   samplerStop = false
   samplerActive = false
 
-proc ensureSamplerLock() =
-  if not samplerLockReady:
-    initLock(samplerLock)
-    samplerLockReady = true
+# ARMED AT MODULE INITIALISATION, for the reason set out at length over the
+# same line in ``writer.nim``. The lazy `ensure` proc that stood here was a
+# plain ``bool`` gating an ``initLock``, and this module is reached the same
+# way the writer is: ``initDaemon`` calls ``startAmbientSampler`` only when
+# the store has a host identity, the host row was written AND the configured
+# sample interval is positive, so in every other configuration the first
+# touch is a connection worker's ``setAmbientLiveLeaseCount`` or
+# ``reportSelfExecution`` -- and several workers can arrive together. Module
+# initialisation runs inside ``NimMain``, before any thread exists.
+initLock(samplerLock)
 
 # ---------------------------------------------------------------------------
 # The live self-report set, and why it is not a `seq`
@@ -688,7 +693,6 @@ proc setAmbientLiveLeaseCount*(count: int) =
   ## Raising it above zero also arms the coverage flag the sampler reads,
   ## which is what makes the tick straddling a lease's START a written
   ## sample rather than a lost one.
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     samplerLiveLeases = max(0, count)
@@ -698,7 +702,6 @@ proc setAmbientLiveLeaseCount*(count: int) =
     release(samplerLock)
 
 proc ambientLiveLeaseCount*(): int =
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     samplerLiveLeases
@@ -718,7 +721,6 @@ proc reportSelfExecution*(executionId: string; cpuPct: float64;
   ##
   ## Repeating an ``executionId`` replaces its figures rather than adding
   ## to them; a client reporting twice must not double its own weight.
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     for i in 0 ..< reportSlotsLen:
@@ -753,7 +755,6 @@ proc endSelfReportedExecution*(executionId: string) =
   ## Drops a finished execution from the live set. ``self_*`` is the sum
   ## over CONCURRENTLY LIVE executions; leaving a finished one in would
   ## grow ``self`` without bound and drive ``foreign`` to the clamp.
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     for i in 0 ..< reportSlotsLen:
@@ -780,7 +781,6 @@ proc endSelfReportsForOwner*(ownerKey: string): int {.discardable.} =
   ## end first.
   if ownerKey.len == 0:
     return 0
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     # Compacted in place, which keeps the survivors in order and hands the
@@ -800,7 +800,6 @@ proc endSelfReportsForOwner*(ownerKey: string): int {.discardable.} =
     release(samplerLock)
 
 proc liveSelfReports*(): seq[SelfReport] =
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     snapshotSelfReports()
@@ -808,7 +807,6 @@ proc liveSelfReports*(): seq[SelfReport] =
     release(samplerLock)
 
 proc clearSelfReportedExecutions*() =
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     clearSelfReportSlots()
@@ -1005,7 +1003,6 @@ proc startAmbientSampler*(path, hostId: string;
   ## Starts the fixed-cadence sampler for ``path``. An empty path or host
   ## id leaves it inactive, which is how a degraded or disabled store is
   ## represented.
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     if samplerActive:
@@ -1043,7 +1040,6 @@ proc startAmbientSampler*(path, hostId: string;
   createThread(samplerThread, samplerMain)
 
 proc ambientSamplerActive*(): bool =
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     samplerActive
@@ -1053,7 +1049,6 @@ proc ambientSamplerActive*(): bool =
 proc ambientSamplerTicks*(): int64 =
   ## How many times the FIXED cadence fired, whether or not the kernel had
   ## anything new to say. ``ticks - taken`` is the honesty gap.
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     samplerTicks
@@ -1061,7 +1056,6 @@ proc ambientSamplerTicks*(): int64 =
     release(samplerLock)
 
 proc ambientSamplesTaken*(): int64 =
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     samplerTaken
@@ -1072,7 +1066,6 @@ proc ambientReadingsStale*(): int64 =
   ## Ticks that saw a byte-identical kernel snapshot and therefore wrote no
   ## row. On macOS this is normally a tenth of the ticks at a 200 ms
   ## cadence; it is not an error, and each one is a sample NOT invented.
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     samplerStale
@@ -1080,7 +1073,6 @@ proc ambientReadingsStale*(): int64 =
     release(samplerLock)
 
 proc ambientReadingsDiscontinuous*(): int64 =
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     samplerDiscontinuous
@@ -1093,7 +1085,6 @@ proc ambientTicksWithoutLease*(): int64 =
   ## idle host this is every tick, which is the point: ambient growth is
   ## bounded by build activity, the same bound every other table in the
   ## store already obeys.
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     samplerNoLease
@@ -1105,7 +1096,6 @@ proc ambientSamplesCollided*(): int64 =
   ## written sample. Nonzero here means the cadence outran the primary
   ## key's resolution; it never means a timestamp was invented, because
   ## this counter exists precisely so that none is.
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     samplerCollided
@@ -1113,7 +1103,6 @@ proc ambientSamplesCollided*(): int64 =
     release(samplerLock)
 
 proc ambientSamplesWritten*(): int64 =
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     samplerWritten
@@ -1121,7 +1110,6 @@ proc ambientSamplesWritten*(): int64 =
     release(samplerLock)
 
 proc ambientSamplesDropped*(): int64 =
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     samplerDropped
@@ -1129,7 +1117,6 @@ proc ambientSamplesDropped*(): int64 =
     release(samplerLock)
 
 proc ambientSampleFailures*(): int64 =
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     samplerFailures
@@ -1137,7 +1124,6 @@ proc ambientSampleFailures*(): int64 =
     release(samplerLock)
 
 proc ambientReadingsUnavailable*(): int64 =
-  ensureSamplerLock()
   acquire(samplerLock)
   try:
     samplerUnavailable
@@ -1146,7 +1132,6 @@ proc ambientReadingsUnavailable*(): int64 =
 
 proc stopAmbientSampler*() =
   ## Flushes what is queued and joins the sampler thread.
-  ensureSamplerLock()
   var running = false
   acquire(samplerLock)
   try:
