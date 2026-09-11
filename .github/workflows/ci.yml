@@ -5,13 +5,33 @@ on:
     branches: [main, dev, stable]
   pull_request:
 
+# WHY THE LINUX x64 LEG NAMES `eph-linux-x64-g2` AND NOT `eph-linux-x64`.
+#
+# `eph-linux-x64` is the scale set on high-mem-server, and that host is the one
+# the fleet's capacity shortage is concentrated on (infra
+# docs/CI-Runner-Fleet-Status.md §1.1: its ceiling is host CPU, not slots).
+# `eph-linux-x64-g2` is gpu-server-002's scale set — same `vmh-linux-runner`
+# golden, same shared host /nix/store, a Samsung 980 PRO NVMe root instead of a
+# RAID5 of consumer QLC SSDs, and four slots that were measurably going unused.
+#
+# Measured 2026-09-11 by sweeping the queued jobs of every repo in the
+# workspace: `eph-linux-x64` was carrying ~290 jobs queued at a mean age of
+# 7-15 h (max 45 h), of which 14 were this repo's; `eph-linux-x64-g2` had ZERO
+# queued and `eph-linux-x64-g1` was draining at a 37-minute mean. This is
+# item 2 of that document's "what would actually add capacity" list.
+#
+# ONLY THE THREE NIX-ONLY JOBS BELOW MOVED. `ci-reprobuild.yml` deliberately
+# stays on `eph-linux-x64`: the GPU hosts do not set `incusReprobuildStore`, so
+# they do not mount /srv/repro-store (see infra
+# machines/server/gpu-server-001/garm-runners.nix), and a reprobuild job must
+# not be moved off the host that has it.
 jobs:
   lint:
     name: Lint
     strategy:
       fail-fast: false
       matrix:
-        runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
+        runner: [eph-linux-x64-g2, eph-linux-arm64, eph-macos-arm64]
     # A CEILING ON THE JOB, BESIDE THE RUNNER'S CEILING ON EACH TEST.
     # `scripts/run_tests.sh` bounds every test binary, which is where a wedge
     # actually happens; this bounds everything the runner does not own -- a
@@ -46,7 +66,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
+        runner: [eph-linux-x64-g2, eph-linux-arm64, eph-macos-arm64]
     timeout-minutes: 90
     runs-on: ${{ matrix.runner }}
     steps:
@@ -72,7 +92,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
+        runner: [eph-linux-x64-g2, eph-linux-arm64, eph-macos-arm64]
     timeout-minutes: 60
     runs-on: ${{ matrix.runner }}
     steps:
@@ -101,7 +121,7 @@ jobs:
     # `std/posix` + `shm_lease/*` imports in `runquota_stats_table`'s publisher
     # (fee60f4) -- and BOTH were found by a DOWNSTREAM consumer's Windows leg
     # rather than here, because `lint`, `test` and `nix-build` all run on
-    # [eph-linux-x64, eph-linux-arm64, eph-macos-arm64] and nothing in this
+    # [eph-linux-x64-g2, eph-linux-arm64, eph-macos-arm64] and nothing in this
     # file had ever compiled the tree for Windows.
     #
     # SCOPE, DELIBERATELY NARROWER THAN "run the suite". runquota's tests are
