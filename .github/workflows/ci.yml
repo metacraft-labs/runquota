@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [eph-linux-x64-g2, eph-linux-arm64, eph-macos-arm64]
+        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
     # A CEILING ON THE JOB, BESIDE THE RUNNER'S CEILING ON EACH TEST.
     # `scripts/run_tests.sh` bounds every test binary, which is where a wedge
     # actually happens; this bounds everything the runner does not own -- a
@@ -66,7 +66,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [eph-linux-x64-g2, eph-linux-arm64, eph-macos-arm64]
+        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
     timeout-minutes: 90
     runs-on: ${{ matrix.runner }}
     steps:
@@ -92,7 +92,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [eph-linux-x64-g2, eph-linux-arm64, eph-macos-arm64]
+        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
     timeout-minutes: 60
     runs-on: ${{ matrix.runner }}
     steps:
@@ -148,7 +148,7 @@ jobs:
     # service then leaves this gate queued or pending, not green. There is no
     # skip-as-pass branch.
     timeout-minutes: 90
-    runs-on: eph-win-x64
+    runs-on: [self-hosted, windows, x64]
     steps:
       - uses: actions/checkout@v4
 
