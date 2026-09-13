@@ -50,7 +50,7 @@ permissions:
 jobs:
   windows:
     name: MSI + Scoop
-    runs-on: eph-win-x64
+    runs-on: [self-hosted, windows, x64]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
