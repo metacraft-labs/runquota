@@ -40,7 +40,7 @@ permissions:
 
 jobs:
   linux:
-    name: deb + rpm + pacman + tarball (${{ matrix.runner }})
+    name: deb + rpm + pacman + tarball (${{ join(matrix.runner, '-') }})
     strategy:
       fail-fast: false
       matrix:
@@ -104,7 +104,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: publish-linux-logs-${{ matrix.runner }}
+          name: publish-linux-logs-${{ join(matrix.runner, '-') }}
           path: test-logs/
           retention-days: 30
 
@@ -112,7 +112,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: runquota-linux-${{ matrix.runner }}-${{ steps.version.outputs.version }}
+          name: runquota-linux-${{ join(matrix.runner, '-') }}-${{ steps.version.outputs.version }}
           path: |
             packaging/build/dist/*.deb
             packaging/build/dist/*.rpm
