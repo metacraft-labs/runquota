@@ -371,6 +371,60 @@ module that opens the store or reaches SQLite, with positive controls in both
 directions so that neither a scanner matching nothing nor one matching
 everything can pass.
 
+### Asking from the command line
+
+`runquota stats` is the client surface over that interface. It is
+`queryStats` calls and nothing else — no verb opens the database file,
+which is why the inspection gate above covers `libs/runquota_cli_support`
+like every other client-facing module.
+
+| Verb | Answers |
+|---|---|
+| `stats capture [--json]` | is capture on, which store, what the daemon's counters say |
+| `stats top [KEY]` | the costliest stats keys: total, count, max — ranked *within* a profile |
+| `stats export [KEY]` | one JSON object per execution, with every recorded column |
+
+Flags: `--limit N`, `--all-users` (widen to host scope), `--all-profiles`,
+`--json`.
+
+**`export` is the general answer and `top` is a shortcut.** An exported
+row carries every column of `executions` plus the `runs` and
+`host_profiles` context that makes it readable on its own, so percentiles,
+before-and-after comparisons, grade filtering and every question nobody
+has anticipated are `jq` expressions over it. RunQuota deliberately ships
+no query language, no filter grammar and no verb per question: those are
+vocabularies a caller has to be taught, and `jq` is one they already know.
+
+`export` writes **NDJSON to stdout and its status to stderr**, so
+`runquota stats export | jq ...` is safe to write — *nothing* but JSON
+objects ever reaches stdout, including on the refusal and error paths.
+`--json` instead emits one document carrying the same rows plus the
+metadata.
+
+**An empty answer is never printed as an empty answer.** Every verb
+reports a `status` — `ok`, `no-data`, `unknown-key`, `no-rows-in-scope`,
+`capture-off`, `daemon-unreachable`, `denied` — and the exit code
+separates the kinds: **0** rows returned, **3** the question has no
+answer, **4** there is no working instrument. Scripting on the exit status
+alone is therefore safe; treating 3 and 4 alike is how a broken store gets
+read as a fast build. `no-rows-in-scope` costs one extra bounded round
+trip, taken only when the first answer was empty.
+
+Two limits worth knowing:
+
+- **A full export row is ~1.4 KB**, and a response must fit the 1 MiB
+  RQSP frame. `--limit` defaults to 250 (~356 KB) and is refused above
+  600 (~855 KB, the measured ceiling) rather than clamped — a caller who
+  asked for more and silently got less would draw conclusions from a
+  window they did not choose. There is no time cursor on the wire, so
+  `export` reaches the newest N rows; a deeper history needs a larger
+  `--limit`, not a second call.
+- **`cpu_user_millis`, `cpu_sys_millis`, `io_read_bytes` and
+  `io_write_bytes` are never populated.** Both of the daemon's insert
+  paths write NULL, because nothing in the lease-finish path measures
+  them. They are exported as `null` rather than omitted, so their absence
+  is a visible fact rather than a mystery.
+
 ## Retention, backup and merge
 
 ### Retention

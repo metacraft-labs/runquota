@@ -135,6 +135,27 @@ type
     columns*: seq[string]
     values*: seq[string]
 
+  ExportCellKind* = enum
+    ## Enough type to render a cell as JSON and no more. The store knows
+    ## which columns are integers because it wrote the schema; a consumer
+    ## that had to guess would emit `"duration_millis": "412"` and every
+    ## `jq` comparison against it would be a string comparison.
+    exportText
+    exportInt
+
+  ExportCell* = object
+    kind*: ExportCellKind
+    isNull*: bool
+      ## SQL NULL, kept distinct from the empty string and from zero. Four
+      ## columns of `executions` are NULL on every row ever written, so a
+      ## renderer that collapsed NULL to 0 would invent measurements.
+    text*: string
+
+  ExportColumn* = object
+    name*: string
+    kind*: ExportCellKind
+    expression*: string
+
   RowQuery* = object
     ## A human-surface query. ``ownerUid`` is supplied by the daemon from
     ## peer credentials and is REQUIRED when ``scope`` is
@@ -408,6 +429,150 @@ proc queryExtensionRows*(store: ObservationStore; query: RowQuery;
       ownerUid: spine.ownerUid,
       columns: names,
       values: values))
+
+proc textColumn(name, expression: string): ExportColumn =
+  ExportColumn(name: name, kind: exportText, expression: expression)
+
+proc intColumn(name, expression: string): ExportColumn =
+  ExportColumn(name: name, kind: exportInt, expression: expression)
+
+proc exportColumns*(): seq[ExportColumn] =
+  ## EVERY COLUMN THE SPINE HOLDS, plus the `runs` and `host_profiles`
+  ## context that makes one row readable on its own.
+  ##
+  ## WHY A ROW CARRIES ITS OWN CONTEXT. `command_stats_id` is opaque to
+  ## RunQuota by design, so a row that carried only that would need a join
+  ## the caller cannot perform — `runquotad` is the only sanctioned reader,
+  ## so there is no second query to make. The tool, the workspace, the git
+  ## commit and the hardware therefore travel WITH each execution rather
+  ## than being left in a table the caller cannot reach.
+  ##
+  ## WHY THE UNWRITTEN COLUMNS ARE HERE ANYWAY. `cpu_user_millis`,
+  ## `cpu_sys_millis`, `io_read_bytes` and `io_write_bytes` are NULL on
+  ## every row ever written, because nothing in the lease-finish path
+  ## measures them. Omitting them would make their absence a mystery a
+  ## reader has to go and discover; emitting them as `null` makes it a
+  ## fact they can see. They cost four nulls a row.
+  ##
+  ## THE LIST IS EXPLICIT AND NEVER `select *`. Column ORDER and column
+  ## NAMES are what a caller's `jq` is written against, and `select *`
+  ## would let a migration silently rename or reorder somebody's field.
+  ##
+  ## `carried_extension_rows` IS NOT REACHABLE FROM HERE, and that is now
+  ## explicit rather than incidental. Its `queryable` column is pinned to
+  ## zero by a CHECK constraint precisely so those rows are never
+  ## answered; until this export existed, nothing selected the table and
+  ## the rule held by accident. Nothing below joins it.
+  result = @[
+    # --- the execution itself --------------------------------------------
+    textColumn("execution_id", "e.execution_id"),
+    textColumn("host_id", "e.host_id"),
+    textColumn("host_profile_id", "e.host_profile_id"),
+    textColumn("run_id", "e.run_id"),
+    textColumn("command_stats_id", "e.command_stats_id"),
+    intColumn("lease_id", "e.lease_id"),
+    intColumn("started_at_unix_millis", "e.started_at_unix_millis"),
+    intColumn("finished_at_unix_millis", "e.finished_at_unix_millis"),
+    intColumn("duration_millis", "e.duration_millis"),
+    intColumn("exit_status", "e.exit_status"),
+    textColumn("termination", "e.termination"),
+    intColumn("attempt", "e.attempt"),
+    textColumn("retry_of", "e.retry_of"),
+    intColumn("peak_rss_bytes", "e.peak_rss_bytes"),
+    intColumn("cpu_user_millis", "e.cpu_user_millis"),
+    intColumn("cpu_sys_millis", "e.cpu_sys_millis"),
+    intColumn("max_processes", "e.max_processes"),
+    intColumn("major_page_faults", "e.major_page_faults"),
+    intColumn("io_read_bytes", "e.io_read_bytes"),
+    intColumn("io_write_bytes", "e.io_write_bytes"),
+    textColumn("capture_completeness", "e.capture_completeness"),
+    intColumn("dropped_observations", "e.dropped_observations"),
+    intColumn("owner_uid", "e.owner_uid"),
+    # --- what invocation it belonged to ----------------------------------
+    textColumn("run_tool", "r.tool"),
+    textColumn("run_tool_version", "r.tool_version"),
+    textColumn("run_invocation_kind", "r.invocation_kind"),
+    intColumn("run_started_at_unix_millis", "r.started_at_unix_millis"),
+    intColumn("run_finished_at_unix_millis", "r.finished_at_unix_millis"),
+    intColumn("run_exit_status", "r.exit_status"),
+    textColumn("run_workspace_id", "r.workspace_id"),
+    textColumn("run_profile", "r.profile"),
+    textColumn("run_git_commit", "r.git_commit"),
+    textColumn("run_git_branch", "r.git_branch"),
+    textColumn("run_capture_completeness", "r.capture_completeness"),
+    intColumn("run_dropped_observations", "r.dropped_observations"),
+    # --- what hardware it ran on -----------------------------------------
+    textColumn("profile_hash", "p.profile_hash"),
+    textColumn("cpu_model", "p.cpu_model"),
+    intColumn("physical_cores", "p.physical_cores"),
+    intColumn("logical_cores", "p.logical_cores"),
+    intColumn("ram_bytes", "p.ram_bytes"),
+    intColumn("swap_bytes", "p.swap_bytes"),
+    textColumn("disk_class", "p.disk_class"),
+    textColumn("fs_type", "p.fs_type"),
+    textColumn("arch", "p.arch"),
+    textColumn("os", "p.os"),
+    textColumn("os_version", "p.os_version"),
+    textColumn("kernel_version", "p.kernel_version"),
+    textColumn("virtualization", "p.virtualization"),
+    textColumn("cpu_share_group", "p.cpu_share_group")]
+
+proc queryExport*(store: ObservationStore;
+                  query: RowQuery): seq[seq[ExportCell]] =
+  ## Every recorded fact about the executions ``query`` selects, as cells.
+  ##
+  ## THE SCOPE RULES ARE THE SAME ONES, REUSED RATHER THAN RESTATED. A
+  ## second copy of the uid predicate is a second thing that can drift out
+  ## of step with the first, and this one is the whole per-user boundary:
+  ## `ownerPredicate` refuses rather than widens when the caller's uid is
+  ## unknown, and this query is built from it exactly as the typed reads
+  ## above are.
+  ##
+  ## LEFT JOINS, because a row whose profile or run could not be resolved
+  ## is still a real execution. An inner join would silently drop exactly
+  ## the rows whose context is missing — which are the rows a reader most
+  ## needs to be told about.
+  if store.isNil or not store.captureEnabled:
+    return @[]
+  let columns = exportColumns()
+  var selected: seq[string] = @[]
+  for column in columns:
+    selected.add(
+      case column.kind
+      of exportText: selectText(column.expression)
+      of exportInt: selectInt(column.expression))
+  let sql = "select " & selected.join(" || '|' || ") &
+    " from executions e" &
+    " left join runs r on r.host_id = e.host_id and r.run_id = e.run_id" &
+    " left join host_profiles p on p.host_id = e.host_id" &
+    " and p.profile_id = e.host_profile_id" &
+    " where 1 = 1" &
+    (if query.statsKey.len == 0: ""
+     else: " and e.command_stats_id = " & encodeText(query.statsKey)) &
+    (case query.scope
+     of statsScopeHost: ""
+     of statsScopeOwner:
+       if query.ownerUid.isNone: " and 0 = 1"
+       else: " and e.owner_uid = " & encodeInt(query.ownerUid.get)) &
+    (case query.span
+     of spanAllProfiles: ""
+     of spanSingleProfile:
+       if query.profileId.isNone: " and e.host_profile_id is null"
+       else: " and e.host_profile_id = " & encodeText(query.profileId.get)) &
+    " order by e.started_at_unix_millis desc, e.execution_id" &
+    limitClause(query.limit) & ";"
+  for row in store.runQuery(sql):
+    if row.len != columns.len:
+      continue
+    var cells: seq[ExportCell] = @[]
+    for index, column in columns:
+      let field = row[index]
+      if field.isNullField:
+        cells.add(ExportCell(kind: column.kind, isNull: true, text: ""))
+      else:
+        cells.add(ExportCell(kind: column.kind, isNull: false,
+          text: if column.kind == exportText: decodeText(field) else: field))
+    result.add(cells)
 
 proc queryRanking*(store: ObservationStore;
                    query: RowQuery): seq[KeyRanking] =

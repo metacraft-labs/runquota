@@ -10,6 +10,7 @@ import runquota_process
 from runquota_ipc import defaultEndpoint, defaultStatsTablePath
 import runquota_protocol
 import runquota_stats_table
+import runquota_cli_support/stats
 
 proc wantsVersion*(args: openArray[string]): bool =
   args.len == 1 and args[0] in ["--version", "-V"]
@@ -29,6 +30,14 @@ proc renderUsage*(programName: string): string =
     "  " & programName & " explain SESSION_ID\n" &
     "  " & programName & " daemon start|status\n" &
     "  " & programName & " stats-table [KEY]\n" &
+    "  " & programName & " stats capture [--json]\n" &
+    "  " & programName & " stats top [KEY] [--limit N] [--all-users] [--all-profiles] [--json]\n" &
+    "  " & programName & " stats export [KEY] [--limit N] [--all-users] [--all-profiles] [--json]\n" &
+    "    export writes one JSON object per execution to stdout (NDJSON) and its\n" &
+    "    status to stderr, so 'stats export | jq ...' works; every recorded\n" &
+    "    column is on the row, so jq does the ranking, percentiles and diffing.\n" &
+    "    stats exit codes: 0 rows returned, 3 no answer (no-data/unknown-key/\n" &
+    "    no-rows-in-scope), 4 no instrument (capture-off/daemon-unreachable/denied)\n" &
     "  " & programName & " acquire --cpu N --mem BYTES [--label TEXT] [--machine ID] [--stats-key KEY] [--benchmark] [-- COMMAND [ARG...]]"
 
 proc parseMemory(value: string): uint64 =
@@ -351,6 +360,230 @@ proc runDebugAcquire(args: seq[string]): int =
   echo "lease " & $lease.id & " released"
   0
 
+# ---------------------------------------------------------------------------
+# `runquota stats` — the observation store's read path, over the socket
+# ---------------------------------------------------------------------------
+
+const
+  DefaultTopLimit = 20'u32
+  DefaultExportLimit = 250'u32
+    ## BOUNDED BY THE FRAME, AND THE NUMBERS ARE MEASURED RATHER THAN
+    ## GUESSED. A full export row is **1424 bytes** on this schema — 49
+    ## columns, most of them the `runs` and `host_profiles` context that
+    ## makes a row readable on its own. A response must fit inside
+    ## `DefaultMaxFrameBytes` (1 MiB), and measurement against a 2001-row
+    ## store puts the wall between 600 rows (855 KB, works) and 700 rows
+    ## (fails). So:
+    ##
+    ##   --limit 250  ->  356 KB   the default: pleasant, streams instantly
+    ##   --limit 600  ->  855 KB   the measured ceiling, ~18% headroom
+    ##   --limit 700  ->  the daemon closes the connection
+    ##
+    ## The ceiling is a ROW COUNT standing in for a BYTE COUNT, so a store
+    ## with unusually wide rows (long branch names, long workspace ids)
+    ## could still cross it under 600. That is why the transport failure
+    ## below is handled as a first-class outcome rather than left to a
+    ## catch-all: the static cap makes it rare, and the handler makes it
+    ## legible when the cap is wrong.
+  MaxExportLimit = 600'u32
+  StatsProbeLimit = 200'u32
+    ## THE PROBE IS A YES/NO QUESTION WITH A BOUND ON IT. It runs only when
+    ## the real query came back empty, and only to decide whether that
+    ## emptiness is the filters talking; an unbounded re-read at host scope
+    ## across every profile would be the single most expensive query this
+    ## CLI can issue, on the one path where nothing was found. The count it
+    ## reports is therefore "at least this many", and the output says so.
+
+proc statsScopeOf(options: StatsOptions): StatsScopeWire =
+  if options.allUsers: statsScopeWireHost else: statsScopeWireOwner
+
+proc statsSpanOf(options: StatsOptions): ProfileSpanWire =
+  if options.allProfiles: profileSpanWireAll else: profileSpanWireSingle
+
+proc probeRowCount(client: var RunQuotaClient; subject: StatsSubject;
+                   statsKey: string): int =
+  ## The same question at the WIDEST scope and span. A failure here is not
+  ## an answer and must not become one: the probe only ever upgrades
+  ## `unknown-key` to `no-rows-in-scope`, so losing it leaves the stricter
+  ## of the two verdicts standing.
+  try:
+    let widened = client.queryStats(subject, statsKey,
+      scope = statsScopeWireHost, span = profileSpanWireAll,
+      limit = StatsProbeLimit)
+    case subject
+    of statsSubjectRanking: widened.rankings.len
+    of statsSubjectExport, statsSubjectExtensionRows:
+      widened.extensionRows.len
+    of statsSubjectExecutions: widened.executions.len
+    of statsSubjectDistribution:
+      if widened.knowledge == statsKnowledgeWireKnown: 1 else: 0
+  except CatchableError:
+    0
+
+proc render(view: StatsAnswerView; asJson: bool): string =
+  if asJson: renderJson(view) else: renderHuman(view)
+
+proc connectForStats(options: StatsOptions; client: var RunQuotaClient;
+                     failed: var int): bool =
+  ## NOT STANDALONE, AND THE ASYMMETRY WITH `acquire` IS DELIBERATE. A
+  ## missing daemon lets work proceed; it does not let a question be
+  ## answered. `daemonReachable` separates "nobody is listening" from
+  ## "somebody is listening and refused us", which is what a protocol
+  ## version mismatch looks like from here.
+  try:
+    client = connectDefault()
+    return true
+  except CatchableError as error:
+    let detail =
+      if daemonReachable(defaultEndpoint()):
+        "the endpoint is bound but the handshake failed: " & error.msg
+      else:
+        error.msg
+    let view = unreachableView(options, detail)
+    if options.verb == svExport and not options.json:
+      stderr.writeLine(statusLines(view))
+    else:
+      echo render(view, options.json)
+    failed = exitCode(view.status)
+    return false
+
+proc runStatsTop(options: StatsOptions): int =
+  var client: RunQuotaClient
+  var failure = 0
+  if not connectForStats(options, client, failure):
+    return failure
+  defer: client.close()
+  let answer = client.queryStats(statsSubjectRanking, options.statsKey,
+    scope = statsScopeOf(options), span = statsSpanOf(options),
+    limit = options.limit)
+  let probe =
+    if answer.rankings.len == 0 and answer.captureEnabled:
+      probeRowCount(client, statsSubjectRanking, options.statsKey)
+    else: 0
+  let view = viewOfRanking(options, answer, probe)
+  echo render(view, options.json)
+  exitCode(view.status)
+
+proc runStatsExport(options: StatsOptions): int =
+  ## THE ROWS GO TO STDOUT AND NOTHING ELSE EVER DOES. `runquota stats
+  ## export | jq ...` is the whole point of the verb, so a status line —
+  ## or an error message — in that stream would break it. Status goes to
+  ## stderr and into the exit code, where it breaks nothing and is still
+  ## impossible to miss.
+  ##
+  ## THE TRANSPORT FAILURE IS CAUGHT HERE RATHER THAN IN THE CATCH-ALL,
+  ## and that is not tidiness. `runThinApp`'s handler `echo`s the message,
+  ## which puts `daemon closed the RQSP connection` ON STDOUT, in the
+  ## middle of the NDJSON — the one place a non-JSON line does real
+  ## damage. It was observed doing exactly that at `--limit 700` before
+  ## the ceiling above was measured.
+  var client: RunQuotaClient
+  var failure = 0
+  if not connectForStats(options, client, failure):
+    return failure
+  defer: client.close()
+  var view: StatsAnswerView
+  try:
+    let answer = client.queryStats(statsSubjectExport, options.statsKey,
+      scope = statsScopeOf(options), span = statsSpanOf(options),
+      limit = options.limit)
+    let probe =
+      if answer.extensionRows.len == 0 and answer.captureEnabled:
+        probeRowCount(client, statsSubjectExport, options.statsKey)
+      else: 0
+    view = viewOfExport(options, answer, probe)
+  except CatchableError as error:
+    view = unreachableView(options,
+      error.msg & " — a response this size may have exceeded the " &
+      "transport's frame limit; retry with a smaller --limit (rows are " &
+      "about 1.4 KB each).")
+  if options.json:
+    echo renderJson(view)
+  else:
+    # STDERR FIRST, so a reader watching a terminal sees why an empty
+    # stream is empty before they see that it is empty.
+    stderr.writeLine(statusLines(view))
+    if view.rows.len > 0:
+      echo renderNdjson(view)
+  exitCode(view.status)
+
+proc runStatsCapture(asJson: bool): int =
+  ## "IS CAPTURE EVEN ON?" — asked the way every other verb asks it, from
+  ## the same `captureEnabled` field they gate their answers on.
+  var options = StatsOptions(verb: svCapture, json: asJson)
+  var client: RunQuotaClient
+  var failure = 0
+  if not connectForStats(options, client, failure):
+    return failure
+  defer: client.close()
+  let answer = client.queryStats(statsSubjectRanking, "", limit = 1'u32)
+  var detail = "{}"
+  try:
+    detail = client.inspectionJson("observations")
+  except CatchableError:
+    discard
+  echo renderCapture(answer.captureEnabled, detail, asJson)
+  exitCode(if answer.captureEnabled: asOk else: asCaptureOff)
+
+proc parseStatsOptions(args: seq[string]; options: var StatsOptions): bool =
+  ## Returns false on anything unrecognised. A misspelt flag must not be
+  ## absorbed into a query that then answers about something else.
+  if args.len == 0:
+    return false
+  try:
+    options.verb = parseEnum[StatsVerb](args[0])
+  except ValueError:
+    return false
+  options.limit =
+    if options.verb == svExport: DefaultExportLimit else: DefaultTopLimit
+  var index = 1
+  if index < args.len and not args[index].startsWith("--"):
+    options.statsKey = args[index]
+    index += 1
+  while index < args.len:
+    case args[index]
+    of "--json":
+      options.json = true
+      index += 1
+    of "--all-users":
+      options.allUsers = true
+      index += 1
+    of "--all-profiles":
+      options.allProfiles = true
+      index += 1
+    of "--limit":
+      if index + 1 >= args.len: return false
+      options.limit = uint32(parseUInt(args[index + 1]))
+      index += 2
+    else:
+      return false
+  if options.verb == svExport:
+    # REFUSED, NOT CLAMPED. A caller who asked for 5000 rows and silently
+    # got 1200 would draw conclusions from a window they did not choose;
+    # a caller told the bound can decide whether it matters.
+    if options.limit == 0'u32 or options.limit > MaxExportLimit:
+      return false
+  true
+
+proc runStats(programName: string; args: seq[string]): int =
+  var options = StatsOptions()
+  if not parseStatsOptions(args, options):
+    # A REFUSAL WITH THE SHAPE IN IT. A misspelt verb or flag that exited
+    # silently would be indistinguishable, at a glance, from a query that
+    # found nothing -- which is the one confusion this whole surface
+    # exists to remove.
+    #
+    # ON STDERR, because `stats export` writes NDJSON to stdout and the
+    # rule that nothing else ever does has to hold on the error paths too
+    # -- those are exactly the paths a caller has not looked at yet.
+    stderr.writeLine("unrecognised 'stats' invocation")
+    stderr.writeLine(renderUsage(programName))
+    return 2
+  case options.verb
+  of svCapture: runStatsCapture(options.json)
+  of svTop: runStatsTop(options)
+  of svExport: runStatsExport(options)
+
 proc runThinApp*(programName: string): int =
   let args = commandLineParams()
   if wantsVersion(args):
@@ -394,6 +627,12 @@ proc runThinApp*(programName: string): int =
           return printStatsTable("")
         if args.len == 2:
           return printStatsTable(args[1])
+      of "stats":
+        # THE OBSERVATION STORE'S READ PATH. Distinct from `stats-table`
+        # above, which is the published aggregate CACHE as this client maps
+        # it: that one answers "what has the daemon published for
+        # admission", this one answers "what has this host recorded".
+        return runStats(programName, args[1 .. ^1])
       of "acquire":
         return runDebugAcquire(args[1 .. ^1])
       else:
