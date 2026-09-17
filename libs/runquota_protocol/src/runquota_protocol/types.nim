@@ -414,6 +414,32 @@ type
       ## and span rules select. RunQuota carries the payload and does not
       ## interpret it (OS-5): the caller names the extension and the
       ## columns, and gets text back.
+    statsSubjectExport = 4
+      ## Every recorded column of the executions the same scope and span
+      ## rules select, as one JSON object per row.
+      ##
+      ## WHY THIS EXISTS RATHER THAN A QUERY LANGUAGE. The typed subjects
+      ## above answer the questions somebody thought of; the next question
+      ## is always the one that is not there, and the alternative to
+      ## guessing it is either a filter grammar or SQL — both of which are
+      ## things a caller has to be taught. A row of JSON is not: every
+      ## consumer of this store already has `jq`. So RunQuota answers with
+      ## the facts and does no analysis at all.
+      ##
+      ## THE ANSWER IS OPAQUE TO THE PROTOCOL ON PURPOSE. It travels in
+      ## ``extensionRows`` — one entry per execution, ``columns ==
+      ## ["row_json"]`` and one value — because that field is already the
+      ## generic "text the protocol carries and does not interpret"
+      ## carrier, already encoded, already decoded by every existing peer.
+      ## Adding a typed field per schema column would put the schema on
+      ## the wire, and then every column RunQuota ever adds would be a
+      ## protocol change. This way none of them are.
+      ##
+      ## ADDITIVE, so no version moves. The enum values above keep their
+      ## ordinals and no encoded message changes shape; a daemon that
+      ## predates this subject fails ``decodeStatsQuery``'s range check and
+      ## answers with an error frame, which is a clear refusal rather than
+      ## a misread.
 
   StatsScopeWire* = enum
     ## Whose rows. Mirrors ``runquota_observation_store.StatsScope``; the

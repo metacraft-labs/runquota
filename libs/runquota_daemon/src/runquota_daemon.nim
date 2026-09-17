@@ -1253,6 +1253,25 @@ proc statsOwnerUid(context: ConnectionContext): Option[int64] =
   else:
     some(int64(context.peer.userId))
 
+proc exportRowJson(columns: seq[ExportColumn];
+                   cells: seq[ExportCell]): string =
+  ## One execution as one JSON object.
+  ##
+  ## NULL IS `null`, NEVER 0 AND NEVER "". Four of these columns are NULL
+  ## on every row this daemon has ever written, and a renderer that turned
+  ## an unmeasured column into a zero would be reporting a measurement
+  ## nobody took.
+  var parts: seq[string] = @[]
+  for index, column in columns:
+    if index >= cells.len:
+      break
+    let cell = cells[index]
+    parts.add(jsonEscape(column.name) & ":" &
+      (if cell.isNull: "null"
+       elif cell.kind == exportInt: cell.text
+       else: jsonEscape(cell.text)))
+  "{" & parts.join(",") & "}"
+
 proc statsAnswer(daemon: var RunQuotaDaemon; context: ConnectionContext;
                  request: StatsQueryMessage): StatsResponseMessage =
   ## Answers one query over the recorded rows.
@@ -1312,7 +1331,8 @@ proc statsAnswer(daemon: var RunQuotaDaemon; context: ConnectionContext;
         durationMillisP90: nonNegative(entry.durationMillisP90),
         durationMillisMax: nonNegative(entry.durationMillisMax),
         peakRssBytesMax: nonNegative(entry.peakRssBytesMax)))
-  of statsSubjectExecutions, statsSubjectRanking, statsSubjectExtensionRows:
+  of statsSubjectExecutions, statsSubjectRanking, statsSubjectExtensionRows,
+      statsSubjectExport:
     let owner = statsOwnerUid(context)
     let query = RowQuery(
       statsKey: request.statsKey,
@@ -1324,7 +1344,33 @@ proc statsAnswer(daemon: var RunQuotaDaemon; context: ConnectionContext;
     if request.scope == statsScopeWireOwner and owner.isSome:
       result.ownerUidPresent = true
       result.ownerUid = uint64(owner.get)
-    if request.subject == statsSubjectExtensionRows:
+    if request.subject == statsSubjectExport:
+      # EVERY RECORDED COLUMN, AS JSON, AND NO ANALYSIS. The daemon is the
+      # only sanctioned reader, so it is the only place that can render
+      # these rows -- but rendering is all it does. It does not rank,
+      # summarise or filter beyond the scope rules above, because the
+      # question a caller is about to ask is not knowable here and `jq`
+      # can express it without RunQuota shipping a vocabulary for it.
+      #
+      # THE TYPES COME FROM THE SCHEMA, not from guessing. The store says
+      # which columns are integers, so `duration_millis` is rendered as a
+      # JSON number and compares as one; a renderer that emitted every
+      # cell as text would make every `jq` comparison a string comparison,
+      # silently.
+      let columns = exportColumns()
+      for cells in daemon.observationStore.queryExport(query):
+        result.extensionRows.add(ExtensionRowWire(
+          hostId: daemon.observationHostId,
+          executionId: "",
+          statsKey: request.statsKey,
+          profile: ProfileIdentityWire(),
+          ownerUidPresent: owner.isSome,
+          ownerUid: if owner.isSome: uint64(owner.get) else: 0'u64,
+          columns: @["row_json"],
+          values: @[exportRowJson(columns, cells)]))
+      if result.extensionRows.len > 0:
+        result.knowledge = statsKnowledgeWireKnown
+    elif request.subject == statsSubjectExtensionRows:
       # THE PAYLOAD PASSES THROUGH UNINTERPRETED (OS-5). The extension and
       # its columns are named by the CALLER; the daemon checks nothing
       # about what they mean, and the scope rules that decided which
