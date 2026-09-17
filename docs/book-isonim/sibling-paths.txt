@@ -1,0 +1,34 @@
+# The sibling source trees the RunQuota book's Nim compiles need on the path.
+#
+# THE ONE COPY OF THIS LIST. `repro.nim`'s `docsBookIsonim` block reads this
+# file to build the `nim.cfg` the SSG compiles against, and the book's
+# `just nim-cfg` recipe reads the same file to write the same thing by hand.
+# Neither owns the list, so neither can drift from the other -- which is the
+# defect this shape exists to prevent. CodeTracer's equivalent list lived in
+# two places (its `repro.nim` and its `ci/deploy/docs.sh` heredoc), and when
+# `codetracer-design-system/nim` was added to one and not the other the deploy
+# lane built the book while the `docs-book` graph action failed with
+# `cannot open file: metacraft_docs_theme`.
+#
+# FORMAT: one entry per line, `<repo-name> <subpath-within-repo>`. A subpath of
+# `.` means the repo root itself. Blank lines and `#` comments are ignored.
+# ORDER IS PRESERVED and is the order the `--path:` lines are emitted in.
+#
+# THE SET IS ALL-OR-NOTHING. A half-resolved path set produces a confusing
+# `cannot open file` deep inside the static-site generator instead of an honest
+# "the book was skipped because <repo> is not checked out", so a single missing
+# repo aborts the whole set. See `sibling_paths.nim`.
+#
+# `codetracer-design-system/nim` supplies `metacraft_docs_theme`, which
+# `src/theme_tokens.nim` imports. It is a real dependency of this book even
+# though nothing else in RunQuota has ever needed it.
+
+isonim-docs src
+codetracer-design-system nim
+isonim src
+nim-everywhere src
+nim-faststreams .
+nim-stew .
+isonim vendor/chronicles
+isonim vendor/serialization
+isonim vendor/json_serialization
