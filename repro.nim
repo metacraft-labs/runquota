@@ -39,13 +39,30 @@
 ## typed-tool resolver instead of the out-of-band ``build_sibling
 ## ../runquota`` shell step in ``scripts/run_tests.sh``.
 
+import std/[os]
+
 import repro_project_dsl
+# ``shell(...)``, used by the documentation-book block at the end of
+# ``build:``. ``"sh"`` is already declared in ``uses:`` below, so the tool the
+# action runs through is provisioned by the same resolver as ``nim`` and
+# ``gcc``.
+import repro_dsl_stdlib/packages/sh
 
 # ``nim.c(...)`` in the ``build:`` block resolves through the ``nim`` const
 # the ``package`` macro auto-imports because ``"nim >=2.2 <3.0"`` appears in
-# ``uses:`` (same mechanism reprobuild's repro.nim relies on). No explicit
-# ``import repro_dsl_stdlib/packages/sh`` is needed any more now that the
-# build is expressed natively instead of through a ``shell(...)`` wrapper.
+# ``uses:`` (same mechanism reprobuild's repro.nim relies on).
+
+# The RunQuota documentation book's sibling-path resolver. A RELATIVE import,
+# deliberately: this file is compiled by the reprobuild engine with the project
+# DSL on its path and none of RunQuota's own ``libs/`` tree, so a module name
+# that had to be found on a ``--path:`` would not resolve. The module imports
+# nothing but ``std``.
+import "./docs/book-isonim/sibling_paths"
+
+const projectRootPath = currentSourcePath().parentDir()
+  ## This repository's checkout root: the directory holding this file. Used to
+  ## locate ``docs/book-isonim`` and, through it, the workspace root the book's
+  ## sibling source trees live in.
 
 package runquota:
   # Declare ``path``-mode tool provisioning so the engine adopts it
@@ -137,3 +154,72 @@ package runquota:
       actionId = "runquota.apps.runquotad"))
 
     discard collect("apps", runquotaAppsActions)
+
+    # -------------------------------------------------------------------
+    # Documentation (docs/book-isonim) as build-graph edges.
+    #
+    # The book is an `isonim-docs` static-site-generator site, and its build
+    # needs nine sibling source trees on the Nim path (the framework, the
+    # shared docs theme, isonim and its vendored serialization stack). Those
+    # live in SIBLING REPOSITORIES, so Nim reaches them through `--path:`
+    # entries in a generated `docs/book-isonim/nim.cfg`.
+    #
+    # WHY GRAPH EDGES RATHER THAN A SHELL SCRIPT. The obvious alternative --
+    # and what CodeTracer's book started as -- is a deploy script that writes
+    # `nim.cfg` immediately before building and deletes it after. The path set
+    # then exists only for the duration of that script, and nothing else (an
+    # editor, a test run, a developer typing `just build`) can reproduce it.
+    # Declaring the file here makes it a TRACKED INPUT instead of a side
+    # effect: editing one `content/*.md` re-runs the SSG and only what needs a
+    # rendered `public/`, and the path set is the same one every caller sees.
+    #
+    # THE LIST ITSELF IS NOT HERE. It is `docs/book-isonim/sibling-paths.txt`,
+    # read by this block and by the book's `just nim-cfg` recipe, so the two
+    # cannot drift. CodeTracer kept two hand-maintained copies and they did
+    # drift: `codetracer-design-system/nim` was added to the deploy script and
+    # not to the graph, so the deploy lane built the book while the graph's
+    # `docs-book` action failed with `cannot open file: metacraft_docs_theme`.
+    #
+    # THE BOOK IS SKIPPED, NOT FAILED, WHEN ITS SIBLINGS ARE ABSENT. Most of
+    # them are not part of the RunQuota project manifest, so a normal RunQuota
+    # workspace has no checkout to build against and every other target in
+    # this file must still resolve. A MISSING SIBLING ABORTS THE WHOLE BLOCK
+    # rather than emitting a partial path set: half a set produces a confusing
+    # `cannot open file` deep inside the SSG instead of an honest skip.
+    block docsBookIsonim:
+      const bookDir = "docs/book-isonim"
+      let bookRoot = projectRootPath / bookDir
+      if not fileExists(bookRoot / BookSiblingSpecFile):
+        # No book in this checkout (a source-subset materialisation, say).
+        break docsBookIsonim
+
+      let siblings =
+        try: readBookSiblingSpec(bookRoot)
+        except CatchableError: @[]
+      if siblings.len == 0:
+        break docsBookIsonim
+
+      let resolved = resolveBookSiblings(projectRootPath, siblings)
+      if not resolved.ok:
+        # `resolved.missingRepo` names what was not found. Nothing is emitted
+        # and nothing is written; the rest of the graph is unaffected.
+        break docsBookIsonim
+
+      # The path set as a real file on disk rather than `--path:` flags on the
+      # command line below: `src/build.nim` shells out to a nested `nim js`
+      # for the book's client bundle, and that child inherits the path set
+      # only through `nim.cfg`.
+      let bookNimCfg = fs.writeText(
+        output = bookDir & "/nim.cfg",
+        text = bookNimCfgText(resolved),
+        actionId = "docs-book-nim-cfg")
+      discard collect("docs-book-nim-cfg", @[bookNimCfg])
+
+      let bookSite = shell(
+        command = "cd " & bookDir & " && nim c -r --hints:off " &
+          "-o:build/build src/build.nim",
+        actionId = "docs-book-build",
+        extraInputs = @[bookDir & "/" & BookSiblingSpecFile,
+                        bookDir & "/nim.cfg"],
+        after = @[bookNimCfg])
+      discard collect("docs-book", @[bookNimCfg, bookSite])

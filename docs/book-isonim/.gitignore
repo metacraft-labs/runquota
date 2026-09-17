@@ -1,0 +1,26 @@
+# Nim / nimble
+nimcache/
+nimblecache/
+*.exe
+build/
+public/
+.nimble/
+.direnv/
+
+# `nim c -r` writes an extensionless native binary next to the source unless
+# `-o:` is given, and `just test` does not give one for every suite.
+tests/test_dev
+src/ssr
+src/build
+write_nim_cfg
+
+# The sibling `--path`s, as absolute paths. Both `just nim-cfg` and
+# `repro.nim`'s `docs-book-nim-cfg` action generate this file, and its contents
+# are machine-specific. Ignoring it is what keeps somebody's `/home/<name>/...`
+# out of a commit; it must stay untracked, because a committed copy would
+# collide with the one the build generates.
+nim.cfg
+
+# `nim js` writes its output next to the compiled .nim file unless -o: is given.
+src/**/*.js
+tests/**/*.js

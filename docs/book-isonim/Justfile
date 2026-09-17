@@ -1,0 +1,62 @@
+# runquota/docs/book-isonim -- task entry points.
+#
+# Every recipe except `nim-cfg` runs inside THIS book's own dev shell. With
+# direnv the shell is already active (see ./.envrc -- it reuses the isonim-docs
+# framework's self-contained dev shell, which declares isonim as its
+# dependency). Without direnv, prefix a recipe with the framework's flake --
+# never isonim's, and never RunQuota's:
+#   nix develop path:../../../isonim-docs -c just --justfile docs/book-isonim/Justfile --working-directory docs/book-isonim build
+#
+# THE BOOK DOES NOT SHARE RUNQUOTA'S TOOLCHAIN. It builds no RunQuota code and
+# links nothing from `libs/`; it is a static-site generator run over `content/`.
+# That is why it has its own `.envrc` rather than being a recipe in the
+# repository-root Justfile.
+
+# Write the sibling `--path` set into ./nim.cfg from ./sibling-paths.txt.
+#
+# Needs no dev shell (stdlib-only Nim) and no siblings to RUN -- it refuses,
+# naming the missing repository, when they are not all present. Run this once
+# in a fresh checkout; `repro build docs-book` generates the same file as a
+# tracked graph output and does not need this recipe.
+nim-cfg:
+    nim r --hints:off write_nim_cfg.nim
+
+# The content-graph suite first -- it needs no framework and no build, so a
+# dangling link is reported in seconds rather than after an SSG run -- then the
+# framework-dependent one.
+#
+# `t_docs_book_content` lives in the REPOSITORY's test tree, not here, because
+# it is `std`-only and therefore runs in every RunQuota workspace, including the
+# ones with no framework checkout. This recipe runs the same file so that a
+# writer working in the book directory gets the same answer without changing
+# directories.
+test:
+    nim c -r --hints:off -o:build/t_docs_book_content ../../tests/unit/t_docs_book_content.nim
+    just build
+    nim c -r --hints:off -o:build/test_dev tests/test_dev.nim
+
+build:
+    nim c -r --hints:off -o:build/build src/build.nim
+
+# Live-reloading docs server: serves content/ + themed assets and hot-reloads
+# every open tab on any content edit. (`dev` is reserved for an app dev server;
+# docs commands are namespaced `-docs` -- see metacraft-dev-guidelines
+# repo-requirements.) Run this, then `just open-docs` in another shell.
+dev-docs port='8000' host='127.0.0.1':
+    nim c -r --hints:off src/dev.nim {{port}} {{host}}
+
+# Live docs server bound to 0.0.0.0 for your private LAN (trusted networks only).
+dev-docs-lan port='8000':
+    @just dev-docs {{port}} 0.0.0.0
+
+# Open the running docs server in a browser (Linux xdg-open / macOS open).
+open-docs port='8000':
+    @xdg-open http://localhost:{{port}}/ 2>/dev/null || open http://localhost:{{port}}/ 2>/dev/null || echo "open http://localhost:{{port}}/ manually"
+
+# One-shot SSR docs preview (no live reload).
+serve-docs:
+    nim c -r --hints:off src/ssr.nim
+
+# Launch the shared theme editor (isonim-docs/site) that themes this book -- Save persists a token; run `just dev-docs` in another shell to see it hot-reload.
+design port='8080' host='127.0.0.1':
+    cd ../../../isonim-docs/site && just design {{port}} {{host}}
