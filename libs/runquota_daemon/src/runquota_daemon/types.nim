@@ -281,6 +281,22 @@ type
       ## Non-zero means the crash exit fired, which is the only evidence
       ## that the leak M11 recorded is actually closed rather than merely
       ## unreachable in the happy path.
+    lostLeasesReaped*: uint64
+      ## ``supervisor_lost`` leases released because their child process is
+      ## provably gone.
+      ##
+      ## A lease whose supervisor died keeps its resources accounted, on
+      ## purpose: the child it launched may still be running, and dropping
+      ## the reservation would let the daemon hand the same CPU and memory
+      ## to someone else while the orphan still holds them. What that
+      ## reasoning does not supply is an END. Nothing ever asked whether the
+      ## orphan had exited, so the reservation outlived the process by the
+      ## daemon's whole lifetime and the capacity was gone until a restart.
+      ##
+      ## The failure that follows is silent and total: requests that no
+      ## longer fit are QUEUED rather than denied, so a host with enough
+      ## leaked leases stops admitting work while reporting itself healthy.
+      ## Non-zero here is the evidence that the end exists.
     activeLeaseCount*: uint32
     activeBenchmarkCount*: uint32
     machineUsage*: Table[string, MachineUsage]

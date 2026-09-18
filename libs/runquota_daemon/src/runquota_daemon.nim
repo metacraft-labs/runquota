@@ -279,7 +279,8 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
     deferredBatchesAccepted: 0'u64,
     deferredBatchesRefused: 0'u64,
     deferredExecutionsRecorded: 0'u64,
-    selfReportsReaped: 0'u64
+    selfReportsReaped: 0'u64,
+    lostLeasesReaped: 0'u64
   )
   for row in loadLearnedEstimates(effectiveConfig.estimateDbPath):
     result.estimates[estimateTableKey(row.scope, row.commandStatsId)] = row
@@ -1149,6 +1150,7 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
     "\"self_cpu_pct\":" & $sumSelfCpuPct(liveSelfReports()) & "," &
     "\"self_rss_bytes\":" & $sumSelfRssBytes(liveSelfReports()) & "," &
     "\"self_reports_reaped\":" & $daemon.selfReportsReaped & "," &
+    "\"lost_leases_reaped\":" & $daemon.lostLeasesReaped & "," &
     "\"deferred_batches_accepted\":" & $daemon.deferredBatchesAccepted & "," &
     "\"deferred_batches_refused\":" & $daemon.deferredBatchesRefused & "," &
     "\"deferred_executions_recorded\":" &
@@ -2146,6 +2148,80 @@ proc requireOwnedLease(daemon: RunQuotaDaemon; connection: var LocalConnection;
     return false
   true
 
+proc orphanStillRunning(processId: uint64): bool =
+  ## Is the child of a ``supervisor_lost`` lease still on this host?
+  ##
+  ## Asked ONLY about leases whose supervisor is already gone, and answered
+  ## conservatively in one direction: an unknown answer means YES. Reporting
+  ## a live process as dead would release a reservation the process is still
+  ## consuming, which is the one outcome worse than holding it — the daemon
+  ## would hand the same CPU and memory to a second tenant.
+  ##
+  ## A zero pid means the lease never reached ``LeaseRunning``, so no child
+  ## was ever reported and there is nothing to outlive the supervisor.
+  ##
+  ## PID REUSE is the known imprecision. A recycled pid reads as alive and
+  ## the lease is kept, which leaks one reservation until the next restart —
+  ## the same direction as every other uncertainty here, and the reason this
+  ## is a reaper rather than an accounting fix.
+  if processId == 0'u64:
+    return false
+  when defined(windows):
+    # PROCESS_QUERY_LIMITED_INFORMATION is the right-sized access: it is
+    # granted for processes this user may not fully open, so a lease whose
+    # child dropped privileges is still answerable.
+    const
+      ProcessQueryLimitedInformation = 0x1000
+      StillActive = 259'i32
+      # winlean carries ERROR_ACCESS_DENIED but not this one.
+      ErrorInvalidParameter = 87'i32
+    let handle = openProcess(DWORD(ProcessQueryLimitedInformation),
+      WINBOOL(0), DWORD(processId))
+    if handle == Handle(0):
+      # Cannot open: either the pid is gone, or it is one this process may
+      # not query at all. ERROR_INVALID_PARAMETER is Windows' answer for "no
+      # such process"; every other failure leaves existence unsettled and is
+      # therefore read as alive.
+      return getLastError() != ErrorInvalidParameter
+    defer: discard closeHandle(handle)
+    var code: int32 = 0
+    if getExitCodeProcess(handle, code) == 0:
+      return true
+    return code == StillActive
+  elif defined(posix):
+    # Signal 0 performs the permission and existence checks without
+    # delivering anything. EPERM proves existence just as well as success.
+    if kill(Pid(processId), 0) == 0:
+      return true
+    return errno == EPERM
+  else:
+    true
+
+proc reapLostLeases(daemon: var RunQuotaDaemon): int =
+  ## Release every ``supervisor_lost`` lease whose child has exited.
+  ##
+  ## This is the END that the supervisor-lost state never had. Without it a
+  ## client killed mid-execution — a Ctrl-C, an OOM kill, an agent that
+  ## terminated its own child process — leaves its reservation held for the
+  ## daemon's whole lifetime. Enough of those and the host silently stops
+  ## admitting work: a request that no longer fits is QUEUED, not denied, so
+  ## every subsequent client waits forever against a machine that reports
+  ## itself healthy and idle.
+  ##
+  ## Called from the admission path rather than a timer. Capacity only
+  ## matters when something wants it, the cost is one cheap liveness probe
+  ## per lost lease, and there are no lost leases at all on a host whose
+  ## clients exit cleanly.
+  var dead: seq[uint64] = @[]
+  for key, lease in daemon.leases.pairs:
+    if lease.state == leaseStateSupervisorLost and
+        not orphanStillRunning(lease.childProcessId):
+      dead.add(key)
+  for id in dead:
+    daemon.removeLeaseFromTable(id)
+  daemon.lostLeasesReaped += uint64(dead.len)
+  dead.len
+
 proc releaseLease(daemon: var RunQuotaDaemon; id: LeaseId) =
   if daemon.leases.hasKey(id.value):
     daemon.removeLeaseFromTable(id.value)
@@ -2257,6 +2333,10 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       connection.sendError(frame.header.requestId, diagnostic(
           diagInvalidArgument, "unknown session id"))
       return
+    # Before deciding what fits, stop counting what is no longer there.
+    # Admission is the only moment capacity means anything, and a host whose
+    # clients all exited cleanly has nothing here to walk.
+    discard daemon.reapLostLeases()
     let effective = daemon.effectiveResources(msg.sessionId,
         msg.commandStatsId, msg.resources, msg.estimate)
     var reason = ""
