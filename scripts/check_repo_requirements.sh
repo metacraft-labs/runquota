@@ -76,9 +76,16 @@ require_contains .github/workflows/ci.yml "actions/upload-artifact@v4"
 # exists, it runs on the Windows pool, it really invokes a shell rather than
 # standing as a placeholder, its test manifest and its Linux-side counterpart
 # are present, and the runner-label config that keeps actionlint able to
-# check `eph-win-x64` at all has not been removed with it.
+# check the Windows pool at all has not been removed with it.
+#
+# THE POOL IS NAMED BY CAPABILITY LABELS, NOT BY AN `eph-*` CLASS NAME. The
+# single-name ephemeral classes (`eph-win-x64` and friends) were retired in
+# favour of the `[self-hosted, <os>, <arch>]` arrays by 126ab5b, which
+# rewrote every `runs-on:` in `.github/workflows/` and left this assertion
+# pinning the old spelling -- so `just lint` has failed on its FIRST script,
+# for everyone, ever since. Assert the spelling the workflows actually use.
 require_contains .github/workflows/ci.yml "windows-compile-gate:"
-require_contains .github/workflows/ci.yml "runs-on: eph-win-x64"
+require_contains .github/workflows/ci.yml "runs-on: [self-hosted, windows, x64]"
 require_contains .github/workflows/ci.yml "shell: pwsh"
 require_file tests/windows/portable_tests.txt
 require_file tests/unit/t_windows_compile_gate.nim
