@@ -19,3 +19,10 @@ bench-results/
 .DS_Store
 .repro/
 .pre-commit-config.yaml
+
+# Agent tooling scratch. `claude --isolation worktree` materialises one git
+# worktree per agent under this path, inside the repo. They are disposable and
+# per-machine, and while an agent holds one the repo reads DIRTY — which
+# `repro workspace lock` refuses, so an untracked one stops the whole
+# workspace publishing locks, not just this repo.
+.claude/worktrees/
