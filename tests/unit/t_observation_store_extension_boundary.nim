@@ -44,7 +44,7 @@ import runquota_observation_store
 
 const
   repoRoot = currentSourcePath().parentDir.parentDir.parentDir
-  boundaryFile = repoRoot / "CLAUDE.md"
+  boundaryFile = repoRoot / "AGENTS.md"
   extensionsSource =
     repoRoot / "libs" / "runquota_observation_store" / "src" /
     "runquota_observation_store" / "extensions.nim"

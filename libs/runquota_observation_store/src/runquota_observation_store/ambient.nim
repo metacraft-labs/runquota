@@ -3,7 +3,7 @@
 ## Normative specification:
 ## ``reprobuild-specs/RunQuota-Observation-Store.md`` §"`ambient_samples`".
 ##
-## THE DESIGN CONSTRAINT. ``runquota/CLAUDE.md`` says ``runquotad`` "is a
+## THE DESIGN CONSTRAINT. ``runquota/AGENTS.md`` says ``runquotad`` "is a
 ## lease authority. It must not spawn, sandbox, monitor, or kill client
 ## process trees." Attribution here is therefore **by difference** and
 ## never by inspection:

@@ -20,7 +20,7 @@
 ## zero" satisfies the first arm and destroys the column.
 ##
 ## The boundary check at the end is a source-inspection test. It is pinned
-## to the sentence in ``runquota/CLAUDE.md`` it enforces, so deleting the
+## to the sentence in ``runquota/AGENTS.md`` it enforces, so deleting the
 ## boundary from the policy file fails the test rather than quietly
 ## retiring it, and it carries a positive control: the same scanner is run
 ## over the client-side helper that DOES walk process trees and must find
@@ -46,7 +46,7 @@ const
     "process_telemetry.nim"
   linuxTreeSource =
     repoRoot / "libs" / "runquota_host_linux" / "src" / "runquota_host_linux.nim"
-  boundaryFile = repoRoot / "CLAUDE.md"
+  boundaryFile = repoRoot / "AGENTS.md"
 
   readerStamp = "result.atUnixMillis = unixMillisNow()"
     ## The ONLY way a reading's instant may be set: a platform reader

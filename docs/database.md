@@ -25,7 +25,7 @@ Both Reprobuild and the CodeTracer test runner are clients of this store. See
 `codetracer-specs/Planned-Features/Nim-Parallel-Test-Framework.md` §17 for the
 test-side reporter.
 
-Note the daemon boundary in `CLAUDE.md`: `runquotad` is a lease authority and does
+Note the daemon boundary in `AGENTS.md`: `runquotad` is a lease authority and does
 not monitor client process trees. Per-execution resource figures are therefore
 **client-reported**, as they already are for learned estimates; the daemon samples
 only host-wide totals and derives foreign load by difference.

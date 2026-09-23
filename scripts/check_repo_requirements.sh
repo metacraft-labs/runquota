@@ -26,6 +26,16 @@ require_symlink() {
   [ "$(readlink "${path}")" = "${target}" ] || fail "${path} must point to ${target}"
 }
 
+# A path the repo must NOT carry. `-L` is checked as well as `-e` so a dangling
+# symlink (which `-e` reports as absent) is still caught.
+forbid_path() {
+  local path="$1"
+  local reason="$2"
+  if [ -e "${path}" ] || [ -L "${path}" ]; then
+    fail "${path} must not exist: ${reason}"
+  fi
+}
+
 require_contains() {
   local path="$1"
   local text="$2"
@@ -40,7 +50,11 @@ for path in .github .github/workflows nix docs libs apps tests benchmarks script
   require_dir "${path}"
 done
 
-require_symlink CLAUDE.md AGENTS.md
+# metacraft-dev-guidelines policies/repo-requirements.md §7: Claude Code reads
+# AGENTS.md itself, and a CLAUDE.md shadows it — on Windows with
+# core.symlinks=false the old CLAUDE.md -> AGENTS.md symlink is checked out as
+# a file holding the single word "AGENTS.md", which is all a session then sees.
+forbid_path CLAUDE.md "Claude Code reads AGENTS.md directly and a CLAUDE.md shadows it"
 require_symlink .github/copilot-instructions.md ../AGENTS.md
 require_file .github/workflows/ci.yml
 
