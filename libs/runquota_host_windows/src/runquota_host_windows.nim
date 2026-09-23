@@ -1,4 +1,4 @@
-import std/sets
+import std/[sets, tables]
 
 import runquota_core
 import runquota_host
@@ -133,9 +133,39 @@ when defined(windows):
       finally:
         discard closeHandle(snapshot)
 
+  proc processCreationMicros(pid: uint64): uint64 =
+    ## A process's creation time (FILETIME, in microseconds), or 0 when it
+    ## cannot be read — it exited, or is protected.
+    let handle = openProcess(PROCESS_QUERY_LIMITED_INFORMATION, WINBOOL(0),
+      int32(uint32(pid)))
+    if handle == 0:
+      return 0
+    try:
+      var creation, exitT, kernelT, userT: FILETIME
+      if getProcessTimes(handle, addr creation, addr exitT,
+          addr kernelT, addr userT) != 0:
+        result = filetimeMicros(creation)
+    finally:
+      discard closeHandle(handle)
+
   proc collectTreePids(rootProcessId: uint64): HashSet[uint64] =
     # Windows: build a PID -> PPID map then BFS from rootProcessId. We do two
     # passes so we don't depend on Toolhelp32 enumeration order.
+    #
+    # `th32ParentProcessID` is the parent's PID AT CREATION and Windows never
+    # clears it when the parent exits, while PIDs are reused. So an unrelated,
+    # long-lived process whose original parent died is reported as a "child"
+    # of whatever NEW process later reuses that PID. Without a guard, a lease
+    # rooted at a recycled PID absorbs a stranger's working set: measured on a
+    # shared workstation, a nim provider compile (~2 GB) was charged 22.9 GiB
+    # and a curl/cp vendor step 23.8 GiB — other sessions' recorders and a
+    # runaway node — and the daemon's learned estimate, which only ratchets
+    # upward, then exceeded the 16 GiB machine budget so the command could
+    # never be admitted again. A real child is never created before its
+    # parent, so a link where the "child" is older than the parent is a
+    # recycled PID and is rejected. When either creation time is unreadable
+    # the link is kept: that is the old behaviour, and a guard that cannot be
+    # evaluated must not hide a genuine child.
     result = initHashSet[uint64]()
     if rootProcessId == 0:
       return
@@ -150,6 +180,11 @@ when defined(windows):
     if not sawRoot:
       return
     result.incl(rootProcessId)
+    var created = initTable[uint64, uint64]()
+    proc creationOf(pid: uint64): uint64 =
+      if pid notin created:
+        created[pid] = processCreationMicros(pid)
+      created[pid]
     var changed = true
     while changed:
       changed = false
@@ -157,6 +192,10 @@ when defined(windows):
         let pid = row[0]
         let ppid = row[1]
         if pid notin result and ppid in result:
+          let childBorn = creationOf(pid)
+          let parentBorn = creationOf(ppid)
+          if childBorn != 0 and parentBorn != 0 and childBorn < parentBorn:
+            continue  # recycled parent PID: not our descendant
           result.incl(pid)
           changed = true
 

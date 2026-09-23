@@ -1583,7 +1583,21 @@ proc effectiveResources(daemon: RunQuotaDaemon; sessionId: SessionId;
   let scope = daemon.sessions[sessionId.value].sessionScope()
   let key = estimateTableKey(scope, commandStatsId)
   if daemon.estimates.hasKey(key):
-    let learned = daemon.estimates[key].conservativeMemoryBytes
+    var learned = daemon.estimates[key].conservativeMemoryBytes
+    # A learned figure is capped at the target machine's memory budget. The
+    # estimate only ratchets upward (see `updateEstimateFromFinish`), so one
+    # inflated sample — an OOM doubling, or a peak that absorbed another
+    # process's working set — would otherwise make every later request for
+    # this command exceed the budget, and `possible` refuses such a request
+    # forever: a permanent static-capacity deadlock no amount of waiting
+    # clears. At the cap the command runs with the whole machine to itself,
+    # which is the most any estimate can honestly ask for. A client-SUPPLIED
+    # estimate (the branch above) is the client's own statement and is not
+    # capped here.
+    var machine: MachineCapacity
+    if daemon.machineFor(result.resolvedMachineId(), machine) and
+        learned > machine.memoryBytes.value:
+      learned = machine.memoryBytes.value
     if learned > result.memory.value:
       result.memory = bytes(learned)
 
