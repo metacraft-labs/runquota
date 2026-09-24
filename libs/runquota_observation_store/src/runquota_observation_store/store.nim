@@ -150,8 +150,18 @@ proc applyMigrations(store: ObservationStore; fromVersion: int64): bool =
   store.schemaVersion = current
   true
 
-proc openObservationStore*(path: string): ObservationStore =
+proc openObservationStore*(path: string; createParent = true): ObservationStore =
   ## Opens (creating if necessary) the store at ``path``. Never raises.
+  ##
+  ## ``createParent = false`` is for a store that lives in a PROVISIONED
+  ## directory -- the daemon's default, beside the host identity in the
+  ## host-wide state directory, which the install step creates and the daemon
+  ## never does (`docs/database.md`). A missing parent then disables capture
+  ## and says why, instead of being created by whoever started first. It
+  ## used to be created regardless; on POSIX that failed for an unprivileged
+  ## daemon and so looked like the rule was being kept, and on Windows, where
+  ## `C:\ProgramData` lets any user create a subdirectory, the daemon made
+  ## the host-wide state directory itself, with whatever ACL it inherited.
   result = ObservationStore(path: path, status: ssOpen, report: "",
                             schemaVersion: -1)
   if path.len == 0:
@@ -164,6 +174,12 @@ proc openObservationStore*(path: string): ObservationStore =
         "' tool is not on PATH; capture disabled")
     return
   let parent = path.parentDir
+  if parent.len > 0 and not dirExists(parent) and not createParent:
+    result.degrade(ssUnwritable,
+      "runquota observation store " & path & ": " & parent &
+        " does not exist; it is created by the install step, never by the " &
+        "daemon; capture disabled")
+    return
   if parent.len > 0 and not dirExists(parent):
     try:
       createDir(parent)

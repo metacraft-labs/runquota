@@ -280,7 +280,11 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
     pressureFileCache: PressureFileCache(
       path: "", mtimeUnix: 0, sizeBytes: 0, raw: ""
     ),
-    observationStore: openObservationStore(effectiveConfig.observationDbPath),
+    # An explicitly named store may have its directory made for it; the
+    # DEFAULT one lives in the provisioned host-state directory, which the
+    # daemon must never create (see `openObservationStore`).
+    observationStore: openObservationStore(effectiveConfig.observationDbPath,
+      createParent = config.observationDbPath.len > 0),
     observationHostId: "",
     observationProfileId: "",
     observationIdentityReport: "",
