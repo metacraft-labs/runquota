@@ -35,6 +35,7 @@ import runquota_core
 import runquota_observation_store
 import runquota_protocol
 import daemon_binary
+import scratch_root
 import daemon_endpoint
 
 const
@@ -177,7 +178,7 @@ suite "observation_extension_write_path":
 
   test "a client declares its extension and attaches a row to its execution":
     let root = scratchRoot("ok")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
@@ -225,7 +226,7 @@ suite "observation_extension_write_path":
     # implementation that checked only "does this connection own the
     # session it named" passes every other arm and fails this one.
     let root = scratchRoot("own")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
@@ -273,7 +274,7 @@ suite "observation_extension_write_path":
     # would accept it, because the id the intruder supplies is the right
     # one.
     let root = scratchRoot("conn")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
@@ -325,7 +326,7 @@ suite "observation_extension_write_path":
     # a client can take the host's lease coordinator down with one
     # one-way message it is never told was rejected.
     let root = scratchRoot("late")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
@@ -366,7 +367,7 @@ suite "observation_extension_write_path":
 
   test "a row for an extension nobody declared is refused":
     let root = scratchRoot("undecl")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
@@ -416,7 +417,7 @@ suite "observation_extension_write_path":
     # A connection naming a session it never opened has no business
     # running one.
     let root = scratchRoot("declconn")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -449,7 +450,7 @@ suite "observation_extension_write_path":
 
   test "a declaration naming a version its ladder cannot reach is refused":
     let root = scratchRoot("ver")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     putEnv("RUNQUOTA_SOCKET", socketPath)

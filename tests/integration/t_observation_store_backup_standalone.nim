@@ -40,6 +40,7 @@ import runquota_core
 import runquota_observation_store
 import runquota_protocol
 import daemon_binary
+import scratch_root
 import daemon_endpoint
 
 # ---------------------------------------------------------------------------
@@ -141,7 +142,7 @@ suite "observation_store_backup_standalone":
     # The copies live OUTSIDE the root, because the root is deleted before
     # the copy is opened.
     let vault = scratchRoot("vault")
-    defer: removeDir(vault)
+    defer: removeScratchRoot(vault)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
@@ -195,7 +196,7 @@ suite "observation_store_backup_standalone":
     # THE ORIGINATING DAEMON IS GONE AND SO IS EVERYTHING IT OWNED: the
     # store, its write-ahead log and shared-memory index, the host identity
     # file, the socket. Whatever the copy needs, it now has to have.
-    removeDir(root)
+    removeScratchRoot(root)
     check not fileExists(dbPath)
     check not dirExists(root)
 
@@ -248,7 +249,7 @@ suite "observation_store_backup_standalone":
     # not have that property, and this is what it looks like when it does
     # not.
     let dir = scratchRoot("wal")
-    defer: removeDir(dir)
+    defer: removeScratchRoot(dir)
     let path = dir / "o.sqlite"
     let store = openObservationStore(path)
     check store.captureEnabled

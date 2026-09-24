@@ -69,6 +69,7 @@ import runquota_observation_store
 import runquota_process
 import runquota_protocol
 import daemon_binary
+import scratch_root
 
 const
   HonestRoleEnv = "RUNQUOTA_M14_HONEST_ROLE"
@@ -443,7 +444,7 @@ suite "standalone_daemonless_degradation":
 
   test "the detector catches a client that writes the store per execution":
     let root = scratchRoot("v")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let probe = installSqliteProbe(root)
     defer: probe.disarm()
     let fixture = compileFixture(root, "passing", PassingTestSource)
@@ -498,7 +499,7 @@ suite "standalone_daemonless_degradation":
 
   test "a build with no daemon succeeds, reports no error, and writes no database":
     let root = scratchRoot("b")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let probe = installSqliteProbe(root)
     defer: probe.disarm()
     check fileExists(cliPath())
@@ -552,7 +553,7 @@ suite "standalone_daemonless_degradation":
 
   test "a test run with no daemon succeeds, buffers, and writes no database":
     let root = scratchRoot("t")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let probe = installSqliteProbe(root)
     defer: probe.disarm()
     let fixture = compileFixture(root, "passing", PassingTestSource)
@@ -597,7 +598,7 @@ suite "standalone_daemonless_degradation":
 
   test "the one exit flush lands, and its rows say the window was incomplete":
     let root = scratchRoot("f")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let probe = installSqliteProbe(root)
     defer: probe.disarm()
     let fixture = compileFixture(root, "passing", PassingTestSource)
@@ -685,7 +686,7 @@ suite "standalone_daemonless_degradation":
     # written straight to the socket -- a real dishonest client, not a
     # stand-in for one.
     let root = scratchRoot("r")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let dbPath = root / "observations.sqlite3"
     var daemon = startDaemon(socketPath, dbPath, root / "host-id")
@@ -756,7 +757,7 @@ suite "standalone_daemonless_degradation":
     const ContradictoryKey = "m14-contradiction-key"
     const HonestKey = "m14-honest-key"
     let root = scratchRoot("t")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let dbPath = root / "observations.sqlite3"
     var daemon = startDaemon(socketPath, dbPath, root / "host-id")
@@ -847,7 +848,7 @@ suite "standalone_daemonless_degradation":
 
   test "with no daemon, aggregation and learned estimates are unavailable":
     let root = scratchRoot("s")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "runquotad.sock"
     putEnv("RUNQUOTA_SOCKET", socketPath)
     check not fileExists(socketPath)
@@ -890,7 +891,7 @@ suite "standalone_daemonless_degradation":
     # THE CONTROL. Without it, "unavailable" is what this command says
     # everywhere, and clause 6 is satisfied by a CLI that never answers.
     let root = scratchRoot("c")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     var daemon = startDaemon(socketPath, root / "observations.sqlite3",
       root / "host-id")

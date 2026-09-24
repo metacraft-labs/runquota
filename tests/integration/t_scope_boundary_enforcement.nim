@@ -38,6 +38,7 @@ import runquota_ipc
 import runquota_observation_store
 import runquota_protocol
 import daemon_binary
+import scratch_root
 import daemon_endpoint
 import owner_uid
 
@@ -267,7 +268,7 @@ when defined(posix):
   suite "scope_boundary_enforcement_daemon_start":
     test "a real daemon REFUSES a pre-created world-writable endpoint directory":
       let root = scratchDir("wide")
-      defer: removeDir(root)
+      defer: removeScratchRoot(root)
       let dir = root / "ep"
       createDir(dir)
       setFilePermissions(dir, {
@@ -311,7 +312,7 @@ when defined(posix):
       # The acceptance half. Without it, a build that refused every start
       # would satisfy both refusals above.
       let root = scratchDir("good")
-      defer: removeDir(root)
+      defer: removeScratchRoot(root)
       let dir = root / "ep"
       let socketPath = dir / "runquotad.sock"
       let dbPath = root / "observations.sqlite"
@@ -343,7 +344,7 @@ else:
 suite "scope_boundary_enforcement_owner_uid":
   test "a client declaring somebody else's uid is REFUSED, and one declaring its own is not":
     let root = scratchDir("owner")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let dir = root / "ep"
     let socketPath = dir / "runquotad.sock"
     let dbPath = root / "observations.sqlite"
@@ -374,7 +375,7 @@ suite "scope_boundary_enforcement_owner_uid":
 
   test "owner_uid on an execution comes from peer credentials":
     let root = scratchDir("exec")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let dir = root / "ep"
     let socketPath = dir / "runquotad.sock"
     let dbPath = root / "observations.sqlite"
@@ -420,7 +421,7 @@ suite "scope_boundary_enforcement_owner_uid":
     # a wrong owner is worse than an absent one: it attributes one user's
     # history to another, and root's at that.
     let root = scratchDir("null")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let dbPath = root / "observations.sqlite"
     let store = openObservationStore(dbPath)
     check store.captureEnabled

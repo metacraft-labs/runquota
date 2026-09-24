@@ -103,6 +103,7 @@ import runquota_client
 import runquota_core
 import runquota_observation_store
 import daemon_binary
+import scratch_root
 
 # ---------------------------------------------------------------------------
 # The synthetic load
@@ -514,7 +515,7 @@ suite "ambient_load_attribution":
 
   test "foreign_cpu_pct tracks a known synthetic foreign load":
     let dir = scratchDir("cpu")
-    defer: removeDir(dir)
+    defer: removeScratchRoot(dir)
     stopAmbientSampler()
     clearSelfReportedExecutions()
     let (store, _) = openSampledStore(dir, cadenceMillis)
@@ -731,7 +732,7 @@ suite "ambient_load_attribution":
 
   test "foreign_rss_bytes tracks a known synthetic memory load":
     let dir = scratchDir("mem")
-    defer: removeDir(dir)
+    defer: removeScratchRoot(dir)
     stopAmbientSampler()
     clearSelfReportedExecutions()
     let (store, _) = openSampledStore(dir, cadenceMillis)
@@ -860,7 +861,7 @@ suite "ambient_load_attribution":
     # client reports its own execution and exactly what makes the
     # assertion falsifiable: no measurement produces 7.5 and 2.25.
     let dir = scratchDir("self")
-    defer: removeDir(dir)
+    defer: removeScratchRoot(dir)
     let socketPath = dir / "d.sock"
     let daemonBinary = daemonPath()
     check fileExists(daemonBinary)
@@ -1008,7 +1009,7 @@ suite "ambient_load_attribution":
 
   test "a real daemon samples on a fixed cadence, independent of executions":
     let dir = scratchDir("dmn")
-    defer: removeDir(dir)
+    defer: removeScratchRoot(dir)
     let socketPath = dir / "d.sock"
     let dbPath = dir / "observations.sqlite"
     let daemonBinary = daemonPath()
@@ -1254,7 +1255,7 @@ suite "ambient_load_attribution":
     # about 86,000 of them per host per day whether the machine is
     # building or asleep.
     let dir = scratchDir("gate")
-    defer: removeDir(dir)
+    defer: removeScratchRoot(dir)
     stopAmbientSampler()
 
     let daemonBinary = daemonPath()

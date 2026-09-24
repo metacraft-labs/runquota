@@ -53,6 +53,7 @@ import runquota_core
 import runquota_observation_store
 import runquota_protocol
 import daemon_binary
+import scratch_root
 import daemon_endpoint
 
 const
@@ -169,7 +170,7 @@ suite "extension_rows_do_not_query_the_registry":
 
   test "a burst of extension rows reads the registry no more than a declaration does":
     let root = scratchRoot("rows")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
@@ -255,7 +256,7 @@ suite "extension_rows_do_not_query_the_registry":
     # extension" become the same answer, and the first one is wrong for
     # every extension registered before this daemon started.
     let root = scratchRoot("miss")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     require fileExists(daemonPath())
@@ -292,7 +293,7 @@ suite "extension_rows_do_not_query_the_registry":
     # row shaped for columns this database does not have, and the row would
     # read back afterwards as a complete observation of an older schema.
     let root = scratchRoot("ver")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     require fileExists(daemonPath())

@@ -36,6 +36,7 @@ import runquota_core
 import runquota_observation_store
 import runquota_protocol
 import daemon_binary
+import scratch_root
 import daemon_endpoint
 
 const
@@ -241,7 +242,7 @@ suite "observation_retention_scheduled":
 
   test "a daemon prunes its own store on a cadence nobody asked it to run":
     let root = scratchRoot("gate")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
@@ -353,7 +354,7 @@ suite "observation_retention_scheduled":
     # dropped and counted, which is OS-2-honest and the trade OS-1 asks
     # for, and no assertion here covers it.
     let root = scratchRoot("hold")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
@@ -489,7 +490,7 @@ suite "observation_retention_scheduled":
 
   test "a zero sweep interval leaves every row where it is":
     let root = scratchRoot("off")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
@@ -540,7 +541,7 @@ suite "observation_retention_scheduled":
     # `none`. Verified by mutation — spelling the parser `value <= 0` left
     # every other arm in this file green.
     let root = scratchRoot("zero")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
@@ -603,7 +604,7 @@ suite "observation_retention_scheduled":
 
   test "--no-write-stats leaves no store to sweep and no sweeper to do it":
     let root = scratchRoot("nostats")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
@@ -634,7 +635,7 @@ suite "observation_retention_scheduled":
     # must go on granting leases, because an advisory subsystem may not
     # take out a machine's build capacity.
     let root = scratchRoot("corrupt")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
@@ -698,7 +699,7 @@ suite "observation_retention_scheduled":
       for suffix in ["", "-wal", "-shm"]:
         if fileExists(dbPath & suffix):
           setFilePermissions(dbPath & suffix, {fpUserRead, fpUserWrite})
-      removeDir(root)
+      removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
     let identityFile = state / "host-id"
     let hostId = mintIdentity(identityFile)

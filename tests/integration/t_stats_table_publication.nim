@@ -43,6 +43,7 @@ import runquota_stats_table
 
 from shm_lease/syscount import syscallCountAvailable, unixSyscallCount
 import daemon_binary
+import scratch_root
 import daemon_endpoint
 
 const
@@ -144,7 +145,7 @@ suite "stats_table_publication":
 
   test "runquotad publishes the aggregate, at a group-readable host-wide mode":
     let root = scratchRoot("pub")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let endpointDir = rendezvousDir(root)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)
@@ -198,7 +199,7 @@ suite "stats_table_publication":
 
   test "a client reads its estimate with ZERO syscalls, against a control that is not zero":
     let root = scratchRoot("sysc")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let endpointDir = rendezvousDir(root)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)
@@ -273,7 +274,7 @@ suite "stats_table_publication":
     ## mapping's real protection and a crash test cannot observe a mapping
     ## nobody stored through.
     let root = scratchRoot("ro")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let endpointDir = rendezvousDir(root)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)
@@ -348,7 +349,7 @@ suite "stats_table_publication":
     ## here would turn a tolerated condition into a behaviour difference,
     ## and every other clause in this file would still pass.
     let root = scratchRoot("stale")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let endpointDir = rendezvousDir(root)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)

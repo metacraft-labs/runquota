@@ -21,6 +21,7 @@ from runquota_core/child_process import readToEnd
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_observation_store
 import daemon_binary
+import scratch_root
 
 proc scratchDir(name: string): string =
   # Short on purpose. Nim's `Sockaddr_un_path_length` is 92 on macOS, and
@@ -110,7 +111,7 @@ proc waitForExecutionRows(path: string; atLeast: int): int =
 suite "observation_store_degraded_capture_build":
   test "a build over a healthy store succeeds and is recorded":
     let dir = scratchDir("h")
-    defer: removeDir(dir)
+    defer: removeScratchRoot(dir)
     let socketPath = dir / "runquotad.sock"
     let dbPath = dir / "observations.sqlite"
     let identityFile = dir / "host-id"
@@ -211,7 +212,7 @@ suite "observation_store_degraded_capture_build":
 
   test "a build over a corrupt store still succeeds, and capture is off":
     let dir = scratchDir("c")
-    defer: removeDir(dir)
+    defer: removeScratchRoot(dir)
     let socketPath = dir / "runquotad.sock"
     let dbPath = dir / "observations.sqlite"
 

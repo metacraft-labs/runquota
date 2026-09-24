@@ -63,6 +63,7 @@ import runquota_core
 import runquota_protocol
 import runquota_stats_table
 import daemon_binary
+import scratch_root
 import daemon_endpoint
 
 const
@@ -201,7 +202,7 @@ suite "completion_report_does_not_wait_on_the_store":
 
   test "a completion report does not drain the writer, and costs what a keyless one costs":
     let root = scratchRoot("lat")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let endpointDir = rendezvousDir(root)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)

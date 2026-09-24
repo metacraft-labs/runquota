@@ -41,6 +41,7 @@ import runquota_core
 import runquota_protocol
 import runquota_stats_table
 import daemon_binary
+import scratch_root
 import daemon_endpoint
 
 const
@@ -198,7 +199,7 @@ suite "stats_table_cache_control":
 
   test "EMPTIED: every store gate and every client gate still passes, unchanged":
     let root = scratchRoot("empty")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let endpointDir = rendezvousDir(root)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)
@@ -323,7 +324,7 @@ suite "stats_table_cache_control":
     ## is one of the things being a cache is supposed to buy, and an option
     ## nobody can exercise is a claim rather than a property.
     let root = scratchRoot("off")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let endpointDir = rendezvousDir(root)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)

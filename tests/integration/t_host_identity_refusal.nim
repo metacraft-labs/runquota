@@ -32,6 +32,7 @@ import std/[os, osproc, streams, strutils, unittest]
 import runquota_ipc
 import runquota_observation_store
 import daemon_binary
+import scratch_root
 
 const EchoFixtureArg = "--echo-fixture"
   ## The leased command below is this binary, re-executed, printing its
@@ -130,7 +131,7 @@ suite "host_identity_refusal":
     ## THE DECIDING CONTROL. Against the pre-fix code the two ids below
     ## differ on every run, and every other assertion in this test passes.
     let dir = scratchDir("a")
-    defer: removeDir(dir)
+    defer: removeScratchRoot(dir)
 
     # A state directory that does not exist and that nothing here creates.
     let absent = dir / "runquota"
@@ -180,7 +181,7 @@ suite "host_identity_refusal":
     ## an implementation that refuses unconditionally, which would pass
     ## every clause of the negative and record nothing anywhere.
     let dir = scratchDir("b")
-    defer: removeDir(dir)
+    defer: removeScratchRoot(dir)
     let file = dir / "host-id"
 
     let first = resolveHostIdentity(file)
@@ -246,7 +247,7 @@ suite "host_identity_refusal":
     ## advisory subsystem take out the host's build capacity. So the
     ## daemon starts and serves -- and says which path and why.
     let dir = scratchDir("c")
-    defer: removeDir(dir)
+    defer: removeScratchRoot(dir)
     let socketPath = dir / "d.sock"
     let dbPath = dir / "obs.sqlite"
     let absent = dir / "state"
