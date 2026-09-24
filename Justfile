@@ -16,7 +16,7 @@ test:
     mkdir -p test-logs
     rc=0; \
     bash scripts/run_tests.sh 2>&1 | tee test-logs/test.log || rc=$?; \
-    runquota-static-helper-gate 2>&1 | tee -a test-logs/test.log || rc=$?; \
+    bash scripts/static_helper_gate.sh 2>&1 | tee -a test-logs/test.log || rc=$?; \
     exit $rc
 
 t: test
@@ -33,7 +33,7 @@ test-release:
     mkdir -p test-logs
     rc=0; \
     RUNQUOTA_BUILD_MODE=release bash scripts/run_tests.sh 2>&1 | tee test-logs/test-release.log || rc=$?; \
-    runquota-static-helper-gate 2>&1 | tee -a test-logs/test-release.log || rc=$?; \
+    bash scripts/static_helper_gate.sh 2>&1 | tee -a test-logs/test-release.log || rc=$?; \
     exit $rc
 
 lint:
@@ -126,4 +126,4 @@ check-repo-requirements:
     bash scripts/check_repo_requirements.sh
 
 check-static-helpers:
-    runquota-static-helper-gate
+    bash scripts/static_helper_gate.sh
