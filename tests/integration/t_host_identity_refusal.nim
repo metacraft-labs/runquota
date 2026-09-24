@@ -33,6 +33,15 @@ import runquota_ipc
 import runquota_observation_store
 import daemon_binary
 
+const EchoFixtureArg = "--echo-fixture"
+  ## The leased command below is this binary, re-executed, printing its
+  ## argument. It was `/bin/echo`, which is not a path on Windows, so the CLI
+  ## could not launch it and the admission clause failed on the fixture.
+
+if paramCount() == 2 and paramStr(1) == EchoFixtureArg:
+  echo paramStr(2)
+  quit 0
+
 proc scratchDir(name: string): string =
   # Short on purpose. Nim's `Sockaddr_un_path_length` is 92 on macOS, and
   # `toSockAddr` refuses `path.len >= 92`, so 91 characters is the whole
@@ -265,7 +274,7 @@ suite "host_identity_refusal":
       let acquired = execCmdEx(quoteShellCommand([
         cliPath(), "acquire", "--cpu", "1000", "--mem", "128MB",
         "--label", "host-identity-refusal", "--",
-        "/bin/echo", "admission-still-works"
+        getAppFilename(), EchoFixtureArg, "admission-still-works"
       ]))
       check acquired.exitCode == 0
       check "admission-still-works" in acquired.output
@@ -379,7 +388,13 @@ suite "host_identity_provisioning":
     check "Provisioning the host-wide state directory" in runbookText
     check "must already exist" in runbookText
     check hostWideStateDir in runbookText
-    check "sudo mkdir -p " & hostWideStateDir in runbookText
+    # The by-hand command for THIS platform: `sudo mkdir -p` on POSIX, and on
+    # Windows the `mkdir` the daemon's own refusal prints
+    # (`provisionHostStateDirCommand`), which carries no uid to fill in.
+    when defined(windows):
+      check provisionHostStateDirCommand(hostWideStateDir) in runbookText
+    else:
+      check "sudo mkdir -p " & hostWideStateDir in runbookText
     check hostWideEndpointDir in runbookText
     check "sudo mkdir -p " & hostWideEndpointDir in runbookText
     check defaultRendezvousGroup in runbookText

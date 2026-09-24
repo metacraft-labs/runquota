@@ -288,6 +288,14 @@ sudo mkdir -p /var/lib/runquota && sudo chown "$(id -u)" /var/lib/runquota && su
 sudo mkdir -p /run/runquota && sudo chown "$(id -u)":runquota /run/runquota && sudo chmod 0750 /run/runquota
 ```
 
+On Windows there is only the state directory -- the endpoint is a named pipe,
+which lives in the kernel object namespace and needs no directory. The MSI
+creates it; by hand, from the account `runquotad` will run as:
+
+```bat
+mkdir C:\ProgramData\runquota
+```
+
 `/run` (and `/var/run` on macOS) is cleared on boot, so the rendezvous
 directory has to be re-created at every boot — which is what
 `RuntimeDirectory=` and the activation script do on a Nix-managed host, and
