@@ -89,14 +89,20 @@
 ## whose own OFF baseline turned out to have been out of range, and then
 ## FAILS saying so rather than reporting a ratio it cannot support.
 
-import std/[algorithm, atomics, cpuinfo, os, osproc, posix, random, streams,
+import std/[algorithm, atomics, cpuinfo, os, osproc, random, streams,
             strutils, times, unittest]
+
+when defined(windows):
+  import std/winlean
+else:
+  import std/posix
 
 from runquota_ipc import endpointDirectoryPermissions
 from runquota_protocol import observedCpuPct
 import runquota_client
 import runquota_core
 import runquota_observation_store
+import daemon_binary
 
 # ---------------------------------------------------------------------------
 # The synthetic load
@@ -181,10 +187,30 @@ type MemoryLoad = object
   base: pointer
   size: int
 
+when defined(windows):
+  # Windows: the same property from `VirtualAlloc` / `VirtualFree`. Pages
+  # committed with `VirtualAlloc` and released with `MEM_RELEASE` go back to
+  # the kernel just as an unmapped anonymous mapping does.
+  const
+    MemCommit = 0x00001000'i32
+    MemReserve = 0x00002000'i32
+    MemRelease = 0x00008000'i32
+    PageReadWrite = 0x04'i32
+
+  proc virtualAlloc(address: pointer; size: int; allocationType,
+                    protect: int32): pointer
+    {.stdcall, dynlib: "kernel32.dll", importc: "VirtualAlloc".}
+  proc virtualFree(address: pointer; size: int; freeType: int32): WINBOOL
+    {.stdcall, dynlib: "kernel32.dll", importc: "VirtualFree".}
+
 proc takeMemory(size: int; random: var Rand): MemoryLoad =
-  let base = mmap(nil, size, PROT_READ or PROT_WRITE,
-    MAP_PRIVATE or MAP_ANONYMOUS, -1, 0)
-  doAssert base != MAP_FAILED, "mmap of " & $size & " bytes failed"
+  when defined(windows):
+    let base = virtualAlloc(nil, size, MemCommit or MemReserve, PageReadWrite)
+    doAssert base != nil, "VirtualAlloc of " & $size & " bytes failed"
+  else:
+    let base = mmap(nil, size, PROT_READ or PROT_WRITE,
+      MAP_PRIVATE or MAP_ANONYMOUS, -1, 0)
+    doAssert base != MAP_FAILED, "mmap of " & $size & " bytes failed"
   # Touched at page granularity with unpredictable bytes: an untouched
   # anonymous page is never backed at all, and a compressible one is taken
   # by the macOS memory compressor -- either would leave the allocation
@@ -198,7 +224,10 @@ proc takeMemory(size: int; random: var Rand): MemoryLoad =
 
 proc release(load: var MemoryLoad) =
   if load.base != nil:
-    discard munmap(load.base, load.size)
+    when defined(windows):
+      discard virtualFree(load.base, 0, MemRelease)
+    else:
+      discard munmap(load.base, load.size)
     load.base = nil
 
 # ---------------------------------------------------------------------------
@@ -208,11 +237,23 @@ proc release(load: var MemoryLoad) =
 proc selfCpuSeconds(): float =
   ## This process's own CPU time, every thread of it. The figure the
   ## synthetic load is "known" by.
-  var usage: RUsage
-  if getrusage(RUSAGE_SELF, addr usage) != 0:
-    return 0.0
-  float(usage.ru_utime.tv_sec) + float(usage.ru_utime.tv_usec) / 1e6 +
-  float(usage.ru_stime.tv_sec) + float(usage.ru_stime.tv_usec) / 1e6
+  ## `getrusage(RUSAGE_SELF)` on POSIX; on Windows its counterpart
+  ## `GetProcessTimes`, in 100 ns units.
+  when defined(windows):
+    var creation, exited, kernel, user: FILETIME
+    if getProcessTimes(getCurrentProcess(), creation, exited, kernel,
+        user) == 0:
+      return 0.0
+    proc ticks(value: FILETIME): float =
+      float((int64(value.dwHighDateTime) shl 32) or
+        int64(uint32(value.dwLowDateTime)))
+    (ticks(kernel) + ticks(user)) / 10_000_000.0
+  else:
+    var usage: RUsage
+    if getrusage(RUSAGE_SELF, addr usage) != 0:
+      return 0.0
+    float(usage.ru_utime.tv_sec) + float(usage.ru_utime.tv_usec) / 1e6 +
+    float(usage.ru_stime.tv_sec) + float(usage.ru_stime.tv_usec) / 1e6
 
 type Window = object
   fromMillis, toMillis: int64
@@ -821,7 +862,7 @@ suite "ambient_load_attribution":
     let dir = scratchDir("self")
     defer: removeDir(dir)
     let socketPath = dir / "d.sock"
-    let daemonBinary = getCurrentDir() / "build" / "bin" / "runquotad"
+    let daemonBinary = daemonPath()
     check fileExists(daemonBinary)
     putEnv("RUNQUOTA_SOCKET", socketPath)
 
@@ -832,8 +873,10 @@ suite "ambient_load_attribution":
     # is deliberately not enabled, so the sampler in this process is the
     # only writer and the rows are unambiguous.
     let daemon = startProcess(daemonBinary,
+      # `--no-write-stats` is what "not enabled" takes now that capture is
+      # on by default: without it this daemon opened the HOST-WIDE store.
       args = ["--socket", socketPath, "--cpu-milli", "64000",
-              "--memory-bytes", "68719476736"],
+              "--memory-bytes", "68719476736", "--no-write-stats"],
       options = {poStdErrToStdOut})
     var load = LoadGenerator()
     try:
@@ -968,7 +1011,7 @@ suite "ambient_load_attribution":
     defer: removeDir(dir)
     let socketPath = dir / "d.sock"
     let dbPath = dir / "observations.sqlite"
-    let daemonBinary = getCurrentDir() / "build" / "bin" / "runquotad"
+    let daemonBinary = daemonPath()
     check fileExists(daemonBinary)
     stopAmbientSampler()
 
@@ -1214,7 +1257,7 @@ suite "ambient_load_attribution":
     defer: removeDir(dir)
     stopAmbientSampler()
 
-    let daemonBinary = getCurrentDir() / "build" / "bin" / "runquotad"
+    let daemonBinary = daemonPath()
     check fileExists(daemonBinary)
 
     proc startGateDaemon(binary, root, tag: string):

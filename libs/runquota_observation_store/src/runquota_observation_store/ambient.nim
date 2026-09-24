@@ -353,12 +353,69 @@ elif defined(linux):
     if not result.available:
       result.detail = "/proc/meminfo carried no MemTotal"
 
+elif defined(windows):
+  # Every figure from a documented, unprivileged, HOST-WIDE interface; see
+  # `windows_host` for what each one is and where it differs from the
+  # POSIX arms (`swapInPages` counts every hard-fault page read, of which
+  # swap-in is a part; `loadAvg1m` is computed from its POSIX definition,
+  # because Windows keeps none).
+  import std/cpuinfo
+  import ./windows_host
+
+  proc readHostLoad*(): HostLoadReading =
+    ## One host-wide reading. Never raises.
+    result = unavailableReading("windows-system-times-pdh", "")
+    # The performance counters FIRST: PDH collection is the slow part (the
+    # first call opens the query, which takes most of a second), and the
+    # CPU counters and the timestamp must describe the same instant -- a
+    # reading stamped after a slow call credits its CPU figures with time
+    # that had not passed when they were read.
+    let counters = readCounters()
+    # AND THE TWO ARE TAKEN AS A BRACKETED PAIR. A reader descheduled
+    # between reading the counters and reading the clock stamps them with a
+    # later instant than they describe, and on a saturated host that gap was
+    # measured at hundreds of milliseconds -- a 2.5 s window came out at 0.84
+    # of its true capacity. So the clock is read on both sides of the
+    # counter read, and a pair whose bracket is wider than one tick of the
+    # system clock is read again, a bounded number of times.
+    const
+      maxBracketMillis = 20'i64
+      bracketAttempts = 8
+    var busy, total: int64
+    for _ in 0 ..< bracketAttempts:
+      let opened = unixMillisNow()
+      if not systemCpuMillis(busy, total):
+        result.detail = "GetSystemTimes failed"
+        return
+      result.atUnixMillis = unixMillisNow()
+      if result.atUnixMillis - opened <= maxBracketMillis:
+        break
+    let memory = memoryFigures()
+    if not memory.ok:
+      result.detail = "GlobalMemoryStatusEx failed"
+      return
+    result.cpuBusyMillis = busy
+    result.cpuTotalMillis = total
+    result.memTotalBytes = memory.totalPhysicalBytes
+    result.memAvailableBytes = memory.availablePhysicalBytes
+    # If PDH will not give the counter it is held at zero. Stated rather
+    # than hidden: `swap_in_rate` has no "unmeasured" sentinel (unlike
+    # `io_queue_depth`), so that reads as a machine that is not paging. It
+    # can never read as a spike, because the zero is the same on every
+    # reading.
+    result.swapInPages = if counters.pagesInputOk: counters.pagesInput else: 0
+    result.ioQueueDepth =
+      if counters.diskQueueOk: counters.diskQueue else: ioQueueDepthUnmeasured
+    result.loadAvg1m = dampedLoadAverage(result.atUnixMillis, busy, total,
+      max(1, countProcessors()),
+      if counters.readyThreadsOk: counters.readyThreads else: 0.0)
+    result.available = total > 0 and memory.totalPhysicalBytes > 0
+    if not result.available:
+      result.detail = "the kernel reported a zero capacity"
+
 else:
-  # Deliberately not written speculatively. Windows host-wide load wants
-  # `GetSystemTimes`, `GlobalMemoryStatusEx` and a performance counter for
-  # the disk queue; guessing at them here would produce a reading that
-  # looks measured and is not. Unavailable writes no row, which is the
-  # honest outcome.
+  # Any other platform: not written speculatively. Unavailable writes no
+  # row, which is the honest outcome.
   proc readHostLoad*(): HostLoadReading =
     unavailableReading("unsupported-platform",
       "host-wide load sampling is not implemented on this platform")

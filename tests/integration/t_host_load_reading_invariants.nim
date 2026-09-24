@@ -78,8 +78,12 @@
 ##   the "kernel reported a zero capacity" branch, are unreachable from a
 ##   test that is not allowed to mock the kernel.
 
-import std/[algorithm, atomics, cpuinfo, os, osproc, posix, strutils, times,
-            unittest]
+import std/[algorithm, atomics, cpuinfo, os, osproc, strutils, times, unittest]
+
+when defined(windows):
+  import std/winlean
+else:
+  import std/posix
 
 import runquota_observation_store
 
@@ -138,13 +142,24 @@ proc stopLoad(load: var LoadGenerator) =
 proc selfCpuMillis(): float =
   ## This process's own CPU time, every thread of it, in the SAME unit as
   ## ``cpuBusyMillis``: milliseconds of CPU summed over cores, not wall
-  ## milliseconds.
-  var usage: Rusage
-  if getrusage(RUSAGE_SELF, addr usage) != 0:
-    return 0.0
-  1000.0 * (
-    float(usage.ru_utime.tv_sec) + float(usage.ru_utime.tv_usec) / 1e6 +
-    float(usage.ru_stime.tv_sec) + float(usage.ru_stime.tv_usec) / 1e6)
+  ## milliseconds. `getrusage(RUSAGE_SELF)` on POSIX; on Windows its
+  ## counterpart `GetProcessTimes`, which reports 100 ns units.
+  when defined(windows):
+    var creation, exited, kernel, user: FILETIME
+    if getProcessTimes(getCurrentProcess(), creation, exited, kernel,
+        user) == 0:
+      return 0.0
+    proc ticks(value: FILETIME): float =
+      float((int64(value.dwHighDateTime) shl 32) or
+        int64(uint32(value.dwLowDateTime)))
+    (ticks(kernel) + ticks(user)) / 10_000.0
+  else:
+    var usage: Rusage
+    if getrusage(RUSAGE_SELF, addr usage) != 0:
+      return 0.0
+    1000.0 * (
+      float(usage.ru_utime.tv_sec) + float(usage.ru_utime.tv_usec) / 1e6 +
+      float(usage.ru_stime.tv_sec) + float(usage.ru_stime.tv_usec) / 1e6)
 
 proc f(value: float; digits = 4): string = value.formatFloat(ffDecimal, digits)
 

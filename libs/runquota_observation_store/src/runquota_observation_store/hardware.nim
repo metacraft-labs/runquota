@@ -20,12 +20,10 @@
 ##   forbids. Capacities belong here; utilisation does not. The one field
 ##   where the line is genuinely blurred is swap, handled below.
 ##
-## PLATFORM STATUS. macOS/arm64 is the only platform this has been run on.
-## The Linux branch is written from ``/proc`` and ``/sys`` semantics and
-## has NEVER EXECUTED; the Windows branch is deliberately a stub that
-## reports what the Nim runtime already knows and ``unknown`` for the
-## rest. Treat a failure on either as a first observation, not a
-## regression.
+## PLATFORM STATUS. macOS/arm64 and Windows 11/x64 are the platforms this
+## has been run on. The Linux branch is written from ``/proc`` and ``/sys``
+## semantics and has NEVER EXECUTED; treat a failure there as a first
+## observation, not a regression.
 
 import std/[os, strutils]
 
@@ -452,17 +450,102 @@ elif defined(linux):
     profile.diskClass = diskClassOf(mounted.fsType, mounted.device)
 
 # ---------------------------------------------------------------------------
+# Windows
+# ---------------------------------------------------------------------------
+
+elif defined(windows):
+  # From documented, unprivileged interfaces; see `windows_host` for each.
+  import ./windows_host
+
+  const
+    cpuKey = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
+    biosKey = r"HARDWARE\DESCRIPTION\System\BIOS"
+    versionKey = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+    controlKey = r"SYSTEM\CurrentControlSet\Control"
+    windows11FirstBuild = 22000'u32
+      ## Microsoft's own dividing line. The registry's `ProductName` still
+      ## says "Windows 10" on every Windows 11 build, so the build number is
+      ## what tells them apart.
+
+  proc orUnknown(value: string): string =
+    let trimmed = value.strip()
+    if trimmed.len > 0: trimmed else: unknownField
+
+  proc osVersionOf(build: uint32): string =
+    var product = registryString(versionKey, "ProductName").strip()
+    if product.len == 0:
+      return unknownField
+    if build >= windows11FirstBuild and product.startsWith("Windows 10"):
+      product = "Windows 11" & product["Windows 10".len .. ^1]
+    let display = registryString(versionKey, "DisplayVersion").strip()
+    if display.len > 0: product & " " & display else: product
+
+  proc virtualizationOf(): string =
+    # A Windows container carries `ContainerType` under the control key;
+    # the host does not.
+    var found = false
+    discard registryDword(controlKey, "ContainerType", found)
+    if found:
+      return "container"
+    let firmware = (registryString(biosKey, "SystemManufacturer") & " " &
+      registryString(biosKey, "SystemProductName")).toLowerAscii
+    # The same markers the Linux arm reads out of the DMI product name;
+    # a Hyper-V guest reports "Microsoft Corporation Virtual Machine".
+    for marker in ["kvm", "qemu", "vmware", "virtualbox", "bochs", "xen",
+                   "hyper-v", "virtual machine", "parallels"]:
+      if marker in firmware:
+        return "vm"
+    if firmware.strip().len == 0: unknownField else: "bare-metal"
+
+  proc detectPlatform(referencePath: string; profile: var HardwareProfile) =
+    profile.cpuModel = orUnknown(registryString(cpuKey, "ProcessorNameString"))
+    var physical, logical: int64
+    if coreCounts(physical, logical):
+      profile.physicalCores = physical
+      profile.logicalCores = logical
+    profile.ramBytes = installedMemoryBytes()
+    let memory = memoryFigures()
+    if profile.ramBytes <= 0 and memory.ok:
+      profile.ramBytes = memory.totalPhysicalBytes
+    # The paging files' size is the commit limit less physical memory. A
+    # system-managed paging file grows on demand, which is the macOS
+    # dynamic-pager situation `quantizeSwapBytes` exists for.
+    if memory.ok:
+      profile.swapBytes = quantizeSwapBytes(
+        memory.commitLimitBytes - memory.totalPhysicalBytes)
+    profile.arch = orUnknown(nativeArchitecture())
+    profile.os = "windows"
+    var major, minor, build: uint32
+    if kernelVersion(major, minor, build):
+      var found = false
+      let revision = registryDword(versionKey, "UBR", found)
+      profile.kernelVersion = $major & "." & $minor & "." & $build &
+        (if found: "." & $revision else: "")
+      profile.osVersion = osVersionOf(build)
+    else:
+      profile.kernelVersion = unknownField
+      profile.osVersion = unknownField
+    profile.virtualization = virtualizationOf()
+    let probe =
+      if referencePath.len > 0: referencePath
+      else: getEnv("SystemDrive", "C:") & "\\"
+    let volume = volumeFacts(probe)
+    profile.fsType = orUnknown(volume.fsType)
+    profile.diskClass =
+      if volume.remote or networkFsType(volume.fsType): dcNetwork
+      elif volume.nvme: dcNvme
+      elif volume.solidState == 1: dcSsd
+      elif volume.solidState == 0: dcHdd
+      else: dcUnknown
+
+# ---------------------------------------------------------------------------
 # Everything else
 # ---------------------------------------------------------------------------
 
 else:
-  # NOT EXECUTED ANYWHERE YET, and deliberately not written speculatively
-  # either. Windows detection wants `GetLogicalProcessorInformationEx`,
-  # `GlobalMemoryStatusEx` and an `IOCTL_STORAGE_QUERY_PROPERTY` for the
-  # media type; guessing at them here would produce a profile that looks
-  # detected and is not. Reporting `unknown` is a worse profile and an
-  # honest one: `ensureHostProfile` still reuses rather than accumulates,
-  # because `unknown` is stable.
+  # Any other platform: not written speculatively. Reporting `unknown` is a
+  # worse profile and an honest one: `ensureHostProfile` still reuses rather
+  # than accumulates, because `unknown` is stable.
   import std/cpuinfo
 
   proc detectPlatform(referencePath: string; profile: var HardwareProfile) =
