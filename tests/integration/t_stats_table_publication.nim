@@ -29,7 +29,10 @@
 ## the precondition for ``t_stats_table_cache_control.nim``, whose emptied
 ## table has to produce the SAME answer over the socket.
 
-import std/[options, os, osproc, posix, streams, strutils, times, unittest]
+import std/[options, os, osproc, streams, strutils, times, unittest]
+
+when defined(posix):
+  import std/posix
 
 from runquota_ipc import endpointDirectoryPermissions, requiredSegmentMode,
   segmentHostWide, segmentIsGroupReadable, defaultStatsTablePath, unixEndpoint
@@ -40,6 +43,7 @@ import runquota_stats_table
 
 from shm_lease/syscount import syscallCountAvailable, unixSyscallCount
 import daemon_binary
+import daemon_endpoint
 
 const
   MiB = 1024'u64 * 1024'u64
@@ -63,10 +67,6 @@ proc hostStateDir(root: string): string =
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
 
-proc socketIsBound(path: string): bool =
-  var info: Stat
-  lstat(path.cstring, info) == 0 and S_ISSOCK(info.st_mode)
-
 proc modeOf(path: string): int =
   var info: Stat
   if lstat(path.cstring, info) != 0: return -1
@@ -83,7 +83,7 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   let process = startProcess(daemonPath(), args = args,
     options = {poStdErrToStdOut})
   for _ in 0 ..< 400:
-    if socketIsBound(socketPath): break
+    if endpointIsBound(socketPath): break
     sleep(25)
   # EXACTLY THREE STARTUP LINES, still. M13b appends its report to the
   # listening line rather than printing a fourth, because the startup output

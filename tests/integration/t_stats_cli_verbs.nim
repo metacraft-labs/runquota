@@ -34,7 +34,10 @@
 ##    safe to write, and the error paths are precisely the ones a caller
 ##    has not tried yet.
 
-import std/[json, options, os, osproc, posix, streams, strutils, unittest]
+import std/[json, options, os, osproc, streams, strutils, unittest]
+
+when defined(posix):
+  import std/posix
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
@@ -42,6 +45,7 @@ import runquota_core
 import runquota_observation_store
 import runquota_protocol
 import daemon_binary
+import daemon_endpoint
 import scratch_root
 
 const
@@ -72,10 +76,6 @@ proc hostStateDir(root: string): string =
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
 
-proc socketIsBound(path: string): bool =
-  var info: Stat
-  lstat(path.cstring, info) == 0 and S_ISSOCK(info.st_mode)
-
 type DaemonHandle = object
   process: Process
 
@@ -87,7 +87,7 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   let process = startProcess(daemonPath(), args = args,
     options = {poStdErrToStdOut})
   for _ in 0 ..< 400:
-    if socketIsBound(socketPath): break
+    if endpointIsBound(socketPath): break
     sleep(25)
   for _ in 0 ..< 3:
     discard process.outputStream.readLine()

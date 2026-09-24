@@ -24,7 +24,10 @@
 ## reason M10, M11 and M13 give: a mutation that only recompiles the test
 ## reports green while the code under test never executes.
 
-import std/[options, os, osproc, posix, streams, strutils, unittest]
+import std/[options, os, osproc, streams, strutils, unittest]
+
+when defined(posix):
+  import std/posix
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
@@ -33,6 +36,7 @@ import runquota_observation_store
 from runquota_observation_store/extensions as extensions import nil
 import runquota_protocol
 import daemon_binary
+import daemon_endpoint
 import scratch_root
 
 const
@@ -94,10 +98,6 @@ proc hostStateDir(root: string): string =
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
 
-proc socketIsBound(path: string): bool =
-  var info: Stat
-  lstat(path.cstring, info) == 0 and S_ISSOCK(info.st_mode)
-
 type DaemonHandle = object
   process: Process
 
@@ -109,7 +109,7 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   let process = startProcess(daemonPath(), args = args,
     options = {poStdErrToStdOut})
   for _ in 0 ..< 400:
-    if socketIsBound(socketPath): break
+    if endpointIsBound(socketPath): break
     sleep(25)
   # Exactly three startup lines, as `t_observation_socket_write_path`
   # asserts: reading them keeps the pipe from filling and wedging the

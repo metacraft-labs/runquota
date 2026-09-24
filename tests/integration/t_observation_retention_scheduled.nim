@@ -27,7 +27,7 @@
 ## answered. Both endpoints are MEASURED, not sampled, which is the defect
 ## class M15's own crash test had to repair.
 
-import std/[algorithm, json, options, os, osproc, posix, streams, strutils,
+import std/[algorithm, json, options, os, osproc, streams, strutils,
   unittest]
 
 from runquota_ipc import endpointDirectoryPermissions
@@ -36,6 +36,7 @@ import runquota_core
 import runquota_observation_store
 import runquota_protocol
 import daemon_binary
+import daemon_endpoint
 
 const
   probeExtension = "m15sched_probe"
@@ -77,10 +78,6 @@ proc hostStateDir(root: string): string =
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
 
-proc socketIsBound(path: string): bool =
-  var info: Stat
-  lstat(path.cstring, info) == 0 and S_ISSOCK(info.st_mode)
-
 type DaemonHandle = object
   process: Process
   startupLines: seq[string]
@@ -93,7 +90,7 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   let process = startProcess(daemonPath(), args = args,
     options = {poStdErrToStdOut})
   for _ in 0 ..< 400:
-    if socketIsBound(socketPath): break
+    if endpointIsBound(socketPath): break
     sleep(25)
   # EXACTLY THREE STARTUP LINES, ALWAYS. Reading precisely three is itself
   # an assertion: retention is reported by APPENDING to the identity line

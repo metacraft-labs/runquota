@@ -32,7 +32,7 @@
 ## ``socketEstimateFallback``, the same two procs the CLI calls), and the
 ## shipped ``runquota acquire`` for the end-to-end arm.
 
-import std/[os, osproc, posix, streams, strutils, unittest]
+import std/[os, osproc, streams, strutils, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_cli_support
@@ -41,6 +41,7 @@ import runquota_core
 import runquota_protocol
 import runquota_stats_table
 import daemon_binary
+import daemon_endpoint
 
 const
   MiB = 1024'u64 * 1024'u64
@@ -63,10 +64,6 @@ proc hostStateDir(root: string): string =
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
 
-proc socketIsBound(path: string): bool =
-  var info: Stat
-  lstat(path.cstring, info) == 0 and S_ISSOCK(info.st_mode)
-
 type DaemonHandle = object
   process: Process
 
@@ -77,7 +74,7 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   let process = startProcess(daemonPath(), args = args,
     options = {poStdErrToStdOut})
   for _ in 0 ..< 400:
-    if socketIsBound(socketPath): break
+    if endpointIsBound(socketPath): break
     sleep(25)
   for _ in 0 ..< 3:
     discard process.outputStream.readLine()

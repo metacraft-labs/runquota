@@ -26,13 +26,14 @@
 ## the real fault (a store on a full or read-only filesystem) and needs no
 ## privileges to arrange.
 
-import std/[json, os, osproc, posix, streams, strutils, times, unittest]
+import std/[json, os, osproc, streams, strutils, times, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
 import runquota_core
 import runquota_protocol
 import daemon_binary
+import daemon_endpoint
 import scratch_root
 
 const
@@ -59,10 +60,6 @@ proc hostStateDir(root: string): string =
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
 
-proc socketIsBound(path: string): bool =
-  var info: Stat
-  lstat(path.cstring, info) == 0 and S_ISSOCK(info.st_mode)
-
 type DaemonHandle = object
   process: Process
 
@@ -74,7 +71,7 @@ proc startDaemon(socketPath, stateDir, estimateDb: string): DaemonHandle =
             "--ambient-sample-interval-millis", "0"],
     options = {poStdErrToStdOut})
   for _ in 0 ..< 400:
-    if socketIsBound(socketPath): break
+    if endpointIsBound(socketPath): break
     sleep(25)
   # EXACTLY THREE STARTUP LINES, consumed by count.
   for _ in 0 ..< 3:

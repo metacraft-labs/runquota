@@ -24,8 +24,11 @@
 ## are refusals or degradations, and each is reached by doing something a
 ## client library cannot be asked to do.
 
-import std/[json, options, os, osproc, posix, streams, strutils, tables,
+import std/[json, options, os, osproc, streams, strutils, tables,
   unittest]
+
+when defined(posix):
+  import std/posix
 
 from runquota_ipc import endpointDirectoryPermissions, sendFrame, receiveFrame
 import runquota_client
@@ -33,6 +36,7 @@ import runquota_core
 import runquota_observation_store
 import runquota_protocol
 import daemon_binary
+import daemon_endpoint
 import scratch_root
 
 const CrashClientEnv = "RUNQUOTA_M13_CRASH_CLIENT"
@@ -102,10 +106,6 @@ proc hostStateDir(root: string): string =
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
 
-proc socketIsBound(path: string): bool =
-  var info: Stat
-  lstat(path.cstring, info) == 0 and S_ISSOCK(info.st_mode)
-
 type DaemonHandle = object
   process: Process
   startupLines: seq[string]
@@ -118,7 +118,7 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   let process = startProcess(daemonPath(), args = args,
     options = {poStdErrToStdOut})
   for _ in 0 ..< 400:
-    if socketIsBound(socketPath): break
+    if endpointIsBound(socketPath): break
     sleep(25)
   # EXACTLY THREE STARTUP LINES, ALWAYS. Before M13 it was three when a
   # store path was given and one when it was not; capture is on without any
