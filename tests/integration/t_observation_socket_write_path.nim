@@ -27,8 +27,6 @@
 import std/[json, options, os, osproc, streams, strutils, tables,
   unittest]
 
-when defined(posix):
-  import std/posix
 
 from runquota_ipc import endpointDirectoryPermissions, sendFrame, receiveFrame
 import runquota_client
@@ -37,6 +35,7 @@ import runquota_observation_store
 import runquota_protocol
 import daemon_binary
 import daemon_endpoint
+import owner_uid
 import scratch_root
 
 const CrashClientEnv = "RUNQUOTA_M13_CRASH_CLIENT"
@@ -320,7 +319,7 @@ suite "observation_socket_write_path":
     check row.finishedAtUnixMillis - row.startedAtUnixMillis ==
       row.durationMillis
     # FROM PEER CREDENTIALS, never from anything the client declared.
-    check row.ownerUid == some(int64(getuid()))
+    check row.ownerUid == some(callerOwnerUid())
     # Columns the protocol still does not carry are NULL, not zero: a zero
     # here would be indistinguishable from a measured zero.
     check row.cpuUserMillis.isNone

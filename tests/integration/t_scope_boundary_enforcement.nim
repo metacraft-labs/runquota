@@ -24,7 +24,10 @@
 ## SECOND real user connect and be attributed correctly; see the milestone
 ## report for that clause's status.
 
-import std/[options, os, osproc, posix, streams, strutils, unittest]
+import std/[options, os, osproc, streams, strutils, unittest]
+
+when defined(posix):
+  import std/posix
 
 # `readToEnd`, not `streams.readAll`: on Windows `readAll` stops at the
 # first short pipe read and returns only what the child had written so far.
@@ -35,28 +38,51 @@ import runquota_ipc
 import runquota_observation_store
 import runquota_protocol
 import daemon_binary
+import daemon_endpoint
+import owner_uid
 
-proc groupOf(path: string): int64 =
-  var info: Stat
-  if lstat(path.cstring, info) != 0:
-    return -1
-  int64(info.st_gid)
+const EchoFixtureArg = "--echo-fixture"
+  ## The leased command in the owner_uid case: this binary, re-executed,
+  ## printing its argument. It was `/bin/echo`, which is not a path on
+  ## Windows.
 
-proc pinRendezvousGroup(dir: string) =
-  ## THE RENDEZVOUS SCOPE IS PINNED, and it has to be. The shipped policy
-  ## is `0750`/`0660` group-gated where a `runquota` group exists and
-  ## `0700`/`0600` owner-only where it does not, so a file asserting either
-  ## mode as a literal would mean two different things on two machines --
-  ## green on the sanctioned host and red nowhere anyone looks.
-  ##
-  ## It is pinned to the group the FIXTURE ACTUALLY HAS rather than to a
-  ## constant, because that group differs by host and by shell: a scratch
-  ## directory under `/private/tmp` is born group-`wheel` by BSD
-  ## inheritance, one under a private `/var/folders` `TMPDIR` is born with
-  ## the caller's gid, and Linux has no inheritance at all. Pinning to the
-  ## inherited gid is what keeps these clauses about the MODE, which is
-  ## what they assert.
-  putEnv("RUNQUOTA_ENDPOINT_GROUP", $groupOf(dir))
+if paramCount() == 2 and paramStr(1) == EchoFixtureArg:
+  echo paramStr(2)
+  quit 0
+
+# WHAT IS POSIX-ONLY HERE, AND WHY. The daemon-start suite is about the
+# rendezvous DIRECTORY -- a world-writable one, one owned by another uid,
+# one created at 0750 -- and on Windows the endpoint is a named pipe with no
+# directory: `docs/database.md` §"Provisioning the host-wide state directory
+# and the rendezvous" lists the Windows rendezvous as "— (named pipes)", and
+# `runquota_ipc.endpointDirectoryTrust` answers `trustOk` for a named pipe.
+# Those cases are skipped there. The owner_uid suite is NOT restricted: it
+# FAILS on Windows through `callerOwnerUid`, because owner_uid has no
+# Windows definition yet (see `tests/support/owner_uid`), except the NULL
+# case, which does not need one.
+
+when defined(posix):
+  proc groupOf(path: string): int64 =
+    var info: Stat
+    if lstat(path.cstring, info) != 0:
+      return -1
+    int64(info.st_gid)
+
+  proc pinRendezvousGroup(dir: string) =
+    ## THE RENDEZVOUS SCOPE IS PINNED, and it has to be. The shipped policy
+    ## is `0750`/`0660` group-gated where a `runquota` group exists and
+    ## `0700`/`0600` owner-only where it does not, so a file asserting either
+    ## mode as a literal would mean two different things on two machines --
+    ## green on the sanctioned host and red nowhere anyone looks.
+    ##
+    ## It is pinned to the group the FIXTURE ACTUALLY HAS rather than to a
+    ## constant, because that group differs by host and by shell: a scratch
+    ## directory under `/private/tmp` is born group-`wheel` by BSD
+    ## inheritance, one under a private `/var/folders` `TMPDIR` is born with
+    ## the caller's gid, and Linux has no inheritance at all. Pinning to the
+    ## inherited gid is what keeps these clauses about the MODE, which is
+    ## what they assert.
+    putEnv("RUNQUOTA_ENDPOINT_GROUP", $groupOf(dir))
 
 proc scratchDir(name: string): string =
   # SHORT ON PURPOSE, and the arithmetic is the reason rather than taste.
@@ -73,92 +99,94 @@ proc scratchDir(name: string): string =
   removeDir(result)
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
-  pinRendezvousGroup(result)
+  when defined(posix):
+    pinRendezvousGroup(result)
 
-proc modeOf(path: string): int =
-  var info: Stat
-  if lstat(path.cstring, info) != 0:
-    return -1
-  int(info.st_mode) and 0o7777
-
-proc ownerOf(path: string): int64 =
-  var info: Stat
-  if lstat(path.cstring, info) != 0:
-    return -1
-  int64(info.st_uid)
-
-proc pathPresent(path: string): bool =
-  ## Anything at all at `path`. `os.fileExists` answers only for REGULAR
-  ## files, so it is false for a bound Unix-domain socket and would make
-  ## "nothing was left behind" vacuously true.
-  var info: Stat
-  lstat(path.cstring, info) == 0
-
-proc socketExists(path: string): bool =
-  var info: Stat
-  lstat(path.cstring, info) == 0 and S_ISSOCK(info.st_mode)
-
-proc foreignOwnedDirectory(): string =
-  ## Owned by another uid and NOT group- or world-writable, so the
-  ## ownership check is the only one that can refuse it.
-  for candidate in ["/usr", "/", "/etc", "/bin"]:
+when defined(posix):
+  proc modeOf(path: string): int =
     var info: Stat
-    if lstat(candidate.cstring, info) != 0:
-      continue
-    if not S_ISDIR(info.st_mode):
-      continue
-    if int64(info.st_uid) == int64(getuid()):
-      continue
-    if (int(info.st_mode) and 0o022) != 0:
-      continue
-    return candidate
-  ""
+    if lstat(path.cstring, info) != 0:
+      return -1
+    int(info.st_mode) and 0o7777
 
-type RefusedStart = object
-  exitedOnItsOwn: bool
-  exitCode: int
-  output: string
+  proc ownerOf(path: string): int64 =
+    var info: Stat
+    if lstat(path.cstring, info) != 0:
+      return -1
+    int64(info.st_uid)
 
-proc startAndExpectExit(socketPath: string): RefusedStart =
-  ## Runs the real daemon and waits, WITH A BOUND, for it to be gone.
-  ##
-  ## The bound is the whole point. A daemon that does NOT refuse serves
-  ## forever, so an unbounded `readAll` or `waitForExit` here would make
-  ## this negative control HANG rather than go red — and a control that
-  ## hangs is not a control, it is a test that never reports. (Verified:
-  ## the first version of this helper did exactly that under the mutation
-  ## that removes enforcement.) A daemon still running after the bound is
-  ## killed, its whole process group with it, and reported as a failure to
-  ## refuse.
-  let process = startProcess(
-    daemonPath(),
-    args = ["--socket", socketPath],
-    options = {poStdErrToStdOut}
-  )
-  var exited = false
-  for _ in 0 ..< 200:
-    if not process.running:
-      exited = true
-      break
-    sleep(25)
-  var code = -1
-  if exited:
-    code = process.waitForExit()
-  else:
-    # Kill the GROUP: a direct kill of the daemon can strand anything it
-    # spawned on pid 1, and this suite must leave nothing behind.
-    discard posix.kill(Pid(-process.processID), SIGKILL)
-    process.terminate()
-    discard process.waitForExit(5000)
-    if process.running:
-      process.kill()
+  proc pathPresent(path: string): bool =
+    ## Anything at all at `path`. `os.fileExists` answers only for REGULAR
+    ## files, so it is false for a bound Unix-domain socket and would make
+    ## "nothing was left behind" vacuously true.
+    var info: Stat
+    lstat(path.cstring, info) == 0
+
+  proc socketExists(path: string): bool =
+    var info: Stat
+    lstat(path.cstring, info) == 0 and S_ISSOCK(info.st_mode)
+
+  proc foreignOwnedDirectory(): string =
+    ## Owned by another uid and NOT group- or world-writable, so the
+    ## ownership check is the only one that can refuse it.
+    for candidate in ["/usr", "/", "/etc", "/bin"]:
+      var info: Stat
+      if lstat(candidate.cstring, info) != 0:
+        continue
+      if not S_ISDIR(info.st_mode):
+        continue
+      if int64(info.st_uid) == int64(getuid()):
+        continue
+      if (int(info.st_mode) and 0o022) != 0:
+        continue
+      return candidate
+    ""
+
+  type RefusedStart = object
+    exitedOnItsOwn: bool
+    exitCode: int
+    output: string
+
+  proc startAndExpectExit(socketPath: string): RefusedStart =
+    ## Runs the real daemon and waits, WITH A BOUND, for it to be gone.
+    ##
+    ## The bound is the whole point. A daemon that does NOT refuse serves
+    ## forever, so an unbounded `readAll` or `waitForExit` here would make
+    ## this negative control HANG rather than go red — and a control that
+    ## hangs is not a control, it is a test that never reports. (Verified:
+    ## the first version of this helper did exactly that under the mutation
+    ## that removes enforcement.) A daemon still running after the bound is
+    ## killed, its whole process group with it, and reported as a failure to
+    ## refuse.
+    let process = startProcess(
+      daemonPath(),
+      args = ["--socket", socketPath],
+      options = {poStdErrToStdOut}
+    )
+    var exited = false
+    for _ in 0 ..< 200:
+      if not process.running:
+        exited = true
+        break
+      sleep(25)
+    var code = -1
+    if exited:
+      code = process.waitForExit()
+    else:
+      # Kill the GROUP: a direct kill of the daemon can strand anything it
+      # spawned on pid 1, and this suite must leave nothing behind.
+      discard posix.kill(Pid(-process.processID), SIGKILL)
+      process.terminate()
       discard process.waitForExit(5000)
-  # Read only after the child is gone, so a full pipe cannot block it and
-  # an unread pipe cannot block us.
-  let output = process.outputStream.readToEnd()
-  check not process.running
-  process.close()
-  RefusedStart(exitedOnItsOwn: exited, exitCode: code, output: output)
+      if process.running:
+        process.kill()
+        discard process.waitForExit(5000)
+    # Read only after the child is gone, so a full pipe cannot block it and
+    # an unread pipe cannot block us.
+    let output = process.outputStream.readToEnd()
+    check not process.running
+    process.close()
+    RefusedStart(exitedOnItsOwn: exited, exitCode: code, output: output)
 
 type DaemonHandle = object
   process: Process
@@ -166,7 +194,7 @@ type DaemonHandle = object
 
 proc waitForSocket(socketPath: string) =
   for _ in 0 ..< 400:
-    if socketExists(socketPath):
+    if endpointIsBound(socketPath):
       return
     sleep(25)
 
@@ -212,7 +240,7 @@ proc exchangeHello(socketPath: string; userId: uint64):
   ## Speaks the wire protocol directly, because the shipped client always
   ## sends `getuid()` and therefore cannot express the attack: a client
   ## DECLARING an owner it does not own is the thing being refused.
-  var connection = connectEndpoint(unixEndpoint(socketPath))
+  var connection = connectEndpoint(endpointForPath(socketPath))
   try:
     connection.sendFrame(helloFrame(userId))
     var frame: RqspFrame
@@ -235,72 +263,82 @@ proc waitForExecutionRows(path: string; atLeast: int): int =
         return
     sleep(100)
 
-suite "scope_boundary_enforcement_daemon_start":
-  test "a real daemon REFUSES a pre-created world-writable endpoint directory":
-    let root = scratchDir("wide")
-    defer: removeDir(root)
-    let dir = root / "ep"
-    createDir(dir)
-    setFilePermissions(dir, {
-      fpUserRead, fpUserWrite, fpUserExec,
-      fpGroupRead, fpGroupWrite, fpGroupExec,
-      fpOthersRead, fpOthersWrite, fpOthersExec})
-    check modeOf(dir) == 0o777
-    let socketPath = dir / "runquotad.sock"
+when defined(posix):
+  suite "scope_boundary_enforcement_daemon_start":
+    test "a real daemon REFUSES a pre-created world-writable endpoint directory":
+      let root = scratchDir("wide")
+      defer: removeDir(root)
+      let dir = root / "ep"
+      createDir(dir)
+      setFilePermissions(dir, {
+        fpUserRead, fpUserWrite, fpUserExec,
+        fpGroupRead, fpGroupWrite, fpGroupExec,
+        fpOthersRead, fpOthersWrite, fpOthersExec})
+      check modeOf(dir) == 0o777
+      let socketPath = dir / "runquotad.sock"
 
-    let refused = startAndExpectExit(socketPath)
-    # It refused ON ITS OWN. Without this the test would pass on a daemon
-    # that had to be killed, which is the opposite of the claim.
-    check refused.exitedOnItsOwn
-    check refused.exitCode != 0
-    check refused.exitCode == 3
-    # Named, not opaque.
-    check dir in refused.output
-    check "0777" in refused.output
-    check "0750" in refused.output
-    # A refusal, not a fallback: nothing was bound and nothing was left
-    # behind in a directory the daemon does not trust.
-    check not pathPresent(socketPath)
-
-  test "a real daemon REFUSES an endpoint directory owned by another uid":
-    let foreign = foreignOwnedDirectory()
-    check foreign.len > 0
-    if foreign.len > 0:
-      # The mode cannot be what refuses this one.
-      check (modeOf(foreign) and 0o022) == 0
-      let socketPath = foreign / ("rq-m13c-" & $getCurrentProcessId() & ".sock")
       let refused = startAndExpectExit(socketPath)
+      # It refused ON ITS OWN. Without this the test would pass on a daemon
+      # that had to be killed, which is the opposite of the claim.
       check refused.exitedOnItsOwn
+      check refused.exitCode != 0
       check refused.exitCode == 3
-      check foreign in refused.output
-      check ("owned by uid " & $ownerOf(foreign)) in refused.output
-      check ("uid " & $getuid()) in refused.output
-      # It refused before touching a path it has no business writing to.
+      # Named, not opaque.
+      check dir in refused.output
+      check "0777" in refused.output
+      check "0750" in refused.output
+      # A refusal, not a fallback: nothing was bound and nothing was left
+      # behind in a directory the daemon does not trust.
       check not pathPresent(socketPath)
 
-  test "a real daemon accepts a directory it created itself, at 0750":
-    # The acceptance half. Without it, a build that refused every start
-    # would satisfy both refusals above.
-    let root = scratchDir("good")
-    defer: removeDir(root)
-    let dir = root / "ep"
-    let socketPath = dir / "runquotad.sock"
-    let dbPath = root / "observations.sqlite"
-    let identityFile = root / "host-id"
-    check fileExists(daemonPath())
-    var daemon = startDaemon(socketPath, dbPath, identityFile)
-    try:
-      check daemon.startupLines[0].contains(socketPath)
-      check dirExists(dir)
-      check modeOf(dir) == 0o750
-      check (modeOf(dir) and 0o022) == 0
-      check ownerOf(dir) == int64(getuid())
-      check socketExists(socketPath)
-      # M13d: the socket the daemon bound is 0660, so a group member may
-      # connect through it and a non-member is refused by the filesystem.
-      check modeOf(socketPath) == 0o660
-    finally:
-      daemon.stop()
+    test "a real daemon REFUSES an endpoint directory owned by another uid":
+      let foreign = foreignOwnedDirectory()
+      check foreign.len > 0
+      if foreign.len > 0:
+        # The mode cannot be what refuses this one.
+        check (modeOf(foreign) and 0o022) == 0
+        let socketPath = foreign / ("rq-m13c-" & $getCurrentProcessId() & ".sock")
+        let refused = startAndExpectExit(socketPath)
+        check refused.exitedOnItsOwn
+        check refused.exitCode == 3
+        check foreign in refused.output
+        check ("owned by uid " & $ownerOf(foreign)) in refused.output
+        check ("uid " & $getuid()) in refused.output
+        # It refused before touching a path it has no business writing to.
+        check not pathPresent(socketPath)
+
+    test "a real daemon accepts a directory it created itself, at 0750":
+      # The acceptance half. Without it, a build that refused every start
+      # would satisfy both refusals above.
+      let root = scratchDir("good")
+      defer: removeDir(root)
+      let dir = root / "ep"
+      let socketPath = dir / "runquotad.sock"
+      let dbPath = root / "observations.sqlite"
+      let identityFile = root / "host-id"
+      check fileExists(daemonPath())
+      var daemon = startDaemon(socketPath, dbPath, identityFile)
+      try:
+        check daemon.startupLines[0].contains(socketPath)
+        check dirExists(dir)
+        check modeOf(dir) == 0o750
+        check (modeOf(dir) and 0o022) == 0
+        check ownerOf(dir) == int64(getuid())
+        check socketExists(socketPath)
+        # M13d: the socket the daemon bound is 0660, so a group member may
+        # connect through it and a non-member is refused by the filesystem.
+        check modeOf(socketPath) == 0o660
+      finally:
+        daemon.stop()
+
+else:
+  suite "scope_boundary_enforcement_daemon_start":
+    for name in [
+        "a real daemon REFUSES a pre-created world-writable endpoint directory",
+        "a real daemon REFUSES an endpoint directory owned by another uid",
+        "a real daemon accepts a directory it created itself, at 0750"]:
+      test name:
+        skip()
 
 suite "scope_boundary_enforcement_owner_uid":
   test "a client declaring somebody else's uid is REFUSED, and one declaring its own is not":
@@ -312,7 +350,7 @@ suite "scope_boundary_enforcement_owner_uid":
     let identityFile = root / "host-id"
     var daemon = startDaemon(socketPath, dbPath, identityFile)
     try:
-      let mine = uint64(getuid())
+      let mine = uint64(callerOwnerUid())
       # A uid this process demonstrably does not own. `mine + 1` on a
       # single-uid host is still a uid the kernel will not report for this
       # connection, which is the entire point: the daemon must believe the
@@ -350,7 +388,7 @@ suite "scope_boundary_enforcement_owner_uid":
         cliPath(),
         args = ["acquire", "--cpu", "1000", "--mem", "64MB",
                 "--label", "m13c-owner", "--",
-                "/bin/echo", "m13c-owner-ok"],
+                getAppFilename(), EchoFixtureArg, "m13c-owner-ok"],
         env = nil,
         options = {poStdErrToStdOut}
       )
@@ -372,7 +410,7 @@ suite "scope_boundary_enforcement_owner_uid":
       # spoofed-Hello refusal in the test above, not this equality.
       # Distinguishing them by the recorded value needs a second real uid.
       check executions[0].ownerUid.isSome
-      check executions[0].ownerUid == some(int64(getuid()))
+      check executions[0].ownerUid == some(callerOwnerUid())
     finally:
       daemon.stop()
       delEnv("RUNQUOTA_SOCKET")

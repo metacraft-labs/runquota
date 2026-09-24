@@ -36,8 +36,6 @@
 
 import std/[json, options, os, osproc, streams, strutils, unittest]
 
-when defined(posix):
-  import std/posix
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
@@ -46,6 +44,8 @@ import runquota_observation_store
 import runquota_protocol
 import daemon_binary
 import daemon_endpoint
+import owner_uid
+from runquota_core/child_process import runCapturedProcess
 import scratch_root
 
 const
@@ -115,17 +115,13 @@ proc runCli(args: varargs[string]): CliResult =
   var argv: seq[string] = @[]
   for arg in args:
     argv.add(arg)
-  let outFile = getTempDir() / ("rq-cli-out-" & $getCurrentProcessId())
-  let errFile = getTempDir() / ("rq-cli-err-" & $getCurrentProcessId())
-  let process = startProcess("/bin/sh", args = ["-c",
-    quoteShellCommand(@[cliPath()] & argv) & " >" & quoteShell(outFile) &
-      " 2>" & quoteShell(errFile)], options = {})
-  let code = process.waitForExit()
-  process.close()
-  result = CliResult(outText: readFile(outFile),
-    errText: readFile(errFile), code: code)
-  removeFile(outFile)
-  removeFile(errFile)
+  #
+  # `runCapturedProcess` keeps them apart itself; this used to redirect them
+  # into two files through `/bin/sh -c`, which is not a path on Windows.
+  let captured = runCapturedProcess(cliPath(), argv, options = {})
+  doAssert captured.failure.len == 0, captured.failure
+  result = CliResult(outText: captured.output, errText: captured.error,
+    code: captured.exitCode)
 
 proc completeOneExecution(client: var RunQuotaClient; statsKey: string;
                           sleepMillis: int) =
@@ -391,11 +387,11 @@ suite "stats_cli_verbs":
           durationMillis: 500, termination: tExited, exitStatus: 0,
           completeness: ccComplete),
         SyntheticRow(suffix: "oom", statsKey: OomKey,
-          profileId: liveProfileId, ownerUid: some(int64(getuid())),
+          profileId: liveProfileId, ownerUid: some(callerOwnerUid()),
           durationMillis: 700, termination: tOomKilled, exitStatus: 0,
           completeness: ccDegraded),
         SyntheticRow(suffix: "retired", statsKey: SeedKey,
-          profileId: retiredProfileId, ownerUid: some(int64(getuid())),
+          profileId: retiredProfileId, ownerUid: some(callerOwnerUid()),
           durationMillis: 100, termination: tExited, exitStatus: 0,
           completeness: ccComplete)])
 
@@ -497,11 +493,11 @@ suite "stats_cli_verbs":
         retiredProfileId))
       store.insertSynthetic(hostId, runId, [
         SyntheticRow(suffix: "r1", statsKey: SeedKey,
-          profileId: retiredProfileId, ownerUid: some(int64(getuid())),
+          profileId: retiredProfileId, ownerUid: some(callerOwnerUid()),
           durationMillis: 100, termination: tExited, exitStatus: 0,
           completeness: ccComplete),
         SyntheticRow(suffix: "r2", statsKey: SeedKey,
-          profileId: retiredProfileId, ownerUid: some(int64(getuid())),
+          profileId: retiredProfileId, ownerUid: some(callerOwnerUid()),
           durationMillis: 120, termination: tExited, exitStatus: 0,
           completeness: ccComplete)])
 

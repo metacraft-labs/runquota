@@ -26,8 +26,6 @@
 
 import std/[options, os, osproc, streams, strutils, unittest]
 
-when defined(posix):
-  import std/posix
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
@@ -37,6 +35,7 @@ from runquota_observation_store/extensions as extensions import nil
 import runquota_protocol
 import daemon_binary
 import daemon_endpoint
+import owner_uid
 import scratch_root
 
 const
@@ -254,7 +253,7 @@ suite "observation_query_interface":
       check store.captureEnabled
       check store.insertHostProfile(
         syntheticProfile(hostId, retiredProfileId))
-      let myUid = int64(getuid())
+      let myUid = callerOwnerUid()
       store.insertSynthetic(hostId, runId, [
         SyntheticRow(statsKey: HistoryKey, profileId: retiredProfileId,
           ownerUid: some(myUid), durationMillis: 100, peakRssBytes: 1_000),
@@ -678,7 +677,7 @@ suite "observation_query_interface":
         if answer.executions.len == 1:
           check answer.executions[0].statsKey == key
           check answer.executions[0].ownerUidPresent
-          check answer.executions[0].ownerUid == uint64(getuid())
+          check answer.executions[0].ownerUid == uint64(callerOwnerUid())
 
       # NON-VACUITY: capture really was on and the rows really were
       # written, so "the query saw it" is a statement about the flush
