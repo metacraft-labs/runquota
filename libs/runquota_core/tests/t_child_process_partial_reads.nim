@@ -30,7 +30,7 @@
 ## No mocks: the child is this test binary re-executed, so the case needs no
 ## shell and runs the same way on every platform.
 
-import std/[os, strutils, unittest]
+import std/[os, osproc, strutils, unittest]
 
 import runquota_core/child_process
 
@@ -91,3 +91,18 @@ suite "runCapturedProcess reads to end of input":
           captured.error == expected('e'):
         intact += 1
     check intact == Captures
+
+  test "a merged capture holds every byte of both streams, in one field":
+    # `poStdErrToStdOut` gives stderr the same pipe as stdout. It used to be
+    # read by BOTH drain threads at once, which split the bytes between
+    # `output` and `error` and garbled each; merged, `output` must hold
+    # every piece of both streams intact and `error` nothing.
+    let captured = runCapturedProcess(getAppFilename(),
+      [PiecesFlag, $PausePerPieceMillis], options = {poStdErrToStdOut})
+    check captured.failure == ""
+    check captured.ok
+    check captured.error == ""
+    check captured.output.len == expected('o').len + expected('e').len
+    for stream in ['o', 'e']:
+      for index in 0 ..< Pieces:
+        check piece(stream, index) in captured.output

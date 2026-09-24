@@ -206,14 +206,24 @@ proc runCapturedProcess*(
     var outputThread: Thread[ptr StreamDrain]
     var errorThread: Thread[ptr StreamDrain]
     var drainsStarted = 0
+    # MERGED MEANS ONE PIPE, AND ONE PIPE GETS ONE READER. With
+    # `poStdErrToStdOut` osproc gives stderr the SAME handle as stdout (on
+    # POSIX and on Windows alike), and `errorStream` wraps that handle in a
+    # second stream. Draining both then put two threads on one pipe, each
+    # taking whichever bytes it read first: the capture came back split
+    # between `output` and `error`, both garbled -- "database is locked"
+    # arrived as "databse islcked" in one field and the missing letters in
+    # the other. The merged form is read by the stdout drain alone.
+    let merged = poStdErrToStdOut in spawnOptions
 
     try:
       outputDrain.stream = process.outputStream
-      errorDrain.stream = process.errorStream
       createThread(outputThread, drainStream, addr outputDrain)
       drainsStarted = 1
-      createThread(errorThread, drainStream, addr errorDrain)
-      drainsStarted = 2
+      if not merged:
+        errorDrain.stream = process.errorStream
+        createThread(errorThread, drainStream, addr errorDrain)
+        drainsStarted = 2
       if input.len > 0:
         let stdinStream = process.inputStream
         stdinStream.write(input)
@@ -241,8 +251,14 @@ proc runCapturedProcess*(
       # the stdout drain would wait on EOF from a child that can no longer
       # reach it. Read stderr on this thread instead, so both streams are still
       # serviced at the same time and the join below is guaranteed to return.
-      if drainsStarted == 1:
-        drainStream(addr errorDrain)
+      if drainsStarted == 1 and not merged:
+        if errorDrain.stream == nil:
+          try:
+            errorDrain.stream = process.errorStream
+          except CatchableError:
+            discard
+        if errorDrain.stream != nil:
+          drainStream(addr errorDrain)
       if drainsStarted >= 1:
         joinThread(outputThread)
       if drainsStarted >= 2:
