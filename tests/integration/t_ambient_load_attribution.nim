@@ -1333,13 +1333,20 @@ suite "ambient_load_attribution":
       check lease.active
 
       sleep(4500)
-      leasedRows = openObservationStore(leasedDb).readAmbientSamples()
 
       # THE OTHER EDGE. The lease goes away; sampling must stop again
       # rather than merely have started once. At most ONE further row may
       # appear -- the tick whose interval straddles the release, which did
       # contain live work -- and then nothing.
+      #
+      # THE BASELINE IS READ AT THE RELEASE, NOT BEFORE IT. Reading the
+      # store opens it, which is several `sqlite3` spawns; on Windows that
+      # can take long enough for further LIVE ticks to land between the read
+      # and the release, and those would be counted as rows that appeared
+      # "after release" although the lease was held for them. (Seen once: 11
+      # against a bound of 10.)
       lease.release()
+      leasedRows = openObservationStore(leasedDb).readAmbientSamples()
       session.closeSession()
       client.close()
       sleep(4000)
