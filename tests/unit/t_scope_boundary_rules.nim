@@ -28,32 +28,55 @@
 ## `host_id` needs root or a container, and the single-uid substitute below
 ## is labelled as a substitute rather than passed off as the clause.
 
-import std/[os, posix, strutils, unittest]
+import std/[os, strutils, unittest]
+
+when defined(posix):
+  import std/posix
 
 import runquota_ipc
 import runquota_observation_store
 
-proc groupOf(path: string): int64 =
-  var info: Stat
-  if lstat(path.cstring, info) != 0:
-    return -1
-  int64(info.st_gid)
+# ---------------------------------------------------------------------------
+# WHAT IS POSIX-ONLY HERE, AND WHY
+# ---------------------------------------------------------------------------
+#
+# The RENDEZVOUS DIRECTORY suite is POSIX-only by design. On Windows the
+# endpoint is a named pipe and there is no directory to create, own or mode:
+# `docs/database.md` §"Provisioning the host-wide state directory and the
+# rendezvous" lists the Windows rendezvous as "— (named pipes)", and
+# `runquota_ipc.endpointDirectoryTrust` answers `trustOk` for a named pipe
+# because "there is no directory to own and no mode to widen". Those cases
+# are reported skipped there.
+#
+# The SEGMENT cases that put a file on disk and read its mode are NOT
+# restricted: the shared-memory segments have a Windows design and no Windows
+# implementation yet (`RunQuota-Shared-Memory-Structures.md`, "Windows arm:
+# designed only"), so on Windows they FAIL, saying so, rather than pass or
+# skip. The segment-scope constants and the host identity cases run
+# everywhere.
 
-proc pinRendezvousGroup(dir: string) =
-  ## THE RENDEZVOUS SCOPE IS PINNED, and it has to be. The shipped policy
-  ## is `0750`/`0660` group-gated where a `runquota` group exists and
-  ## `0700`/`0600` owner-only where it does not, so a file asserting either
-  ## mode as a literal would mean two different things on two machines --
-  ## green on the sanctioned host and red nowhere anyone looks.
-  ##
-  ## It is pinned to the group the FIXTURE ACTUALLY HAS rather than to a
-  ## constant, because that group differs by host and by shell: a scratch
-  ## directory under `/private/tmp` is born group-`wheel` by BSD
-  ## inheritance, one under a private `/var/folders` `TMPDIR` is born with
-  ## the caller's gid, and Linux has no inheritance at all. Pinning to the
-  ## inherited gid is what keeps these clauses about the MODE, which is
-  ## what they assert.
-  putEnv("RUNQUOTA_ENDPOINT_GROUP", $groupOf(dir))
+when defined(posix):
+  proc groupOf(path: string): int64 =
+    var info: Stat
+    if lstat(path.cstring, info) != 0:
+      return -1
+    int64(info.st_gid)
+
+  proc pinRendezvousGroup(dir: string) =
+    ## THE RENDEZVOUS SCOPE IS PINNED, and it has to be. The shipped policy
+    ## is `0750`/`0660` group-gated where a `runquota` group exists and
+    ## `0700`/`0600` owner-only where it does not, so a file asserting either
+    ## mode as a literal would mean two different things on two machines --
+    ## green on the sanctioned host and red nowhere anyone looks.
+    ##
+    ## It is pinned to the group the FIXTURE ACTUALLY HAS rather than to a
+    ## constant, because that group differs by host and by shell: a scratch
+    ## directory under `/private/tmp` is born group-`wheel` by BSD
+    ## inheritance, one under a private `/var/folders` `TMPDIR` is born with
+    ## the caller's gid, and Linux has no inheritance at all. Pinning to the
+    ## inherited gid is what keeps these clauses about the MODE, which is
+    ## what they assert.
+    putEnv("RUNQUOTA_ENDPOINT_GROUP", $groupOf(dir))
 
 proc scratchDir(name: string): string =
   # SHORT ON PURPOSE, and the arithmetic is the reason rather than taste.
@@ -70,216 +93,243 @@ proc scratchDir(name: string): string =
   removeDir(result)
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
-  pinRendezvousGroup(result)
+  when defined(posix):
+    pinRendezvousGroup(result)
 
-proc modeOf(path: string): int =
-  var info: Stat
-  if lstat(path.cstring, info) != 0:
-    return -1
-  int(info.st_mode) and 0o7777
-
-proc ownerOf(path: string): int64 =
-  var info: Stat
-  if lstat(path.cstring, info) != 0:
-    return -1
-  int64(info.st_uid)
-
-proc foreignOwnedDirectory(): string =
-  ## A directory this host already has that is owned by a uid other than
-  ## ours AND is NOT group- or world-writable.
-  ##
-  ## Both halves matter. Foreign ownership is the thing under test; the
-  ## absence of group/world write is what makes the ownership check the
-  ## ONLY check that can refuse it, so a build with the ownership check
-  ## removed stops refusing this path instead of refusing it for the wrong
-  ## reason. `/usr` and `/` are root-owned `0755` on macOS and on Linux.
-  for candidate in ["/usr", "/", "/etc", "/bin"]:
+when defined(posix):
+  proc modeOf(path: string): int =
     var info: Stat
-    if lstat(candidate.cstring, info) != 0:
-      continue
-    if not S_ISDIR(info.st_mode):
-      continue
-    if int64(info.st_uid) == int64(getuid()):
-      continue
-    if (int(info.st_mode) and 0o022) != 0:
-      continue
-    return candidate
-  ""
+    if lstat(path.cstring, info) != 0:
+      return -1
+    int(info.st_mode) and 0o7777
 
-suite "scope_boundary_rules_endpoint_directory":
-  test "the endpoint directory is created 0750 by an explicit mode, not by the umask":
-    # THE UMASK IS SET WIDE OPEN ON PURPOSE. `createDir` with no mode asks
-    # for 0777 and gets whatever the umask leaves, so on a developer box
-    # with umask 022 it lands on 0755 and the defect is invisible. Under
-    # umask 0 an unfixed creation path produces a 0777 rendezvous
-    # directory, which is the whole defect, in one line.
-    #
-    # M13d: 0750 and not 0700. The rendezvous is SHARED -- a private mode
-    # on it locks out every user but one, which is the same defect as
-    # running a daemon per user. What must never happen is group- or
-    # other-WRITABLE, and that is asserted separately below so a future
-    # widening cannot pass by changing one number.
-    let root = scratchDir("create")
-    defer: removeDir(root)
-    let dir = root / "ep"
-    let saved = umask(Mode(0))
-    try:
-      ensureEndpointDir(unixEndpoint(dir / "runquotad.sock"))
-    finally:
-      discard umask(saved)
-    check dirExists(dir)
-    check modeOf(dir) == 0o750
-    check (modeOf(dir) and 0o022) == 0
-    check ownerOf(dir) == int64(getuid())
-    # And the directory it just made is one it will accept again, which is
-    # what makes creation and verification one contract rather than two.
-    check endpointDirectoryRefusal(unixEndpoint(dir / "runquotad.sock")) == ""
+  proc ownerOf(path: string): int64 =
+    var info: Stat
+    if lstat(path.cstring, info) != 0:
+      return -1
+    int64(info.st_uid)
 
-  test "a pre-created world-writable endpoint directory is REFUSED, and named":
-    let root = scratchDir("world")
-    defer: removeDir(root)
-    let dir = root / "ep"
-    createDir(dir)
-    setFilePermissions(dir, {
-      fpUserRead, fpUserWrite, fpUserExec,
-      fpGroupRead, fpGroupWrite, fpGroupExec,
-      fpOthersRead, fpOthersWrite, fpOthersExec})
-    check modeOf(dir) == 0o777
+  proc foreignOwnedDirectory(): string =
+    ## A directory this host already has that is owned by a uid other than
+    ## ours AND is NOT group- or world-writable.
+    ##
+    ## Both halves matter. Foreign ownership is the thing under test; the
+    ## absence of group/world write is what makes the ownership check the
+    ## ONLY check that can refuse it, so a build with the ownership check
+    ## removed stops refusing this path instead of refusing it for the wrong
+    ## reason. `/usr` and `/` are root-owned `0755` on macOS and on Linux.
+    for candidate in ["/usr", "/", "/etc", "/bin"]:
+      var info: Stat
+      if lstat(candidate.cstring, info) != 0:
+        continue
+      if not S_ISDIR(info.st_mode):
+        continue
+      if int64(info.st_uid) == int64(getuid()):
+        continue
+      if (int(info.st_mode) and 0o022) != 0:
+        continue
+      return candidate
+    ""
 
-    let trust = endpointDirectoryTrust(unixEndpoint(dir / "runquotad.sock"))
-    check trust.reason == trustBadMode
-    check trust.path == dir
-    check trust.mode == 0o777
-    # Named, not opaque: the offending path and the offending mode are both
-    # in the message, and so is the mode that was required.
-    check dir in trust.message
-    check "0777" in trust.message
-    check "0750" in trust.message
-    check "group- or world-writable" in trust.message
-    check endpointDirectoryRefusal(unixEndpoint(dir / "runquotad.sock")) ==
-      trust.message
-
-  test "a group-writable endpoint directory is REFUSED too":
-    # 0770 is the mode a lax deployment reaches for when it wants "the
-    # team" to share a build box. It is still a directory every member of
-    # that group can plant a socket in.
-    let root = scratchDir("group")
-    defer: removeDir(root)
-    let dir = root / "ep"
-    createDir(dir)
-    setFilePermissions(dir, {
-      fpUserRead, fpUserWrite, fpUserExec,
-      fpGroupRead, fpGroupWrite, fpGroupExec})
-    check modeOf(dir) == 0o770
-    let trust = endpointDirectoryTrust(unixEndpoint(dir / "runquotad.sock"))
-    check trust.reason == trustBadMode
-    check trust.mode == 0o770
-    check "0770" in trust.message
-    check "group- or world-writable" in trust.message
-
-  test "a merely loose 0755 endpoint directory is REFUSED as well":
-    # This is the one a lax umask produces, and it is the reason "mode is
-    # verified" is not the same statement as "mode is not writable by
-    # others". Nobody else can write here, and it is still refused,
-    # because a mode that was never verified as created MUST NOT be
-    # assumed.
-    let root = scratchDir("loose")
-    defer: removeDir(root)
-    let dir = root / "ep"
-    createDir(dir)
-    setFilePermissions(dir, {
-      fpUserRead, fpUserWrite, fpUserExec,
-      fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
-    check modeOf(dir) == 0o755
-    let trust = endpointDirectoryTrust(unixEndpoint(dir / "runquotad.sock"))
-    check trust.reason == trustBadMode
-    check "0755" in trust.message
-    check "0750" in trust.message
-
-  test "an endpoint directory owned by another uid is REFUSED, as an OWNERSHIP problem":
-    # THE ATTACK IS ON THE PATH, NOT ON THE CONNECTION. `getpeereid`
-    # validates who connects; it cannot tell that the socket they are
-    # connecting to sits in a directory somebody else owns and could have
-    # planted. Both checks are needed and this is the one the peer check
-    # does not make.
-    let foreign = foreignOwnedDirectory()
-    check foreign.len > 0
-    if foreign.len > 0:
-      check ownerOf(foreign) != int64(getuid())
-      # Not group- or world-writable, so the MODE check cannot be what
-      # refuses this. If it were, a build with the ownership check removed
-      # would still refuse the path and the ownership check would be
-      # untestable.
-      check (modeOf(foreign) and 0o022) == 0
-
-      let trust = endpointDirectoryTrust(unixEndpoint(foreign / "rq.sock"))
-      check trust.path == foreign
-      check trust.reason == trustForeignOwner
-      check foreign in trust.message
-      check ("owned by uid " & $ownerOf(foreign)) in trust.message
-      check ("uid " & $getuid()) in trust.message
-      check modeText(trust.mode) in trust.message
-
-  test "a symlink at the rendezvous path is refused rather than followed":
-    # Following it would check the mode of whatever it points at while the
-    # daemon binds through the link, so the check would be reading a
-    # different object from the one being used.
-    let root = scratchDir("link")
-    defer: removeDir(root)
-    let real = root / "real"
-    createDir(real)
-    setFilePermissions(real, {fpUserRead, fpUserWrite, fpUserExec})
-    let link = root / "ep"
-    createSymlink(real, link)
-    let trust = endpointDirectoryTrust(unixEndpoint(link / "runquotad.sock"))
-    check trust.reason == trustWrongType
-    check link in trust.message
-
-  test "a directory that is not there yet is not a refusal":
-    # The daemon is about to create it with an explicit mode, and a client
-    # gets an ordinary connect failure. Refusing here would make the first
-    # start of a daemon impossible.
-    let root = scratchDir("absent")
-    defer: removeDir(root)
-    let dir = root / "not-yet"
-    let trust = endpointDirectoryTrust(unixEndpoint(dir / "runquotad.sock"))
-    check trust.reason == trustMissing
-    check endpointDirectoryRefusal(unixEndpoint(dir / "runquotad.sock")) == ""
-
-  test "connecting through a widened directory is REFUSED at attach time":
-    # Verification happens on EVERY CLIENT ATTACH and not only at daemon
-    # start: the directory was fine when the daemon bound and was widened
-    # afterwards, which is precisely the window a start-only check leaves
-    # open.
-    let root = scratchDir("attach")
-    defer: removeDir(root)
-    let dir = root / "ep"
-    let socketPath = dir / "runquotad.sock"
-    var listener = bindEndpoint(unixEndpoint(socketPath))
-    try:
+when defined(posix):
+  suite "scope_boundary_rules_endpoint_directory":
+    test "the endpoint directory is created 0750 by an explicit mode, not by the umask":
+      # THE UMASK IS SET WIDE OPEN ON PURPOSE. `createDir` with no mode asks
+      # for 0777 and gets whatever the umask leaves, so on a developer box
+      # with umask 022 it lands on 0755 and the defect is invisible. Under
+      # umask 0 an unfixed creation path produces a 0777 rendezvous
+      # directory, which is the whole defect, in one line.
+      #
+      # M13d: 0750 and not 0700. The rendezvous is SHARED -- a private mode
+      # on it locks out every user but one, which is the same defect as
+      # running a daemon per user. What must never happen is group- or
+      # other-WRITABLE, and that is asserted separately below so a future
+      # widening cannot pass by changing one number.
+      let root = scratchDir("create")
+      defer: removeDir(root)
+      let dir = root / "ep"
+      let saved = umask(Mode(0))
+      try:
+        ensureEndpointDir(unixEndpoint(dir / "runquotad.sock"))
+      finally:
+        discard umask(saved)
+      check dirExists(dir)
       check modeOf(dir) == 0o750
-      # A client attaches happily while the directory is still private.
-      var ok = connectEndpoint(unixEndpoint(socketPath))
-      ok.close()
+      check (modeOf(dir) and 0o022) == 0
+      check ownerOf(dir) == int64(getuid())
+      # And the directory it just made is one it will accept again, which is
+      # what makes creation and verification one contract rather than two.
+      check endpointDirectoryRefusal(unixEndpoint(dir / "runquotad.sock")) == ""
 
+    test "a pre-created world-writable endpoint directory is REFUSED, and named":
+      let root = scratchDir("world")
+      defer: removeDir(root)
+      let dir = root / "ep"
+      createDir(dir)
       setFilePermissions(dir, {
         fpUserRead, fpUserWrite, fpUserExec,
         fpGroupRead, fpGroupWrite, fpGroupExec,
         fpOthersRead, fpOthersWrite, fpOthersExec})
-      var refused = false
-      var message = ""
+      check modeOf(dir) == 0o777
+
+      let trust = endpointDirectoryTrust(unixEndpoint(dir / "runquotad.sock"))
+      check trust.reason == trustBadMode
+      check trust.path == dir
+      check trust.mode == 0o777
+      # Named, not opaque: the offending path and the offending mode are both
+      # in the message, and so is the mode that was required.
+      check dir in trust.message
+      check "0777" in trust.message
+      check "0750" in trust.message
+      check "group- or world-writable" in trust.message
+      check endpointDirectoryRefusal(unixEndpoint(dir / "runquotad.sock")) ==
+        trust.message
+
+    test "a group-writable endpoint directory is REFUSED too":
+      # 0770 is the mode a lax deployment reaches for when it wants "the
+      # team" to share a build box. It is still a directory every member of
+      # that group can plant a socket in.
+      let root = scratchDir("group")
+      defer: removeDir(root)
+      let dir = root / "ep"
+      createDir(dir)
+      setFilePermissions(dir, {
+        fpUserRead, fpUserWrite, fpUserExec,
+        fpGroupRead, fpGroupWrite, fpGroupExec})
+      check modeOf(dir) == 0o770
+      let trust = endpointDirectoryTrust(unixEndpoint(dir / "runquotad.sock"))
+      check trust.reason == trustBadMode
+      check trust.mode == 0o770
+      check "0770" in trust.message
+      check "group- or world-writable" in trust.message
+
+    test "a merely loose 0755 endpoint directory is REFUSED as well":
+      # This is the one a lax umask produces, and it is the reason "mode is
+      # verified" is not the same statement as "mode is not writable by
+      # others". Nobody else can write here, and it is still refused,
+      # because a mode that was never verified as created MUST NOT be
+      # assumed.
+      let root = scratchDir("loose")
+      defer: removeDir(root)
+      let dir = root / "ep"
+      createDir(dir)
+      setFilePermissions(dir, {
+        fpUserRead, fpUserWrite, fpUserExec,
+        fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
+      check modeOf(dir) == 0o755
+      let trust = endpointDirectoryTrust(unixEndpoint(dir / "runquotad.sock"))
+      check trust.reason == trustBadMode
+      check "0755" in trust.message
+      check "0750" in trust.message
+
+    test "an endpoint directory owned by another uid is REFUSED, as an OWNERSHIP problem":
+      # THE ATTACK IS ON THE PATH, NOT ON THE CONNECTION. `getpeereid`
+      # validates who connects; it cannot tell that the socket they are
+      # connecting to sits in a directory somebody else owns and could have
+      # planted. Both checks are needed and this is the one the peer check
+      # does not make.
+      let foreign = foreignOwnedDirectory()
+      check foreign.len > 0
+      if foreign.len > 0:
+        check ownerOf(foreign) != int64(getuid())
+        # Not group- or world-writable, so the MODE check cannot be what
+        # refuses this. If it were, a build with the ownership check removed
+        # would still refuse the path and the ownership check would be
+        # untestable.
+        check (modeOf(foreign) and 0o022) == 0
+
+        let trust = endpointDirectoryTrust(unixEndpoint(foreign / "rq.sock"))
+        check trust.path == foreign
+        check trust.reason == trustForeignOwner
+        check foreign in trust.message
+        check ("owned by uid " & $ownerOf(foreign)) in trust.message
+        check ("uid " & $getuid()) in trust.message
+        check modeText(trust.mode) in trust.message
+
+    test "a symlink at the rendezvous path is refused rather than followed":
+      # Following it would check the mode of whatever it points at while the
+      # daemon binds through the link, so the check would be reading a
+      # different object from the one being used.
+      let root = scratchDir("link")
+      defer: removeDir(root)
+      let real = root / "real"
+      createDir(real)
+      setFilePermissions(real, {fpUserRead, fpUserWrite, fpUserExec})
+      let link = root / "ep"
+      createSymlink(real, link)
+      let trust = endpointDirectoryTrust(unixEndpoint(link / "runquotad.sock"))
+      check trust.reason == trustWrongType
+      check link in trust.message
+
+    test "a directory that is not there yet is not a refusal":
+      # The daemon is about to create it with an explicit mode, and a client
+      # gets an ordinary connect failure. Refusing here would make the first
+      # start of a daemon impossible.
+      let root = scratchDir("absent")
+      defer: removeDir(root)
+      let dir = root / "not-yet"
+      let trust = endpointDirectoryTrust(unixEndpoint(dir / "runquotad.sock"))
+      check trust.reason == trustMissing
+      check endpointDirectoryRefusal(unixEndpoint(dir / "runquotad.sock")) == ""
+
+    test "connecting through a widened directory is REFUSED at attach time":
+      # Verification happens on EVERY CLIENT ATTACH and not only at daemon
+      # start: the directory was fine when the daemon bound and was widened
+      # afterwards, which is precisely the window a start-only check leaves
+      # open.
+      let root = scratchDir("attach")
+      defer: removeDir(root)
+      let dir = root / "ep"
+      let socketPath = dir / "runquotad.sock"
+      var listener = bindEndpoint(unixEndpoint(socketPath))
       try:
-        var late = connectEndpoint(unixEndpoint(socketPath))
-        late.close()
-      except EndpointTrustError as error:
-        refused = true
-        message = error.msg
-      check refused
-      check dir in message
-      check "0777" in message
-    finally:
-      setFilePermissions(dir, {fpUserRead, fpUserWrite, fpUserExec})
-      listener.close()
+        check modeOf(dir) == 0o750
+        # A client attaches happily while the directory is still private.
+        var ok = connectEndpoint(unixEndpoint(socketPath))
+        ok.close()
+
+        setFilePermissions(dir, {
+          fpUserRead, fpUserWrite, fpUserExec,
+          fpGroupRead, fpGroupWrite, fpGroupExec,
+          fpOthersRead, fpOthersWrite, fpOthersExec})
+        var refused = false
+        var message = ""
+        try:
+          var late = connectEndpoint(unixEndpoint(socketPath))
+          late.close()
+        except EndpointTrustError as error:
+          refused = true
+          message = error.msg
+        check refused
+        check dir in message
+        check "0777" in message
+      finally:
+        setFilePermissions(dir, {fpUserRead, fpUserWrite, fpUserExec})
+        listener.close()
+
+else:
+  suite "scope_boundary_rules_endpoint_directory":
+    for name in [
+        "the endpoint directory is created 0750 by an explicit mode, not by the umask",
+        "a pre-created world-writable endpoint directory is REFUSED, and named",
+        "a group-writable endpoint directory is REFUSED too",
+        "a merely loose 0755 endpoint directory is REFUSED as well",
+        "an endpoint directory owned by another uid is REFUSED, as an OWNERSHIP problem",
+        "a symlink at the rendezvous path is refused rather than followed",
+        "a directory that is not there yet is not a refusal",
+        "connecting through a widened directory is REFUSED at attach time"]:
+      test name:
+        skip()
+
+template posixSegmentFile(body: untyped) =
+  ## The on-disk half of a segment case: POSIX file modes. See the note
+  ## above -- on Windows this is an unimplemented arm and FAILS.
+  when defined(posix):
+    body
+  else:
+    checkpoint("shared-memory segments have no Windows implementation " &
+      "(RunQuota-Shared-Memory-Structures.md: Windows arm designed only)")
+    fail()
 
 suite "scope_boundary_rules_segment_scopes":
   # THE THREE STRUCTURES DO NOT SHARE ONE RULE. These are separate tests
@@ -289,32 +339,34 @@ suite "scope_boundary_rules_segment_scopes":
 
   test "per-user segments are 0600":
     check requiredSegmentMode(segmentPerUser) == 0o600
-    let root = scratchDir("peruser")
-    defer: removeDir(root)
-    let path = root / "budget.seg"
-    writeFile(path, "x")
-    setFilePermissions(path, {fpUserRead, fpUserWrite})
-    check modeOf(path) == 0o600
-    check segmentTrust(path, segmentPerUser).reason == trustOk
+    posixSegmentFile:
+      let root = scratchDir("peruser")
+      defer: removeDir(root)
+      let path = root / "budget.seg"
+      writeFile(path, "x")
+      setFilePermissions(path, {fpUserRead, fpUserWrite})
+      check modeOf(path) == 0o600
+      check segmentTrust(path, segmentPerUser).reason == trustOk
 
   test "a group- or world-writable per-user segment is REFUSED, and named":
-    let root = scratchDir("segwide")
-    defer: removeDir(root)
-    for (perms, mode) in [
-        ({fpUserRead, fpUserWrite, fpGroupRead, fpGroupWrite}, 0o660),
-        ({fpUserRead, fpUserWrite, fpOthersRead, fpOthersWrite}, 0o606),
-        ({fpUserRead, fpUserWrite, fpGroupRead, fpGroupWrite,
-          fpOthersRead, fpOthersWrite}, 0o666)]:
-      let path = root / ("ring-" & $mode & ".seg")
-      writeFile(path, "x")
-      setFilePermissions(path, perms)
-      check modeOf(path) == mode
-      let trust = segmentTrust(path, segmentPerUser)
-      check trust.reason == trustBadMode
-      check path in trust.message
-      check modeText(mode) in trust.message
-      check "0600" in trust.message
-      check "group- or world-writable" in trust.message
+    posixSegmentFile:
+      let root = scratchDir("segwide")
+      defer: removeDir(root)
+      for (perms, mode) in [
+          ({fpUserRead, fpUserWrite, fpGroupRead, fpGroupWrite}, 0o660),
+          ({fpUserRead, fpUserWrite, fpOthersRead, fpOthersWrite}, 0o606),
+          ({fpUserRead, fpUserWrite, fpGroupRead, fpGroupWrite,
+            fpOthersRead, fpOthersWrite}, 0o666)]:
+        let path = root / ("ring-" & $mode & ".seg")
+        writeFile(path, "x")
+        setFilePermissions(path, perms)
+        check modeOf(path) == mode
+        let trust = segmentTrust(path, segmentPerUser)
+        check trust.reason == trustBadMode
+        check path in trust.message
+        check modeText(mode) in trust.message
+        check "0600" in trust.message
+        check "group- or world-writable" in trust.message
 
   test "the host-wide stats table is group-readable and is NOT 0600":
     # BY DESIGN, and this is the clause a blanket per-segment 0600 would
@@ -326,22 +378,23 @@ suite "scope_boundary_rules_segment_scopes":
     check segmentIsGroupReadable(segmentHostWide)
     check (requiredSegmentMode(segmentHostWide) and 0o040) != 0
 
-    let root = scratchDir("hostwide")
-    defer: removeDir(root)
-    let path = root / "stats.seg"
-    writeFile(path, "x")
-    setFilePermissions(path, {fpUserRead, fpUserWrite, fpGroupRead})
-    check modeOf(path) == 0o640
-    check segmentTrust(path, segmentHostWide).reason == trustOk
+    posixSegmentFile:
+      let root = scratchDir("hostwide")
+      defer: removeDir(root)
+      let path = root / "stats.seg"
+      writeFile(path, "x")
+      setFilePermissions(path, {fpUserRead, fpUserWrite, fpGroupRead})
+      check modeOf(path) == 0o640
+      check segmentTrust(path, segmentHostWide).reason == trustOk
 
-    # The same file at 0600 is REFUSED for the host-wide scope: a table no
-    # second user can read is a table that has stopped being host-wide.
-    setFilePermissions(path, {fpUserRead, fpUserWrite})
-    check modeOf(path) == 0o600
-    let tooTight = segmentTrust(path, segmentHostWide)
-    check tooTight.reason == trustBadMode
-    check "0600" in tooTight.message
-    check "0640" in tooTight.message
+      # The same file at 0600 is REFUSED for the host-wide scope: a table no
+      # second user can read is a table that has stopped being host-wide.
+      setFilePermissions(path, {fpUserRead, fpUserWrite})
+      check modeOf(path) == 0o600
+      let tooTight = segmentTrust(path, segmentHostWide)
+      check tooTight.reason == trustBadMode
+      check "0600" in tooTight.message
+      check "0640" in tooTight.message
 
   test "the host-wide rule is not the per-user rule":
     # Stated as its own assertion so that collapsing the two -- applying
@@ -355,42 +408,44 @@ suite "scope_boundary_rules_segment_scopes":
   test "the host-wide table still refuses a group-WRITABLE mode":
     # Group-readable is the exception; group-writable is not. The reason
     # the table needs no isolation is that no client can write it.
-    let root = scratchDir("hostwritable")
-    defer: removeDir(root)
-    let path = root / "stats.seg"
-    writeFile(path, "x")
-    setFilePermissions(path, {fpUserRead, fpUserWrite, fpGroupRead,
-      fpGroupWrite})
-    check modeOf(path) == 0o660
-    let trust = segmentTrust(path, segmentHostWide)
-    check trust.reason == trustBadMode
-    check "0660" in trust.message
-    check "group- or world-writable" in trust.message
+    posixSegmentFile:
+      let root = scratchDir("hostwritable")
+      defer: removeDir(root)
+      let path = root / "stats.seg"
+      writeFile(path, "x")
+      setFilePermissions(path, {fpUserRead, fpUserWrite, fpGroupRead,
+        fpGroupWrite})
+      check modeOf(path) == 0o660
+      let trust = segmentTrust(path, segmentHostWide)
+      check trust.reason == trustBadMode
+      check "0660" in trust.message
+      check "group- or world-writable" in trust.message
 
   test "a segment owned by another uid is REFUSED":
-    let foreign = foreignOwnedDirectory()
-    check foreign.len > 0
-    if foreign.len > 0:
-      # A real regular file owned by another uid, inside it.
-      var victim = ""
-      for candidate in [foreign / "bin" / "sh", foreign / "sh",
-                        "/bin/sh", "/usr/bin/env"]:
-        if fileExists(candidate) and ownerOf(candidate) != int64(getuid()):
-          victim = candidate
-          break
-      check victim.len > 0
-      if victim.len > 0:
-        let trust = segmentTrust(victim, segmentPerUser)
-        check trust.reason == trustForeignOwner
-        check victim in trust.message
-        check ("owned by uid " & $ownerOf(victim)) in trust.message
-        check modeText(trust.mode) in trust.message
+    posixSegmentFile:
+      let foreign = foreignOwnedDirectory()
+      check foreign.len > 0
+      if foreign.len > 0:
+        # A real regular file owned by another uid, inside it.
+        var victim = ""
+        for candidate in [foreign / "bin" / "sh", foreign / "sh",
+                          "/bin/sh", "/usr/bin/env"]:
+          if fileExists(candidate) and ownerOf(candidate) != int64(getuid()):
+            victim = candidate
+            break
+        check victim.len > 0
+        if victim.len > 0:
+          let trust = segmentTrust(victim, segmentPerUser)
+          check trust.reason == trustForeignOwner
+          check victim in trust.message
+          check ("owned by uid " & $ownerOf(victim)) in trust.message
+          check modeText(trust.mode) in trust.message
 
 suite "scope_boundary_rules_host_identity":
   test "host_id is read from a host-wide, daemon-owned path":
     let path = defaultHostIdentityFile()
     check path == hostWideStateDir / "host-id"
-    check path.startsWith("/")
+    check path.isAbsolute
     # Nothing per-user may appear in it. A path under the home directory
     # is per-user by construction, and that is the defect: one machine
     # would present as one identity per account.
