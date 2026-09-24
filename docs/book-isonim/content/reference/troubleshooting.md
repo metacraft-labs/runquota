@@ -103,8 +103,22 @@ recognise. The most common cause is a missing `--json` — `sessions`, `leases`,
 ## Lease counts look wrong after a client crashed
 
 `runquota status` reports `supervisor_lost_leases`. A client that vanishes has
-its session torn down and its leases reclaimed; the counter is how you tell
-that happened from a budget that was genuinely in use.
+its session torn down: leases it had not started are released at once, but a
+lease whose child was already running becomes `supervisor_lost` and keeps its
+reservation for as long as that child runs, because the child may still be
+using the memory it was admitted for. The daemon releases it at the next
+admission decision after the child is gone (any `RequestLease`,
+`OfferCandidates` or `GrantNext`, so a client waiting in the queue is enough to
+trigger it).
+
+To see what a lost lease is waiting for, run `runquota leases --json`: each
+lease carries `child_process_id` and `child_start_stamp`, the identity the
+daemon recorded when the lease started running. The lease is released when that
+pid no longer exists **or now belongs to a different process** (a different
+start stamp), so a recycled pid does not keep it alive.
+`runquota observations --json` counts the releases as `lost_leases_reaped`. A
+lost lease that stays while nothing is running under its `child_process_id`
+is a bug.
 
 ## The published stats table says entries are stale
 

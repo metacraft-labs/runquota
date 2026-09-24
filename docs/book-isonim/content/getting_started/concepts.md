@@ -34,9 +34,11 @@ signal".
 
 A client registers a session — a name and a version — before it takes any
 leases, and every lease is scoped to it. If a client vanishes, its session goes
-with it and the daemon reclaims the leases it was holding; `runquota status`
-reports those as `supervisor_lost_leases`. Sessions are what make a crashed
-build tool a recoverable event rather than a permanently leaked budget.
+with it and the daemon reclaims the leases it was holding. A lease whose child
+was already running is held as `supervisor_lost` until that child is gone
+(`runquota status` counts these as `supervisor_lost_leases`), because an
+orphaned child may still be using its reservation. Sessions are what make a
+crashed build tool a recoverable event rather than a permanently leaked budget.
 
 ## Resource vector
 

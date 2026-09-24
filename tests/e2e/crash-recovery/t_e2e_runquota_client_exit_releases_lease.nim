@@ -1,4 +1,4 @@
-import std/[envvars, os, osproc, strutils, unittest]
+import std/[envvars, json, os, osproc, strutils, unittest]
 
 when defined(posix):
   import std/posix
@@ -38,6 +38,14 @@ proc readStatus(): DaemonStatusMessage =
   var client = connectDefault()
   defer: client.close()
   client.daemonStatus()
+
+proc lostLeasesReaped(): int =
+  ## How many ``supervisor_lost`` leases the daemon has released, from the
+  ## ``observations`` inspection subject.
+  var client = connectDefault()
+  defer: client.close()
+  parseJson(client.inspectionJson("observations"))["observations"][
+    "lost_leases_reaped"].getInt
 
 proc waitForStatus(activeSessions, activeLeases, supervisorLost,
                    finishedLeases: uint32; totalFinished: uint64): DaemonStatusMessage =
@@ -282,16 +290,25 @@ suite "e2e_runquota_client_exit_releases_lease":
           discard helper.waitForExit(3000)
         helper.close()
 
-  test "starting lease becomes supervisor-lost on supervisor exit":
+  # A STARTING LEASE HAS NO CHILD TO WAIT FOR. It never reported
+  # `LeaseRunning`, so the orphan policy has no pid to hold it on and releases
+  # it at the next admission decision -- which session loss itself now is.
+  # These two cases used to observe it sitting in `supervisor_lost`, but only
+  # because the reaper then ran on `RequestLease` alone and nothing here sent
+  # one: the same gap that stranded a waiting client's reservation behind a
+  # killed build. What is asserted instead is the whole lifecycle: granted,
+  # lost rather than finished, and released by the reaper.
+  test "starting lease is lost, never finished, and released on supervisor exit":
     withDaemon:
       var helper = spawnHelper("starting-abnormal")
       check helper.waitForExit(3000) == 32
       helper.close()
 
-      let status = waitForStatus(0'u32, 1'u32, 1'u32, 0'u32, 0'u64)
+      let status = waitForStatus(0'u32, 0'u32, 0'u32, 0'u32, 0'u64)
       check status.totalGranted == 1'u64
+      check lostLeasesReaped() == 1
 
-  test "forced supervisor kill marks starting lease supervisor-lost":
+  test "forced supervisor kill loses a starting lease and releases it":
     withDaemon:
       let readyPath = socketDir / "starting.ready"
       var helper = spawnHelper("starting-kill", [readyPath])
@@ -299,9 +316,10 @@ suite "e2e_runquota_client_exit_releases_lease":
         waitForReady(readyPath)
         forceKillSupervisor(helper)
 
-        let status = waitForStatus(0'u32, 1'u32, 1'u32, 0'u32, 0'u64)
+        let status = waitForStatus(0'u32, 0'u32, 0'u32, 0'u32, 0'u64)
         check status.totalGranted == 1'u64
         check status.totalFinished == 0'u64
+        check lostLeasesReaped() == 1
       finally:
         if helper.running:
           helper.terminate()

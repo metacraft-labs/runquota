@@ -121,6 +121,13 @@ type
     supervisorUserId*: uint64
     peer*: PeerIdentity
     childProcessId*: uint64
+    childStartStamp*: uint64
+      ## The child's start stamp, read by the daemon itself when
+      ## ``LeaseRunning`` named ``childProcessId``; 0 when it could not be
+      ## read. The pid alone stops naming the child the moment the child
+      ## exits, so this is what lets the lost-lease reaper tell the child
+      ## from a later process that inherited its pid
+      ## (``runquota_daemon/child_identity``).
     processGroupId*: uint64
     cleanupRegistered*: bool
     finish*: LeaseFinish
