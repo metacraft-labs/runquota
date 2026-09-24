@@ -8,6 +8,17 @@ import runquota_ipc except connectDefault
 import runquota_protocol
 import daemon_binary
 
+const MarkerFixtureArg = "--write-benchmark-marker"
+  ## The command `runquota acquire --benchmark` runs: this test binary,
+  ## re-executed, writing "ok" to the path it is given. It used to be
+  ## `/bin/sh -c 'echo ok > "$1"'`, a path that exists on POSIX hosts only,
+  ## so on Windows the CLI could not launch it and the case failed on the
+  ## fixture rather than on the benchmark isolation it checks.
+
+if paramCount() == 2 and paramStr(1) == MarkerFixtureArg:
+  writeFile(paramStr(2), "ok")
+  quit 0
+
 proc waitForDaemon(socketPath: string) =
   putEnv("RUNQUOTA_SOCKET", socketPath)
   var lastError = ""
@@ -479,7 +490,7 @@ suite "e2e_runquota_multi_client_fairness":
           "--mem", "64MiB",
           "--label", "cli-benchmark",
           "--",
-          "/bin/sh", "-c", "echo ok > \"$1\"", "sh", markerPath
+          getAppFilename(), MarkerFixtureArg, markerPath
         ],
         options = {poStdErrToStdOut}
       )

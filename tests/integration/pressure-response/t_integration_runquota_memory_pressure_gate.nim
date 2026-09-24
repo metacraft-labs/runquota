@@ -5,6 +5,8 @@ import runquota_core
 import runquota_core/child_process
 when defined(linux):
   import runquota_host_linux
+elif defined(windows):
+  import runquota_host_windows
 import runquota_host_macos
 import runquota_process
 import runquota_protocol
@@ -103,8 +105,13 @@ proc waitForProcessTelemetry(processId: uint64): HostProcessTreeTelemetrySample 
   ## returning that sample reports a startup footprint as the child's peak.
   for _ in 0 ..< 200:
     result =
+      # Each host's own backend. This had no Windows arm, so on Windows it
+      # asked the macOS sampler -- which is a stub there -- and could never
+      # observe the child.
       when defined(linux):
         sampleLinuxProcessTreeTelemetry(processId)
+      elif defined(windows):
+        sampleWindowsProcessTreeTelemetry(processId)
       else:
         sampleMacosProcessTreeTelemetry(processId)
     if result.diagnostic.code == diagOk and result.rootAlive and
