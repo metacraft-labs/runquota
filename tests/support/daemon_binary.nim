@@ -45,7 +45,12 @@ proc newestSourceTime(dir: string): (Time, string) =
 proc checkedBinary(name: string): string =
   ## `build/bin/<name>`, checked to be at least as new as every source it
   ## is built from. Quits with an actionable message otherwise.
-  result = getCurrentDir() / "build" / "bin" / name
+  # `addFileExt`, not `name & ExeExt`: Nim's `ExeExt` has no dot ("exe" on
+  # Windows, "" elsewhere), and `nim c --out:build/bin/runquotad` writes
+  # `runquotad.exe` on Windows. Without the extension this looked for a file
+  # the build never writes -- and found a stray extensionless one when a
+  # host had one lying about, which it then reported as stale.
+  result = getCurrentDir() / "build" / "bin" / addFileExt(name, ExeExt)
 
   if not fileExists(result):
     quit(name & " is not built.\n" &
