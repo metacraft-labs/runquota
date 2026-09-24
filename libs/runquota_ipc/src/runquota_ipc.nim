@@ -1282,12 +1282,39 @@ proc close*(listener: var LocalListener) =
     discard
 
 when defined(windows):
-  proc winReadExact(handle: WinHandle; size: int; data: var string): bool =
+  proc winReadExact(handle: WinHandle; size: int; data: var string;
+                    timeoutMs = 0): bool =
+    ## ``timeoutMs > 0`` bounds the read by an absolute deadline, as
+    ## ``readExactSocket`` does on POSIX -- see there for why the control
+    ## handshakes need one. It was accepted and IGNORED here, so on Windows a
+    ## daemon that took the connection and then said nothing blocked its
+    ## client forever, and a caller asking "is anything left on the wire?"
+    ## with a bound never got an answer. The pipe is opened for synchronous
+    ## I/O, so the wait is a ``PeekNamedPipe`` poll, and each ``ReadFile`` is
+    ## sized to what the peek reported so that it cannot block past the
+    ## deadline either.
     data.setLen(size)
     var offset = 0
+    let deadline =
+      if timeoutMs > 0: epochTime() + timeoutMs.float / 1000.0
+      else: 0.0
     while offset < size:
       var got: int32 = 0
-      let want = int32(size - offset)
+      var want = int32(size - offset)
+      if deadline > 0.0:
+        var available = 0'i32
+        while true:
+          if not peekNamedPipe(handle, lpTotalBytesAvail = addr available):
+            # Broken or closed: no bytes will ever arrive.
+            data.setLen(0)
+            return false
+          if available > 0:
+            break
+          if epochTime() >= deadline:
+            data.setLen(0)
+            return false
+          sleep(1)
+        want = min(want, available)
       let rc = readFile(handle, addr data[offset], want, addr got, nil)
       if rc == 0:
         let err = osLastError().int32
@@ -1387,7 +1414,7 @@ proc readExact(connection: var LocalConnection; size: int; data: var string;
     readExactSocket(connection.socket, size, data, timeoutMs)
   of endpointNamedPipe:
     when defined(windows):
-      winReadExact(WinHandle(connection.pipeHandle), size, data)
+      winReadExact(WinHandle(connection.pipeHandle), size, data, timeoutMs)
     else:
       false
   else:
