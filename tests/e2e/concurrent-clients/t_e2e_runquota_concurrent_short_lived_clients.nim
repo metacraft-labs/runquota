@@ -4,6 +4,7 @@ import runquota_client
 import runquota_protocol
 from runquota_ipc import endpointDirectoryPermissions
 import daemon_binary
+import scratch_root
 
 proc truePath(): string =
   for path in ["/usr/bin/true", "/bin/true"]:
@@ -60,7 +61,7 @@ suite "e2e_runquota_concurrent_short_lived_clients":
     let socketDir = "/tmp" / ("rq-concurrent-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
-      removeDir(socketDir)
+      removeScratchRoot(socketDir)
     createDir(socketDir)
     # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
     # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
@@ -76,6 +77,10 @@ suite "e2e_runquota_concurrent_short_lived_clients":
       daemonPath(),
       args = [
         "--socket", socketPath,
+        # The host state -- identity and observation store -- in the scratch
+        # directory, never the machine's: without it this daemon read and wrote
+        # the host-wide store other daemons on the host are using.
+        "--host-identity-file", socketPath.parentDir / "host-id",
         "--cpu-milli", "32000",
         "--memory-bytes", $(32'u64 * 1024'u64 * 1024'u64 * 1024'u64),
         "--pool", "link=2"
@@ -112,4 +117,4 @@ suite "e2e_runquota_concurrent_short_lived_clients":
         discard daemon.waitForExit(3000)
       daemon.close()
       if dirExists(socketDir):
-        removeDir(socketDir)
+        removeScratchRoot(socketDir)

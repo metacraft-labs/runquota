@@ -4,6 +4,7 @@ import runquota_client
 import runquota_core
 from runquota_ipc import endpointDirectoryPermissions
 import daemon_binary
+import scratch_root
 
 proc waitForDaemon(socketPath: string) =
   putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -23,7 +24,7 @@ suite "e2e_runquota_single_client_lease":
     let socketDir = getTempDir() / ("runquota-e2e-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
-      removeDir(socketDir)
+      removeScratchRoot(socketDir)
     createDir(socketDir)
     # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
     # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
@@ -36,7 +37,9 @@ suite "e2e_runquota_single_client_lease":
 
     let process = startProcess(
       daemonPath(),
-      args = ["--socket", socketPath],
+      args = ["--socket", socketPath,
+      # The host state in the scratch directory, never the machine's.
+      "--host-identity-file", socketPath.parentDir / "host-id"],
       options = {poStdErrToStdOut}
     )
     try:
@@ -73,4 +76,4 @@ suite "e2e_runquota_single_client_lease":
         process.terminate()
         discard process.waitForExit(3000)
       process.close()
-      removeDir(socketDir)
+      removeScratchRoot(socketDir)

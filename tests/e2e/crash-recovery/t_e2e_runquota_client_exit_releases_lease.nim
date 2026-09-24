@@ -8,6 +8,7 @@ import runquota_core
 import runquota_protocol
 from runquota_ipc import endpointDirectoryPermissions
 import daemon_binary
+import scratch_root
 
 const HelperModeEnv = "RUNQUOTA_E2E_CRASH_MODE"
 
@@ -206,7 +207,7 @@ template withDaemon(body: untyped) =
   let socketDir {.inject.} = "/tmp" / ("rq" & $getCurrentProcessId() & "-" & $daemonCounter)
   let socketPath {.inject.} = socketDir / "runquotad.sock"
   if dirExists(socketDir):
-    removeDir(socketDir)
+    removeScratchRoot(socketDir)
   createDir(socketDir)
   # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
   # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
@@ -218,7 +219,9 @@ template withDaemon(body: untyped) =
   check fileExists(daemonPath())
   let process = startProcess(
     daemonPath(),
-    args = ["--socket", socketPath],
+    args = ["--socket", socketPath,
+      # The host state in the scratch directory, never the machine's.
+      "--host-identity-file", socketPath.parentDir / "host-id"],
     options = {poStdErrToStdOut}
   )
   try:
@@ -230,7 +233,7 @@ template withDaemon(body: untyped) =
       discard process.waitForExit(3000)
     process.close()
     if dirExists(socketDir):
-      removeDir(socketDir)
+      removeScratchRoot(socketDir)
 
 suite "e2e_runquota_client_exit_releases_lease":
   test "explicit release still clears the lease before session close":

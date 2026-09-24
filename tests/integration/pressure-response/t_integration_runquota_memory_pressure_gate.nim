@@ -12,6 +12,7 @@ import runquota_process
 import runquota_protocol
 from runquota_ipc import endpointDirectoryPermissions
 import daemon_binary
+import scratch_root
 
 const FixtureArg = "--pressure-fixture"
 
@@ -166,7 +167,7 @@ suite "integration_runquota_memory_pressure_gate":
     let pressurePath = socketDir / "pressure.txt"
     let estimateDb = socketDir / "estimates.sqlite"
     if dirExists(socketDir):
-      removeDir(socketDir)
+      removeScratchRoot(socketDir)
     createDir(socketDir)
     # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
     # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
@@ -182,6 +183,10 @@ suite "integration_runquota_memory_pressure_gate":
       daemonPath(),
       args = [
         "--socket", socketPath,
+        # The host state -- identity and observation store -- in the scratch
+        # directory, never the machine's: without it this daemon read and wrote
+        # the host-wide store other daemons on the host are using.
+        "--host-identity-file", socketPath.parentDir / "host-id",
         "--cpu-milli", "2000",
         "--memory-bytes", $mib(DaemonMemoryBudgetMiB),
         "--memory-pressure-source", "deterministic-file",
@@ -288,4 +293,4 @@ suite "integration_runquota_memory_pressure_gate":
         discard daemon.waitForExit(3000)
       daemon.close()
       if dirExists(socketDir):
-        removeDir(socketDir)
+        removeScratchRoot(socketDir)

@@ -7,6 +7,7 @@ import runquota_core/child_process
 import runquota_ipc except connectDefault
 import runquota_protocol
 import daemon_binary
+import scratch_root
 
 const MarkerFixtureArg = "--write-benchmark-marker"
   ## The command `runquota acquire --benchmark` runs: this test binary,
@@ -150,7 +151,7 @@ suite "e2e_runquota_multi_client_fairness":
     let socketDir = getTempDir() / ("runquota-m3-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
-      removeDir(socketDir)
+      removeScratchRoot(socketDir)
     createDir(socketDir)
     # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
     # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
@@ -166,6 +167,10 @@ suite "e2e_runquota_multi_client_fairness":
       daemonPath(),
       args = [
         "--socket", socketPath,
+        # The host state -- identity and observation store -- in the scratch
+        # directory, never the machine's: without it this daemon read and wrote
+        # the host-wide store other daemons on the host are using.
+        "--host-identity-file", socketPath.parentDir / "host-id",
         "--cpu-milli", "3000",
         "--memory-bytes", $(3072'u64 * 1024'u64 * 1024'u64),
         "--io-slots", "1",
@@ -283,13 +288,13 @@ suite "e2e_runquota_multi_client_fairness":
         discard process.waitForExit(3000)
       process.close()
       if dirExists(socketDir):
-        removeDir(socketDir)
+        removeScratchRoot(socketDir)
 
   test "real daemon queues IO admission without blocking fitting non-IO work":
     let socketDir = getTempDir() / ("runquota-m3-io-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
-      removeDir(socketDir)
+      removeScratchRoot(socketDir)
     createDir(socketDir)
     # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
     # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
@@ -305,6 +310,10 @@ suite "e2e_runquota_multi_client_fairness":
       daemonPath(),
       args = [
         "--socket", socketPath,
+        # The host state -- identity and observation store -- in the scratch
+        # directory, never the machine's: without it this daemon read and wrote
+        # the host-wide store other daemons on the host are using.
+        "--host-identity-file", socketPath.parentDir / "host-id",
         "--cpu-milli", "2000",
         "--memory-bytes", $(2048'u64 * 1024'u64 * 1024'u64),
         "--io-slots", "1"
@@ -395,14 +404,14 @@ suite "e2e_runquota_multi_client_fairness":
         discard process.waitForExit(3000)
       process.close()
       if dirExists(socketDir):
-        removeDir(socketDir)
+        removeScratchRoot(socketDir)
 
   test "real daemon grants benchmark leases only after outstanding work drains":
     let socketDir = getTempDir() / ("runquota-m3-benchmark-" &
         $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
-      removeDir(socketDir)
+      removeScratchRoot(socketDir)
     createDir(socketDir)
     # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
     # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
@@ -419,6 +428,10 @@ suite "e2e_runquota_multi_client_fairness":
       daemonPath(),
       args = [
         "--socket", socketPath,
+        # The host state -- identity and observation store -- in the scratch
+        # directory, never the machine's: without it this daemon read and wrote
+        # the host-wide store other daemons on the host are using.
+        "--host-identity-file", socketPath.parentDir / "host-id",
         "--cpu-milli", "3000",
         "--memory-bytes", $(3072'u64 * 1024'u64 * 1024'u64)
       ],
@@ -528,14 +541,14 @@ suite "e2e_runquota_multi_client_fairness":
         discard process.waitForExit(3000)
       process.close()
       if dirExists(socketDir):
-        removeDir(socketDir)
+        removeScratchRoot(socketDir)
 
   test "real daemon models host and VM shared CPU topology":
     let socketDir = getTempDir() / ("runquota-m3-topology-" &
         $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
-      removeDir(socketDir)
+      removeScratchRoot(socketDir)
     createDir(socketDir)
     # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
     # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
@@ -551,6 +564,10 @@ suite "e2e_runquota_multi_client_fairness":
       daemonPath(),
       args = [
         "--socket", socketPath,
+        # The host state -- identity and observation store -- in the scratch
+        # directory, never the machine's: without it this daemon read and wrote
+        # the host-wide store other daemons on the host are using.
+        "--host-identity-file", socketPath.parentDir / "host-id",
         "--machine", "host=4000," & $(4096'u64 * 1024'u64 * 1024'u64) &
             ",1,physical",
         "--machine", "vm=4000," & $(4096'u64 * 1024'u64 * 1024'u64) &
@@ -631,13 +648,13 @@ suite "e2e_runquota_multi_client_fairness":
         discard process.waitForExit(3000)
       process.close()
       if dirExists(socketDir):
-        removeDir(socketDir)
+        removeScratchRoot(socketDir)
 
   test "real daemon reports candidate batch and frame flow-control diagnostics":
     let socketDir = getTempDir() / ("runquota-m3-flow-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
-      removeDir(socketDir)
+      removeScratchRoot(socketDir)
     createDir(socketDir)
     # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
     # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
@@ -652,6 +669,10 @@ suite "e2e_runquota_multi_client_fairness":
       daemonPath(),
       args = [
         "--socket", socketPath,
+        # The host state -- identity and observation store -- in the scratch
+        # directory, never the machine's: without it this daemon read and wrote
+        # the host-wide store other daemons on the host are using.
+        "--host-identity-file", socketPath.parentDir / "host-id",
         "--cpu-milli", "3000",
         "--memory-bytes", $(3072'u64 * 1024'u64 * 1024'u64)
       ],
@@ -685,4 +706,4 @@ suite "e2e_runquota_multi_client_fairness":
         discard process.waitForExit(3000)
       process.close()
       if dirExists(socketDir):
-        removeDir(socketDir)
+        removeScratchRoot(socketDir)

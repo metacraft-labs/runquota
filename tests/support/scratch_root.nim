@@ -50,6 +50,14 @@ proc scratchEntryCount*(root: string): int =
 
 proc removeScratchRoot*(root: string) =
   ## Waits for ``root`` to stop changing, then removes it.
+  ##
+  ## ON WINDOWS A FILE THAT IS STILL OPEN CANNOT BE DELETED, and stopping the
+  ## daemon there is `TerminateProcess`: its `sqlite3` children are not
+  ## signalled with it and finish the statement they were given, holding the
+  ## database open for that long. Nothing about that is visible as the tree
+  ## CHANGING, so the settle wait below cannot see it; the removal itself is
+  ## the only probe, and a sharing violation is retried within the same
+  ## bound. Past it the error is raised exactly as before.
   const
     SettleStepMillis = 25
     SettleBudgetMillis = 2000
@@ -62,4 +70,16 @@ proc removeScratchRoot*(root: string) =
     previous = current
     sleep(SettleStepMillis)
     waited += SettleStepMillis
-  removeDir(root)
+  when defined(windows):
+    var retried = 0
+    while true:
+      try:
+        removeDir(root)
+        return
+      except OSError:
+        if retried >= SettleBudgetMillis:
+          raise
+        sleep(SettleStepMillis)
+        retried += SettleStepMillis
+  else:
+    removeDir(root)
