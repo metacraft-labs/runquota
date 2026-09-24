@@ -32,7 +32,10 @@
 ## NO MOCKS. The real `runquotad` binary, a real socket, the shipped client,
 ## a real signal, and the database file the daemon left behind.
 
-import std/[os, osproc, posix, streams, strutils, times, unittest]
+import std/[os, osproc, streams, strutils, times, unittest]
+
+when defined(posix):
+  import std/posix
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
@@ -40,6 +43,7 @@ import runquota_core
 import runquota_observation_store
 import runquota_protocol
 import daemon_binary
+import daemon_endpoint
 
 const
   MiB = 1024'u64 * 1024'u64
@@ -70,10 +74,6 @@ proc hostStateDir(root: string): string =
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
 
-proc socketIsBound(path: string): bool =
-  var info: Stat
-  lstat(path.cstring, info) == 0 and S_ISSOCK(info.st_mode)
-
 proc startDaemon(socketPath, stateDir: string): Process =
   result = startProcess(daemonPath(),
     args = ["--socket", socketPath,
@@ -81,7 +81,7 @@ proc startDaemon(socketPath, stateDir: string): Process =
             "--ambient-sample-interval-millis", "0"],
     options = {poStdErrToStdOut})
   for _ in 0 ..< 400:
-    if socketIsBound(socketPath): break
+    if endpointIsBound(socketPath): break
     sleep(25)
   # EXACTLY THREE STARTUP LINES, consumed by count.
   for _ in 0 ..< 3:
@@ -102,55 +102,64 @@ proc completeOne(session: var RunQuotaSession; peakBytes: uint64) =
 suite "sigterm_drains_before_exit":
 
   test "a TERMed daemon runs its shutdown and keeps what was reported":
-    let root = scratchRoot("drain")
-    let socketPath = rendezvousDir(root) / "d.sock"
-    let state = hostStateDir(root)
-    let expectedDb = state / "observations.sqlite3"
-    require fileExists(daemonPath())
+    # POSIX ONLY, BY DESIGN: there is no SIGTERM on Windows. `runquotad`'s
+    # Windows stop request arrives from the Service Control Manager instead,
+    # and the shutdown watcher that turns it into the same orderly `serve`
+    # exit exists only under the SCM -- `runquota_daemon`, the section
+    # headed "WINDOWS HAS NO SIGTERM, AND THAT IS NOT THE SAME AS HAVING NO
+    # STOP". What this case sends does not exist there to be sent.
+    when defined(posix):
+      let root = scratchRoot("drain")
+      let socketPath = rendezvousDir(root) / "d.sock"
+      let state = hostStateDir(root)
+      let expectedDb = state / "observations.sqlite3"
+      require fileExists(daemonPath())
 
-    putEnv("RUNQUOTA_SOCKET", socketPath)
-    var daemon = startDaemon(socketPath, state)
-    var exitCode = -1
-    var elapsedMillis = 0.0
-    try:
-      var client = connectDefault()
-      var session = client.registerSession("sigterm-drain", "0.1.0")
-      # THE BURST. Nothing waits for the store between these and the signal,
-      # which is the whole point: what is still queued is what a daemon that
-      # dies where it stands would lose.
-      for i in 0 ..< Completions:
-        completeOne(session, uint64(8 + i) * MiB)
-      session.closeSession()
-      client.close()
+      putEnv("RUNQUOTA_SOCKET", socketPath)
+      var daemon = startDaemon(socketPath, state)
+      var exitCode = -1
+      var elapsedMillis = 0.0
+      try:
+        var client = connectDefault()
+        var session = client.registerSession("sigterm-drain", "0.1.0")
+        # THE BURST. Nothing waits for the store between these and the signal,
+        # which is the whole point: what is still queued is what a daemon that
+        # dies where it stands would lose.
+        for i in 0 ..< Completions:
+          completeOne(session, uint64(8 + i) * MiB)
+        session.closeSession()
+        client.close()
 
-      let start = epochTime()
-      doAssert kill(Pid(daemon.processID), SIGTERM) == 0,
-        "could not send SIGTERM to the daemon"
-      exitCode = daemon.waitForExit(ShutdownBudgetMillis)
-      elapsedMillis = (epochTime() - start) * 1000.0
-    finally:
-      if daemon.running:
-        daemon.kill()
-        discard daemon.waitForExit(5000)
-      daemon.close()
-      delEnv("RUNQUOTA_SOCKET")
+        let start = epochTime()
+        doAssert kill(Pid(daemon.processID), SIGTERM) == 0,
+          "could not send SIGTERM to the daemon"
+        exitCode = daemon.waitForExit(ShutdownBudgetMillis)
+        elapsedMillis = (epochTime() - start) * 1000.0
+      finally:
+        if daemon.running:
+          daemon.kill()
+          discard daemon.waitForExit(5000)
+        daemon.close()
+        delEnv("RUNQUOTA_SOCKET")
 
-    echo "  sigterm: exit=", exitCode, " after ",
-      elapsedMillis.formatFloat(ffDecimal, 1), " ms"
+      echo "  sigterm: exit=", exitCode, " after ",
+        elapsedMillis.formatFloat(ffDecimal, 1), " ms"
 
-    # CLAUSE 1. 143 is "killed by SIGTERM"; 0 is "`serve` returned".
-    check exitCode == 0
-    # CLAUSE 3.
-    check elapsedMillis < float(ShutdownBudgetMillis)
+      # CLAUSE 1. 143 is "killed by SIGTERM"; 0 is "`serve` returned".
+      check exitCode == 0
+      # CLAUSE 3.
+      check elapsedMillis < float(ShutdownBudgetMillis)
 
-    # CLAUSE 2. Read out of the file the daemon left behind, by a process
-    # that had nothing to do with writing it.
-    check fileExists(expectedDb)
-    let store = openObservationStore(expectedDb)
-    check store.captureEnabled
-    let executions = store.readExecutions()
-    echo "  sigterm: executions in the store = ", executions.len,
-      " of ", Completions
-    check executions.len == Completions
+      # CLAUSE 2. Read out of the file the daemon left behind, by a process
+      # that had nothing to do with writing it.
+      check fileExists(expectedDb)
+      let store = openObservationStore(expectedDb)
+      check store.captureEnabled
+      let executions = store.readExecutions()
+      echo "  sigterm: executions in the store = ", executions.len,
+        " of ", Completions
+      check executions.len == Completions
 
-    removeDir(root)
+      removeDir(root)
+    else:
+      skip()
