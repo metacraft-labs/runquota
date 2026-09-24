@@ -50,9 +50,10 @@
 ##
 ## NO MOCKS. A real store, a real ``sqlite3``, a real ``SIGKILL``.
 
-import std/[os, osproc, posix, streams, strutils, times, unittest]
+import std/[os, osproc, streams, strutils, times, unittest]
 
 import runquota_observation_store
+from runquota_core/child_process import runCapturedProcess
 
 const
   RoleEnv = "RUNQUOTA_M15_PRUNE_ROLE"
@@ -81,6 +82,94 @@ proc declaration(index: int): ExtensionDeclaration =
     migrations: @[extensionDdl(index)])
 
 # ---------------------------------------------------------------------------
+# The group the prune runs in
+# ---------------------------------------------------------------------------
+#
+# ON POSIX A PROCESS GROUP, ON WINDOWS A JOB OBJECT -- the same guarantee
+# from each platform's own primitive: the `sqlite3` child the prune spawns is
+# a member from birth, and one call ends every member at once. The role makes
+# the group itself (`setpgid(0, 0)`; or a job it names and joins), so the
+# parent can reach it by the role's pid alone.
+
+when defined(windows):
+  import std/winlean
+
+  const
+    JobObjectTerminate = 0x0008'i32
+    JobObjectQuery = 0x0004'i32
+    JobObjectBasicAccountingInformation = 1'i32
+
+  type JobBasicAccounting = object
+    totalUserTime, totalKernelTime: int64
+    thisPeriodUserTime, thisPeriodKernelTime: int64
+    totalPageFaults, totalProcesses, activeProcesses: uint32
+    totalTerminatedProcesses: uint32
+
+  proc createJobObjectW(security: pointer; name: WideCString): Handle
+    {.stdcall, dynlib: "kernel32.dll", importc: "CreateJobObjectW".}
+  proc openJobObjectW(access: int32; inherit: WINBOOL; name: WideCString):
+      Handle {.stdcall, dynlib: "kernel32.dll", importc: "OpenJobObjectW".}
+  proc assignProcessToJobObject(job, process: Handle): WINBOOL
+    {.stdcall, dynlib: "kernel32.dll", importc: "AssignProcessToJobObject".}
+  proc terminateJobObject(job: Handle; exitCode: uint32): WINBOOL
+    {.stdcall, dynlib: "kernel32.dll", importc: "TerminateJobObject".}
+  proc queryInformationJobObject(job: Handle; infoClass: int32;
+                                 info: pointer; length: int32;
+                                 returned: ptr int32): WINBOOL
+    {.stdcall, dynlib: "kernel32.dll", importc: "QueryInformationJobObject".}
+
+  proc roleJobName(rolePid: int): string =
+    "Local\runquota-m15c-prune-" & $rolePid
+
+  proc enterOwnGroup() =
+    let job = createJobObjectW(nil, newWideCString(
+      roleJobName(getCurrentProcessId())))
+    doAssert job != 0, "could not create the prune role's job object"
+    doAssert assignProcessToJobObject(job, getCurrentProcess()) != 0,
+      "could not join the prune role's job object"
+    # The handle stays open for the life of the role, which keeps the job
+    # alive and reachable by name.
+
+  type RoleGroup = Handle
+
+  proc openGroup(rolePid: int): RoleGroup =
+    openJobObjectW(JobObjectTerminate or JobObjectQuery, 0,
+      newWideCString(roleJobName(rolePid)))
+
+  proc killGroup(group: RoleGroup): bool =
+    group != 0 and terminateJobObject(group, 1) != 0
+
+  proc noSurvivors(group: RoleGroup): bool =
+    ## The job reports no live member. Asked of the job itself rather than
+    ## of a process listing, so nothing that joined it can be missed.
+    var info: JobBasicAccounting
+    group != 0 and queryInformationJobObject(group,
+      JobObjectBasicAccountingInformation, addr info, int32(sizeof(info)),
+      nil) != 0 and info.activeProcesses == 0
+
+  proc closeGroup(group: RoleGroup) =
+    if group != 0:
+      discard closeHandle(group)
+else:
+  import std/posix
+
+  proc enterOwnGroup() =
+    discard setpgid(0, 0)
+
+  type RoleGroup = int
+
+  proc openGroup(rolePid: int): RoleGroup = rolePid
+
+  proc killGroup(group: RoleGroup): bool =
+    kill(Pid(-group), SIGKILL) == 0
+
+  proc noSurvivors(group: RoleGroup): bool =
+    execCmdEx("pgrep -g " & $group & " 2>/dev/null || true").
+      output.strip().len == 0
+
+  proc closeGroup(group: RoleGroup) = discard group
+
+# ---------------------------------------------------------------------------
 # The prune role
 # ---------------------------------------------------------------------------
 
@@ -89,7 +178,7 @@ proc runPruneRole(dbPath, readyPath: string) =
   # with this process rather than outliving it and committing. Without
   # this, "killed mid-prune" would be "the caller died and the prune
   # finished anyway".
-  discard setpgid(0, 0)
+  enterOwnGroup()
   let store = openObservationStore(dbPath)
   doAssert store.captureEnabled, store.report
   writeFile(readyPath, $getCurrentProcessId() & "\n")
@@ -187,8 +276,20 @@ proc writeLocked(path: string): bool =
   ## Whether somebody else holds a write transaction on ``path`` RIGHT NOW.
   ## ``.timeout 0`` so the probe reports the state instead of waiting for it
   ## to pass.
-  let outcome = execCmdEx("sqlite3 -batch -bail -cmd '.timeout 0' " &
-    quoteShell(path) & " 'begin immediate; rollback;' 2>&1")
+  ##
+  ## An argument vector rather than a shell line: the quoting this used to
+  ## rely on is POSIX shell quoting, which cmd.exe does not do.
+  ##
+  ## `begin immediate;` ALONE, with no `rollback` after it: the probe's
+  ## connection closes when the tool exits, which rolls back whatever it
+  ## began. The pair used to be sent together, and sqlite3 3.53 reports only
+  ## the LAST statement's error for a multi-statement argument -- so a
+  ## refused `begin` surfaced as "cannot rollback - no transaction is
+  ## active", the probe never saw "locked", and the kill never fired.
+  let outcome = runCapturedProcess(sqliteTool,
+    args = ["-batch", "-bail", "-cmd", ".timeout 0", path,
+            "begin immediate;"],
+    options = {poUsePath, poStdErrToStdOut})
   outcome.exitCode != 0 and "locked" in outcome.output.toLowerAscii
 
 proc startWalPin(path: string): Process =
@@ -445,7 +546,9 @@ suite "observation_store_retention_crash":
 
     # THE WHOLE GROUP, so the `sqlite3` child executing the batch dies with
     # its caller instead of committing after it.
-    check kill(Pid(-rolePid), SIGKILL) == 0
+    let group = openGroup(rolePid)
+    defer: closeGroup(group)
+    check killGroup(group)
     discard role.waitForExit(10_000)
     check not role.running
     role.close()
@@ -453,8 +556,7 @@ suite "observation_store_retention_crash":
     # landed inside" means from the other side.
     check not fileExists(ready & ".finished")
     # And nothing of it is left running.
-    check execCmdEx("pgrep -g " & $rolePid & " 2>/dev/null || true").
-      output.strip().len == 0
+    check noSurvivors(group)
     # The pin has done its job; released before the store is reopened so
     # what follows is a reader like any other.
     stopWalPin(pin)
