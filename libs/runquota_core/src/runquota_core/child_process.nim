@@ -44,6 +44,9 @@ import std/[osproc, streams, strtabs]
 
 import ./spawn_guard
 
+when compileOption("threads"):
+  import ./process_owned
+
 type
   CapturedProcess* = object
     ## What a finished child left behind.
@@ -59,26 +62,82 @@ type
       ## Why the command could not be run or could not be drained. Empty when
       ## the child ran, whatever it exited with.
 
+proc readToEnd*(stream: Stream): string =
+  ## Read ``stream`` until the child closes its end, and return everything.
+  ##
+  ## NOT ``streams.readAll``. That proc stops at the first read that returns
+  ## fewer bytes than it asked for, which is end of input for a file and for
+  ## the buffered C stream osproc hands out on POSIX -- ``fread`` only comes
+  ## back short at EOF -- but not for the pipe handle osproc hands out on
+  ## Windows. There ``ReadFile`` returns whatever the child has written SO
+  ## FAR, so ``readAll`` returned the first fragment and dropped the rest:
+  ## ``sqlite3`` wrote ``Error: FOREIGN KEY constraint failed`` to stderr in
+  ## pieces and the caller saw ``E``; a query answer that did not arrive in
+  ## one write came back empty or truncated. The only end of input a pipe has
+  ## is a read that returns nothing, so that is the only stop condition here,
+  ## on every platform.
+  const chunkSize = 64 * 1024
+  result = ""
+  var chunk = newString(chunkSize)
+  while true:
+    let count = stream.readData(addr chunk[0], chunkSize)
+    if count <= 0:
+      break
+    let start = result.len
+    result.setLen(start + count)
+    copyMem(addr result[start], addr chunk[0], count)
+
 when compileOption("threads"):
   type
     StreamDrain = object
-      ## One end of a child pipe plus the text read from it. Passed to a drain
+      ## One end of a child pipe plus what was read from it. Passed to a drain
       ## thread by ``ptr``, so the thread argument itself carries no managed
       ## memory.
+      ##
+      ## WHAT THE THREAD READ IS HELD IN PROCESS-OWNED STORAGE, not in a Nim
+      ## ``string``. The drain thread has exited by the time the caller looks
+      ## at the result, and a block allocated on a thread's ORC region and
+      ## freed after that thread is gone dereferences a dead region inside
+      ## ``addToSharedFreeList`` -- see ``runquota_core/process_owned`` for
+      ## the mechanism. This held a ``string`` filled on the drain thread and
+      ## freed by the caller, which is exactly that shape: on Windows, where
+      ## a thread's TLS block is released when it exits, it crashed
+      ## ``runSqlite``'s caller with a SIGSEGV in ``rawDealloc`` on a
+      ## timing-dependent fraction of calls. Chunks are copied into
+      ## ``OwnedStrings`` on the drain thread and copied back out into
+      ## ordinary strings on the caller's.
       stream: Stream
-      text: string
-      failure: string
+      chunks: OwnedStrings
+      failure: OwnedStrings
 
   proc drainStream(drain: ptr StreamDrain) {.thread.} =
     ## Read one stream to EOF. Never propagates: a thread that let an exception
     ## escape would terminate the process, and this runs inside a daemon whose
     ## whole contract is to degrade rather than fail.
+    ##
+    ## End of input is a read that returns nothing, for the reason
+    ## ``readToEnd`` gives; every string allocated here is also freed here.
+    const chunkSize = 64 * 1024
     try:
-      drain.text = drain.stream.readAll()
+      var chunk = newString(chunkSize)
+      while true:
+        let count = drain.stream.readData(addr chunk[0], chunkSize)
+        if count <= 0:
+          break
+        if not drain.chunks.add(chunk[0 ..< count]):
+          discard drain.failure.add("out of memory capturing child output")
+          break
     except CatchableError as error:
-      drain.failure = error.msg
+      discard drain.failure.add(error.msg)
     except Defect as error:
-      drain.failure = error.msg
+      discard drain.failure.add(error.msg)
+
+  proc takeText(store: var OwnedStrings): string =
+    ## Everything in ``store``, concatenated into a string allocated on the
+    ## CALLING thread, and the store released.
+    result = ""
+    for piece in store.takeAll():
+      result.add(piece)
 
 proc runCapturedProcess*(
     command: string;
@@ -142,8 +201,8 @@ proc runCapturedProcess*(
   var capturedError = ""
 
   when compileOption("threads"):
-    var outputDrain = StreamDrain(stream: nil, text: "", failure: "")
-    var errorDrain = StreamDrain(stream: nil, text: "", failure: "")
+    var outputDrain = StreamDrain(stream: nil)
+    var errorDrain = StreamDrain(stream: nil)
     var outputThread: Thread[ptr StreamDrain]
     var errorThread: Thread[ptr StreamDrain]
     var drainsStarted = 0
@@ -189,12 +248,14 @@ proc runCapturedProcess*(
       if drainsStarted >= 2:
         joinThread(errorThread)
 
-    if failure.len == 0 and outputDrain.failure.len > 0:
-      failure = outputDrain.failure
-    if failure.len == 0 and errorDrain.failure.len > 0:
-      failure = errorDrain.failure
-    capturedOutput = outputDrain.text
-    capturedError = errorDrain.text
+    let outputFailure = outputDrain.failure.takeText()
+    let errorFailure = errorDrain.failure.takeText()
+    if failure.len == 0 and outputFailure.len > 0:
+      failure = outputFailure
+    if failure.len == 0 and errorFailure.len > 0:
+      failure = errorFailure
+    capturedOutput = outputDrain.chunks.takeText()
+    capturedError = errorDrain.chunks.takeText()
   else:
     # NO THREADS -- the static-helper gate builds `runquota_core`,
     # `runquota_host_macos` and their closure with `--mm:arc --app:staticlib`
@@ -228,7 +289,7 @@ proc runCapturedProcess*(
 
     if failure.len == 0:
       try:
-        capturedOutput = process.outputStream.readAll()
+        capturedOutput = process.outputStream.readToEnd()
       except CatchableError as error:
         failure = error.msg
       except Defect as error:
