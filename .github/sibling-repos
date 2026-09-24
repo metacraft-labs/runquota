@@ -1,2 +1,9 @@
 # Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
 # revisions (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
+
+# The package catalog `repro.nim`'s `uses: "sqlite3"` resolves from (reprobuild
+# looks up names its stdlib does not bundle in a `reprobuild-packages` checkout
+# beside this one). Needed by the reprobuild-flavor job; the nix jobs take
+# sqlite from the flake. Pinned to the mainline branch until the catalog is in
+# the workspace lock.
+reprobuild-packages=dev

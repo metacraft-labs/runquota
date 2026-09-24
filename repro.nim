@@ -65,14 +65,15 @@ const projectRootPath = currentSourcePath().parentDir()
   ## sibling source trees live in.
 
 package runquota:
-  # Declare ``path``-mode tool provisioning so the engine adopts it
-  # automatically. Without this, ``repro build`` refuses to run with
-  # "typed tool provisioning is required for uses declarations" unless
-  # the caller passes ``--tool-provisioning=path`` explicitly. The
-  # runquota dev shell (``nix develop``) and ``just build`` both
-  # furnish every tool we need via PATH, so the weak-local PATH mode
-  # is the right default for this repo (mirrors reprobuild's choice).
-  defaultToolProvisioning "path"
+  # Provision every tool below rather than find it on PATH, so that
+  # ``repro shell`` / ``repro exec`` is a complete development environment on
+  # its own -- the reprobuild equivalent of ``nix develop``, not a layer over
+  # it. Linux and macOS take the tools from Nix, as the flake does; Windows
+  # takes release archives into the tool store.
+  #
+  # Override per invocation without editing this file:
+  #   REPRO_TOOL_PROVISIONING=path repro exec -- just test
+  defaultToolProvisioning(when defined(windows): tarball else: nix)
 
   uses:
     # Toolchain floor — the PATH-resolvable binaries the runquota
@@ -87,12 +88,37 @@ package runquota:
     "just >=1"
     "sh"
 
-    # Note: runquota has no system shared-library or source-only
-    # dependencies of its own — the build is pure Nim against the
-    # in-repo ``libs/<name>/src`` trees. If/when runquota grows a
-    # system dep (sqlite, libsodium, etc.) it would be listed here
-    # alongside the env-var-based provisioning shape that reprobuild
-    # uses for libblake3 / xxhash / sqlite.
+    # ``scripts/run_tests.sh`` and ``scripts/build_apps.sh`` are bash scripts.
+    # On Windows this is Git for Windows' bash, whose launcher also puts its
+    # coreutils (find, sort, timeout, ...) on the script's PATH.
+    "bash >=4"
+
+    # THE ``sqlite3`` COMMAND-LINE TOOL, a runtime dependency of the
+    # observation store and of ``runquota_persistence``: both reach SQLite by
+    # spawning it rather than linking a library, so that its absence is a
+    # catchable condition ("degrade, never fail") and not a load-time abort.
+    # Without it on PATH the store opens as ``degraded-no-sqlite-tool`` and
+    # roughly half the test suite asserts against a store that refused to
+    # exist; ``scripts/run_tests.sh`` refuses to start for that reason. The
+    # flake's dev shell carries ``pkgs.sqlite`` for the same reason. The
+    # package is defined in reprobuild-packages
+    # (``packages/interfaces/sqlite3``).
+    "sqlite3 >=3"
+
+    # Not yet here from the flake's dev shell: the lint tools (``shellcheck``
+    # has no Windows realization; ``shfmt``, ``typos``, ``repomix`` and
+    # ``nixfmt`` are not reachable from ``uses:``), so ``just lint`` still
+    # needs ``nix develop`` or a PATH that has them.
+
+  # ``repro shell`` / ``repro exec -- <cmd>``: the tools in ``uses:`` above,
+  # provisioned per ``defaultToolProvisioning``. ``nim-shm-lease`` is found
+  # the way ``config.nims`` always finds it -- ``SHM_LEASE_SRC`` or the
+  # workspace sibling -- so it needs nothing here.
+  devEnv:
+    activity "default"
+    task "test",
+      command = "just test",
+      description = "Build the apps and run the full test suite"
 
   # Library declaration — every ``.nim`` file under ``libs/<name>/src``
   # that ``config.nims`` adds to ``--path`` is importable when this
