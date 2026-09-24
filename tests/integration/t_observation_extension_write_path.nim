@@ -166,12 +166,23 @@ proc declareProbe(session: var RunQuotaSession): string =
   session.declareExtension(d.id, d.owner, d.version, d.ladder)
 
 proc waitForProbeRows(path: string; atLeast: int64): int64 =
-  for _ in 0 ..< 200:
+  ## Polls for up to TEN SECONDS -- the window the 200 x 50 ms loop this
+  ## replaced was sized to. The loop was bounded by a count, and each pass
+  ## opens the store, which is several `sqlite3` spawns: about 5 ms each on
+  ## macOS and 30-50 ms on Windows, so on Windows the same 200 passes took
+  ## 40 s. For the "no row appears" arms that whole budget is always spent,
+  ## and it pushed the orphan-row arm past its 90 s wedge deadline on a
+  ## daemon that had answered every request. A deadline gives every host the
+  ## same window.
+  let deadline = epochTime() + 10.0
+  while true:
     let store = openObservationStore(path)
     if store.captureEnabled:
       result = store.extensionRowCount(ProbeExtension)
       if result >= atLeast:
         return
+    if epochTime() >= deadline:
+      return
     sleep(50)
 
 suite "observation_extension_write_path":
