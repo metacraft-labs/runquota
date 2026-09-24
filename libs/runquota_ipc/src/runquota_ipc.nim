@@ -918,11 +918,23 @@ when defined(windows):
     # Windows: ConnectNamedPipe returns 0 with last-error ERROR_PIPE_CONNECTED
     # when the client raced ahead and is already on the pipe. Both outcomes
     # mean "ready to use".
+    #
+    # ERROR_NO_DATA IS A CONNECTION TOO. It is what ConnectNamedPipe reports
+    # when a client opened this instance AND CLOSED IT before the call: the
+    # instance is connected to a peer that has already gone. That is the
+    # named-pipe form of the connect-and-vanish peer a Unix socket's backlog
+    # hands to `accept`, and it is answered the same way -- as an accepted
+    # connection whose first read finds nothing, which the daemon counts as
+    # ended before Hello and closes, releasing the instance. It used to be
+    # raised as an accept failure WITHOUT releasing the instance, so every
+    # later accept failed on the same dead handle, and 64 of them in a row
+    # ended the accept loop: any client that opened the host-wide pipe and
+    # dropped it quickly enough could take the daemon down.
     let rc = connectNamedPipe(handle, nil)
     if rc != 0:
       return true
     let err = osLastError().int32
-    if err == ERROR_PIPE_CONNECTED:
+    if err == ERROR_PIPE_CONNECTED or err == ERROR_NO_DATA:
       return true
     false
 

@@ -32,28 +32,34 @@
 ## being measured -- so the leak is checked against the daemon's real open-fd
 ## count rather than argued from the source.
 
-import std/[json, nativesockets, os, osproc, posix, streams, strutils, unittest]
+import std/[envvars, json, os, osproc, streams, strtabs, strutils, unittest]
+
+when defined(windows):
+  import std/[oserrors, winlean]
+else:
+  import std/[nativesockets, posix]
 
 import runquota_client
 import runquota_core
+import runquota_core/child_process
 import runquota_ipc
 import runquota_protocol
 import daemon_binary
+import daemon_endpoint
+import scratch_root
 
 const MiB = 1024'u64 * 1024'u64
-
-proc socketIsBound(path: string): bool =
-  var info: Stat
-  lstat(path.cstring, info) == 0 and S_ISSOCK(info.st_mode)
 
 type DaemonHandle = object
   process: Process
 
 proc startDaemon(socketPath: string): DaemonHandle =
-  let process = startProcess(daemonPath(), args = ["--socket", socketPath],
+  let process = startProcess(daemonPath(), args = ["--socket", socketPath,
+      # The host state in the scratch directory, never the machine's.
+      "--host-identity-file", socketPath.parentDir / "host-id"],
     options = {poStdErrToStdOut})
   for _ in 0 ..< 400:
-    if socketIsBound(socketPath): break
+    if endpointIsBound(socketPath): break
     sleep(25)
   # Exactly three startup lines, as the rest of this suite asserts: reading
   # them keeps the pipe from filling and wedging the daemon on a write
@@ -72,46 +78,99 @@ proc stop(handle: var DaemonHandle) =
   handle.process.close()
 
 proc scratchRoot(tag: string): string =
-  # SHORT ON PURPOSE. `sun_path` is 104 bytes on this platform and the
-  # session scratch directory alone overruns it, which fails as
+  # SHORT ON PURPOSE on POSIX. `sun_path` is 104 bytes on this platform and
+  # the session scratch directory alone overruns it, which fails as
   # "socket path too long" from inside `bindUnix` rather than anywhere
-  # informative.
-  result = "/tmp/rq-" & tag & "-" & $getCurrentProcessId()
+  # informative. Windows has no such limit and no `/tmp`: `--socket` names a
+  # pipe there (see `endpointForPath`), and the directory only holds files.
+  let base =
+    when defined(windows): getTempDir()
+    else: "/tmp"
+  result = base / ("rq-" & tag & "-" & $getCurrentProcessId())
   removeDir(result)
   createDir(result)
   setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
 
-proc connectThenCloseWithoutHello(socketPath: string) =
-  ## The three lines of Python that used to kill the daemon, in Nim: open a
-  ## connection and drop it without ever sending `Hello`.
-  let handle = createNativeSocket(AF_UNIX, SOCK_STREAM, cint(0))
-  doAssert handle != osInvalidSocket
-  var address: Sockaddr_un
-  address.sun_family = uint8(AF_UNIX)
-  let path = socketPath
-  doAssert path.len < sizeof(address.sun_path)
-  copyMem(addr address.sun_path[0], unsafeAddr path[0], path.len)
-  address.sun_path[path.len] = '\0'
-  discard connect(SocketHandle(handle), cast[ptr SockAddr](addr address),
-    SockLen(sizeof(address)))
-  discard posix.close(cint(handle))
+when defined(windows):
+  proc createFileW(name: WideCString; access, share: int32; security: pointer;
+                   disposition, flags: int32; templateFile: Handle): Handle
+    {.stdcall, dynlib: "kernel32.dll", importc: "CreateFileW".}
+  proc getProcessHandleCount(process: Handle; count: ptr int32): WINBOOL
+    {.stdcall, dynlib: "kernel32.dll", importc: "GetProcessHandleCount".}
 
-proc openDescriptorCount(pid: int): int =
-  ## The daemon's real open-descriptor count, read from the OS rather than
-  ## inferred. Returns -1 when it cannot be determined, which the caller
-  ## treats as "do not assert" rather than as zero.
-  let probe = execCmdEx("lsof -p " & $pid & " 2>/dev/null | wc -l")
-  if probe.exitCode != 0:
-    return -1
-  try:
-    result = parseInt(probe.output.strip())
-  except ValueError:
-    result = -1
+  proc connectThenCloseWithoutHello(socketPath: string) =
+    ## The same abuse over the transport Windows serves: open the daemon's
+    ## pipe and drop it without ever sending `Hello`.
+    const
+      GenericReadWrite = cast[int32](0xC0000000'u32)
+      OpenExisting = 3'i32
+    let pipeName = endpointForPath(socketPath).path
+    var handle = INVALID_HANDLE_VALUE
+    for _ in 0 ..< 50:
+      handle = createFileW(newWideCString(pipeName), GenericReadWrite, 0,
+        nil, OpenExisting, 0, Handle(0))
+      if handle != INVALID_HANDLE_VALUE:
+        break
+      # Every instance busy: the daemon pre-creates the next one after it
+      # hands the last to a worker, so the next attempt finds it.
+      sleep(10)
+    doAssert handle != INVALID_HANDLE_VALUE,
+      "could not open the daemon's pipe " & pipeName & " (Windows error " &
+        $osLastError().int32 & ")"
+    discard closeHandle(handle)
+
+  proc openDescriptorCount(pid: int): int =
+    ## The daemon's real open-HANDLE count, which is what a leaked accepted
+    ## pipe instance would grow, read from the OS. -1 when it cannot be
+    ## read, which the caller treats as "do not assert" rather than as zero.
+    const ProcessQueryLimitedInformation = 0x1000'i32
+    let process = openProcess(ProcessQueryLimitedInformation, 0, int32(pid))
+    if process == 0:
+      return -1
+    defer: discard closeHandle(process)
+    var count = 0'i32
+    if getProcessHandleCount(process, addr count) == 0:
+      return -1
+    int(count)
+else:
+  proc connectThenCloseWithoutHello(socketPath: string) =
+    ## The three lines of Python that used to kill the daemon, in Nim: open a
+    ## connection and drop it without ever sending `Hello`.
+    let handle = createNativeSocket(AF_UNIX, SOCK_STREAM, cint(0))
+    doAssert handle != osInvalidSocket
+    var address: Sockaddr_un
+    address.sun_family = uint8(AF_UNIX)
+    let path = socketPath
+    doAssert path.len < sizeof(address.sun_path)
+    copyMem(addr address.sun_path[0], unsafeAddr path[0], path.len)
+    address.sun_path[path.len] = '\0'
+    discard connect(SocketHandle(handle), cast[ptr SockAddr](addr address),
+      SockLen(sizeof(address)))
+    discard posix.close(cint(handle))
+
+  proc openDescriptorCount(pid: int): int =
+    ## The daemon's real open-descriptor count, read from the OS rather than
+    ## inferred. Returns -1 when it cannot be determined, which the caller
+    ## treats as "do not assert" rather than as zero.
+    let probe = execCmdEx("lsof -p " & $pid & " 2>/dev/null | wc -l")
+    if probe.exitCode != 0:
+      return -1
+    try:
+      result = parseInt(probe.output.strip())
+    except ValueError:
+      result = -1
 
 proc failedConnectionCount(socketPath: string): int =
-  let probe = execCmdEx("RUNQUOTA_SOCKET=" & socketPath & " " &
-    cliPath() & " observations --json")
-  doAssert probe.exitCode == 0, "observations query failed: " & probe.output
+  ## `RUNQUOTA_SOCKET` goes in through the child's environment rather than
+  ## as a `VAR=value cmd` shell prefix, which only a POSIX shell parses.
+  let env = newStringTable(modeCaseSensitive)
+  for key, value in envPairs():
+    env[key] = value
+  env["RUNQUOTA_SOCKET"] = socketPath
+  let probe = runCapturedProcess(cliPath(), ["observations", "--json"],
+    env = env, options = {})
+  doAssert probe.ok, "observations query failed: " & probe.output &
+    probe.error & probe.failure
   let doc = parseJson(probe.output)
   doc["observations"]["connections_failed"].getInt
 
@@ -121,12 +180,12 @@ suite "connection_failure_does_not_stop_the_daemon":
     const AbortedConnections = 50
 
     let root = scratchRoot("connfail")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = root / "d.sock"
 
     var daemon = startDaemon(socketPath)
     defer: daemon.stop()
-    check socketIsBound(socketPath)
+    check endpointIsBound(socketPath)
 
     let pid = daemon.process.processID
     let descriptorsBefore = openDescriptorCount(pid)
@@ -145,7 +204,7 @@ suite "connection_failure_does_not_stop_the_daemon":
     # through the ordinary client library on the same socket the abuse
     # arrived on.
     # ---------------------------------------------------------------------
-    var client = connect(Endpoint(kind: endpointUnixSocket, path: socketPath))
+    var client = connect(endpointForPath(socketPath))
     var session = client.registerSession("connfail", "0.1.0")
     var request = resourceRequest("connfail-probe", milliCpu(1000),
       bytes(64'u64 * MiB))
@@ -188,16 +247,15 @@ suite "connection_failure_does_not_stop_the_daemon":
     const RefusedConnections = 7
 
     let root = scratchRoot("connrefuse")
-    defer: removeDir(root)
+    defer: removeScratchRoot(root)
     let socketPath = root / "d.sock"
 
     var daemon = startDaemon(socketPath)
     defer: daemon.stop()
-    check socketIsBound(socketPath)
+    check endpointIsBound(socketPath)
 
     for i in 0 ..< RefusedConnections:
-      var connection = connectEndpoint(
-        Endpoint(kind: endpointUnixSocket, path: socketPath))
+      var connection = connectEndpoint(endpointForPath(socketPath))
       connection.sendFrame(encodeFrame(rqStatusRequest, 0'u16,
         uint64(i + 1), ""))
       # The daemon's diagnostic is read rather than ignored: leaving it
@@ -213,7 +271,7 @@ suite "connection_failure_does_not_stop_the_daemon":
     check failedConnectionCount(socketPath) == RefusedConnections
 
     # STILL SERVING, on the same socket, after the refusals.
-    var client = connect(Endpoint(kind: endpointUnixSocket, path: socketPath))
+    var client = connect(endpointForPath(socketPath))
     var session = client.registerSession("connrefuse", "0.1.0")
     var request = resourceRequest("connrefuse-probe", milliCpu(1000),
       bytes(64'u64 * MiB))
