@@ -56,6 +56,19 @@ import std/[atomics, cpuinfo, math, os, strutils, tempfiles, unittest]
 import runquota_observation_store
 import runquota_observation_store/ids
 
+when defined(windows):
+  # THE STEP CADENCE IS `StepMillis`, AND ON WINDOWS `sleep` DOES NOT HONOUR
+  # IT BY DEFAULT: the system timer runs at 15.6 ms, so `sleep(2)` sleeps
+  # 15.6 ms and the probe moved an eighth as often as this test is built
+  # around -- too slowly to step between the sampler's two reads, and, on a
+  # contended host, too few times to clear the `steps.len > 100` floor at
+  # all. `timeBeginPeriod(1)` is how a Windows process asks for the
+  # millisecond timer the cadence assumes; it is released when the test ends.
+  proc timeBeginPeriod(period: uint32): uint32
+    {.stdcall, dynlib: "winmm.dll", importc: "timeBeginPeriod".}
+  proc timeEndPeriod(period: uint32): uint32
+    {.stdcall, dynlib: "winmm.dll", importc: "timeEndPeriod".}
+
 const
   ProbeId = "atomicity-probe"
   ProbeRss = 4096'i64
@@ -234,6 +247,9 @@ suite "ambient sample atomicity":
     # cannot produce more than this many; a stepper that somehow reached the
     # end simply stops recording, and `steps.len > 100` below still refuses a
     # run that recorded nothing.
+    when defined(windows):
+      discard timeBeginPeriod(1)
+      defer: discard timeEndPeriod(1)
     stepper.steps = newSeq[StepRecord](StepCapacity)
     stepper.stepCount = 0
     createThread(stepperThread, stepProbe, addr stepper)
