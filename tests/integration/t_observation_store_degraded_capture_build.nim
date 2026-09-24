@@ -14,6 +14,10 @@
 
 import std/[nativesockets, options, os, osproc, streams, strutils, unittest]
 
+# `readToEnd`, not `streams.readAll`: on Windows `readAll` stops at the
+# first short pipe read and returns only what the child had written so far.
+from runquota_core/child_process import readToEnd
+
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_observation_store
 import daemon_binary
@@ -58,7 +62,7 @@ proc runBuildUnderLease(dir, source, binary: string): tuple[
   ]
   let process = startProcess(command[0], args = command[1 .. ^1],
     options = {poStdErrToStdOut})
-  let output = process.outputStream.readAll()
+  let output = process.outputStream.readToEnd()
   let code = process.waitForExit()
   process.close()
   (code, output)

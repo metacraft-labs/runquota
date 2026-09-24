@@ -61,6 +61,10 @@
 
 import std/[os, osproc, strtabs, streams, strutils, unittest]
 
+# `readToEnd`, not `streams.readAll`: on Windows `readAll` stops at the
+# first short pipe read and returns only what the child had written so far.
+from runquota_core/child_process import readToEnd
+
 const gateSourceDir = currentSourcePath().parentDir()
 
 type
@@ -126,7 +130,7 @@ proc runChecks(root: string; targets: seq[CheckTarget]): seq[CheckOutcome] =
   ## Type-check every target for Windows, a bounded number at a time, and
   ## return one outcome per target in target order.
   ##
-  ## Output is read with `readAll` BEFORE `waitForExit`: `readAll` returns at
+  ## Output is read to end BEFORE `waitForExit`: `readToEnd` returns at
   ## EOF, which the child's exit produces, so the pipe cannot fill and
   ## deadlock the way a `waitForExit`-then-read would. The children of one
   ## batch still run concurrently; only the reads are serialised.
@@ -171,7 +175,7 @@ proc runChecks(root: string; targets: seq[CheckTarget]): seq[CheckOutcome] =
         options = {poStdErrToStdOut})
     for i in index ..< batchEnd:
       let process = running[i - index]
-      let output = process.outputStream.readAll()
+      let output = process.outputStream.readToEnd()
       let code = process.waitForExit()
       process.close()
       result.add CheckOutcome(

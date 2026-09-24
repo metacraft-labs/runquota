@@ -26,6 +26,10 @@
 
 import std/[options, os, osproc, posix, streams, strutils, unittest]
 
+# `readToEnd`, not `streams.readAll`: on Windows `readAll` stops at the
+# first short pipe read and returns only what the child had written so far.
+from runquota_core/child_process import readToEnd
+
 import runquota_core
 import runquota_ipc
 import runquota_observation_store
@@ -151,7 +155,7 @@ proc startAndExpectExit(socketPath: string): RefusedStart =
       discard process.waitForExit(5000)
   # Read only after the child is gone, so a full pipe cannot block it and
   # an unread pipe cannot block us.
-  let output = process.outputStream.readAll()
+  let output = process.outputStream.readToEnd()
   check not process.running
   process.close()
   RefusedStart(exitedOnItsOwn: exited, exitCode: code, output: output)

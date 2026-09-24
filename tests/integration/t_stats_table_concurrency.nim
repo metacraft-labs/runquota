@@ -31,6 +31,10 @@
 
 import std/[os, osproc, streams, strutils, tables, times, unittest]
 
+# `readToEnd`, not `streams.readAll`: on Windows `readAll` stops at the
+# first short pipe read and returns only what the child had written so far.
+from runquota_core/child_process import readToEnd
+
 import runquota_stats_table
 
 const driverSource = "tests/fixtures/stats-table/publish_driver.nim"
@@ -63,8 +67,11 @@ suite "stats_table_concurrency":
       let compiler = findExe("nim")
       check compiler.len > 0
       if compiler.len > 0:
+        # `addFileExt`: `--out:` without an extension gets `.exe` on
+        # Windows, so checking the bare name looked for a file the compile
+        # never writes.
         let outPath = getCurrentDir() / "build" / "test-bin" /
-          "stats_table_publish_driver"
+          addFileExt("stats_table_publish_driver", ExeExt)
         # THE INNER COMPILE INHERITS THIS FILE'S BUILD MODE, and it has to.
         # The writer's release fences are what the reader's acquire fence
         # pairs with, and neither is observable at -O0: removing them leaves
@@ -248,7 +255,7 @@ suite "stats_table_concurrency":
     let localBase = cast[uint](table.unsafeMappedBase())
     table.close()
 
-    let writerOutput = writer.outputStream.readAll()
+    let writerOutput = writer.outputStream.readToEnd()
     discard writer.waitForExit(15000)
     writer.close()
 

@@ -57,6 +57,10 @@
 
 import std/[json, options, os, osproc, streams, strutils, unittest]
 
+# `readToEnd`, not `streams.readAll`: on Windows `readAll` stops at the
+# first short pipe read and returns only what the child had written so far.
+from runquota_core/child_process import readToEnd
+
 from runquota_ipc import endpointDirectoryPermissions, endpointForPath,
   sendFrame
 import runquota_client
@@ -194,7 +198,14 @@ proc runViolatorRole() =
     inc index
   writeRoleReport(getEnv(RoleReportEnv), ["failures=0", "wrote=" & $index])
 
+const ExitZeroArg = "--exit-zero"
+  ## The command `runquota acquire` wraps in the "unavailable" case: this
+  ## binary, re-executed, exiting 0. It was `/bin/sh -c "exit 0"`, which is
+  ## not a path on Windows.
+
 when isMainModule:
+  if paramCount() == 1 and paramStr(1) == ExitZeroArg:
+    quit 0
   let honest = getEnv(HonestRoleEnv)
   if honest.len > 0:
     runHonestRole(honest)
@@ -241,6 +252,11 @@ proc installSqliteProbe(root: string): SqliteProbe =
   ## by any library the client links, and by any helper the client spawns
   ## -- including one that does not exist yet. It also cannot be satisfied
   ## by a client that merely avoided the store's own entry points.
+  ##
+  ## ON WINDOWS THE SHIM IS A COMPILED `sqlite3.exe`, because a `#!/bin/sh`
+  ## script is not something `CreateProcess` can run and `poUsePath` looks
+  ## for `sqlite3.exe`, not for a file called `sqlite3`. It records its
+  ## argument vector the same way and runs the real tool on the same stdio.
   let real = findExe("sqlite3")
   doAssert real.len > 0, "the probe needs a real sqlite3 to delegate to"
   result = SqliteProbe(
@@ -249,16 +265,36 @@ proc installSqliteProbe(root: string): SqliteProbe =
     savedPath: getEnv("PATH"))
   createDir(result.shimDir)
   writeFile(result.logPath, "")
-  let shim = result.shimDir / "sqlite3"
-  writeFile(shim, "#!/bin/sh\n" &
-    "printf '%s\\n' \"$*\" >> " & quoteShell(result.logPath) & "\n" &
-    "exec " & quoteShell(real) & " \"$@\"\n")
-  setFilePermissions(shim, {fpUserRead, fpUserWrite, fpUserExec,
-    fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
+  when defined(windows):
+    let source = result.shimDir / "sqlite3_shim.nim"
+    writeFile(source, "import std/[os, osproc]\n" &
+      "let log = open(" & escape(result.logPath) & ", fmAppend)\n" &
+      "var line = \"\"\n" &
+      "for arg in commandLineParams():\n" &
+      "  if line.len > 0: line.add(' ')\n" &
+      "  line.add(arg)\n" &
+      "log.writeLine(line)\n" &
+      "log.close()\n" &
+      "let child = startProcess(" & escape(real) & ",\n" &
+      "  args = commandLineParams(), options = {poParentStreams})\n" &
+      "quit(child.waitForExit())\n")
+    let shim = result.shimDir / "sqlite3.exe"
+    let build = execProcess(findExe("nim"), args = ["c", "--hints:off",
+      "--verbosity:0", "--nimcache:" & (result.shimDir / "nimcache"),
+      "--out:" & shim, source], env = nil, options = {poStdErrToStdOut})
+    doAssert fileExists(shim), "the sqlite3 probe shim did not compile:\n" &
+      build
+  else:
+    let shim = result.shimDir / "sqlite3"
+    writeFile(shim, "#!/bin/sh\n" &
+      "printf '%s\n' \"$*\" >> " & quoteShell(result.logPath) & "\n" &
+      "exec " & quoteShell(real) & " \"$@\"\n")
+    setFilePermissions(shim, {fpUserRead, fpUserWrite, fpUserExec,
+      fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
 
 proc arm(probe: SqliteProbe) =
   ## Put the shim in front for everything launched from here on.
-  putEnv("PATH", probe.shimDir & ":" & probe.savedPath)
+  putEnv("PATH", probe.shimDir & PathSep & probe.savedPath)
 
 proc disarm(probe: SqliteProbe) =
   putEnv("PATH", probe.savedPath)
@@ -301,8 +337,10 @@ proc databaseFilesUnder(root: string; probe: SqliteProbe): seq[string] =
 # ---------------------------------------------------------------------------
 
 proc compileFixture(root, name, source: string): string =
-  ## A real Nim compile producing a real binary.
-  result = root / name
+  ## A real Nim compile producing a real binary. `addFileExt`, because
+  ## `--out:` without an extension gets `.exe` on Windows and the bare name
+  ## is then a file the compile never writes.
+  result = root / addFileExt(name, ExeExt)
   let sourcePath = root / (name & ".nim")
   writeFile(sourcePath, source)
   var args = @["c", "--hints:off", "--verbosity:0",
@@ -334,7 +372,7 @@ proc runProcess(program: string; args: openArray[string]):
     tuple[exitCode: int; output: string] =
   let process = startProcess(program, args = @args,
     options = {poStdErrToStdOut})
-  let output = process.outputStream.readAll()
+  let output = process.outputStream.readToEnd()
   let code = process.waitForExit()
   process.close()
   (code, output)
@@ -833,7 +871,7 @@ suite "standalone_daemonless_degradation":
     let acquire = runProcess(cliPath(), [
       "acquire", "--cpu", "1000", "--mem", "128MB",
       "--stats-key", "m14-unknown-key", "--",
-      "/bin/sh", "-c", "exit 0"])
+      selfPath(), ExitZeroArg])
     check acquire.exitCode == 0
     check "unavailable" in acquire.output
     check "degraded" in acquire.output
