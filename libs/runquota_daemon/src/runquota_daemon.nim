@@ -11,6 +11,7 @@ import runquota_daemon/types as daemonTypes
 # below reads the same on both platforms and the contract is compiled on
 # every leg rather than only on the one that uses it.
 import runquota_daemon/windows_service
+import runquota_daemon/host_config
 import runquota_codec
 import runquota_core
 import runquota_core/process_owned
@@ -70,6 +71,17 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     retentionSweepIntervalMillis: defaultRetentionSweepIntervalMillis,
     retentionMaxDeferredSweeps: defaultMaxDeferredSweeps
   )
+
+proc applyHostConfig*(config: var DaemonConfig; host: HostConfig) =
+  ## Overlay the host budget file (`runquota_daemon/host_config`) onto
+  ## `defaultDaemonConfig`. `runquotad` applies its flags after this, which is
+  ## what makes a flag win for one launch.
+  if host.memoryBytes.isSome:
+    config.memoryBytes = bytes(host.memoryBytes.get)
+  if host.cpuMilli.isSome:
+    config.cpuSlots = milliCpu(host.cpuMilli.get)
+  for name, units in host.pools:
+    config.namedPoolCaps[name] = units
 
 proc machineCapacity*(id: string; cpuSlots: MilliCpu; memoryBytes: Bytes;
                       ioSlots: uint32; cpuShareGroup = ""): MachineCapacity =

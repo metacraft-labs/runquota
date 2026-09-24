@@ -25,10 +25,49 @@ service named `runquotad`.
 
 `runquota daemon start` is the convenience path: it checks whether a daemon is
 already answering, and only if not spawns a detached `runquotad` **with no
-arguments**, then polls for readiness. Idempotent, but it gives you the default
-budget — if you want flags, start the daemon yourself or use the service.
+arguments**, then polls for readiness. Idempotent; the budget it gets is the
+host file's (below), or the defaults when there is none. For flags,
+start the daemon yourself or use the service.
 
 ## Configuring the budget
+
+### The host file
+
+One daemon serves the whole host, so its budget belongs to the host, not to
+whichever shell started it. `runquotad` reads it at start from:
+
+| OS | Path |
+|---|---|
+| Windows | `C:\ProgramData\runquota\runquotad.toml` |
+| Linux, macOS | `/etc/runquota/runquotad.toml` |
+
+```toml
+schema = "runquota.host-config.v1"
+
+[machine]
+memory_bytes = 103_079_215_104   # 96 GiB
+cpu_milli    = 16000
+
+[pools]
+compile = 8
+fetch   = 2
+```
+
+Every key is optional; an absent one keeps the default in the table below. A
+flag given on the command line overrides the file for that launch. The file is
+read once, at start: restart the daemon to apply a change.
+
+The reader accepts exactly this shape: a `schema` string, positive integers in
+`[machine]` and `[pools]`, `_` between digits, and `#` comments. Anything else
+is refused with the file and line, and the daemon exits **2** without starting,
+because a budget file that was half-read would look configured when it is not.
+A missing file is not an error, and the daemon never creates the file or its
+directory.
+
+A daemon that reprobuild starts for you reads the same file, and reprobuild
+passes budget flags only for the keys the file leaves unset.
+
+### Flags
 
 `runquotad --help` prints the full list. The ones that shape admission:
 

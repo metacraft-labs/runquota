@@ -3,6 +3,7 @@ import std/[options, strutils, tables]
 
 import runquota_core
 import runquota_daemon
+import runquota_daemon/host_config
 import runquota_ipc
 
 proc optionalRetentionBound(text: string): Option[int64] =
@@ -110,6 +111,16 @@ when isMainModule:
     quit 0
 
   var config = defaultDaemonConfig(defaultEndpoint())
+  # The host's budget, between the built-in defaults and the flags below, so
+  # that a flag still overrides it for one launch
+  # (reprobuild-specs/RunQuota-Host-Configuration.md). A malformed file stops
+  # the daemon: a budget that is silently half-read looks configured and is
+  # not. A missing file is the ordinary case and changes nothing.
+  try:
+    config.applyHostConfig(readHostConfig())
+  except HostConfigError as err:
+    echo "runquotad: " & err.msg
+    quit 2
   let usage = "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N]"
   var i = 0
   while i < args.len:
