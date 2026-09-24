@@ -10,6 +10,7 @@ import runquota_core/child_process
 import runquota_exec
 import runquota_process
 import daemon_binary
+import scratch_root
 
 const FixtureOutput = "--m5-fixture-output"
 const FixtureCwdEnv = "--m5-fixture-cwd-env"
@@ -141,7 +142,17 @@ suite "m5_process_exec_bench_contract":
     let cancelled = sleeping.cancelAndWait(3000)
     sleeping.close()
     check cancelled.cancelled
-    check cancelled.signaled or cancelled.timedOut
+    when defined(windows):
+      # No POSIX signals on Windows: a cancelled child is known by the exit
+      # code the Job Object termination gives it, which is the evidence
+      # `runquota_protocol.killedWithExitCode` documents for this platform.
+      # The fixture exits 0 on its own, so this cannot pass by the child
+      # finishing its sleep.
+      check cancelled.signaled or cancelled.timedOut or
+        (cancelled.exited and
+          cancelled.exitCode == int(windowsCancelledExitCode))
+    else:
+      check cancelled.signaled or cancelled.timedOut
     check cancelled.elapsedMillis < 3500
 
   test "process helper applies cwd and environment to child":
@@ -340,7 +351,7 @@ suite "m5_process_exec_bench_contract":
     let socketDir = getTempDir() / ("runquota-m5-test-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
-      removeDir(socketDir)
+      removeScratchRoot(socketDir)
     createDir(socketDir)
     # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
     # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
@@ -356,6 +367,10 @@ suite "m5_process_exec_bench_contract":
       daemonPath(),
       args = [
         "--socket", socketPath,
+        # The host state -- identity and observation store -- in the scratch
+        # directory, never the machine's: without it this daemon read and wrote
+        # the host-wide store other daemons on the host are using.
+        "--host-identity-file", socketPath.parentDir / "host-id",
         "--cpu-milli", "2000",
         "--memory-bytes", $((1024'u64 * 1024'u64 * 1024'u64))
       ],
@@ -428,7 +443,7 @@ suite "m5_process_exec_bench_contract":
         discard daemon.waitForExit(3000)
       daemon.close()
       if dirExists(socketDir):
-        removeDir(socketDir)
+        removeScratchRoot(socketDir)
 
   test "process benchmark quick path emits cwd env workload evidence":
     # This runs a BUILD SCRIPT -- `nim c` of the benchmark, then the benchmark
@@ -440,9 +455,13 @@ suite "m5_process_exec_bench_contract":
     # much the compiler has to say, so the first genuinely noisy build would
     # not have failed this test, it would have HUNG it, and hung it with the
     # compiler's explanation still sitting unread in the pipe.
+    # Through `bash`, the way the Justfile's `bench-runquota-process-execution`
+    # recipe runs it: executing the `.sh` directly relies on a shebang, which
+    # only a POSIX kernel honours -- on Windows `CreateProcess` refused it and
+    # the case failed before the benchmark ran.
     let captured = runCapturedProcess(
-      "scripts/run-m5-benchmark.sh",
-      args = ["process", "--quick"],
+      "bash",
+      args = ["scripts/run-m5-benchmark.sh", "process", "--quick"],
       options = {poUsePath}
     )
     # The script's diagnostics are now readable, so a failed build says why

@@ -89,4 +89,7 @@ type
     # when the freed memory happens to alias a Process with those options.
     winProcess*: Process
     winJobHandle*: uint64
+    # Windows: end of input seen on the child's stdout / stderr pipe.
+    winStdoutClosed*: bool
+    winStderrClosed*: bool
     temporaryLaunchFiles*: seq[string]

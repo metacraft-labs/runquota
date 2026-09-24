@@ -134,7 +134,8 @@ proc mean(values: seq[float]): float =
   total / float(values.len)
 
 proc daemonPath(): string =
-  getCurrentDir() / "build" / "bin" / "runquotad"
+  # `addFileExt`: the build writes `runquotad.exe` on Windows.
+  getCurrentDir() / "build" / "bin" / addFileExt("runquotad", ExeExt)
 
 proc prepareDir(path: string) =
   if dirExists(path):

@@ -116,7 +116,8 @@ proc repoRoot(): string =
   getCurrentDir()
 
 proc daemonPath(): string =
-  repoRoot() / "build" / "bin" / "runquotad"
+  # `addFileExt`: the build writes `runquotad.exe` on Windows.
+  repoRoot() / "build" / "bin" / addFileExt("runquotad", ExeExt)
 
 proc waitForDaemon(socketPath: string) =
   putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -138,6 +139,9 @@ proc startDaemon(socketPath: string): Process =
     daemonPath(),
     args = [
       "--socket", socketPath,
+      # The host state beside the benchmark's socket, never the machine's:
+      # a benchmark daemon must not write rows into the host-wide store.
+      "--host-identity-file", socketPath.parentDir / "host-id",
       "--cpu-milli", "8000",
       "--memory-bytes", $((8'u64 * 1024'u64 * 1024'u64 * 1024'u64))
     ],
@@ -340,7 +344,13 @@ proc runProcessSuite(quick: bool): seq[BenchMetric] =
     let cancelStart = epochTime()
     let cancelled = cancellable.cancelAndWait(3000)
     cancellable.close()
-    if not cancelled.cancelled or (not cancelled.signaled and not cancelled.timedOut):
+    # On Windows a cancelled child is known by its exit code, there being no
+    # signals (see `windowsCancelledExitCode`); elsewhere by the signal.
+    let endedByCancel =
+      cancelled.signaled or cancelled.timedOut or
+        (defined(windows) and cancelled.exited and
+          cancelled.exitCode == int(windowsCancelledExitCode))
+    if not cancelled.cancelled or not endedByCancel:
       raise newException(ValueError, "cancellation did not terminate fixture")
     result.addMetric(
       "process-tree-cancel latency",

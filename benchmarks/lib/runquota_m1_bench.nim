@@ -515,7 +515,7 @@ runquota_m1_bench --mode=calibrate|study|tap-overhead [options]
 
 proc parseConfig(): Config =
   result.mode = "study"
-  result.daemonBin = "build/bin/runquotad"
+  result.daemonBin = "build/bin/" & addFileExt("runquotad", ExeExt)
   result.reproBin = ""
   result.subjectName = "unnamed"
   result.subjectDir = ""

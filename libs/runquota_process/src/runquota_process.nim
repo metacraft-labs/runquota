@@ -393,15 +393,22 @@ when defined(windows):
     hJob: Handle, uExitCode: uint32
   ): WINBOOL {.stdcall, dynlib: "kernel32.dll", importc: "TerminateJobObject".}
 
-  # Windows: stdlib's std/osproc exposes Process.fProcessHandle and .id but on
-  # different versions/branches the field names move. Pull them out via a tiny
-  # accessor module so the only place that names them is here.
-  proc winProcessHandle(p: Process): Handle =
-    # Windows: std/osproc stores the handle in `p.fProcessHandle` on Windows.
-    when compiles(p.fProcessHandle):
-      Handle(p.fProcessHandle)
-    else:
-      Handle(0)
+  proc winOpenForJob(p: Process): Handle =
+    ## A handle to the child with the rights `AssignProcessToJobObject`
+    ## needs, opened by pid.
+    ##
+    ## This used to read `p.fProcessHandle` behind `when compiles(...)`. That
+    ## field is PRIVATE to `std/osproc`, so from this module the `compiles`
+    ## was always false and the proc always returned 0: every
+    ## `AssignProcessToJobObject` failed, no child was ever in its Job Object,
+    ## and `terminate` / `killNow` / `cancelAndWait` -- which terminate the
+    ## job -- stopped nothing. A cancelled child ran to its natural end.
+    const
+      ProcessSetQuota = 0x0100'i32
+      ProcessTerminate = 0x0001'i32
+      ProcessQueryLimitedInformation = 0x1000'i32
+    Handle(openProcess(ProcessSetQuota or ProcessTerminate or
+      ProcessQueryLimitedInformation, 0'i32, int32(p.processID)))
 
   proc applyKillOnJobClose(job: Handle) =
     var info: JobExtendedLimitW
@@ -451,8 +458,8 @@ proc backendProfile*(): ProcessBackendProfile =
     ProcessBackendProfile(
       name: "windows-osproc-jobobject",
       launchPrimitive: "CreateProcess+AssignProcessToJobObject",
-      outputCapture: "osproc-pipes",
-      completionWait: "waitForExit",
+      outputCapture: "nonblocking-pipes-peek-bounded",
+      completionWait: "exit-code-poll",
       cancellation: "TerminateJobObject",
       telemetry: "job-object-accounting",
       directArgv: true,
@@ -469,6 +476,14 @@ proc backendProfile*(): ProcessBackendProfile =
       directArgv: false,
       implicitShell: false
     )
+
+const windowsCancelledExitCode* = 1'u32
+  ## The exit code a child ended by `terminate`, `killNow` or `cancelAndWait`
+  ## reports on Windows. There are no POSIX signals there, so a cancelled
+  ## child is known by its exit status alone -- the form
+  ## `runquota_protocol.killedWithExitCode` documents as the only kill
+  ## evidence a Windows supervisor can offer. Exported so a caller can
+  ## recognise it rather than restate the number.
 
 proc commandSpec*(argv: openArray[string]; cwd = ""; env: openArray[string] = [];
                   stdoutLimit = DefaultOutputLimit; stderrLimit = DefaultOutputLimit;
@@ -717,27 +732,59 @@ when defined(windows):
       target, total, data, count, limit,
       unlimitedWhenNonPositive = true)
 
-  proc winDrainOutput(child: var LaunchedProcess; process: Process;
-                      blocking: bool) =
-    # Windows: drain whatever the osproc output pipe currently holds into
-    # `child.stdoutText`. stderr is merged into stdout via poStdErrToStdOut at
-    # launch, so there is no separate stderr stream to drain. When `blocking`
-    # is false we only read while PeekNamedPipe reports data ready, so an idle
-    # child cannot stall the caller.
-    let outputStream = process.outputStream
-    if outputStream == nil:
+  const winLingeringPipeDrainSeconds = 0.25
+    ## How long output is still collected after the leased process itself has
+    ## exited, when something it started keeps a pipe write-end open. The
+    ## POSIX arm's `lingeringPipeDrainSeconds`, for the same reason.
+
+  proc winDrainPipe(handle: FileHandle; stream: Stream; closed: var bool;
+                    target: var string; total: var uint64; limit: int) =
+    ## Read what one pipe holds RIGHT NOW, never waiting for more.
+    ##
+    ## `PeekNamedPipe` says how much is buffered and, by failing (with
+    ## `ERROR_BROKEN_PIPE`), that every write end has closed and nothing is
+    ## left -- which is the only non-blocking way to see end of input on an
+    ## anonymous pipe. Reads are sized to what the peek reported, so
+    ## `ReadFile` returns at once instead of parking until the writer writes
+    ## again or goes away. That wait is what used to make completion of a
+    ## FORKING action -- a leader that exits while a descendant holds the
+    ## inherited write end -- take as long as the descendant lived.
+    if closed or stream == nil:
       return
     var buffer: array[8192, char]
     while true:
-      if not blocking and not process.hasData():
-        break
-      let n = outputStream.readData(addr buffer[0], buffer.len)
+      var available = 0'i32
+      if not peekNamedPipe(Handle(handle), lpTotalBytesAvail = addr available):
+        closed = true
+        return
+      if available <= 0:
+        return
+      let n = stream.readData(addr buffer[0], min(int(available), buffer.len))
       if n <= 0:
-        break
-      winAppendBounded(child.stdoutText, child.stdoutBytes,
-                       addr buffer[0], n, child.stdoutLimit)
-      if not blocking and not process.hasData():
-        break
+        closed = true
+        return
+      winAppendBounded(target, total, addr buffer[0], n, limit)
+
+  proc winDrainOutput(child: var LaunchedProcess; process: Process) =
+    # Windows: drain whatever the stdout and stderr pipes currently hold into
+    # `child.stdoutText` / `child.stderrText`. The two are separate pipes, as
+    # on POSIX: every consumer writes `completion.stdout` and
+    # `completion.stderr` to different places, and `stderrLimit` bounds the
+    # second one.
+    winDrainPipe(process.outputHandle, process.outputStream,
+      child.winStdoutClosed, child.stdoutText, child.stdoutBytes,
+      child.stdoutLimit)
+    winDrainPipe(process.errorHandle, process.errorStream,
+      child.winStderrClosed, child.stderrText, child.stderrBytes,
+      child.stderrLimit)
+
+  proc winOutputSettled(child: LaunchedProcess): bool =
+    ## After the leased process has exited: true once both pipes have reached
+    ## end of input (the ordinary case) or the lingering-drain grace is over
+    ## (a descendant still holds a write end open). Completion is gated on
+    ## the leased process itself, never on its descendants' pipes.
+    (child.winStdoutClosed and child.winStderrClosed) or
+      epochTime() - child.doneSeconds >= winLingeringPipeDrainSeconds
 
   proc winSampleTelemetry(child: var LaunchedProcess; force = false) =
     # Windows: sample the live process tree's RSS / process count via the
@@ -834,7 +881,10 @@ when defined(windows):
         workingDir = cwd,
         args = args,
         env = windowsChildEnv(spec),
-        options = {poStdErrToStdOut, poUsePath}
+        # stdout and stderr on SEPARATE pipes, as on POSIX. They used to be
+        # merged here, which left `completion.stderr` empty on Windows and
+        # made `stderrLimit` bound nothing.
+        options = {poUsePath}
       )
     except CatchableError:
       for path in prepared.temporaryFiles:
@@ -843,14 +893,25 @@ when defined(windows):
         except CatchableError:
           discard
       raise
-    let processHandle = winProcessHandle(process)
-    let job = createJobObjectW(nil, nil)
+    var job = createJobObjectW(nil, nil)
     if job != 0:
       # Windows: best-effort assignment. The child has already started; if it
       # was launched without CREATE_SUSPENDED it may have spawned a grandchild
       # before we get here. We accept this race for now.
-      discard assignProcessToJobObject(job, processHandle)
-      applyKillOnJobClose(job)
+      #
+      # A job the child is NOT in is closed rather than kept: `terminate` and
+      # `killNow` fall back to terminating the process itself when there is
+      # no job, and a kept empty job would make them terminate nothing.
+      let processHandle = winOpenForJob(process)
+      let assigned = processHandle != 0 and
+        assignProcessToJobObject(job, processHandle) != 0
+      if processHandle != 0:
+        discard closeHandle(processHandle)
+      if assigned:
+        applyKillOnJobClose(job)
+      else:
+        discard closeHandle(job)
+        job = 0
     let processId = uint64(process.processID)
     result = LaunchedProcess(
       pid: int(processId),
@@ -1127,7 +1188,8 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
     # Windows: nonblocking completion check. We sample live tree telemetry,
     # drain any output the pipe already holds (PeekNamedPipe-gated so an idle
     # child doesn't stall us), and ask osproc whether the process has exited.
-    # When it has, drain the remainder and populate `child.completion`.
+    # When it has, keep draining until both pipes reach end of input or the
+    # lingering-drain grace expires, then populate `child.completion`.
     if child.completion.exited or child.completion.signaled or
         child.completion.timedOut:
       return true
@@ -1137,8 +1199,9 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
 
     # Windows: sample RSS / process count before draining so even a very
     # short-lived child gets at least one snapshot while still alive.
-    winSampleTelemetry(child)
-    winDrainOutput(child, process, blocking = false)
+    if not child.doneFlag:
+      winSampleTelemetry(child)
+    winDrainOutput(child, process)
 
     if not child.doneFlag:
       var alive = true
@@ -1149,16 +1212,21 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
       if not alive:
         child.doneFlag = true
         child.runningFlag = false
+        child.doneSeconds = epochTime()
         try:
           child.waitStatus = process.peekExitCode()
         except CatchableError:
           child.waitStatus = -1
+        # Windows: one final telemetry snapshot, taken once.
+        winSampleTelemetry(child, force = true)
+        winDrainOutput(child, process)
 
     if child.doneFlag:
-      # Windows: take one final telemetry snapshot and drain whatever the pipe
-      # still buffers before reporting completion.
-      winSampleTelemetry(child, force = true)
-      winDrainOutput(child, process, blocking = true)
+      # Gated on the leased process having exited, NOT on its pipes reaching
+      # end of input -- see `winOutputSettled`. Until then the caller polls
+      # again, exactly as the POSIX arm does.
+      if not child.winOutputSettled():
+        return false
       if child.winJobHandle != 0:
         var cpuMicros = 0'u64
         var jobProcessCount = 0'u32
@@ -1175,6 +1243,21 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
   else:
     raise newException(OSError, "runquota_process is only implemented on POSIX")
 
+when defined(windows):
+  proc winTerminateLeader(child: LaunchedProcess) =
+    ## The fallback when the child is in no Job Object: terminate the leader
+    ## alone, with the same exit code a job termination gives. NOT
+    ## `osproc.terminate`, which calls `TerminateProcess(handle, 0)` -- a
+    ## cancelled child reported as a clean exit 0, which is the one pair
+    ## `KillEvidence` exists to make unstatable.
+    const ProcessTerminate = 0x0001'i32
+    if child.pid <= 0:
+      return
+    let handle = openProcess(ProcessTerminate, 0'i32, int32(child.pid))
+    if handle != 0:
+      discard terminateProcess(handle, int(windowsCancelledExitCode))
+      discard closeHandle(handle)
+
 proc terminate*(child: var LaunchedProcess) =
   when defined(posix):
     child.cancelSent = true
@@ -1188,9 +1271,10 @@ proc terminate*(child: var LaunchedProcess) =
     # primary process via osproc.
     child.cancelSent = true
     if child.winJobHandle != 0:
-      discard terminateJobObject(Handle(child.winJobHandle), 1'u32)
-    elif not child.winProcess.isNil:
-      try: child.winProcess.terminate() except CatchableError: discard
+      discard terminateJobObject(Handle(child.winJobHandle),
+        windowsCancelledExitCode)
+    else:
+      winTerminateLeader(child)
 
 proc killNow*(child: var LaunchedProcess) =
   when defined(posix):
@@ -1204,9 +1288,10 @@ proc killNow*(child: var LaunchedProcess) =
     # since TerminateJobObject is unconditional).
     child.cancelSent = true
     if child.winJobHandle != 0:
-      discard terminateJobObject(Handle(child.winJobHandle), 1'u32)
-    elif not child.winProcess.isNil:
-      try: child.winProcess.kill() except CatchableError: discard
+      discard terminateJobObject(Handle(child.winJobHandle),
+        windowsCancelledExitCode)
+    else:
+      winTerminateLeader(child)
 
 proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessCompletion =
   when defined(posix):
@@ -1270,10 +1355,9 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
     child.completion = result
   elif defined(windows):
     # Windows: mirror the POSIX structure — repeatedly call pollCompletion
-    # (which drains the bounded stdout buffer, samples Job Object / toolhelp32
-    # telemetry, and detects exit) until the child finishes or the deadline
-    # elapses. stderr is merged into stdout via poStdErrToStdOut at launch, so
-    # there is no separate stderr stream.
+    # (which drains the bounded stdout and stderr buffers, samples Job Object /
+    # toolhelp32 telemetry, and detects exit) until the child finishes or the
+    # deadline elapses.
     if child.winProcess.isNil:
       raise newException(OSError, "runquota_process: missing Windows process handle")
     let process = child.winProcess
@@ -1292,7 +1376,7 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
         let killDeadline = epochTime() + 1.0
         while epochTime() < killDeadline:
           winSampleTelemetry(child)
-          winDrainOutput(child, process, blocking = false)
+          winDrainOutput(child, process)
           var alive = true
           try:
             alive = process.running()
@@ -1318,8 +1402,16 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
           child.doneFlag = true
           child.runningFlag = false
         # Windows: final telemetry + output drain, plus Job Object accounting.
+        # The drain is bounded like the ordinary completion path's: the Job
+        # Object took the whole tree down, so the pipes normally close at
+        # once, but nothing here may wait on a write end it cannot see.
         winSampleTelemetry(child, force = true)
-        winDrainOutput(child, process, blocking = true)
+        child.doneSeconds = epochTime()
+        while true:
+          winDrainOutput(child, process)
+          if child.winOutputSettled():
+            break
+          sleep(5)
         if child.winJobHandle != 0:
           var cpuMicros = 0'u64
           var jobProcessCount = 0'u32
