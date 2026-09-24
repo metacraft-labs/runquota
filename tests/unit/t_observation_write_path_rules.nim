@@ -49,7 +49,9 @@ suite "observation_write_path_rules":
 
   test "an operator who relocates the host state relocates the store":
     let relocated = observationDbBeside("/somewhere/else/host-id")
-    check relocated == "/somewhere/else/observations.sqlite3"
+    # `unixToNativePath`: the store path is built with the os `/` operator,
+    # so on Windows it comes back with backslashes. Same path, native form.
+    check relocated == unixToNativePath("/somewhere/else/observations.sqlite3")
     # An empty argument is the default host, not the current directory.
     check observationDbBeside("") == defaultObservationDbFile()
 
@@ -62,7 +64,8 @@ suite "observation_write_path_rules":
     # integration file asserts it against rows a real daemon wrote.
     check config.observationDbPath.len == 0
     check config.writeStatsDisabled == false
-    check effectiveObservationDbPath(config) == "/scratch/state/observations.sqlite3"
+    check effectiveObservationDbPath(config) ==
+      unixToNativePath("/scratch/state/observations.sqlite3")
 
     # (2) AN EXPLICIT PATH WINS OVER THE DEFAULT.
     var explicitConfig = config

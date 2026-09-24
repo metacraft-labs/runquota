@@ -157,7 +157,9 @@ suite "stats_table_rules":
     # to the store. The rule lives in the repository's own boundary document
     # and the wording is pinned, so removing it fails here rather than
     # quietly.
-    let boundary = readFile(repoRoot / "AGENTS.md")
+    # CRLF normalised: a Windows checkout with `core.autocrlf` has it in
+    # this file, and one pinned phrase below spans a line break.
+    let boundary = readFile(repoRoot / "AGENTS.md").replace("\r\n", "\n")
     check "only writer of the published aggregate table" in boundary
     check "may hold a writable mapping of it" in boundary
     check "must not read it back as\n  authority" in boundary

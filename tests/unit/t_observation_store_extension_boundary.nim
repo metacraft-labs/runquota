@@ -76,6 +76,16 @@ const
       # same snake_case shape, in a spine table RunQuota owns outright.
     "peak_rss_bytes", "major_page_faults", "command_stats_id"]
 
+proc toSlash(path: string): string =
+  ## The path with the host's separator turned into a slash. The exclusion
+  ## below is written `"/tests/"`, and `walkDirRec` yields `DirSep`: on
+  ## Windows it excluded nothing, and this gate reported the concrete table
+  ## a TEST names (which it is supposed to be allowed to) as a violation.
+  when DirSep == '/':
+    path
+  else:
+    path.replace(DirSep, '/')
+
 proc runQuotaSources(): seq[string] =
   ## Every Nim source RunQuota ships, DISCOVERED rather than listed.
   ##
@@ -87,7 +97,7 @@ proc runQuotaSources(): seq[string] =
     for path in walkDirRec(repoRoot / root):
       if not path.endsWith(".nim"):
         continue
-      if "/tests/" in path:
+      if "/tests/" in toSlash(path):
         continue
       result.add(path)
   result.sort()

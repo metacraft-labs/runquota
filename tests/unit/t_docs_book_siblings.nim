@@ -122,12 +122,18 @@ nim-stew .
     check resolved.paths.len == siblings.len
     check resolved.cfgLines.len == siblings.len
     for i, sibling in siblings:
+      # `paths` are native paths -- backslash separators on Windows -- so the tail
+      # is joined with `/` (the os module operator), not a literal slash; and
+      # the cfg line carries the path in `toNimCfgPath` form, which is the
+      # native path on POSIX and the `/`-separated one on Windows (see "a
+      # nim.cfg path never carries a backslash" below).
       let tail =
-        if sibling.subPath.len > 0: sibling.repo & "/" & sibling.subPath
+        if sibling.subPath.len > 0: sibling.repo / sibling.subPath
         else: sibling.repo
       check resolved.paths[i].endsWith(tail)
       check resolved.paths[i].isAbsolute
-      check resolved.cfgLines[i] == "--path:\"" & resolved.paths[i] & "\""
+      check resolved.cfgLines[i] ==
+        "--path:\"" & toNimCfgPath(resolved.paths[i]) & "\""
     check bookNimCfgText(resolved) == resolved.cfgLines.join("\n") & "\n"
 
   test "a worktree one level deeper still finds the workspace root":

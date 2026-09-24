@@ -94,6 +94,17 @@ const
     "runSqlite",
     "sqlite3"]
 
+proc toSlash(path: string): string =
+  ## The path with the HOST's separator turned into a slash, for the same
+  ## reason `t_stats_table_rules` gives: every prefix and substring test in
+  ## this file is written with slashes while `walkDirRec` yields the host's
+  ## `DirSep`, so on Windows `"/tests/"` excluded nothing and
+  ## `"libs/runquota_client/"` matched nothing.
+  when DirSep == '/':
+    path
+  else:
+    path.replace(DirSep, '/')
+
 proc runQuotaSources(): seq[string] =
   ## Every Nim source RunQuota ships, DISCOVERED rather than listed. Tests
   ## are excluded: a test of the read path must construct fixtures through
@@ -103,13 +114,15 @@ proc runQuotaSources(): seq[string] =
     for path in walkDirRec(repoRoot / root):
       if not path.endsWith(".nim"):
         continue
-      if "/tests/" in path:
+      if "/tests/" in toSlash(path):
         continue
       result.add(path)
   result.sort()
 
 proc relativeToRepo(path: string): string =
-  if path.startsWith(repoRoot & "/"): path[repoRoot.len + 1 .. ^1] else: path
+  let root = toSlash(repoRoot)
+  let slashed = toSlash(path)
+  if slashed.startsWith(root & "/"): slashed[root.len + 1 .. ^1] else: slashed
 
 proc codeOnly(text: string): string =
   ## The source with comments removed.
@@ -176,7 +189,9 @@ suite "observation_store_reader_boundary":
     # A GATE NOBODY CAN FIND THE RULE FOR GETS DELETED as an obstacle. The
     # rule lives in the repository's own boundary document, and the wording
     # is pinned so that removing it fails here rather than quietly.
-    let boundary = readFile(repoRoot / "AGENTS.md")
+    # Line endings normalised: a Windows checkout with `core.autocrlf` has
+    # CRLF in this file, and the pinned wording spans a line break.
+    let boundary = readFile(repoRoot / "AGENTS.md").replace("\r\n", "\n")
     check "only sanctioned reader of the observation store" in boundary
     check "No client\n  may open the database file directly" in boundary
     check "must not clamp it, second-guess it, or validate it against its own" in
