@@ -69,6 +69,15 @@ Repository posture and state-boundary requirements: `../../docs/database.md`.
   statement against one are the spine key it is joined by. Both are
   asserted by inspection over a discovered source set, with positive
   controls, in `tests/unit/t_observation_store_extension_boundary.nim`.
+- `recordUser` / `userUpsertStatement` write a `users` row (schema
+  version 6) and `readUsers` reads them. The daemon writes one per
+  connecting principal, from peer credentials, queued on the writer ahead
+  of every row that owner's leases produce (`enqueueUserRecord`); a rename
+  refreshes the name and stamps `name_updated_at_unix_millis`, and a name
+  that no longer resolves is kept. What `owner_uid` IS on each platform —
+  the uid, or the SID's hash with bit 62 set — is defined in
+  `runquota_core/owner_id`, and `docs/database.md` §"What the owner id is
+  on each platform" explains it.
 - `startObservationWriter` runs the drain thread. Recording is an
   in-memory append under an uncontended lock: no blocking, no fsync, no
   failure path into the caller (OS-1). A full queue drops and counts.
@@ -95,6 +104,8 @@ would abort at load time.
 | 2 | `dropped_observations` on `runs` and `executions`. OS-2 requires every dropped observation to be counted, and the specification's table lists gave the count no home. |
 | 3 | `host_profiles_current`, a unique index on `host_id` where `valid_to` is NULL. "Unchanged hardware must not accumulate profile rows" becomes a database constraint rather than a property of this library's code, and holds against a client reaching past it into `sqlite3`. Superseded rows stay unconstrained. |
 | 4 | `owner_uid` on `executions`, nullable. One host-wide daemon means one store holding every user's executions, so a row has to say whose it is; the value comes from the connection's peer credentials and never from anything a client declares. |
+| 5 | `carried_extension_rows`, the merge quarantine for extension rows the receiver does not know: an opaque payload, `queryable` pinned to 0 by a check constraint, and no timestamp, because a clock would make merge order-dependent. |
+| 6 | `users`: each owner recorded once — the principal its id was derived from (the uid, or on Windows the SID whose hash the id is) and a display name the daemon refreshes on rename and never erases. Triggers refuse an execution naming an owner with no row, a second principal under an existing id (a hash collision), and deleting a referenced owner. The migration backfills a row for every existing owner and sets to NULL the `owner_uid = 0` every pre-fix Windows daemon recorded. |
 
 Migrations are forward-only and a shipped step is never edited afterwards:
 `tests/unit/t_observation_store_migration.nim` builds a version-1 database

@@ -254,6 +254,17 @@ suite "observation_query_interface":
       check store.insertHostProfile(
         syntheticProfile(hostId, retiredProfileId))
       let myUid = callerOwnerUid()
+      # THE CALLER'S OWNER WAS RECORDED BY THE DAEMON, from the peer
+      # credentials of the connection above -- the uid, or on Windows the
+      # token user SID the id is the hash of. Nothing in this test wrote it.
+      let myOwnerRow = store.userRow(myUid)
+      check myOwnerRow.isSome
+      if myOwnerRow.isSome:
+        check myOwnerRow.get.principal == callerOwnerPrincipal().principal
+        check $myOwnerRow.get.principalKind == $callerOwnerPrincipal().kind
+      # The OTHER owner is a fixture, and like any owner it needs its
+      # `users` row before an execution may name it (schema version 6).
+      check store.recordUser(OtherUid, pkUid, $OtherUid, none(string))
       store.insertSynthetic(hostId, runId, [
         SyntheticRow(statsKey: HistoryKey, profileId: retiredProfileId,
           ownerUid: some(myUid), durationMillis: 100, peakRssBytes: 1_000),

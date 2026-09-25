@@ -131,10 +131,12 @@ type
     captureCompleteness*: CaptureCompleteness
     droppedObservations*: int64
     ownerUid*: Option[int64]
-      ## The uid whose lease this execution ran under, taken by the daemon
-      ## from the connection's peer credentials and NEVER from anything the
-      ## client declares. ``none`` means the transport could not report
-      ## them; it does not mean root.
+      ## The owner id whose lease this execution ran under -- the uid on
+      ## POSIX, the SID's hash on Windows (``runquota_core/owner_id``) --
+      ## taken by the daemon from the connection's peer credentials and
+      ## NEVER from anything the client declares. ``none`` means the
+      ## transport could not report them; it does not mean root. A value
+      ## must have a ``users`` row: the schema refuses the insert otherwise.
 
   AmbientSampleRow* = object
     hostId*: string
@@ -155,3 +157,27 @@ type
     owner*: string
     tableName*: string
     registeredAtUnixMillis*: int64
+
+  PrincipalKind* = enum
+    ## What a ``users`` row's owner id was derived from.
+    pkUid = "uid"
+      ## A POSIX uid; ``principal`` is the uid in decimal.
+    pkSid = "sid"
+      ## A Windows SID; ``principal`` is its string form and the owner id
+      ## its hash (``runquota_core/owner_id``).
+
+  UserRow* = object
+    ## One owner, recorded once. ``executions.owner_uid`` references it.
+    ownerUid*: int64
+    principalKind*: PrincipalKind
+    principal*: string
+      ## The preimage of ``ownerUid``. Immutable: a different principal
+      ## under an existing id is a collision and is refused.
+    name*: Option[string]
+      ## For display only -- ``DOMAIN\user`` or the login name. ``none``
+      ## means it has never been resolved; a name that stops resolving is
+      ## KEPT rather than cleared.
+    firstSeenAtUnixMillis*: int64
+    nameUpdatedAtUnixMillis*: Option[int64]
+      ## When ``name`` last took its current value. ``none`` exactly when
+      ## ``name`` is.

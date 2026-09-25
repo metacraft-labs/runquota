@@ -467,6 +467,12 @@ suite "observation_socket_write_path":
     check reported["queued"].getInt() == 7
     check reported["dropped"].getInt() == 0
     check reported["write_failures"].getInt() == 0
+    # ONE OWNER, RECORDED ONCE. Every connection above is this process, so
+    # one `users` row -- written at the first Hello and not again, since the
+    # name did not change -- and it is not an observation, so it is not in
+    # `queued` above.
+    check reported["owner_records_written"].getInt() == 1
+    check reported["owner_records_lost"].getInt() == 0
 
   # -------------------------------------------------------------------------
   # THE GATE: --no-write-stats disables it

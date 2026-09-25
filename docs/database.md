@@ -164,6 +164,102 @@ peer credentials is refused rather than corrected. It is `NULL`, not `0`, where
 the transport cannot report credentials: `0` is root, and a wrong owner is
 worse than an absent one.
 
+### What the owner id is on each platform
+
+`libs/runquota_core/src/runquota_core/owner_id.nim` is the one definition,
+used by the daemon (from the peer) and by the client (for its own Hello):
+
+| Platform | Credential the daemon reads | `owner_uid` |
+|---|---|---|
+| Linux, macOS | the Unix socket's peer uid (`SO_PEERCRED`, `getpeereid`) | the uid, `0 … 2^32 − 1` |
+| Windows | the named pipe's client pid → that process's token → the token user SID | `(be64(sha256(SID)[0..7]) & (2^62 − 1)) \| 2^62` |
+
+**Windows ids are a hash of the SID string**, as `ConvertSidToStringSidW`
+renders it (`S-1-5-21-…`). A hash needs no lookup and no domain rules, both
+ends compute it from the SID alone, and it is the same for one account on every
+host. Bit 62 is always set and bit 63 always clear, so every Windows id is a
+positive 64-bit integer `≥ 2^62`, never `0`, and above every POSIX uid: rows
+merged from a Linux store and a Windows store cannot mistake one platform's
+owner for the other's. SHA-256 because it is the stable cryptographic hash
+RunQuota already carries (`runquota_core/sha256`, tested against the FIPS 180-4
+vectors); the id is persisted and merged, so the function can never change.
+An operator can reproduce one with `sha256sum`: the first 16 hex digits of
+`printf '%s' "$SID" | sha256sum`, top two bits cleared, bit 62 set. Until
+this existed every Windows client was recorded as `0` — root — and the Hello
+check compared `0` with `0`.
+
+A named-pipe peer whose token cannot be read has **no** owner: it is
+`peerIdentityUnavailable`, its rows carry `NULL`, and a scoped query answers
+empty rather than widening. A client and a daemon on Windows have to be upgraded
+together: a client from before this change declares `0` and is refused, with a
+message saying why.
+
+### `users`: who each owner is (schema version 6)
+
+A uid is not something a reader maps to a person by eye, and a SID hash is not
+even reversible, so each owner is recorded **once** in `users`, and
+`executions.owner_uid` references it:
+
+| Column | Notes |
+|---|---|
+| `owner_uid` | Primary key; the same integer `executions.owner_uid` holds |
+| `principal_kind` | `uid` or `sid`; a check constraint pins `uid` to `0 … 2^32 − 1` with `principal` equal to its decimal, and `sid` to `≥ 2^62` |
+| `principal` | What the id was derived from: the uid in decimal, or the SID string. Immutable |
+| `name` | For display: the login name (`getpwuid_r`) or `DOMAIN\user` (`LookupAccountSidW`); `NULL` if it never resolved |
+| `first_seen_at_unix_millis` | When the daemon first recorded this principal |
+| `name_updated_at_unix_millis` | When `name` last took its current value; `NULL` exactly when `name` is |
+
+The daemon writes the row **from peer credentials** — the principal is the one
+the connection's credentials name, never anything the client sent — when a
+principal first connects, queued on the observation writer ahead of every row
+that principal's leases can produce. The name is resolved on the connection's
+own worker **before** the daemon-wide lock, because resolution can block on
+NSS/LDAP or a domain controller.
+
+**Renames.** The key is stable across a rename — a uid or a SID does not change
+when an account's name does — but the stored name can go stale. When the name
+the daemon resolves for a connecting principal differs from the stored one, the
+name is replaced and `name_updated_at_unix_millis` stamped; `owner_uid` is
+never touched. An account that no longer resolves (deleted, or its domain
+unreachable) **keeps its last known name** rather than being overwritten with
+`NULL`. The rule is in the upsert itself, not only in the daemon, so a tool or
+a second daemon life writing the same row cannot erase a name either.
+
+Three triggers make the rest structural rather than a property of the daemon:
+
+- `executions_owner_is_a_user` refuses an execution whose `owner_uid` names no
+  `users` row. It is a trigger rather than a foreign key because SQLite cannot
+  add a constraint to an existing column, and rebuilding `executions` would
+  rebuild the table every extension and the merge quarantine reference.
+- `users_principal_is_immutable` aborts any write that would change a row's
+  principal. A second principal under an existing id is a **hash collision** —
+  vanishingly rare at 62 bits, about one in 10^13 for a thousand accounts — and
+  two accounts sharing an id would share a scope, so it fails loudly. The daemon
+  also refuses such a Hello outright, from a ledger it seeds from `users` at
+  startup, and counts it as `owner_collisions_refused` in the `observations`
+  inspection subject (beside `owners_known`, `owner_records`,
+  `owner_records_written` and `owner_records_lost`, which are kept out of
+  `queued` and `dropped` because an owner row is not an observation).
+- `users_referenced_are_kept` refuses deleting an owner rows still reference.
+  Retention never deletes `users`, for the reason it never deletes `hosts`.
+
+**The migration.** Version 6 gives every owner already in `executions` a
+`users` row (kind `uid`, no name; the daemon fills the name in the next time
+that user connects), and sets to `NULL` the `owner_uid = 0` that every Windows
+daemon before it recorded — identified by a host whose hardware profile says
+`os = 'windows'`. That `0` was never a credential, and the SID it should have
+been was never recorded, so "owner unknown" is the truth; a real uid 0 from a
+POSIX host in the same store is left alone. It is the one migration that edits
+`executions`, so it lifts the immutability trigger for that single statement
+and re-creates it from the same text.
+
+`runquota stats export` carries `owner_name` beside `owner_uid` on every row,
+from `users`. It is the name as last refreshed, so a renamed account shows its
+new name on its old rows — which is the point of keeping it in one place. The
+header's `scope owner-uid N` line still shows the number: carrying a name
+there would change the RQSP `StatsResponse` frame, and that is a protocol
+change this one does not make.
+
 ## Provisioning the host-wide state directory and the rendezvous
 
 `runquotad` needs two directories that **the install step creates and the
@@ -645,6 +741,18 @@ the two-path entry point takes only file names.
   that is not there, an execution with a NULL `host_profile_id`, or one naming
   a profile that is not there. A source at a schema newer than this build
   understands is refused too, exactly as `openObservationStore` refuses one.
+- **Owners merge as a lattice, and a collision is refused.** `users` rows are
+  keyed by an id derived from the principal, so one account seen on two hosts
+  arrives under one key with one principal and collapses to one row:
+  `first_seen` takes the minimum, and the name is the greatest under one total
+  order — a name over none, a readable name over a redaction token, a later
+  `name_updated_at` over an earlier one, then the text. A key that arrives with
+  a *different* principal is refused before anything is written, naming both
+  principals (`refused-owners`), as is a source execution naming an owner with
+  no `users` row on either side.
+- **A source older than this build is migrated on a private copy**, taken with
+  `vacuum into` beside the destination and deleted afterwards. The source file
+  is only read.
 
 **The gate for this milestone asks for byte-identical databases and that is
 not achievable for this schema.** Every spine table is an ordinary rowid
@@ -709,6 +817,7 @@ The policies are `CLI/stats.md`'s `--redact=none|default|strict`:
 | relative, slash-bearing tokens | | | ✓ |
 | `runs.git_branch`, `runs.workspace_id` | | ✓ | ✓ |
 | `executions.command_stats_id` | | ✓ | ✓ |
+| `users.name` | | ✓ | ✓ |
 | `carried_extension_rows.payload` | | ✓ | ✓ |
 | `runs.git_commit`, `runs.profile` | | | ✓ |
 | non-key text in `ext_*` tables | | | ✓ |
@@ -737,6 +846,13 @@ Never redacted: primary keys and both ends of every foreign key (a rewritten
 key is a broken join, and the spine's ids are specified as opaque anyway), and
 every integer and real — the durations and byte counts the artifact exists to
 carry.
+
+`users.principal` is not redacted either, and that is a limit rather than a
+choice: it is the preimage of `owner_uid` — the uid, or the SID — and merge
+compares it to refuse a hash collision, so a redacted principal would make every
+merge of that export into a store holding the real one look like a collision.
+A SID's domain and RID therefore travel with an export; an organisation that
+must not disclose them should not export that host's store.
 
 The applied policy is recorded in an `export_manifest` table written into the
 destination only. It records the format, the policy, the **set of categories

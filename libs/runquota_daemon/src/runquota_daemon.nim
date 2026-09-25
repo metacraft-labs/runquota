@@ -319,6 +319,7 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
     # daemon must never create (see `openObservationStore`).
     observationStore: openObservationStore(effectiveConfig.observationDbPath,
       createParent = config.observationDbPath.len > 0),
+    owners: initOwnerLedger(),
     observationHostId: "",
     observationProfileId: "",
     observationIdentityReport: "",
@@ -401,6 +402,7 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
         result.observationStore.ensureHostProfile(identity.hostId, hardware)
       startObservationWriter(result.observationStore.path,
         effectiveConfig.observationQueueCapacity)
+      result.owners.seed(result.observationStore.readUsers())
       # Ambient load sampling (M11, OS-6). Host-wide totals only: the
       # daemon is a lease authority and does not inspect client process
       # trees, so `self_*` comes from what clients report about themselves
@@ -1223,6 +1225,17 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
     # unobservable for the simplest of reasons: it killed the daemon, so
     # there was nothing left to ask.
     "\"connections_failed\":" & $daemon.connectionsFailed & "," &
+    # OWNERS. `owner_records` counts `users` upserts queued -- one per
+    # principal first seen, one per rename -- `owner_records_written` and
+    # `owner_records_lost` what became of them (kept out of `queued` and
+    # `dropped`, which count observations), and `owner_collisions_refused`
+    # the Hellos turned away because their owner id already belonged to a
+    # different principal.
+    "\"owners_known\":" & $daemon.owners.known.len & "," &
+    "\"owner_records\":" & $daemon.owners.records & "," &
+    "\"owner_records_written\":" & $ownerRecordsWritten() & "," &
+    "\"owner_records_lost\":" & $ownerRecordsLost() & "," &
+    "\"owner_collisions_refused\":" & $daemon.owners.collisionsRefused & "," &
     # M17: same reasoning as ``rejected`` above. ``rqExtensionRow`` is
     # one-way, so a client is never told its row was refused, and this is
     # the only place the loss can be counted.
@@ -1306,11 +1319,10 @@ proc statsOwnerUid(context: ConnectionContext): Option[int64] =
   ## ``none`` when the transport cannot report them, and the caller below
   ## turns that into an EMPTY uid-scoped answer rather than a host-wide
   ## one: a scope-to-me query with nobody to scope to must not silently
-  ## become a scope-to-everybody query.
-  if context.peer.kind == peerIdentityUnavailable:
-    none(int64)
-  else:
-    some(int64(context.peer.userId))
+  ## become a scope-to-everybody query. On Windows the id is the SID's hash
+  ## (``runquota_core/owner_id``), which is what ``executions.owner_uid``
+  ## holds for that user's rows.
+  ownerIdOf(context.peer)
 
 proc exportRowJson(columns: seq[ExportColumn];
                    cells: seq[ExportCell]): string =
@@ -1506,8 +1518,32 @@ proc inspectionJson(daemon: var RunQuotaDaemon;
   else:
     "{\"error\":\"unknown inspection subject\"}"
 
+proc observeHelloPeer*(connection: LocalConnection): HelloPeer =
+  ## The peer's credentials and its principal's display name, gathered
+  ## WITHOUT the daemon-wide lock -- see ``HelloPeer``. Called once per
+  ## connection, before its Hello is handled.
+  let identity = connection.peerIdentity()
+  HelloPeer(identity: identity, ownerName: observePeerOwner(identity).name)
+
+proc noteOwner(daemon: var RunQuotaDaemon; principal: OwnerPrincipal;
+               name: Option[string]): string =
+  ## Records a connecting principal in ``users``, from PEER CREDENTIALS, by
+  ## the ledger's rules (``owners.nim``). Returns the refusal text for a
+  ## collision, or "".
+  let decision = daemon.owners.decide(principal, name, unixMillisNow(),
+    daemon.observationCaptureEnabled())
+  if decision.refusal.len > 0:
+    return decision.refusal
+  if decision.statement.len > 0 and enqueueUserRecord(decision.statement):
+    # QUEUED AHEAD OF every row this connection's leases can produce: the
+    # writer drains `users` first (`writer.nim`), so an execution never
+    # reaches the store before the owner it names.
+    daemon.owners.confirm(principal, name)
+  ""
+
 proc handleHello(daemon: var RunQuotaDaemon; connection: var LocalConnection;
-                 context: var ConnectionContext; frame: RqspFrame): bool =
+                 context: var ConnectionContext; frame: RqspFrame;
+                 helloPeer: HelloPeer): bool =
   if frame.header.messageKind != rqHello:
     connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
         "client must send Hello first"))
@@ -1528,14 +1564,27 @@ proc handleHello(daemon: var RunQuotaDaemon; connection: var LocalConnection;
   # and where the kernel supplies them a Hello that disagrees is refused
   # rather than corrected: a client that declares somebody else's uid is
   # either broken or lying, and neither is a connection to keep serving.
-  let peer = connection.peerIdentity()
+  let peer = helloPeer.identity
   if peer.kind != peerIdentityUnavailable and hello.userId != peer.userId:
     connection.sendError(frame.header.requestId, diagnostic(diagDenied,
       "client declared uid " & $hello.userId &
         " but its peer credentials say uid " & $peer.userId,
       "owner_uid is recorded from peer credentials and MUST NOT be " &
-        "declared by the client"))
+        "declared by the client" &
+        (if peer.sid.len > 0 and hello.userId == 0'u64:
+          "; on Windows the owner id is the hash of the token user SID " &
+            peer.sid & ", and a client that declares 0 predates it -- " &
+            "upgrade the client together with the daemon"
+         else: "")))
     return false
+  let owner = ownerPrincipalOf(peer)
+  if owner.isSome:
+    let refusal = daemon.noteOwner(owner.get, helloPeer.ownerName)
+    if refusal.len > 0:
+      connection.sendError(frame.header.requestId, diagnostic(diagDenied,
+        refusal, "owner ids are hashes of the principal (" &
+          "runquota_core/owner_id) and a collision is refused, never merged"))
+      return false
   let platformName =
     when defined(macosx): "macos"
     elif defined(linux): "linux"
@@ -1937,11 +1986,7 @@ proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
     # exists to prevent.
     #
     # NULL, not 0, when the transport cannot report credentials: 0 is root.
-    ownerUid:
-      if lease.peer.kind == peerIdentityUnavailable:
-        none(int64)
-      else:
-        some(int64(lease.peer.userId))
+    ownerUid: ownerIdOf(lease.peer)
   ))
 
 proc declareClientExtension(daemon: var RunQuotaDaemon;
@@ -2133,11 +2178,7 @@ proc captureDeferredBatch(daemon: var RunQuotaDaemon;
       # FROM PEER CREDENTIALS, exactly as on the admitted path. A
       # standalone client is no more entitled to name its own owner than
       # a leased one.
-      ownerUid:
-        if context.peer.kind == peerIdentityUnavailable:
-          none(int64)
-        else:
-          some(int64(context.peer.userId))
+      ownerUid: ownerIdOf(context.peer)
     ))
   # ROWS WRITTEN, not records offered. A count that included the ones the
   # decoder refused would say the flush landed whole when part of it did
@@ -2759,7 +2800,8 @@ proc handleConnection*(daemon: var RunQuotaDaemon;
   var frame: RqspFrame
   if not connection.receiveFrameOrDiagnostic(frame):
     return
-  if not daemon.handleHello(connection, context, frame):
+  let helloPeer = connection.observeHelloPeer()
+  if not daemon.handleHello(connection, context, frame, helloPeer):
     return
   try:
     while connection.receiveFrameOrDiagnostic(frame):
@@ -3023,10 +3065,14 @@ proc handleSharedConnection(accepted: AcceptedConnection) {.thread, gcsafe.} =
         "the peer sent no readable frame")
       localConnection.close()
       return
+    # OUTSIDE THE LOCK: reading the peer's token and resolving its name may
+    # block, and nothing else on the host may wait behind that.
+    let helloPeer = localConnection.observeHelloPeer()
     acquire(sharedDaemon.lock)
     let helloOk =
       try:
-        sharedDaemon.daemon.handleHello(localConnection, context, frame)
+        sharedDaemon.daemon.handleHello(localConnection, context, frame,
+          helloPeer)
       finally:
         release(sharedDaemon.lock)
     if not helloOk:

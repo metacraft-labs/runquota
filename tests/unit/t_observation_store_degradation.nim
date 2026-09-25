@@ -118,10 +118,24 @@ suite "observation_store_degradation":
 
     var data = readFile(path)
     check data.len > 16384
-    # Page-aligned, half way in, and well clear of page 1 — so the header,
-    # `sqlite_master` and `user_version` all survive intact.
-    let start = (data.len div 2) and not 0x1ff
-    check start >= 4096
+    # A PAGE HEADER half way in, and well clear of page 1 — so the file
+    # header, `sqlite_master` and `user_version` all survive intact.
+    #
+    # ALIGNED TO THE PAGE, not to 512 bytes, and the difference is the
+    # point. The midpoint used to be sector-aligned only, which happened to
+    # be a page boundary for as long as the file had an even number of
+    # pages. Schema version 6 added a table, the file grew by one page, and
+    # the same arithmetic landed 2048 bytes into an EMPTY index page -- in
+    # bytes no cell and no header covers, where damage is legitimately
+    # invisible to `quick_check`. Which bytes a midpoint hits is a property
+    # of the schema, not of the store's corruption handling, so the damage
+    # now always starts at a page boundary: every b-tree page has a header
+    # there, and a damaged one is what `quick_check` reports.
+    let pageSize = (int(byte(data[16])) shl 8) or int(byte(data[17]))
+    check pageSize >= 1024
+    check data.len mod pageSize == 0
+    let start = ((data.len div 2) div pageSize) * pageSize
+    check start >= 4 * pageSize
     for i in start ..< min(start + 512, data.len):
       data[i] = 'Z'
     writeFile(path, data)

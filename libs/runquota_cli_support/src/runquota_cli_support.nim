@@ -379,6 +379,12 @@ const
     ##   --limit 600  ->  855 KB   the measured ceiling, ~18% headroom
     ##   --limit 700  ->  the daemon closes the connection
     ##
+    ## Schema version 6 added a 50th column, `owner_name`, and the figures
+    ## above were NOT re-measured for it. By arithmetic it adds
+    ## `,"owner_name":"..."` -- about 35 bytes for a POSIX login name, about
+    ## 45 for a Windows `DOMAIN\user` -- so 600 rows grow by roughly 27 KB,
+    ## to about 880 KB: still under the frame, with less headroom.
+    ##
     ## The ceiling is a ROW COUNT standing in for a BYTE COUNT, so a store
     ## with unusually wide rows (long branch names, long workspace ids)
     ## could still cross it under 600. That is why the transport failure

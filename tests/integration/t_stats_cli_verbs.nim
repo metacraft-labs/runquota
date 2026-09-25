@@ -40,6 +40,7 @@ import std/[json, options, os, osproc, streams, strutils, unittest]
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
 import runquota_core
+from runquota_ipc import resolveOwnerName
 import runquota_observation_store
 import runquota_protocol
 import daemon_binary
@@ -54,6 +55,7 @@ const
   OomKey = "cli/oom-victim"
   NeverKey = "cli/never-recorded"
   OtherUid = 4043'i64
+  OtherOwnerName = "fixture-other-owner"
   MiB = 1024'u64 * 1024'u64
 
 # ---------------------------------------------------------------------------
@@ -381,6 +383,11 @@ suite "stats_cli_verbs":
       let retiredProfileId = "profile-cli-retired"
       check store.insertHostProfile(syntheticProfile(hostId,
         retiredProfileId))
+      # The other owner is a fixture and needs its `users` row before an
+      # execution may name it (schema version 6); the caller's was recorded
+      # by the daemon from the connection above.
+      check store.recordUser(OtherUid, pkUid, $OtherUid,
+        some(OtherOwnerName))
       store.insertSynthetic(hostId, runId, [
         SyntheticRow(suffix: "other", statsKey: OtherKey,
           profileId: liveProfileId, ownerUid: some(OtherUid),
@@ -428,6 +435,19 @@ suite "stats_cli_verbs":
       check row["io_read_bytes"].kind == JNull
       check row["io_write_bytes"].kind == JNull
 
+      # WHO THE OWNER IS travels with the row, from `users`: the caller's
+      # name is whatever the daemon resolved for the principal the peer
+      # credentials named -- the login name, or the Windows DOMAIN and
+      # account -- and NULL, not absent, where the account does not resolve.
+      check row["owner_uid"].getInt == int(callerOwnerUid())
+      check row.hasKey("owner_name")
+      let expectedName = resolveOwnerName(callerOwnerPrincipal())
+      if expectedName.isSome:
+        check row["owner_name"].kind == JString
+        check row["owner_name"].getStr == expectedName.get
+      else:
+        check row["owner_name"].kind == JNull
+
       # SCOPED TO THE CALLER, from peer credentials. The other uid's row
       # really is in the store, which is what makes its absence a
       # statement about scoping rather than about an empty table.
@@ -439,6 +459,7 @@ suite "stats_cli_verbs":
       check widened.code == 0
       check widened.ndjson.len == 1
       check widened.ndjson[0]["owner_uid"].getInt == int(OtherUid)
+      check widened.ndjson[0]["owner_name"].getStr == OtherOwnerName
 
       # PROFILE SCOPING: the retired profile's row is reachable only by
       # widening, and when it comes back it names its own hardware.

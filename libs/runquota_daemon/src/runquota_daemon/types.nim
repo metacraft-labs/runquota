@@ -1,4 +1,4 @@
-import std/tables
+import std/[options, tables]
 
 import runquota_core
 import runquota_ipc
@@ -6,6 +6,9 @@ import runquota_observation_store
 import runquota_persistence
 import runquota_protocol
 import runquota_stats_table/publisher
+import ./owners
+
+export owners
 
 type
   LibraryInfo* = object
@@ -148,6 +151,16 @@ type
     peer*: PeerIdentity
     sessionIds*: seq[SessionId]
 
+  HelloPeer* = object
+    ## What the daemon learned about a connection's peer BEFORE taking the
+    ## daemon-wide lock: its credentials, and the display name of the
+    ## principal they name. Resolving a name can block -- ``getpwuid_r`` may
+    ## ask NSS/LDAP, ``LookupAccountSidW`` a domain controller -- so it is
+    ## done on the connection's own worker and handed in, never done under
+    ## the lock every lease decision waits behind.
+    identity*: PeerIdentity
+    ownerName*: Option[string]
+
   MachineUsage* = object
     cpu*: uint32
     memory*: uint64
@@ -173,6 +186,12 @@ type
     estimates*: Table[string, LearnedEstimateRow]
     estimateStore*: EstimateStore
     observationStore*: ObservationStore
+    owners*: OwnerLedger
+      ## Every owner this daemon has seen or found in its store, with the
+      ## principal each id was derived from (``owners.nim``). What lets a
+      ## Hello whose id another principal already holds be refused, and a
+      ## known user connect without rewriting its ``users`` row unless the
+      ## name changed.
     observationHostId*: string
     observationProfileId*: string
       ## The hardware profile current for this daemon's host. Every

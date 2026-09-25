@@ -11,7 +11,7 @@
 ## registered in ``extension_registry`` (M12).
 
 const
-  spineSchemaVersion* = 5'i64
+  spineSchemaVersion* = 6'i64
     ## The schema version this build understands. A database whose
     ## ``user_version`` exceeds it is REFUSED, never degraded (see
     ## ``openObservationStore``).
@@ -28,7 +28,8 @@ const
     "executions",
     "ambient_samples",
     "extension_registry",
-    carriedExtensionTable
+    carriedExtensionTable,
+    "users"
   ]
 
   migrationV1 = """
@@ -223,8 +224,115 @@ create index carried_extension_rows_by_execution
   on carried_extension_rows(host_id, execution_id);
 """
 
+  # Version 6 says WHO an owner id is. `executions.owner_uid` holds an
+  # integer; on POSIX it is the uid, and on Windows -- where the credential
+  # is a SID and not an integer -- it is the SID's hash with bit 62 set
+  # (`runquota_core/owner_id`). Neither is readable by a person, and the
+  # Windows one is not even reversible, so the table below records, ONCE per
+  # owner, the principal the id was derived from and a name to show for it.
+  #
+  # `owner_uid` IS THE KEY AND NEVER CHANGES. `principal` is its preimage --
+  # the uid in decimal, or the SID string -- and is immutable too: a second
+  # principal arriving under an existing id is a hash collision, and the
+  # trigger below turns it into an abort rather than letting two users
+  # silently share a scope. The check constraint pins each kind to its range,
+  # so a Windows id and a POSIX uid cannot be confused in a store merged
+  # from both.
+  #
+  # `name` IS FOR DIAGNOSTICS AND MAY GO STALE: accounts get renamed. The
+  # daemon refreshes it when the name it resolves for a connecting principal
+  # differs from the stored one, and stamps `name_updated_at_unix_millis`
+  # when it does; a principal that no longer resolves (a deleted account)
+  # keeps its last known name rather than being overwritten with NULL. NULL
+  # means "never resolved", which is why the two columns are NULL together.
+  #
+  # THE REFERENCE FROM `executions` IS A TRIGGER, NOT A FOREIGN KEY, and
+  # that is the cheaper of two correct choices: SQLite cannot add a
+  # constraint to an existing column, and rebuilding `executions` would
+  # rebuild the table every extension and the merge quarantine point at.
+  # The trigger enforces the same thing for every row written from now on,
+  # and the backfill below makes it true of every row already there.
+  #
+  # TWO PASSES OVER WHAT IS ALREADY THERE.
+  #
+  # 1. Rows a WINDOWS daemon wrote before this version carry `owner_uid = 0`,
+  #    and that 0 was never a credential: the named-pipe peer never set it,
+  #    so every Windows client was recorded as root. docs/database.md says a
+  #    wrong owner is worse than an absent one, so those rows are set to
+  #    NULL -- "the owner is unknown", which is the truth, since the SID was
+  #    never recorded. A Windows host is one whose hardware profile says
+  #    `os = 'windows'`; a real uid 0 from a POSIX host merged into the same
+  #    store is left alone. This is the one migration that edits
+  #    `executions`, so the immutability trigger is lifted for that single
+  #    statement and re-created from the same text.
+  # 2. Every remaining owner is a POSIX uid (no other id space existed), and
+  #    gets a `users` row with no name. The daemon fills the name in the
+  #    next time that user connects.
+  migrationV6 = """
+create table users (
+  owner_uid integer primary key,
+  principal_kind text not null check (principal_kind in ('uid', 'sid')),
+  principal text not null,
+  name text,
+  first_seen_at_unix_millis integer not null,
+  name_updated_at_unix_millis integer,
+  check ((principal_kind = 'uid' and owner_uid between 0 and 4294967295
+            and principal = cast(owner_uid as text))
+      or (principal_kind = 'sid' and owner_uid >= 4611686018427387904)),
+  check ((name is null) = (name_updated_at_unix_millis is null))
+);
+
+create trigger users_principal_is_immutable
+before update of owner_uid, principal_kind, principal on users
+when new.owner_uid is not old.owner_uid
+  or new.principal_kind is not old.principal_kind
+  or new.principal is not old.principal
+begin
+  select raise(abort,
+    'runquota: owner id collision: users.principal is the key''s preimage and never changes (constraint)');
+end;
+
+create trigger users_referenced_are_kept
+before delete on users
+when exists (select 1 from executions where owner_uid = old.owner_uid)
+begin
+  select raise(abort,
+    'runquota: users rows referenced by executions are never deleted (constraint)');
+end;
+
+drop trigger executions_immutable;
+
+update executions set owner_uid = null
+where owner_uid = 0
+  and host_id in (select host_id from host_profiles where os = 'windows');
+
+create trigger executions_immutable
+before update on executions
+begin
+  select raise(abort,
+    'runquota: executions rows are immutable after write (OS-3)');
+end;
+
+insert into users (owner_uid, principal_kind, principal, name,
+                   first_seen_at_unix_millis, name_updated_at_unix_millis)
+select owner_uid, 'uid', cast(owner_uid as text), null,
+       min(started_at_unix_millis), null
+from executions
+where owner_uid between 0 and 4294967295
+group by owner_uid;
+
+create trigger executions_owner_is_a_user
+before insert on executions
+when new.owner_uid is not null
+  and not exists (select 1 from users where owner_uid = new.owner_uid)
+begin
+  select raise(abort,
+    'runquota: executions.owner_uid names no users row (constraint)');
+end;
+"""
+
   migrations* = [migrationV1, migrationV2, migrationV3, migrationV4,
-                 migrationV5]
+                 migrationV5, migrationV6]
     ## Index ``i`` migrates ``user_version`` ``i`` to ``i + 1``.
 
 static:

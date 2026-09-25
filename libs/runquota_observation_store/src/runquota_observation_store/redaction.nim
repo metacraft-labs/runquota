@@ -178,6 +178,9 @@ type
       ## spine's carrier of command-line shape.
     rcRevision = "revision"
     rcProfile = "profile"
+    rcOwnerName = "owner-name"
+      ## ``users.name``: an account's display name (``DOMAIN\user``, or a
+      ## login name). It names a person, which no other spine column does.
     rcExtension = "extension"
       ## A text value in a product-owned or carried row, replaced whole
       ## because RunQuota may not read it (OS-5).
@@ -252,13 +255,23 @@ const
     ## and an extension row that cannot be joined is a row the receiver
     ## cannot use for anything at all.
 
-  spineColumnCategories*: array[5, (string, string, RedactionCategory)] = [
+  spineColumnCategories*: array[6, (string, string, RedactionCategory)] = [
     ("runs", "workspace_id", rcWorkspace),
     ("runs", "git_branch", rcBranch),
     ("runs", "git_commit", rcRevision),
     ("runs", "profile", rcProfile),
-    ("executions", "command_stats_id", rcCommand)
+    ("executions", "command_stats_id", rcCommand),
+    ("users", "name", rcOwnerName)
   ]
+    ## ``users.principal`` IS DELIBERATELY ABSENT, and that is a limit, not
+    ## an oversight. It is the preimage of ``owner_uid`` -- the uid, or the
+    ## SID -- and merge compares it to refuse a hash collision between two
+    ## principals. A redacted principal would make every merge of that
+    ## export into a store holding the real one look like a collision, or
+    ## else force merge to stop checking. The owner id itself is an integer
+    ## and never redacted either, so a SID's domain and RID travel with an
+    ## export; an organisation that must not disclose them should not
+    ## export the ``users`` table's host.
 
 proc activeCategories*(policy: RedactionPolicy): set[RedactionCategory] =
   ## The one place a policy is turned into a set of categories.
@@ -266,10 +279,10 @@ proc activeCategories*(policy: RedactionPolicy): set[RedactionCategory] =
   of rpNone:
     {}
   of rpDefault:
-    {rcPath, rcBranch, rcWorkspace, rcCommand}
+    {rcPath, rcBranch, rcWorkspace, rcCommand, rcOwnerName}
   of rpStrict:
     {rcPath, rcRelativePath, rcBranch, rcWorkspace, rcCommand, rcRevision,
-     rcProfile, rcExtension}
+     rcProfile, rcOwnerName, rcExtension}
 
 proc parseRedactionPolicy*(text: string): Option[RedactionPolicy] =
   for policy in RedactionPolicy:

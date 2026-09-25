@@ -42,6 +42,14 @@
 ## That order is load-bearing, because an extension row carries a foreign key
 ## to its execution.
 ##
+## OWNERS COME FIRST, BEFORE ALL THREE. An execution whose ``owner_uid``
+## names no ``users`` row is refused by the schema (version 6), so the
+## ``users`` upserts the daemon queues when a principal connects are drained
+## ahead of the runs, executions and extension rows of the same batch. The
+## daemon queues them at Hello, before any lease that connection can
+## finish, so an execution's owner is always in the same batch or an
+## earlier one.
+##
 ## A FLUSH MEANS "EVERY ROW QUEUED BEFORE THIS CALL IS COMMITTED", and
 ## for a while it meant "the queue was empty when I looked". The two differ
 ## for exactly as long as a drain pass takes, because ``drainOnce`` swaps
@@ -63,10 +71,22 @@ var
   writerThread: Thread[void]
   writerPath = ""
   writerCapacity = 0
+  writerUsers: OwnedStrings
+    ## ``users`` upserts. Not bounded by ``writerCapacity``: there is one per
+    ## distinct principal the daemon has seen plus one per rename, and a
+    ## dropped one would make every later execution of that owner a
+    ## rejected row rather than one lost observation.
   writerRuns: OwnedStrings
   writerExecutions: OwnedStrings
   writerExtensionInserts: OwnedStrings
   writerDropped = 0'i64
+  writerOwnersWritten = 0'i64
+  writerOwnersLost = 0'i64
+    ## ``users`` upserts committed, and lost with a failed batch or refused
+    ## at the door. Kept apart from ``writerWritten``/``writerDropped``,
+    ## which count OBSERVATIONS: an owner row is bookkeeping about who, and a
+    ## count that mixed the two would report one more observation per user
+    ## than any lease produced.
   writerFailures = 0'i64
   writerQueued = 0'i64
   writerWritten = 0'i64
@@ -144,6 +164,7 @@ proc drainOnce() {.gcsafe.} =
     # copies them out of process-owned storage, so what this proc frees on
     # its way out is what this proc allocated; see the head of this module.
     var statements: seq[string] = @[]
+    var ownerStatements = 0
     var path = ""
     acquire(writerLock)
     try:
@@ -153,7 +174,10 @@ proc drainOnce() {.gcsafe.} =
       # extension row's foreign key names its execution, and `foreign_keys`
       # is on, so a row placed before its parent aborts the transaction and
       # takes the parent with it.
-      statements = writerRuns.takeAll()
+      statements = writerUsers.takeAll()
+      ownerStatements = statements.len
+      for statement in writerRuns.takeAll():
+        statements.add(statement)
       for statement in writerExecutions.takeAll():
         statements.add(statement)
       for statement in writerExtensionInserts.takeAll():
@@ -170,7 +194,8 @@ proc drainOnce() {.gcsafe.} =
       # that has already happened must not wait for it forever.
       acquire(writerLock)
       try:
-        writerDropped += int64(statements.len)
+        writerDropped += int64(statements.len - ownerStatements)
+        writerOwnersLost += int64(ownerStatements)
         writerSettled += int64(statements.len)
         broadcast(writerSettledCond)
       finally:
@@ -189,10 +214,12 @@ proc drainOnce() {.gcsafe.} =
     acquire(writerLock)
     try:
       if outcome.ok:
-        writerWritten += int64(statements.len)
+        writerWritten += int64(statements.len - ownerStatements)
+        writerOwnersWritten += int64(ownerStatements)
       else:
         writerFailures += 1
-        writerDropped += int64(statements.len)
+        writerDropped += int64(statements.len - ownerStatements)
+        writerOwnersLost += int64(ownerStatements)
       # EVERY ROW TAKEN ABOVE NOW HAS AN OUTCOME. Counted and announced
       # under the same lock that holds the counters, so a waiter cannot see
       # the wake without the count that justifies it.
@@ -226,11 +253,14 @@ proc startObservationWriter*(path: string; capacity = 1024) =
       return
     writerPath = path
     writerCapacity = max(1, capacity)
+    writerUsers.clear()
     writerRuns.clear()
     writerExecutions.clear()
     writerExtensionInserts.clear()
     writerStop = false
     writerDropped = 0
+    writerOwnersWritten = 0
+    writerOwnersLost = 0
     writerFailures = 0
     writerQueued = 0
     writerWritten = 0
@@ -250,6 +280,29 @@ proc observationWriterActive*(): bool =
   acquire(writerLock)
   try:
     writerActive
+  finally:
+    release(writerLock)
+
+proc enqueueUserRecord*(statement: string): bool {.discardable.} =
+  ## Queue one ``users`` upsert (``userUpsertStatement``), composed by the
+  ## caller from the connection's PEER CREDENTIALS.
+  ##
+  ## Drained before every other row -- see the head of this module -- and
+  ## not subject to the shared capacity, for the reason given at
+  ## ``writerUsers``. Returns false when the writer is inactive or the
+  ## allocator refused; the caller then leaves the owner unrecorded and
+  ## tries again at its next connection. Counted in ``ownerRecordsLost``,
+  ## never in ``observationsDropped``: it is not an observation.
+  acquire(writerLock)
+  try:
+    if not writerActive or statement.len == 0:
+      writerOwnersLost += 1
+      return false
+    if not writerUsers.add(statement):
+      writerOwnersLost += 1
+      return false
+    writerQueued += 1
+    true
   finally:
     release(writerLock)
 
@@ -433,6 +486,22 @@ proc observationsWritten*(): int64 =
   acquire(writerLock)
   try:
     writerWritten
+  finally:
+    release(writerLock)
+
+proc ownerRecordsWritten*(): int64 =
+  ## ``users`` upserts committed by this writer.
+  acquire(writerLock)
+  try:
+    writerOwnersWritten
+  finally:
+    release(writerLock)
+
+proc ownerRecordsLost*(): int64 =
+  ## ``users`` upserts refused at the door or lost with a failed batch.
+  acquire(writerLock)
+  try:
+    writerOwnersLost
   finally:
     release(writerLock)
 

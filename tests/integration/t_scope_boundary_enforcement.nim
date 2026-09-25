@@ -57,10 +57,10 @@ if paramCount() == 2 and paramStr(1) == EchoFixtureArg:
 # directory: `docs/database.md` §"Provisioning the host-wide state directory
 # and the rendezvous" lists the Windows rendezvous as "— (named pipes)", and
 # `runquota_ipc.endpointDirectoryTrust` answers `trustOk` for a named pipe.
-# Those cases are skipped there. The owner_uid suite is NOT restricted: it
-# FAILS on Windows through `callerOwnerUid`, because owner_uid has no
-# Windows definition yet (see `tests/support/owner_uid`), except the NULL
-# case, which does not need one.
+# Those cases are skipped there. The owner_uid suite is NOT restricted: on
+# Windows the owner id is the hash of the token user SID
+# (`runquota_core/owner_id`), and `callerOwnerUid` derives it the way the
+# daemon does, so every case asserts the same property on both platforms.
 
 when defined(posix):
   proc groupOf(path: string): int64 =
@@ -412,6 +412,14 @@ suite "scope_boundary_enforcement_owner_uid":
       # Distinguishing them by the recorded value needs a second real uid.
       check executions[0].ownerUid.isSome
       check executions[0].ownerUid == some(callerOwnerUid())
+      # AND THE OWNER IT NAMES IS RECORDED, by the daemon, from the same
+      # peer credentials: the principal the id was derived from -- the uid,
+      # or the SID -- is what `users` holds for it, and nothing in this test
+      # wrote that row.
+      let owner = store.userRow(callerOwnerUid())
+      check owner.isSome
+      if owner.isSome:
+        check owner.get.principal == callerOwnerPrincipal().principal
     finally:
       daemon.stop()
       delEnv("RUNQUOTA_SOCKET")

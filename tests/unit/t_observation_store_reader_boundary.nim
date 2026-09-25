@@ -84,6 +84,8 @@ const
     "readHostProfiles",
     "readAmbientSamples",
     "readExtensionRegistry",
+    "readUsers",
+    "userRow",
     "runQuery",
     "estimateFor",
     "queryExecutions",

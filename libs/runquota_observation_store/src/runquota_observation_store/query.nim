@@ -437,8 +437,8 @@ proc intColumn(name, expression: string): ExportColumn =
   ExportColumn(name: name, kind: exportInt, expression: expression)
 
 proc exportColumns*(): seq[ExportColumn] =
-  ## EVERY COLUMN THE SPINE HOLDS, plus the `runs` and `host_profiles`
-  ## context that makes one row readable on its own.
+  ## EVERY COLUMN THE SPINE HOLDS, plus the `runs`, `users` and
+  ## `host_profiles` context that makes one row readable on its own.
   ##
   ## WHY A ROW CARRIES ITS OWN CONTEXT. `command_stats_id` is opaque to
   ## RunQuota by design, so a row that carried only that would need a join
@@ -488,6 +488,15 @@ proc exportColumns*(): seq[ExportColumn] =
     textColumn("capture_completeness", "e.capture_completeness"),
     intColumn("dropped_observations", "e.dropped_observations"),
     intColumn("owner_uid", "e.owner_uid"),
+    # --- who that owner is -----------------------------------------------
+    # From `users`, where each owner's name is recorded once. `owner_uid` is
+    # the uid on POSIX but a hash on Windows, and neither is something a
+    # reader can map to a person by eye. NULL for a row whose owner is
+    # unknown, and for an owner whose account has never resolved. It is the
+    # name as last refreshed, not as it was when the row ran: a renamed
+    # account shows its new name on its old rows, which is the point of
+    # keeping it in one place.
+    textColumn("owner_name", "u.name"),
     # --- what invocation it belonged to ----------------------------------
     textColumn("run_tool", "r.tool"),
     textColumn("run_tool_version", "r.tool_version"),
@@ -546,6 +555,7 @@ proc queryExport*(store: ObservationStore;
     " left join runs r on r.host_id = e.host_id and r.run_id = e.run_id" &
     " left join host_profiles p on p.host_id = e.host_id" &
     " and p.profile_id = e.host_profile_id" &
+    " left join users u on u.owner_uid = e.owner_uid" &
     " where 1 = 1" &
     (if query.statsKey.len == 0: ""
      else: " and e.command_stats_id = " & encodeText(query.statsKey)) &

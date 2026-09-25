@@ -52,12 +52,32 @@
 ## only sanctioned reader of a LIVE store, and a merge is an offline
 ## operation over stores nobody is serving.
 ##
+## OWNERS MERGE AS A LATTICE TOO, and a collision is REFUSED (schema
+## version 6). A ``users`` row is keyed by ``owner_uid``, which is derived
+## deterministically from the principal -- the uid, or the SID's hash -- so
+## the same account seen on two hosts arrives under the same key with the
+## same principal and collapses to one row. Its mutable columns combine by
+## rules that do not depend on arrival order: ``first_seen`` takes the
+## minimum, and the name is the greatest under one total order -- a name
+## over no name, a readable name over a redaction token, then the later
+## ``name_updated_at``, then the text itself as a tie-break. A key that
+## arrives with a DIFFERENT principal is two accounts whose ids collided,
+## and merging them would hand one user the other's rows; the merge is
+## refused before anything is written, naming both principals.
+##
+## A SOURCE OLDER THAN THIS BUILD IS MIGRATED ON A PRIVATE COPY, never in
+## place. The copy is taken with ``vacuum into`` (a read transaction on the
+## source), opened -- which runs the forward-only ladder, including the
+## version-6 backfill that gives every owner a ``users`` row -- merged from,
+## and deleted. The source file is not written; a merge that migrated it in
+## place would have changed a file the caller only asked to read.
+##
 ## The registry itself is NOT merged. Copying a source's registry row for
 ## an extension the receiver does not know would make the receiver claim to
 ## know it, which is exactly the claim the carried-row quarantine exists to
 ## avoid making.
 
-import std/[algorithm, options, os, strutils]
+import std/[algorithm, options, os, strutils, times]
 
 import ./canonical, ./extensions, ./schema, ./sqlite_cli, ./store
 
@@ -68,11 +88,16 @@ type
     moSourceUnreadable = "source-unreadable"
     moRefusedNewerSchema = "refused-newer-schema"
     moRefusedNoHostDimension = "refused-no-host-dimension"
+    moRefusedOwners = "refused-owners"
+      ## An owner the two stores disagree about: the same ``owner_uid``
+      ## derived from two different principals (a hash collision), or a
+      ## source execution naming an owner with no ``users`` row.
     moFailed = "failed"
 
   MergeReport* = object
     outcome*: MergeOutcome
     detail*: string
+    usersAdded*: int64
     hostsAdded*: int64
     hostProfilesAdded*: int64
     runsAdded*: int64
@@ -168,6 +193,72 @@ proc hostDimensionDetail*(sourcePath: string): string =
       " source execution(s) name a hardware profile that is not there"
   ""
 
+proc ownerDetail*(destinationPath, sourcePath: string): string =
+  ## Empty means the source's owners can be merged into the destination's.
+  ## Anything else is the text of the refusal.
+  ##
+  ## Two failures. A COLLISION -- one ``owner_uid``, two principals -- is
+  ## refused because the alternative is two users sharing a scope; the
+  ## ``users_principal_is_immutable`` trigger would abort the transaction
+  ## anyway, but a refusal that names both principals is what an operator
+  ## can act on. An UNOWNED EXECUTION -- a source row whose ``owner_uid``
+  ## has no ``users`` row on either side -- is refused because the
+  ## destination's schema refuses it, and a merge that got halfway before
+  ## finding out would be worse than one that did not start.
+  let attach = "attach database " & encodeText(sourcePath) & " as src;\n"
+  let collisions = linesOf(destinationPath, attach &
+    "select m.owner_uid || ': ' || m.principal_kind || ' ' || " &
+    "quote(m.principal) || ' here, ' || s.principal_kind || ' ' || " &
+    "quote(s.principal) || ' in the source' from main.users m join " &
+    "src.users s on s.owner_uid = m.owner_uid where m.principal_kind is " &
+    "not s.principal_kind or m.principal is not s.principal " &
+    "order by m.owner_uid;")
+  if collisions.len > 0:
+    return "owner id collision: " & $collisions.len &
+      " owner_uid value(s) name a different principal in each store (" &
+      collisions.join("; ") & "); merging would give one account the " &
+      "other's rows"
+  let unowned = scalarOf(destinationPath, attach &
+    "select count(*) from src.executions e where e.owner_uid is not null " &
+    "and not exists (select 1 from src.users u where u.owner_uid = " &
+    "e.owner_uid) and not exists (select 1 from main.users u where " &
+    "u.owner_uid = e.owner_uid);")
+  if unowned < 0:
+    return "source owners could not be read"
+  if unowned > 0:
+    return $unowned & " source execution(s) name an owner with no users row"
+  ""
+
+proc nameRank(table: string): string =
+  ## The total order a merged name is chosen by, as a SQL row value over
+  ## ``table``'s columns: some name before none, a readable name before a
+  ## redaction token, a later update before an earlier one, then the text.
+  ## A maximum under a total order is what makes the choice independent of
+  ## which store arrived first.
+  "(" & table & ".name is not null, substr(coalesce(" & table &
+    ".name, ''), 1, 10) <> '[redacted:', coalesce(" & table &
+    ".name_updated_at_unix_millis, -1), coalesce(" & table & ".name, ''))"
+
+proc usersMergeStatement(): string =
+  ## Source owners into the destination, combined by the lattice rules in
+  ## the module header. ``principal`` is SET, not skipped, so that a
+  ## collision ``ownerDetail`` failed to catch still meets the immutability
+  ## trigger and aborts the transaction rather than merging silently.
+  let wins = nameRank("excluded") & " > " & nameRank("users")
+  "insert into main.users (owner_uid, principal_kind, principal, name, " &
+    "first_seen_at_unix_millis, name_updated_at_unix_millis) select " &
+    "owner_uid, principal_kind, principal, name, " &
+    "first_seen_at_unix_millis, name_updated_at_unix_millis from " &
+    "src.users where true on conflict (owner_uid) do update set " &
+    "principal_kind = excluded.principal_kind, " &
+    "principal = excluded.principal, " &
+    "first_seen_at_unix_millis = min(users.first_seen_at_unix_millis, " &
+    "excluded.first_seen_at_unix_millis), " &
+    "name = case when " & wins & " then excluded.name else users.name end, " &
+    "name_updated_at_unix_millis = case when " & wins &
+    " then excluded.name_updated_at_unix_millis else " &
+    "users.name_updated_at_unix_millis end;\n"
+
 proc sourceExtensionTables*(sourcePath: string): seq[string] =
   ## Every extension table the SOURCE holds, discovered from its schema
   ## rather than from its registry.
@@ -207,6 +298,31 @@ proc carriedPayloadExpression*(columns: openArray[string]): string =
     parts.add(encodeText(column) & " || '=' || " &
       canonicalValueExpression(column))
   parts.join(" || '" & canonicalFieldSeparator & "' || ")
+
+proc removeStoreFiles(path: string) =
+  for suffix in ["", "-wal", "-shm", "-journal"]:
+    try:
+      removeFile(path & suffix)
+    except CatchableError:
+      discard
+
+proc migratedSourceCopy(sourcePath, destinationPath: string):
+    tuple[path, detail: string] =
+  ## A private copy of ``sourcePath`` at this build's schema, beside the
+  ## destination (the one directory a merge already writes to). Empty
+  ## ``path`` with the reason in ``detail`` when it cannot be made.
+  let copy = destinationPath & ".merge-source-" & $getCurrentProcessId() &
+    "-" & $int64(epochTime() * 1000.0) & ".sqlite3"
+  removeStoreFiles(copy)
+  let snapshot = runSqlite(sourcePath, "vacuum into " & encodeText(copy) & ";")
+  if not snapshot.ok:
+    removeStoreFiles(copy)
+    return ("", "could not copy the source: " & snapshot.error.strip())
+  let migrated = openObservationStore(copy, createParent = false)
+  if not migrated.captureEnabled:
+    removeStoreFiles(copy)
+    return ("", migrated.report)
+  (copy, "")
 
 proc mergeObservationStore*(destination: ObservationStore;
                             sourcePath: string): MergeReport =
@@ -250,6 +366,20 @@ proc mergeObservationStore*(destination: ObservationStore;
       ", this build understands at most " & $spineSchemaVersion
     return
 
+  if sourceVersion < spineSchemaVersion:
+    # AN OLDER SOURCE IS MIGRATED ON A COPY. See the module header.
+    let copy = migratedSourceCopy(sourcePath, destination.path)
+    if copy.path.len == 0:
+      result.outcome = moSourceUnreadable
+      result.detail = "source at schema " & $sourceVersion &
+        " could not be migrated for merging: " & copy.detail
+      return
+    try:
+      result = mergeObservationStore(destination, copy.path)
+    finally:
+      removeStoreFiles(copy.path)
+    return
+
   let dimension = hostDimensionDetail(sourcePath)
   if dimension.len > 0:
     # REFUSED BEFORE ANYTHING IS WRITTEN. A partial merge that stopped on
@@ -259,6 +389,14 @@ proc mergeObservationStore*(destination: ObservationStore;
     result.detail = dimension
     return
 
+  let owners = ownerDetail(destination.path, sourcePath)
+  if owners.len > 0:
+    # REFUSED BEFORE ANYTHING IS WRITTEN, like the host dimension above.
+    result.outcome = moRefusedOwners
+    result.detail = owners
+    return
+
+  let usersBefore = scalarOf(destination.path, "select count(*) from users;")
   var before: seq[int64] = @[]
   for table in mergedSpineTables:
     before.add(scalarOf(destination.path, "select count(*) from " & table & ";"))
@@ -271,6 +409,9 @@ proc mergeObservationStore*(destination: ObservationStore;
   # holding executions whose extension rows never arrived.
   var sql = "attach database " & encodeText(sourcePath) & " as src;\n"
   sql.add("begin immediate;\n")
+  # OWNERS FIRST: an execution naming an owner with no `users` row is
+  # refused by the destination's schema.
+  sql.add(usersMergeStatement())
   for table in mergedSpineTables:
     let columns = sharedColumns(columnsOf(destination.path, table),
                                 columnsOf(sourcePath, table))
@@ -323,6 +464,8 @@ proc mergeObservationStore*(destination: ObservationStore;
     result.detail = destination.lastError
     return
 
+  result.usersAdded = scalarOf(destination.path,
+    "select count(*) from users;") - usersBefore
   for i, table in mergedSpineTables:
     let added = scalarOf(destination.path,
       "select count(*) from " & table & ";") - before[i]

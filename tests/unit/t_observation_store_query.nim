@@ -142,6 +142,12 @@ proc buildFixture(path: string): ObservationStore =
     workspaceId: none(string), profile: none(string),
     gitCommit: none(string), gitBranch: none(string),
     captureCompleteness: ccComplete, droppedObservations: 0))
+  # Every owner an execution names needs its `users` row first (schema
+  # version 6), and that is enforced by the schema, not by this fixture.
+  doAssert result.recordUser(UidAlice, pkUid, $UidAlice, some("alice"),
+    1_000), result.lastError
+  doAssert result.recordUser(UidBob, pkUid, $UidBob, some("bob"), 1_000),
+    result.lastError
   for index, row in fixtureRows:
     doAssert result.insertExecution(ExecutionRow(
       executionId: "exec-m13a-" & $index,
