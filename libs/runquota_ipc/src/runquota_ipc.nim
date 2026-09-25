@@ -110,7 +110,7 @@ proc libraryInfo*(): ipcTypes.LibraryInfo =
   ipcTypes.LibraryInfo(name: libraryName)
 
 proc unixEndpoint*(path: string): Endpoint =
-  Endpoint(kind: endpointUnixSocket, path: path)
+  Endpoint(kind: endpointUnixSocket, path: path, rendezvousPath: path)
 
 when defined(windows):
   proc namedPipeEndpoint*(path: string): Endpoint =
@@ -203,7 +203,13 @@ proc endpointForPath*(path: string): Endpoint =
     if path.startsWith(r"\\.\pipe\") or path.startsWith(r"\\?\pipe\"):
       namedPipeEndpoint(path)
     else:
-      namedPipeEndpoint(r"\\.\pipe\runquota-" & windowsPipeToken(path))
+      # THE PATH IS KEPT, not only the pipe it maps to: it is the directory
+      # the caller named, and the published stats table lives beside it
+      # exactly as it lives beside a Unix socket (`defaultStatsTablePath`).
+      var endpoint = namedPipeEndpoint(r"\\.\pipe\runquota-" &
+        windowsPipeToken(path))
+      endpoint.rendezvousPath = path
+      endpoint
   else:
     unixEndpoint(path)
 
@@ -470,9 +476,24 @@ proc defaultStatsTablePath*(endpoint: Endpoint): string =
   ## somewhere the clients of THIS daemon do not look is an unpublished
   ## table with extra moving parts, and it fails silently as a permanently
   ## cold cache.
+  ##
+  ## WINDOWS: beside the path the pipe was derived from, and nowhere for a
+  ## pipe named outright. A named pipe has no directory, so the table goes
+  ## where the caller's own path puts it -- the same directory a Unix socket
+  ## of that path would have been bound in -- and a pipe given as
+  ## ``\\.\pipe\...``, the host-wide default among them, has no
+  ## published table at all: clients fall back to the socket, which answers
+  ## everything the table can. Inventing a directory for it would put a
+  ## daemon-owned segment on a path nobody provisioned and nobody verifies,
+  ## which is the squatting hazard the rendezvous rules exist to exclude.
+  ## `RunQuota-Shared-Memory-Structures.md` §"Where the table lives on
+  ## Windows" records the decision and what would change it.
   case endpoint.kind
   of endpointUnixSocket: parentDir(endpoint.path) / statsTableSegmentName
-  of endpointNamedPipe, endpointUnsupported: ""
+  of endpointNamedPipe:
+    if endpoint.rendezvousPath.len == 0: ""
+    else: parentDir(endpoint.rendezvousPath) / statsTableSegmentName
+  of endpointUnsupported: ""
 
 proc requiredSegmentMode*(scope: SegmentScope): int =
   ## The mode a segment of ``scope`` must be created with and verified at.

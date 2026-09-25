@@ -22,6 +22,13 @@ type
   Endpoint* = object
     kind*: EndpointKind
     path*: string
+    rendezvousPath*: string
+      ## The FILESYSTEM path a named-pipe endpoint was derived from, or ""
+      ## when it was named as a pipe outright. A Unix socket IS a filesystem
+      ## path, so there it is simply ``path``; a Windows pipe lives in the
+      ## kernel object namespace, and without this the directory the caller
+      ## named -- where the published stats table lives beside it -- would be
+      ## lost the moment the name was mapped onto a pipe.
 
   PeerIdentity* = object
     kind*: PeerIdentityKind

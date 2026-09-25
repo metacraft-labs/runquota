@@ -62,14 +62,25 @@ type LibraryInfo* = object
 proc libraryInfo*(): LibraryInfo =
   LibraryInfo(name: libraryName)
 
-const statsTableSupported* = defined(linux) or defined(macosx)
-  ## False on any platform without POSIX ``mmap(MAP_SHARED)``. Every
-  ## operation then reports unavailable, so a caller degrades to the socket
-  ## instead of failing — the same portable no-op arm the rest of the
-  ## campaign's segments carry.
+const statsTableSupported* = defined(linux) or defined(macosx) or
+    defined(windows)
+  ## False on any platform with neither POSIX ``mmap(MAP_SHARED)`` nor a
+  ## Windows file mapping. Every operation then reports unavailable, so a
+  ## caller degrades to the socket instead of failing — the same portable
+  ## no-op arm the rest of the campaign's segments carry.
+  ##
+  ## WINDOWS maps the same file, with the same layout, through
+  ## ``CreateFileMappingW`` + ``MapViewOfFileEx`` (the structures spec's
+  ## §"Shared memory and the alignment hazard"). Everything above the
+  ## mapping -- the seqlock, the probe, the key re-check -- is this module's
+  ## one implementation, unchanged, because none of it is platform-specific.
+
+when defined(windows):
+  import std/winlean
+elif statsTableSupported:
+  import std/posix
 
 when statsTableSupported:
-  import std/posix
 
   # REUSED, NOT REIMPLEMENTED. Boot id, process start time and the
   # liveness verdict that defeats pid reuse are `nim-shm-lease`'s
@@ -121,7 +132,13 @@ type
     missCount*: uint64
     when statsTableSupported:
       base: ShmBase
+    when statsTableSupported and not defined(windows):
       fd: cint
+        ## POSIX keeps the descriptor for the mapping's lifetime. The Windows
+        ## arm keeps neither the file nor the mapping handle: a view holds
+        ## its section open by itself, and a handle held for nothing would
+        ## be one more thing that could keep a newer daemon from replacing
+        ## the file.
 
   SlotRead = enum
     ## The outcome of ONE stable snapshot of ONE slot.
@@ -175,7 +192,52 @@ proc openStatsTable*(path: string; wantBase: pointer = nil): StatsTable =
   ## not model cross-mapping; it is asserted by execution.
   result.available = false
   result.path = path
-  when statsTableSupported:
+  when defined(windows):
+    # THE SAME READ-ONLY ATTACH, AND THE KERNEL ENFORCES IT THE SAME WAY. The
+    # file is opened for GENERIC_READ alone and the view is FILE_MAP_READ over
+    # a PAGE_READONLY section, so a store through it is an access violation,
+    # exactly as a store through a PROT_READ mapping is SIGSEGV. The share
+    # mode is everything, deliberately: a reader must never be the reason
+    # the daemon cannot write, zero or replace the file it publishes.
+    if path.len == 0: return
+    let file = createFileW(newWideCString(path), GENERIC_READ,
+      FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil,
+      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, Handle(0))
+    if file == INVALID_HANDLE_VALUE: return
+    var info: BY_HANDLE_FILE_INFORMATION
+    if getFileInformationByHandle(file, addr info) == 0 or
+        (info.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY) != 0:
+      discard closeHandle(file)
+      return
+    let size = int((uint64(cast[uint32](info.nFileSizeHigh)) shl 32) or
+      uint64(cast[uint32](info.nFileSizeLow)))
+    if size < StatsEntriesOff + StatsEntryStride:
+      discard closeHandle(file)
+      return
+    let mapping = createFileMappingW(file, nil, PAGE_READONLY, 0, 0, nil)
+    discard closeHandle(file)
+    if mapping == Handle(0): return
+    # ``wantBase`` must be a multiple of the ALLOCATION GRANULARITY (64 KiB),
+    # not of the page size; a misaligned one fails the map with
+    # ERROR_MAPPED_ALIGNMENT and the table is simply not attached.
+    let p = mapViewOfFileEx(mapping, FILE_MAP_READ, 0, 0, WinSizeT(size),
+      wantBase)
+    discard closeHandle(mapping)
+    if p == nil: return
+    let base = cast[ShmBase](p)
+    if not statsHeaderValid(base, bootId(), size):
+      discard unmapViewOfFile(p)
+      return
+    result.base = base
+    result.size = size
+    result.slotCount = int(loadU64Relaxed(base, StatsOffSlotCount))
+    let verdict = anchorVerdict(
+      loadU64Relaxed(base, StatsOffBootId),
+      loadU64Relaxed(base, StatsOffOwnerPid),
+      loadU64Relaxed(base, StatsOffOwnerStartTime))
+    result.ownerAlive = verdict == avLive
+    result.available = true
+  elif statsTableSupported:
     result.fd = -1
     if path.len == 0: return
     var info: Stat
@@ -229,7 +291,11 @@ proc close*(table: var StatsTable) =
   ## GUARDED ON ``available`` RATHER THAN ON THE DESCRIPTOR: a
   ## default-constructed ``StatsTable`` has ``fd == 0``, and closing
   ## descriptor 0 would take standard input out from under the process.
-  when statsTableSupported:
+  when defined(windows):
+    if table.available:
+      discard unmapViewOfFile(cast[pointer](table.base))
+      table.base = nil
+  elif statsTableSupported:
     if table.available:
       discard munmap(cast[pointer](table.base), table.size)
       table.base = nil

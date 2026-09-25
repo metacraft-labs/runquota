@@ -30,6 +30,19 @@ import runquota_stats_table/publisher
 
 when defined(posix):
   import std/posix
+elif defined(windows):
+  from shm_lease/waitword import allocationGranularity
+
+  const
+    MemReserve = 0x2000'u32
+    MemRelease = 0x8000'u32
+    PageNoAccess = 0x01'u32
+
+  proc virtualAlloc(address: pointer; size: uint; allocationType: uint32;
+                    protect: uint32): pointer {.
+    stdcall, dynlib: "kernel32.dll", importc: "VirtualAlloc".}
+  proc virtualFree(address: pointer; size: uint; freeType: uint32): int32 {.
+    stdcall, dynlib: "kernel32.dll", importc: "VirtualFree".}
 
 proc stampedPayload(key: string; generation: uint64): PublishedEstimate =
   PublishedEstimate(
@@ -123,13 +136,21 @@ proc runRebind(path: string; keyA, keyB: string; durationMs: int;
   pub.close()
   0
 
-proc runReadAt(path: string; key: string; iterations: int;
-               baseOffset: int): int =
-  ## Attach at a CHOSEN address. A pre-reserved anonymous region is mapped
-  ## first and the segment is then placed inside it with `MAP_FIXED`, which
-  ## is how `nim-shm-lease` makes the differing-base property provable
-  ## instead of merely likely: two processes both calling `mmap(nil, ...)`
-  ## would very often land at the same address and prove nothing.
+proc chooseBase(path: string; baseOffset: int; want: var pointer): int =
+  ## An address ``baseOffset`` into a region nothing else in this process
+  ## occupies, or an error exit code.
+  ##
+  ## POSIX: a PROT_NONE anonymous reservation is mapped and the segment is
+  ## then placed inside it with `MAP_FIXED`, which replaces that part of the
+  ## reservation atomically.
+  ##
+  ## WINDOWS: `MapViewOfFileEx` cannot map over a reservation, so the region
+  ## is reserved to learn a free range and released again just before the
+  ## map. This fixture is single-threaded, so nothing else can take the range
+  ## in between. The chosen base must be a multiple of the ALLOCATION
+  ## GRANULARITY (64 KiB) -- not of the page size, which is the Windows form
+  ## of the hazard the structures spec names -- and a reservation's own base
+  ## always is, so an offset that is a multiple of it keeps the property.
   when defined(posix):
     var info: Stat
     if stat(path.cstring, info) != 0:
@@ -141,7 +162,42 @@ proc runReadAt(path: string; key: string; iterations: int;
     if reservation == MAP_FAILED:
       echo "ERROR could not reserve"
       return 1
-    let want = cast[pointer](cast[uint](reservation) + uint(baseOffset))
+    want = cast[pointer](cast[uint](reservation) + uint(baseOffset))
+    0
+  elif defined(windows):
+    if not fileExists(path):
+      echo "ERROR no segment " & path
+      return 1
+    if baseOffset mod allocationGranularity() != 0:
+      echo "ERROR offset " & $baseOffset & " is not a multiple of the " &
+        "allocation granularity " & $allocationGranularity()
+      return 1
+    let size = int(getFileSize(path))
+    let span = uint(size + baseOffset + 1 shl 20)
+    let reservation = virtualAlloc(nil, span, MemReserve, PageNoAccess)
+    if reservation == nil:
+      echo "ERROR could not reserve"
+      return 1
+    want = cast[pointer](cast[uint](reservation) + uint(baseOffset))
+    if virtualFree(reservation, 0, MemRelease) == 0:
+      echo "ERROR could not release the reservation"
+      return 1
+    0
+  else:
+    echo "ERROR not supported"
+    1
+
+proc runReadAt(path: string; key: string; iterations: int;
+               baseOffset: int): int =
+  ## Attach at a CHOSEN address, which is how `nim-shm-lease` makes the
+  ## differing-base property provable instead of merely likely: two
+  ## processes both mapping wherever the kernel likes would very often land
+  ## at the same address and prove nothing.
+  when defined(posix) or defined(windows):
+    var want: pointer = nil
+    let chosen = chooseBase(path, baseOffset, want)
+    if chosen != 0:
+      return chosen
     var table = openStatsTable(path, want)
     if not table.available:
       echo "ERROR could not attach " & path

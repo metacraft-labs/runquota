@@ -100,6 +100,16 @@ A host-wide shared-memory segment the daemon publishes at
 `<rendezvous dir>/stats-table`, group-readable and daemon-written. It exists so
 a client can look up an estimate without a round trip.
 
+On Windows the endpoint is a named pipe and has no directory, so the table goes
+beside the path the pipe was derived from: a daemon started with
+`--socket D:\rq\ep\d.sock` (or reached through `RUNQUOTA_SOCKET` set to that
+path) publishes `D:\rq\ep\stats-table`. The host-wide default pipe, and any
+pipe named outright as `\\.\pipe\...`, has no published table: estimates go
+over the pipe instead, unless `RUNQUOTA_STATS_TABLE_PATH` names one for the
+daemon and its clients alike. "Group-readable" there means the file's DACL
+grants its group read, and write to nobody but its owner and the machine's
+administrators.
+
 It is **a cache and never a second source of truth**. The socket can answer
 anything the table can, no behaviour exists only while an entry is resident,
 and the daemon never reads it back as authority. That is what makes it safe to

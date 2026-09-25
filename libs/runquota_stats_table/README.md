@@ -24,7 +24,9 @@ table and requires every store gate and every client gate to keep passing.
 ## Two modules, and the split is the enforcement
 
 - `runquota_stats_table` — the **reader**. Maps the segment `PROT_READ` from
-  an `O_RDONLY` descriptor, so a client cannot write it even by mistake;
+  an `O_RDONLY` descriptor — on Windows, a `FILE_MAP_READ` view of a
+  `PAGE_READONLY` section of a file opened `GENERIC_READ` — so a client cannot
+  write it even by mistake;
   `lookupEstimate` never blocks and never fails. Absent key, stale entry, a
   torn read whose retry budget ran out, no segment at all — every one of them
   means "ask over the socket, or use your own default".
@@ -36,6 +38,27 @@ table and requires every store gate and every client gate to keep passing.
 
 `tests/unit/t_stats_table_rules.nim` scans the tree and fails if anything
 outside `runquota_daemon` / `apps/runquotad` imports the publisher.
+
+## Windows
+
+The same file, the same layout and the same seqlock, mapped through
+`CreateFileMappingW` + `MapViewOfFileEx` instead of `mmap`; nothing above the
+mapping has a second implementation. What differs, and where it is decided
+(`reprobuild-specs/RunQuota-Shared-Memory-Structures.md` §Windows):
+
+- **Where it lives.** Beside the filesystem path a named-pipe endpoint was
+  derived from (`Endpoint.rendezvousPath`); a pipe named outright, the
+  host-wide default among them, has no table and its clients use the socket.
+- **Its mode.** `0640` is written as a protected DACL at `CreateFileW` time
+  and read back as the DACL's projection onto owner / group / others
+  (`runquota_ipc/segment_mode`).
+- **Share modes.** The reader opens with every share flag and keeps no handle
+  once the view exists, so a reader can never stop the daemon writing, zeroing
+  or replacing the file.
+- **The anchor.** Boot id, start time and liveness come from
+  `nim-shm-lease`'s Windows anchor arm, as they do on POSIX.
+- **A chosen base** must be a multiple of the 64 KiB allocation granularity,
+  not of the page size.
 
 ## The seqlock, and why it is written out longhand
 

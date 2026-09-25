@@ -189,11 +189,19 @@ proc emptyTheTable(path: string) =
   ## deployment — the segment is `0640` and daemon-owned — and that is
   ## precisely why it is the control: it produces a state the system must
   ## survive and no well-behaved participant can construct.
-  var blob = readFile(path)
-  doAssert blob.len > StatsEntriesOff
-  for i in StatsEntriesOff ..< blob.len:
-    blob[i] = '\0'
-  writeFile(path, blob)
+  ##
+  ## IN PLACE, NOT ``writeFile``: the daemon has this file MAPPED while it
+  ## runs. Rewriting it truncates it first, which Windows refuses outright
+  ## for a file with a mapped section, and which on POSIX leaves the
+  ## daemon's own mapping of the truncated range faulting until the rewrite
+  ## lands -- a crash of the publisher, which is not the state under test.
+  ## Zeros written over the entries are.
+  let size = int(getFileSize(path))
+  doAssert size > StatsEntriesOff
+  var file = open(path, fmReadWriteExisting)
+  defer: file.close()
+  file.setFilePos(StatsEntriesOff)
+  file.write(newString(size - StatsEntriesOff))
 
 suite "stats_table_cache_control":
 

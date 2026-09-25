@@ -55,17 +55,22 @@ import std/[algorithm, os, strutils, times]
 import ./types
 export types
 
-const statsPublisherSupported* = defined(linux) or defined(macosx)
+const statsPublisherSupported* = defined(linux) or defined(macosx) or
+    defined(windows)
 
-# The publisher's write path is a POSIX shared-memory + mmap seqlock and only
-# builds on Linux/macOS. Keep its platform-only imports -- std/posix and the
-# shm_lease modules -- behind that guard so this module still COMPILES on
-# Windows, where it is an inert stub. Unconditional imports broke the Windows
-# build with `cannot open file: shm_lease/anchor` (and would fail on std/posix
-# too), first surfaced by reprobuild's windows-x86_64 release leg. Every use of
-# these symbols below is already inside `when statsPublisherSupported`.
-when statsPublisherSupported:
+# The platform-only imports stay behind the platform guards, so this module
+# still COMPILES where it is an inert stub. Unconditional imports once broke
+# the Windows build with `cannot open file: shm_lease/anchor`, first surfaced
+# by reprobuild's windows-x86_64 release leg -- and that was when Windows WAS
+# the stub. It is not now: it maps the same file with the same layout through
+# `CreateFileMappingW`, and everything above the mapping (the round, the
+# shadow, placement, eviction) is this module's one implementation.
+when defined(windows):
+  import std/winlean
+  from runquota_ipc/segment_mode import SegmentSecurity, initSegmentSecurity
+elif statsPublisherSupported:
   import std/posix
+when statsPublisherSupported:
   from shm_lease/anchor import bootId, processStartTime
   from shm_lease/waitword import pageSize
 
@@ -90,6 +95,7 @@ type
     tick: uint64
     when statsPublisherSupported:
       base: ptr UncheckedArray[byte]
+    when statsPublisherSupported and not defined(windows):
       fd: cint
 
 when statsPublisherSupported:
@@ -140,7 +146,97 @@ proc createStatsPublisher*(path: string; slotCount = DefaultStatsSlotCount;
   ## rather than a literal.
   result.available = false
   result.path = path
-  when statsPublisherSupported:
+  when defined(windows):
+    if path.len == 0: return
+    if slotCount <= 0 or slotCount > MaxStatsSlotCount: return
+    if (slotCount and (slotCount - 1)) != 0: return # power of two
+    let size = statsSegmentSize(slotCount)
+    let boot = bootId()
+    try:
+      let dir = parentDir(path)
+      if dir.len > 0 and not dirExists(dir): return
+    except CatchableError: return
+    let uniq = int(epochTime() * 1_000_000) mod 1_000_000
+    let tmp = path & ".tmp." & $getCurrentProcessId() & "." & $uniq
+    # THE MODE IS PART OF THE CREATE, as it is on POSIX: the descriptor that
+    # expresses ``mode`` goes to `CreateFileW` itself rather than being
+    # applied afterwards, because a file created under the directory's
+    # inherited DACL has a window in which another account can open it, and
+    # a handle opened in that window keeps its access. The build is also
+    # EXCLUSIVE (share mode 0) until the magic is written: nobody can open a
+    # half-initialised segment, however the directory is permissioned.
+    var security: SegmentSecurity
+    initSegmentSecurity(security, mode)
+    if not security.ok: return
+    let tfile = createFileW(newWideCString(tmp), GENERIC_READ or GENERIC_WRITE,
+      0, addr security.attributes, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+      Handle(0))
+    if tfile == INVALID_HANDLE_VALUE: return
+    var sizeHigh = LONG(uint64(size) shr 32)
+    let sized =
+      setFilePointer(tfile, LONG(uint64(size) and 0xFFFF_FFFF'u64),
+        addr sizeHigh, FILE_BEGIN) != DWORD(INVALID_SET_FILE_POINTER) and
+      setEndOfFile(tfile) != 0
+    if not sized:
+      discard closeHandle(tfile)
+      discard deleteFileW(newWideCString(tmp))
+      return
+    let tmapping = createFileMappingW(tfile, nil, PAGE_READWRITE, 0, 0, nil)
+    if tmapping == Handle(0):
+      discard closeHandle(tfile)
+      discard deleteFileW(newWideCString(tmp))
+      return
+    let p = mapViewOfFileEx(tmapping, FILE_MAP_WRITE, 0, 0, WinSizeT(size),
+      nil)
+    discard closeHandle(tmapping)
+    if p == nil:
+      discard closeHandle(tfile)
+      discard deleteFileW(newWideCString(tmp))
+      return
+    let base = cast[ShmBase](p)
+    storeU32Relaxed(base, StatsOffFlags, 0)
+    storeU64Relaxed(base, StatsOffSlotCount, uint64(slotCount))
+    storeU64Relaxed(base, StatsOffEntryStride, uint64(StatsEntryStride))
+    storeU64Relaxed(base, StatsOffEntriesOff, uint64(StatsEntriesOff))
+    storeU64Relaxed(base, StatsOffSegmentSize, uint64(size))
+    storeU64Relaxed(base, StatsOffMaxKeyBytes, uint64(StatsTableMaxKeyBytes))
+    storeU64Relaxed(base, StatsOffReserved1, 0)
+    storeU64Relaxed(base, StatsOffReserved2, 0)
+    storeU64Relaxed(base, StatsOffBootId, boot)
+    let pid = getCurrentProcessId()
+    storeU64Relaxed(base, StatsOffOwnerPid, uint64(pid))
+    storeU64Relaxed(base, StatsOffOwnerStartTime, processStartTime(pid))
+    storeU32Release(base, StatsOffFormatVersion, StatsSegFormatVersion)
+    storeU64Release(base, StatsOffMagic, StatsSegMagic)
+    discard unmapViewOfFile(p)
+    discard closeHandle(tfile)
+    # REPLACE-EXISTING, like `rename(2)`. A reader of an earlier daemon's
+    # table holds it open with FILE_SHARE_DELETE precisely so that this
+    # rename is never refused on its account.
+    if moveFileExW(newWideCString(tmp), newWideCString(path),
+        MOVEFILE_REPLACE_EXISTING) == 0:
+      discard deleteFileW(newWideCString(tmp))
+      return
+    let file = createFileW(newWideCString(path), GENERIC_READ or GENERIC_WRITE,
+      FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil,
+      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, Handle(0))
+    if file == INVALID_HANDLE_VALUE: return
+    let mapping = createFileMappingW(file, nil, PAGE_READWRITE, 0, 0, nil)
+    discard closeHandle(file)
+    if mapping == Handle(0): return
+    let mapped = mapViewOfFileEx(mapping, FILE_MAP_WRITE, 0, 0,
+      WinSizeT(size), nil)
+    discard closeHandle(mapping)
+    if mapped == nil: return
+    result.base = cast[ShmBase](mapped)
+    result.size = size
+    result.slotCount = slotCount
+    result.slotKeys = newSeq[string](slotCount)
+    result.slotSeq = newSeq[uint64](slotCount)
+    result.slotUse = newSeq[uint64](slotCount)
+    result.slotTick = newSeq[uint64](slotCount)
+    result.available = true
+  elif statsPublisherSupported:
     result.fd = -1
     if path.len == 0: return
     if slotCount <= 0 or slotCount > MaxStatsSlotCount: return
@@ -206,7 +302,11 @@ proc close*(publisher: var StatsPublisher) =
   ## default-constructed ``StatsPublisher`` has ``fd == 0`` and closing
   ## descriptor 0 would take the process's standard input out from under it
   ## — a failure that would show up somewhere else entirely.
-  when statsPublisherSupported:
+  when defined(windows):
+    if publisher.available:
+      discard unmapViewOfFile(cast[pointer](publisher.base))
+      publisher.base = nil
+  elif statsPublisherSupported:
     if publisher.available:
       discard munmap(cast[pointer](publisher.base), publisher.size)
       publisher.base = nil

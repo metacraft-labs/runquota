@@ -46,6 +46,24 @@ proc rawU64(path: string; offset: int): uint64 =
   for i in countdown(7, 0):
     result = (result shl 8) or uint64(uint8(blob[offset + i]))
 
+proc zeroEntriesInPlace(path: string) =
+  ## Zero every entry of the segment FILE, leaving the header -- and the
+  ## file's size -- exactly as they were.
+  ##
+  ## IN PLACE, NOT ``writeFile``. Rewriting the file truncates it first, and a
+  ## segment is a file somebody has MAPPED: Windows refuses to truncate a file
+  ## with a mapped section at all (``writeFile`` raises "cannot open"), and on
+  ## POSIX every mapping of the truncated range faults until the rewrite has
+  ## put the bytes back. Neither is the state under test, which is a table
+  ## whose entries are zero -- so the zeros are written over the entries, and
+  ## nothing else about the file moves.
+  let size = int(getFileSize(path))
+  doAssert size > StatsEntriesOff
+  var file = open(path, fmReadWriteExisting)
+  defer: file.close()
+  file.setFilePos(StatsEntriesOff)
+  file.write(newString(size - StatsEntriesOff))
+
 proc entryOffset(slot: int; field: int): int =
   StatsEntriesOff + slot * StatsEntryStride + field
 
@@ -394,10 +412,8 @@ suite "stats_table_rules":
 
     # Zero every entry, leaving the header intact -- which is exactly what
     # "forcibly emptied" means for a table whose header carries the geometry.
-    var blob = readFile(path)
-    for i in StatsEntriesOff ..< blob.len:
-      blob[i] = '\0'
-    writeFile(path, blob)
+    # With `table` still attached, as a reader in the field would be.
+    zeroEntriesInPlace(path)
 
     var reopened = openStatsTable(path)
     check reopened.available
@@ -418,6 +434,14 @@ suite "stats_table_rules":
     check "PROT_WRITE" notin readerSource
     check "O_RDONLY" in readerSource
     check "O_RDWR" notin readerSource
+    # THE WINDOWS ARM, by the same two halves: the view is FILE_MAP_READ over
+    # a PAGE_READONLY section of a file opened GENERIC_READ, and none of the
+    # three writable spellings appears anywhere in the reader.
+    check "PAGE_READONLY" in readerSource
+    check "FILE_MAP_READ" in readerSource
+    check "PAGE_READWRITE" notin readerSource
+    check "FILE_MAP_WRITE" notin readerSource
+    check "GENERIC_WRITE" notin readerSource
     # ...and the CONTROL, without which the two `notin`s above would pass
     # against a scanner reading the wrong file: the publisher, which really
     # does map read-write, must trip the same tokens.
@@ -426,6 +450,9 @@ suite "stats_table_rules":
       "publisher.nim"))
     check "PROT_WRITE" in writerSource
     check "O_RDWR" in writerSource
+    check "PAGE_READWRITE" in writerSource
+    check "FILE_MAP_WRITE" in writerSource
+    check "GENERIC_WRITE" in writerSource
 
   test "the scanner can see a writer, and can see that a reader is not one":
     # A SCANNER THAT MATCHES NOTHING PASSES EVERYWHERE. Both controls, before

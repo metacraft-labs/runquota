@@ -18,7 +18,10 @@
 ##     the instrument;
 ##   * **the client's mapping is read-only** is asserted by a child process
 ##     STORING THROUGH IT and being killed by the kernel. A test that merely
-##     showed the reader works would pass against a read-write mapping;
+##     showed the reader works would pass against a read-write mapping. On
+##     Windows the child is this binary started again rather than forked, and
+##     the kernel's account is the access violation it raises -- a WRITE, at
+##     the mapping's base -- rather than a signal;
 ##   * **the segment's mode is group-readable and not 0600** is the clause a
 ##     blanket per-segment ``0600`` rule would silently break, taking the
 ##     host-wide table away from every user but one — and looking exactly
@@ -35,7 +38,8 @@ when defined(posix):
   import std/posix
 
 from runquota_ipc import endpointDirectoryPermissions, requiredSegmentMode,
-  segmentHostWide, segmentIsGroupReadable, defaultStatsTablePath, unixEndpoint
+  segmentHostWide, segmentIsGroupReadable, defaultStatsTablePath, unixEndpoint,
+  segmentFileMode
 import runquota_client
 import runquota_core
 import runquota_protocol
@@ -69,9 +73,75 @@ proc hostStateDir(root: string): string =
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
 
 proc modeOf(path: string): int =
-  var info: Stat
-  if lstat(path.cstring, info) != 0: return -1
-  int(info.st_mode) and 0o7777
+  ## The kernel's mode on POSIX (``lstat``, as ever); on Windows the DACL's
+  ## projection onto owner / group / others, which is what the daemon created
+  ## the file with and what ``segmentTrust`` verifies.
+  when defined(posix):
+    var info: Stat
+    if lstat(path.cstring, info) != 0: return -1
+    int(info.st_mode) and 0o7777
+  else:
+    segmentFileMode(path)
+
+when defined(windows):
+  # --- the read-only clause's CHILD, on a platform without fork(2) ----------
+  #
+  # This binary started again with `storeFlag` attaches the table the way any
+  # client does and stores through the mapping. What must end it is the
+  # KERNEL: a write to a read-only view raises an access violation, and a
+  # vectored handler -- which runs before Nim's own -- turns exactly that
+  # fault into the process's exit status. Exactly that one: an ACCESS
+  # VIOLATION, on a WRITE, at the address stored to. Anything else continues
+  # to Nim's handler and exits 1, and a store that SUCCEEDS exits 0; either
+  # fails the parent's assertion, which is what a read-write mapping would
+  # produce.
+  from runquota_core/child_process import readToEnd
+
+  const
+    storeFlag = "--store-through-client-mapping"
+    StatusAccessViolation = 0xC000_0005'u32
+    ExceptionContinueSearch = 0'i32
+
+  type
+    ExceptionRecord {.pure.} = object
+      code: uint32
+      flags: uint32
+      inner: pointer
+      address: pointer
+      parameterCount: uint32
+      information: array[15, uint]
+    ExceptionPointers {.pure.} = object
+      record: ptr ExceptionRecord
+      context: pointer
+
+  proc addVectoredExceptionHandler(first: uint32;
+      handler: proc (info: ptr ExceptionPointers): int32 {.stdcall.}): pointer {.
+    stdcall, dynlib: "kernel32.dll", importc: "AddVectoredExceptionHandler".}
+  proc terminateProcess(process: int; code: uint32): int32 {.
+    stdcall, dynlib: "kernel32.dll", importc: "TerminateProcess".}
+  proc getCurrentProcess(): int {.
+    stdcall, dynlib: "kernel32.dll", importc: "GetCurrentProcess".}
+
+  var storeTarget: uint = 0
+
+  proc onFault(info: ptr ExceptionPointers): int32 {.stdcall.} =
+    let record = info.record
+    # ExceptionInformation[0] is 1 for a write; [1] is the faulting address.
+    if record.code == StatusAccessViolation and record.parameterCount >= 2 and
+        record.information[0] == 1'u and record.information[1] == storeTarget:
+      discard terminateProcess(getCurrentProcess(), StatusAccessViolation)
+    ExceptionContinueSearch
+
+  if paramCount() == 2 and paramStr(1) == storeFlag:
+    var table = openStatsTable(paramStr(2))
+    if not table.available:
+      quit 3
+    let base = table.unsafeMappedBase()
+    storeTarget = cast[uint](base)
+    discard addVectoredExceptionHandler(1, onFault)
+    let word = cast[ptr uint64](base)
+    word[] = 0xdeadbeef'u64
+    quit 0
 
 type DaemonHandle = object
   process: Process
@@ -299,28 +369,42 @@ suite "stats_table_publication":
 
       # A CHILD, because the store is expected to be fatal and a fatal
       # signal in this process would take the suite with it.
-      let child = fork()
-      check child >= 0
-      if child == 0:
-        # The child's Nim runtime prints a traceback for the fault before
-        # the process dies of the signal; that noise on stdout is expected
-        # and the assertion below is on the WAIT STATUS, which is the
-        # kernel's account rather than the runtime's.
-        #
-        # Store through the client's mapping. If it succeeds, this process
-        # exits 0 and the parent's assertion below fails -- which is exactly
-        # what a read-write mapping would produce.
-        let word = cast[ptr uint64](base)
-        word[] = 0xdeadbeef'u64
-        exitnow(0)
-      var status: cint = 0
-      discard waitpid(child, status, 0)
-      let signalled = WIFSIGNALED(status)
-      let signalNumber = if signalled: WTERMSIG(status) else: 0.cint
-      echo "  write through a client mapping: signalled=" & $signalled &
-        " signal=" & $signalNumber
-      check signalled
-      check signalNumber in [SIGSEGV, SIGBUS]
+      when defined(posix):
+        let child = fork()
+        check child >= 0
+        if child == 0:
+          # The child's Nim runtime prints a traceback for the fault before
+          # the process dies of the signal; that noise on stdout is expected
+          # and the assertion below is on the WAIT STATUS, which is the
+          # kernel's account rather than the runtime's.
+          #
+          # Store through the client's mapping. If it succeeds, this process
+          # exits 0 and the parent's assertion below fails -- which is exactly
+          # what a read-write mapping would produce.
+          let word = cast[ptr uint64](base)
+          word[] = 0xdeadbeef'u64
+          exitnow(0)
+        var status: cint = 0
+        discard waitpid(child, status, 0)
+        let signalled = WIFSIGNALED(status)
+        let signalNumber = if signalled: WTERMSIG(status) else: 0.cint
+        echo "  write through a client mapping: signalled=" & $signalled &
+          " signal=" & $signalNumber
+        check signalled
+        check signalNumber in [SIGSEGV, SIGBUS]
+      else:
+        # The child attaches its OWN client mapping, as a second client on
+        # the host would; this process's mapping is re-checked below.
+        let child = startProcess(getAppFilename(),
+          args = [storeFlag, tablePath], options = {poStdErrToStdOut})
+        let childOutput = child.outputStream.readToEnd()
+        let status = child.waitForExit(30_000)
+        child.close()
+        let exitStatus = cast[uint32](int32(status))
+        echo "  write through a client mapping: exit status 0x" &
+          toHex(exitStatus) & (if childOutput.len > 0:
+            " (" & childOutput.strip() & ")" else: "")
+        check exitStatus == StatusAccessViolation
 
       # ...and the table is intact FOR EVERY OTHER CLIENT ON THE HOST, which
       # is the consequence a successful store would have had: the word at
