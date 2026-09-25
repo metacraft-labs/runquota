@@ -92,21 +92,20 @@ wide_dir="${examples_root}/c-cpp-make/wide-binary"
 # THE SUBJECT NEEDS ITS OWN ENVIRONMENT, NOT THIS ONE. The harness is compiled
 # with runquota's toolchain but it SPAWNS `repro`, and `repro` needs
 # reprobuild's dev shell (its C toolchain, its provider search paths). Run
-# under runquota's direnv instead and the builds fail in ~100 ms with a
+# under runquota's environment instead and the builds fail in ~100 ms with a
 # non-zero exit -- which the harness now reports loudly rather than publishing
 # as a build that made no IPC.
 #
-# So the harness is EXECUTED under reprobuild's environment. `direnv exec DIR`
-# keeps the working directory, so the relative paths below still resolve
-# against the runquota checkout.
-bench_exec=("${bench_bin}")
-if command -v direnv >/dev/null 2>&1 && [ -f "${reprobuild_root}/.envrc" ]; then
-  bench_exec=(direnv exec "${reprobuild_root}" "${bench_bin}")
-else
-  echo "note: direnv or ${reprobuild_root}/.envrc not found; running the" \
-       "harness with the ambient environment. If the subject builds fail," \
-       "this is the first thing to check." >&2
+# Execute under reprobuild's environment, then restore this checkout's cwd:
+# the harness binary and result paths below are relative to runquota.
+if ! command -v repro >/dev/null 2>&1; then
+  echo "M1 needs repro on PATH to enter ${reprobuild_root}'s environment." >&2
+  exit 2
 fi
+# Positional arguments expand after activation, in the child shell.
+# shellcheck disable=SC2016
+bench_exec=(repro exec "${reprobuild_root}" -- bash -c
+  'cd "$1" && shift && exec "$@"' runquota-m1 "$PWD" "${bench_bin}")
 
 run_subject() {
   local name="$1"; shift
