@@ -36,9 +36,6 @@ when defined(windows):
     GENERIC_WRITE_W = 0x40000000'i32
     OPEN_EXISTING_W = 3'i32
     DefaultPipeBufferSize = 65536'i32
-    # Windows: GetTokenInformation TokenUser class (TOKEN_INFORMATION_CLASS=1).
-    TokenUserClass = 1'i32
-    TOKEN_QUERY_W = 0x0008'i32
     ERROR_PIPE_CONNECTED = 535'i32
     ERROR_NO_DATA = 232'i32
     ERROR_BROKEN_PIPE = 109'i32
@@ -73,28 +70,11 @@ when defined(windows):
     Pipe: WinHandle, ClientProcessId: ptr int32
   ): WINBOOL {.stdcall, dynlib: "kernel32.dll", importc: "GetNamedPipeClientProcessId".}
 
-  proc openProcessToken(
-    ProcessHandle: WinHandle, DesiredAccess: int32, TokenHandle: ptr WinHandle
-  ): WINBOOL {.stdcall, dynlib: "advapi32.dll", importc: "OpenProcessToken".}
-
-  proc getTokenInformation(
-    TokenHandle: WinHandle, TokenInformationClass: int32,
-    TokenInformation: pointer, TokenInformationLength: int32,
-    ReturnLength: ptr int32
-  ): WINBOOL {.stdcall, dynlib: "advapi32.dll", importc: "GetTokenInformation".}
-
-  proc convertSidToStringSidW(
-    Sid: pointer, StringSid: ptr ptr uint16
-  ): WINBOOL {.stdcall, dynlib: "advapi32.dll", importc: "ConvertSidToStringSidW".}
-
-  proc localFree(hMem: pointer): pointer {.stdcall, dynlib: "kernel32.dll", importc: "LocalFree".}
-
-  proc getCurrentProcessHandle(): WinHandle {.stdcall, dynlib: "kernel32.dll", importc: "GetCurrentProcess".}
-
   proc closeHandleW(hObject: WinHandle): WINBOOL {.stdcall, dynlib: "kernel32.dll", importc: "CloseHandle".}
 
 import runquota_ipc/types as ipcTypes
 import runquota_ipc/segment_mode
+import runquota_ipc/owner_identity as ownerIdentity
 import runquota_core
 import runquota_protocol
 when defined(windows):
@@ -103,6 +83,7 @@ when defined(windows):
 
 export ipcTypes
 export segment_mode
+export ownerIdentity
 
 const libraryName* = "runquota_ipc"
 
@@ -1425,46 +1406,28 @@ proc close*(accepted: AcceptedConnection) =
 
 when defined(windows):
   proc readPeerSidFromHandle(pipe: WinHandle; identity: var PeerIdentity) =
-    # Windows: best-effort peer identity. We open the client's process for
-    # token query only; if any step fails we leave the identity as
-    # peerIdentityUnavailable. The textual SID is returned to callers so the
-    # daemon can log it.
+    # The named-pipe peer: the client's pid, that process's token, and the
+    # token's user SID. The SID IS the credential, so the identity stays
+    # `peerIdentityUnavailable` unless it was read -- a pid alone names a
+    # process, not an owner, and an "available" identity with no owner is
+    # what recorded every Windows client as uid 0 (root) until the owner id
+    # below existed.
+    #
+    # `userId` is the SID's owner id (`runquota_core/owner_id`): a hash of
+    # the SID string in a range no POSIX uid reaches, computed the same way
+    # by the client for its Hello, so the Hello check compares two real
+    # derivations rather than 0 with 0.
     var clientPid: int32 = 0
     if getNamedPipeClientProcessId(pipe, addr clientPid) == 0:
       return
     identity.processId = uint64(clientPid)
+    let sid = processIdUserSid(clientPid)
+    if sid.len == 0:
+      return
+    let principal = sidPrincipal(sid)
     identity.kind = peerIdentityProcess
-    const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000'i32
-    let processHandle = openProcess(
-      PROCESS_QUERY_LIMITED_INFORMATION,
-      0'i32,
-      int32(clientPid)
-    )
-    if processHandle == 0:
-      return
-    var tokenHandle: WinHandle = 0
-    if openProcessToken(WinHandle(processHandle), TOKEN_QUERY_W, addr tokenHandle) == 0:
-      discard closeHandleW(WinHandle(processHandle))
-      return
-    var needed: int32 = 0
-    discard getTokenInformation(tokenHandle, TokenUserClass, nil, 0, addr needed)
-    if needed <= 0:
-      discard closeHandleW(tokenHandle)
-      discard closeHandleW(WinHandle(processHandle))
-      return
-    var buffer = newString(needed)
-    if getTokenInformation(
-      tokenHandle, TokenUserClass, addr buffer[0], needed, addr needed) != 0:
-      # Windows: TOKEN_USER layout is { SID_AND_ATTRIBUTES Sid; }; SID_AND_ATTRIBUTES
-      # is { PSID Sid; DWORD Attributes; }. So the first pointer-sized field is
-      # a pointer to the SID we want to stringify.
-      let sidPtr = cast[ptr pointer](addr buffer[0])[]
-      var stringSid: ptr uint16 = nil
-      if convertSidToStringSidW(sidPtr, addr stringSid) != 0 and stringSid != nil:
-        identity.sid = $cast[WideCString](stringSid)
-        discard localFree(stringSid)
-    discard closeHandleW(tokenHandle)
-    discard closeHandleW(WinHandle(processHandle))
+    identity.sid = principal.principal
+    identity.userId = uint64(principal.ownerId)
 
 proc peerIdentity*(connection: LocalConnection): PeerIdentity =
   case connection.kind

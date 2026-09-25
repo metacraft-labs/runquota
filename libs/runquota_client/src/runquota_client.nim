@@ -1,7 +1,4 @@
-import std/[os, tables, strutils]
-
-when defined(posix):
-  import std/posix
+import std/[options, os, tables, strutils]
 
 import runquota_client/types as clientTypes
 import runquota_client/standalone as clientStandalone
@@ -139,11 +136,16 @@ proc connect*(endpoint: Endpoint; clientName = "runquota-nim";
       uint64(getCurrentProcessId())
     else:
       0'u64
-  let uid =
-    when defined(posix):
-      uint64(getuid())
-    else:
-      0'u64
+  # THIS PROCESS'S OWNER ID, derived exactly as the daemon derives it from
+  # the connection: the uid on POSIX, the hash of the token user SID on
+  # Windows (`runquota_core/owner_id`). The daemon records the owner from
+  # peer credentials and never from this field; what the field buys is the
+  # refusal of a client that declares somebody else. It was `0` on every
+  # non-POSIX platform, which made that check `0 == 0` on Windows and the
+  # declared owner root. A process whose own token cannot be read declares
+  # 0, and a daemon that CAN read it refuses the mismatch.
+  let ownerId = currentProcessOwnerId()
+  let uid = if ownerId.isSome: uint64(ownerId.get) else: 0'u64
   let hello = HelloMessage(
     clientName: clientName,
     clientVersion: clientVersion,

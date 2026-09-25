@@ -34,6 +34,10 @@ type
     kind*: PeerIdentityKind
     processId*: uint64
     userId*: uint64
+      ## The peer's OWNER ID (`runquota_core/owner_id`): the uid on POSIX,
+      ## the hash of `sid` on Windows. Meaningful only when `kind` is not
+      ## `peerIdentityUnavailable`; read it through `ownerIdOf`, which
+      ## answers none rather than 0 when there is no credential.
     groupId*: uint64
     # Windows: the textual SID of the peer when available (empty otherwise).
     sid*: string
