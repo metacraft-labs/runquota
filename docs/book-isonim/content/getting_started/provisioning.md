@@ -15,7 +15,10 @@ almost certainly why.
 | **Rendezvous** — the socket the daemon listens on | `/run/runquota` | `/var/run/runquota` | *(none — named pipes)* |
 
 Host state is mode `0755`. The rendezvous directory is `0750`, group
-`runquota`, and the socket inside it is `0660`.
+`runquota`, and the socket inside it is `0660`. On Windows there are no modes:
+the host state directory must be owned by the daemon's account, SYSTEM or
+Administrators, and its DACL must not let anyone else write in it (see
+"Provisioning by hand" below).
 
 ## Why the daemon will not just create them
 
@@ -88,6 +91,19 @@ sudo mkdir -p /run/runquota     && sudo chown "$(id -u)":runquota /run/runquota 
 sudo mkdir -p /var/db/runquota  && sudo chown "$(id -u)" /var/db/runquota  && sudo chmod 0755 /var/db/runquota
 sudo mkdir -p /var/run/runquota && sudo chown "$(id -u)":runquota /var/run/runquota && sudo chmod 0750 /var/run/runquota
 ```
+
+On Windows, from an elevated `cmd.exe` (the shipped service runs as SYSTEM,
+which the first two grants cover):
+
+```bat
+mkdir "C:\ProgramData\runquota" && icacls "C:\ProgramData\runquota" /reset && icacls "C:\ProgramData\runquota" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "%USERDOMAIN%\%USERNAME%:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"
+```
+
+**A bare `mkdir` is not enough on Windows.** `C:\ProgramData` lets every user
+create files in every directory made under it, so the daemon refuses such a
+directory -- naming the ACE that lets other users write -- and keeps serving
+leases with capture off. `/inheritance:r` is what removes that ACE. The MSI
+does not create this directory.
 
 **`/run` is cleared on boot** (and so is `/var/run` on macOS), so the
 rendezvous directory has to be re-created on every boot. That is what the

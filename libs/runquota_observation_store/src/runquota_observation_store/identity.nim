@@ -42,6 +42,8 @@ import std/[os, strutils]
 
 when not defined(windows):
   import std/posix
+else:
+  import runquota_host_windows/security
 
 import ./ids
 
@@ -120,7 +122,52 @@ proc oneLine(text: string): string =
       parts.add(trimmed)
   parts.join("; ")
 
-proc provisionHostStateDirCommand*(directory: string): string =
+when defined(windows):
+  proc restrictHostStateDirCommand*(directory: string; account = ""): string =
+    ## WINDOWS: the ``icacls`` line that gives ``directory`` the DACL the
+    ## daemon's trust check accepts. The Windows counterpart of the POSIX
+    ## ``chown`` + ``chmod 0755``, and like them it names the DAEMON's
+    ## account, not the operator's.
+    ##
+    ## ``/inheritance:r`` IS THE POINT. ``C:\ProgramData`` hands every
+    ## directory created under it ``BUILTIN\Users:(CI)(WD,AD,WEA,WA)`` --
+    ## any user may add files and subdirectories -- so a bare ``mkdir``
+    ## there makes a state directory in which another user can plant
+    ## ``host-id`` or ``observations.sqlite3`` before the daemon does.
+    ## Removing inheritance drops that, and the grants put back exactly
+    ## what the POSIX ``0755`` means: full control for the daemon's
+    ## account, SYSTEM and Administrators, and read/traverse for every
+    ## user.
+    ##
+    ## ``/reset`` FIRST, as its own command, because the refusal this is
+    ## printed in can be about an EXPLICIT ACE, and ``/grant:r`` does not
+    ## remove one: it replaces a principal's grant only for the same
+    ## inheritance flags, so ``Users:(CI)(WD,AD,...)`` survives a
+    ## ``/grant:r Users:(OI)(CI)RX`` untouched -- measured, and the reason
+    ## the repair once left the directory refused. ``/reset`` drops every
+    ## explicit ACE, whoever wrote it; ``/inheritance:r`` then drops the
+    ## inherited ones; the grants are then the whole DACL. On a directory
+    ## ``mkdir`` has just made it is a no-op.
+    ##
+    ## ``account`` is how the command names the daemon's account. Empty --
+    ## what the daemon itself prints -- means THIS process's own SID, filled
+    ## in the way the POSIX command fills in ``getuid()``; the runbook,
+    ## which cannot know it, passes ``%USERDOMAIN%\%USERNAME%`` for cmd.exe
+    ## to expand as whoever runs it. A daemon running as SYSTEM or as
+    ## Administrators gets no separate grant: the first two already say it.
+    let sid = (if account.len > 0: "" else: processUserSid())
+    let who =
+      if account.len > 0: account
+      elif sid.len > 0: "*" & sid
+      else: r"%USERDOMAIN%\%USERNAME%"
+    result = "icacls \"" & directory & "\" /reset && icacls \"" &
+      directory & "\" /inheritance:r /grant:r " &
+      "\"*S-1-5-18:(OI)(CI)F\" \"*S-1-5-32-544:(OI)(CI)F\" "
+    if sid notin ["S-1-5-18", "S-1-5-32-544"]:
+      result.add("\"" & who & ":(OI)(CI)F\" ")
+    result.add("\"*S-1-5-32-545:(OI)(CI)RX\"")
+
+proc provisionHostStateDirCommand*(directory: string; account = ""): string =
   ## The exact command an operator runs on a host the install step has not
   ## reached. Named in the refusal itself: a refusal that says only "cannot
   ## persist" leaves the operator to guess, and the guess -- creating the
@@ -130,9 +177,16 @@ proc provisionHostStateDirCommand*(directory: string): string =
   ## Ownership is the DAEMON's, not root's: the daemon has to write the
   ## identity file inside it on first start. The mode is 0755 rather than
   ## 0700 because the directory is host-wide by design.
+  ##
+  ## On Windows a bare ``mkdir`` is NOT enough, and used to be all this
+  ## printed: see ``restrictHostStateDirCommand``, whose ``icacls`` follows
+  ## it. ``account`` is passed through to it, and ignored on POSIX, where
+  ## the uid is always this process's own.
   when defined(windows):
-    "mkdir " & directory
+    "mkdir \"" & directory & "\" && " &
+      restrictHostStateDirCommand(directory, account)
   else:
+    discard account
     "sudo mkdir -p " & directory & " && sudo chown " & $getuid() & " " &
       directory & " && sudo chmod 0755 " & directory
 

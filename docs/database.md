@@ -119,12 +119,14 @@ machine. Only macOS/arm64 has ever sampled; the Linux branch is written from
 
 Host identity and the hardware dimension are live. The machine's `host_id` is
 128 random bits kept in a **host-wide, daemon-owned** state file
-(`--host-identity-file PATH`, defaulting to `/var/db/runquota/host-id` on macOS
-and `/var/lib/runquota/host-id` elsewhere).
-**That directory must already exist**, with the right owner and a mode nobody
-else can write: see "Provisioning the host-wide state directory and the rendezvous" below. The daemon
-never creates it, verifies its ownership and mode on every start, and where it
-is missing or untrustworthy capture is off — path and reason named.
+(`--host-identity-file PATH`, defaulting to `/var/db/runquota/host-id` on macOS,
+`C:\ProgramData\runquota\host-id` on Windows and `/var/lib/runquota/host-id`
+elsewhere).
+**That directory must already exist**, with the right owner and a mode (on
+Windows, a DACL) nobody else can write: see "Provisioning the host-wide state
+directory and the rendezvous" below. The daemon never creates it, verifies its
+ownership and mode -- or owner and DACL -- on every start, and where it is
+missing or untrustworthy capture is off — path and reason named.
 `runquotad` is one daemon per host,
 so the file that names the machine has to be as host-wide as the daemon that
 owns it: a per-user file — which is what this was before, under
@@ -172,7 +174,7 @@ its socket in the second:
 |----------|-----------------|-------|------|
 | macOS | `/var/db/runquota` | the account `runquotad` runs as | `0755` |
 | Linux | `/var/lib/runquota` | the account `runquotad` runs as | `0755` |
-| Windows | `C:\ProgramData\runquota` | the account `runquotad` runs as | — |
+| Windows | `C:\ProgramData\runquota` | the account `runquotad` runs as, SYSTEM, or Administrators | no mode: a DACL, see "On Windows: the owner and the DACL" |
 
 | Platform | Rendezvous directory | Owner | Group | Mode |
 |----------|----------------------|-------|-------|------|
@@ -229,7 +231,9 @@ for hosts whose group is real but not resolvable by name.
 
 Both directories' **ownership and mode are verified on every daemon start and
 every client attach**, and a squatted or wrong-moded one is refused rather than
-used — path and mode named. Existence is not trust: a state directory owned by
+used — path and mode named. (On Windows it is the state directory's owner and
+DACL that are verified, on every daemon start; there is no rendezvous directory
+to check.) Existence is not trust: a state directory owned by
 the wrong uid lets any local user replace `host-id` and thereby fork this
 machine's history or merge it with another machine's, and a rendezvous
 directory owned by the wrong uid is a rendezvous point somebody else controls.
@@ -246,6 +250,40 @@ for the current process: an id nothing wrote down would be a different machine
 on every invocation, no two rows would ever pool, and the aggregates would still
 carry a hardware dimension, so nothing would look wrong. That failure has no
 symptom at the point of use, which is why it is a refusal.
+
+### On Windows: the owner and the DACL
+
+Windows has no mode bits to read -- the kernel checks an object's **owner** and
+its **DACL** -- so the same invariant, *nobody but the daemon can replace what
+lives in the state directory*, is stated on those. `runquotad` refuses the
+state directory, and turns capture off exactly as the POSIX check does, unless
+every rule below holds:
+
+| Rule | What is refused | Why |
+|------|-----------------|-----|
+| It is a directory | a file, or a **reparse point** (junction, symlink): it is opened with `FILE_FLAG_OPEN_REPARSE_POINT` and never followed | a link's own ACL says nothing about the directory the daemon would write through it (the POSIX check uses `lstat` for the same reason) |
+| Its **owner** is the account `runquotad` runs as, SYSTEM (`S-1-5-18`), or Administrators (`S-1-5-32-544`) | any other owner, named by account and SID | the owner of a Windows object can always rewrite its DACL, so a directory another account owns is one another account controls. SYSTEM and Administrators are accepted because they already control every file on the host; trusting them adds nobody who could not already replace `host-id` |
+| It **has a DACL** | a NULL DACL | Windows reads a NULL DACL as "Everyone: full control" |
+| No **allow ACE** grants a write right to anyone else | an ACE granting `WD`, `AD`, `WEA`, `WA`, `DC`, `D`, `WDAC`, `WO`, `GW` or `GA` to any principal other than the owner, the daemon's account, SYSTEM, Administrators, `OWNER RIGHTS` or `CREATOR OWNER` -- named by principal, scope and rights | the Windows form of "group- or world-writable". **Inherit-only ACEs count**: an ACE that applies only to children is exactly what would hand another user the `host-id` the daemon is about to create. `CREATOR OWNER` resolves, on each child, to that child's creator, and this rule is what restricts who may create one. `CREATOR GROUP` is refused: it resolves to the creator's primary *group*, whose members nobody vetted |
+| Every allow ACE can be read | an ACE whose trustee this code cannot read | "could not tell who it grants" is not "grants nobody" |
+
+Deny ACEs only ever remove access and are not consulted. Read and traverse
+rights for other users are allowed: they are the Windows form of the `0755`
+in the table above. There is no Windows form of the POSIX check's *exact*
+mode -- a DACL has no single canonical value -- so the invariant is what is
+enforced, for the default directory and for one named with
+`--host-identity-file` alike. The check is `inspectDirectoryAcl` in
+`runquota_ipc`; `tests/unit/t_host_state_directory_rules.nim` takes this table
+one row at a time, and `tests/integration/t_host_state_directory_trust.nim`
+asserts the refusals against a real daemon.
+
+**Why a bare `mkdir` is not enough.** `C:\ProgramData` hands every directory
+created under it `BUILTIN\Users:(CI)(WD,AD,WEA,WA)` -- any local user may add
+files and subdirectories -- so `mkdir C:\ProgramData\runquota` on its own makes
+a state directory in which another user can create `host-id` or
+`observations.sqlite3` before the daemon does, and own it. The daemon refuses
+that directory, and its refusal ends with the `icacls` line that repairs it,
+with the daemon's own account already filled in.
 
 ### Under Nix
 
@@ -289,12 +327,29 @@ sudo mkdir -p /run/runquota && sudo chown "$(id -u)":runquota /run/runquota && s
 ```
 
 On Windows there is only the state directory -- the endpoint is a named pipe,
-which lives in the kernel object namespace and needs no directory. The MSI
-creates it; by hand, from the account `runquotad` will run as:
+which lives in the kernel object namespace and needs no directory. **The MSI
+does not create it**: reprobuild's packaging layer places every Windows
+component under the install prefix and its MSI producer emits no
+`CreateFolder`, so the package cannot express `C:\ProgramData\runquota` (a gap
+recorded in `codetracer-specs/runbooks/packaging/runquota.md`). Create it once,
+from an elevated `cmd.exe`, as the account `runquotad` will run as -- or, for
+the shipped service, which runs as SYSTEM, from any elevated `cmd.exe`: the
+first two grants already cover SYSTEM, and the third then only adds you:
 
 ```bat
-mkdir C:\ProgramData\runquota
+mkdir "C:\ProgramData\runquota" && icacls "C:\ProgramData\runquota" /reset && icacls "C:\ProgramData\runquota" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "%USERDOMAIN%\%USERNAME%:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"
 ```
+
+`/inheritance:r` drops the `BUILTIN\Users` write ACE `C:\ProgramData` would
+otherwise hand the directory; the grants then give full control to SYSTEM,
+Administrators and the daemon's account, and read/traverse to every user --
+the `0755` of the POSIX rows. `/reset`, first and on its own, drops every
+*explicit* ACE: `/grant:r` replaces a principal's grant only for the same
+inheritance flags, so an explicit `Users:(CI)(WD,AD,...)` would survive it. A
+directory that already exists needs only the two `icacls` commands, which are
+what the daemon's refusal prints. Tightening a directory does not vet what is
+already in it: on a host where another user could write there, check the owner
+of any `host-id` or `observations.sqlite3` it holds before trusting them.
 
 `/run` (and `/var/run` on macOS) is cleared on boot, so the rendezvous
 directory has to be re-created at every boot — which is what

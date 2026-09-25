@@ -37,6 +37,8 @@ import daemon_binary
 import daemon_endpoint
 import owner_uid
 import scratch_root
+when defined(windows):
+  import windows_acl_fixture
 
 const CrashClientEnv = "RUNQUOTA_M13_CRASH_CLIENT"
 const CrashReadyEnv = "RUNQUOTA_M13_CRASH_READY"
@@ -690,10 +692,19 @@ suite "observation_socket_write_path":
     let socketPath = rendezvousDir(root) / "d.sock"
     let state = root / "state"
     createDir(state)
-    # WORLD-WRITABLE: the `sudo mkdir` an operator ran without the chmod.
-    setFilePermissions(state, {fpUserRead, fpUserWrite, fpUserExec,
-      fpGroupRead, fpGroupWrite, fpGroupExec,
-      fpOthersRead, fpOthersWrite, fpOthersExec})
+    when defined(windows):
+      # WRITABLE BY EVERY USER, the Windows way: the ACE `C:\ProgramData`
+      # hands each directory created under it, which is what a bare `mkdir`
+      # there produces. A POSIX mode means nothing on NTFS -- Nim's
+      # `setFilePermissions` only toggles the read-only attribute -- so the
+      # fixture is a DACL, built with `icacls`.
+      restrictToOwnerAndSystem(state)
+      grantUsersCreate(state)
+    else:
+      # WORLD-WRITABLE: the `sudo mkdir` an operator ran without the chmod.
+      setFilePermissions(state, {fpUserRead, fpUserWrite, fpUserExec,
+        fpGroupRead, fpGroupWrite, fpGroupExec,
+        fpOthersRead, fpOthersWrite, fpOthersExec})
     let identityFile = state / "host-id"
     let expectedDb = state / "observations.sqlite3"
 
@@ -707,7 +718,12 @@ suite "observation_socket_write_path":
       # refused.
       check daemon.startupLines[1].contains("capture enabled")
       check daemon.startupLines[2].contains("no host identity")
-      check daemon.startupLines[2].contains("group- or world-writable")
+      when defined(windows):
+        check daemon.startupLines[2].contains(
+          "writable by a principal other than its owner")
+        check daemon.startupLines[2].contains("S-1-5-32-545")
+      else:
+        check daemon.startupLines[2].contains("group- or world-writable")
 
       var client = connectDefault()
       discard client.completeOneExecution("untrusted", true)

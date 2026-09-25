@@ -184,6 +184,39 @@ proc hostStateDirectoryRefusal(config: DaemonConfig): string =
     # reports an unprovisioned host, with the command that provisions it,
     # and two reports for one condition would be one report too many.
     if trust.reason in {trustOk, trustMissing}: "" else: trust.message
+  elif defined(windows):
+    # THE SAME INVARIANT, ON A DACL. Windows has no mode to read; what the
+    # kernel checks is the directory's owner and its ACL, so that is what
+    # is verified (`inspectDirectoryAcl`; the rule is written down in
+    # `docs/database.md` beside the POSIX table). This arm used to return
+    # "" -- trusted, without looking -- on a platform where the documented
+    # `mkdir C:\ProgramData\runquota` produces exactly the directory the
+    # rule exists to refuse: `C:\ProgramData` hands every child
+    # `BUILTIN\Users:(CI)(WD,AD,WEA,WA)`, so any local user could plant
+    # `host-id` there first.
+    #
+    # The owner expected is the account this process runs as -- SYSTEM
+    # under the shipped service -- read from its own token, as the POSIX
+    # arm reads `getuid()`.
+    let identityPath =
+      if config.hostIdentityFilePath.len > 0: config.hostIdentityFilePath
+      else: defaultHostIdentityFile()
+    let directory = identityPath.parentDir
+    if directory.len == 0:
+      return ""
+    let trust = inspectDirectoryAcl(directory, processUserSid(),
+      label = "host state directory")
+    case trust.reason
+    of trustOk, trustMissing:
+      ""
+    of trustBadAcl:
+      # The repair is one line, and it is the one the install step should
+      # have run, so the refusal carries it -- with this daemon's own
+      # account filled in, as the provisioning refusal does.
+      trust.message & " -- tighten it with: " &
+        restrictHostStateDirCommand(directory)
+    else:
+      trust.message
   else:
     ""
 

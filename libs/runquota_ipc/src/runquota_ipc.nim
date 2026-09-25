@@ -96,6 +96,9 @@ when defined(windows):
 import runquota_ipc/types as ipcTypes
 import runquota_core
 import runquota_protocol
+when defined(windows):
+  import runquota_host_windows/security as windowsSecurity
+  export windowsSecurity
 
 export ipcTypes
 
@@ -288,6 +291,13 @@ type
       ## group is one no client can reach, or -- worse -- one the wrong
       ## population can.
     trustBadMode
+    trustBadAcl
+      ## WINDOWS ONLY: the directory's DACL lets a principal other than its
+      ## owner, the daemon's account, SYSTEM or Administrators write in it
+      ## (or has no DACL at all, which grants Everyone full control). The
+      ## Windows counterpart of ``trustBadMode``'s "group- or
+      ## world-writable": a DACL, not a mode, is what the kernel checks
+      ## there, so a separate reason rather than a mode that was never read.
 
   PathTrust* = object
     reason*: PathTrustReason
@@ -298,6 +308,9 @@ type
       ## The owning uid found on disk, or -1 when it could not be read.
     groupGid*: int64
       ## The owning gid found on disk, or -1 when it could not be read.
+    ownerSid*: string
+      ## WINDOWS: the owning SID found on disk, or "" when it could not be
+      ## read. Empty on POSIX, where ``ownerUid`` carries the same fact.
     message*: string
       ## Empty exactly when ``reason`` is ``trustOk``. Always names the
       ## offending path, and names the mode whenever one was read.
@@ -696,6 +709,195 @@ when defined(posix):
             "what lives there"
         else:
           "; the mode was not verified as created and MUST NOT be assumed")
+      return
+
+when defined(windows):
+  const
+    windowsSystemSid* = "S-1-5-18"
+      ## ``NT AUTHORITY\SYSTEM``: the account the shipped MSI registers
+      ## ``runquotad`` to run as (``Account="LocalSystem"``).
+    windowsAdministratorsSid* = "S-1-5-32-544"
+      ## ``BUILTIN\Administrators``. The owner Windows gives an object an
+      ## ELEVATED administrator creates, which is how an install step that
+      ## runs elevated leaves the directory.
+    windowsUsersSid* = "S-1-5-32-545"
+      ## ``BUILTIN\Users``: every interactive local user.
+    windowsCreatorOwnerSid* = "S-1-3-0"
+      ## ``CREATOR OWNER``. A placeholder, not a principal: in an
+      ## inheritable ACE it is replaced, on each new child, by that child's
+      ## owner, and on the directory itself it matches nobody.
+    windowsOwnerRightsSid* = "S-1-3-4"
+      ## ``OWNER RIGHTS``: whoever currently owns the object.
+    windowsWriteRights* = 0x500D0156'u32
+      ## Every access right that lets a principal change what a directory
+      ## holds, or who may: the specific bits of ``FILE_GENERIC_WRITE`` --
+      ## ``FILE_ADD_FILE`` 0x2, ``FILE_ADD_SUBDIRECTORY`` 0x4,
+      ## ``FILE_WRITE_EA`` 0x10, ``FILE_WRITE_ATTRIBUTES`` 0x100 -- plus
+      ## ``FILE_DELETE_CHILD`` 0x40, ``DELETE`` 0x10000, ``WRITE_DAC``
+      ## 0x40000, ``WRITE_OWNER`` 0x80000, and the generic
+      ## ``GENERIC_WRITE`` 0x40000000 and ``GENERIC_ALL`` 0x10000000 that
+      ## inheritable ACEs are commonly written with. Read and execute
+      ## rights are not here: a directory everybody may READ is the
+      ## ``0755`` the POSIX table asks for.
+
+  proc windowsRightsText(mask: uint32): string =
+    ## The write rights in ``mask``, in ``icacls``'s own abbreviations, so
+    ## a refusal reads the way the tool an operator repairs it with does.
+    const names = [
+      (0x10000000'u32, "GA"), (0x40000000'u32, "GW"), (0x2'u32, "WD"),
+      (0x4'u32, "AD"), (0x10'u32, "WEA"), (0x100'u32, "WA"),
+      (0x40'u32, "DC"), (0x10000'u32, "D"), (0x40000'u32, "WDAC"),
+      (0x80000'u32, "WO")]
+    var parts: seq[string] = @[]
+    for (bit, name) in names:
+      if (mask and bit) != 0:
+        parts.add(name)
+    parts.join(",")
+
+  proc windowsAceScopeText(flags: int): string =
+    ## Where an ACE applies, in ``icacls``'s notation: ``(OI)(CI)(IO)``...
+    var parts = ""
+    if (flags and 0x01) != 0: parts.add("(OI)")
+    if (flags and 0x02) != 0: parts.add("(CI)")
+    if (flags and 0x08) != 0: parts.add("(IO)")
+    if (flags and 0x04) != 0: parts.add("(NP)")
+    if (flags and 0x10) != 0: parts.add("(I)")
+    parts
+
+  proc windowsPrincipalText*(sid: string): string =
+    ## ``DOMAIN\name (S-1-...)``, or the bare SID when it does not resolve.
+    let name = accountNameOfSid(sid)
+    if name.len > 0: name & " (" & sid & ")" else: sid
+
+  proc inspectDirectoryAcl*(path: string; expectedOwnerSid: string;
+                            label: string): PathTrust =
+    ## THE WINDOWS FORM OF ``inspectPath`` FOR A DIRECTORY: the same
+    ## invariant, "nobody but this daemon -- and the principals that
+    ## already control the whole machine -- can replace what lives here",
+    ## stated on an owner SID and a DACL instead of a uid and a mode.
+    ##
+    ## ``docs/database.md`` §"Provisioning the host-wide state directory
+    ## and the rendezvous" is the normative text. In short:
+    ##
+    ## 1. It must exist and be a DIRECTORY -- not a file, and not a
+    ##    junction or symlink, which is refused rather than followed.
+    ## 2. Its OWNER must be ``expectedOwnerSid`` (the account the daemon
+    ##    runs as), SYSTEM, or Administrators. The owner of a Windows
+    ##    object may always rewrite its DACL, so an owner is a principal
+    ##    that can grant itself anything: a directory another account
+    ##    owns is one another account controls. SYSTEM and Administrators
+    ##    are accepted because they already control every file on the host
+    ##    (``SeTakeOwnershipPrivilege``, ``SeRestorePrivilege``), so
+    ##    trusting them adds no one who could not already replace
+    ##    ``host-id`` -- which is also why the POSIX check does not guard
+    ##    against root.
+    ## 3. It must HAVE a DACL. A NULL DACL grants Everyone full control.
+    ## 4. No ALLOW ACE may grant a write right (``windowsWriteRights``) to
+    ##    anyone but the owner, ``expectedOwnerSid``, SYSTEM,
+    ##    Administrators, ``OWNER RIGHTS``, or ``CREATOR OWNER``. INHERIT-
+    ##    ONLY ACEs COUNT: an ACE that applies only to children is exactly
+    ##    what would hand another user control of the ``host-id`` the
+    ##    daemon is about to create. ``CREATOR OWNER`` is accepted because
+    ##    it resolves, on each child, to that child's creator, and rule 4
+    ##    is what restricts who can create one. ``CREATOR GROUP`` is NOT:
+    ##    it resolves to the creator's primary GROUP, whose other members
+    ##    are nobody this rule has vetted. A deny ACE only ever removes
+    ##    access, and is not consulted.
+    ## 5. An allow ACE this code cannot read the trustee of is REFUSED.
+    ##    "Could not tell who it grants" is not "grants nobody".
+    ##
+    ## CHECK ORDER IS LOAD-BEARING, as in ``inspectPath``: ownership is
+    ## judged before the DACL, and the owner is among the principals the
+    ## DACL rule accepts -- as the POSIX rule ignores the owner's own mode
+    ## bits -- so a directory owned by another account and writable only
+    ## by it is refused FOR ITS OWNER. Were the ownership check removed,
+    ## such a directory would be accepted, which is what makes the
+    ## ownership check testable at all.
+    ##
+    ## There is no Windows form of the POSIX arm's EXACT mode. A DACL has
+    ## no single canonical value -- the same access is expressed by many
+    ## ACE lists -- so the invariant is what is enforced for every state
+    ## directory, default or named.
+    result = PathTrust(reason: trustOk, path: path, mode: -1, ownerUid: -1,
+                       groupGid: -1, ownerSid: "", message: "")
+    if path.len == 0:
+      result.reason = trustMissing
+      result.message = "runquota " & label & ": no path was given"
+      return
+    let facts = readDirectorySecurity(path)
+    if facts.errorCode in [NoSuchFileError, NoSuchPathError]:
+      result.reason = trustMissing
+      result.message = "runquota " & label & " " & path & ": does not exist"
+      return
+    if facts.errorCode != 0:
+      result.reason = trustUnreadable
+      result.message = "runquota " & label & " " & path &
+        ": cannot be inspected (Windows error " & $facts.errorCode & ")"
+      return
+    result.ownerSid = facts.ownerSid
+    const
+      fileAttributeDirectory = 0x10'u32
+      fileAttributeReparsePoint = 0x400'u32
+    if (facts.attributes and fileAttributeReparsePoint) != 0:
+      result.reason = trustWrongType
+      result.message = "runquota " & label & " " & path &
+        ": is a reparse point (a junction or symbolic link), not a " &
+        "directory; refusing to follow it, since its own ACL says nothing " &
+        "about the directory it leads to"
+      return
+    if (facts.attributes and fileAttributeDirectory) == 0:
+      result.reason = trustWrongType
+      result.message = "runquota " & label & " " & path &
+        ": is not a directory"
+      return
+    let owner = facts.ownerSid
+    if owner.len == 0 or expectedOwnerSid.len == 0 or
+        owner notin [expectedOwnerSid, windowsSystemSid,
+                     windowsAdministratorsSid]:
+      result.reason = trustForeignOwner
+      result.message = "runquota " & label & " " & path &
+        ": refusing a directory owned by " &
+        (if owner.len > 0: windowsPrincipalText(owner) else: "an unreadable owner") &
+        "; this process runs as " &
+        (if expectedOwnerSid.len > 0: windowsPrincipalText(expectedOwnerSid)
+         else: "an account whose SID could not be read") &
+        ", and only that account, SYSTEM (" & windowsSystemSid &
+        ") or Administrators (" & windowsAdministratorsSid &
+        ") may own it -- the owner of a directory can rewrite its ACL, so " &
+        "a directory another account owns is one another account controls"
+      return
+    if not facts.daclPresent:
+      result.reason = trustBadAcl
+      result.message = "runquota " & label & " " & path &
+        ": refusing a directory with no DACL, which grants Everyone full " &
+        "control, so another user can replace what lives there"
+      return
+    let trusted = [owner, expectedOwnerSid, windowsSystemSid,
+                   windowsAdministratorsSid, windowsOwnerRightsSid,
+                   windowsCreatorOwnerSid]
+    for ace in facts.aces:
+      # Deny ACEs, in every form, only ever take access away.
+      if ace.aceType in [1, 6, 10, 12]:
+        continue
+      let grants = ace.aceType in [0, 5, 9, 11]
+      if grants and ace.sidKnown and
+          (ace.mask and windowsWriteRights) == 0:
+        continue
+      if grants and ace.sidKnown and ace.sid in trusted:
+        continue
+      result.reason = trustBadAcl
+      if grants and ace.sidKnown:
+        result.message = "runquota " & label & " " & path &
+          ": refusing an ACL that grants " & windowsPrincipalText(ace.sid) &
+          " " & windowsAceScopeText(ace.flags) & "(" &
+          windowsRightsText(ace.mask) & "); it is writable by a principal " &
+          "other than its owner, SYSTEM and Administrators, so another " &
+          "user can replace what lives there"
+      else:
+        result.message = "runquota " & label & " " & path &
+          ": refusing an ACL carrying an ACE of type " & $ace.aceType &
+          " whose trustee or meaning could not be read; an entry that " &
+          "cannot be vetted is not one that grants nothing"
       return
 
 proc endpointDirectoryTrust*(endpoint: Endpoint;

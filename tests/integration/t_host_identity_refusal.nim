@@ -390,10 +390,15 @@ suite "host_identity_provisioning":
     check "must already exist" in runbookText
     check hostWideStateDir in runbookText
     # The by-hand command for THIS platform: `sudo mkdir -p` on POSIX, and on
-    # Windows the `mkdir` the daemon's own refusal prints
-    # (`provisionHostStateDirCommand`), which carries no uid to fill in.
+    # Windows the `mkdir` + `icacls` the daemon's own refusal prints
+    # (`provisionHostStateDirCommand`), with the daemon's account spelled the
+    # way the runbook must spell it -- as cmd.exe's `%USERDOMAIN%\%USERNAME%`
+    # of whoever runs it, where the daemon fills in its own SID. Asserting
+    # the whole line, not a prefix, is what keeps the runbook from going back
+    # to a bare `mkdir`, which produces a directory the daemon refuses.
     when defined(windows):
-      check provisionHostStateDirCommand(hostWideStateDir) in runbookText
+      check provisionHostStateDirCommand(hostWideStateDir,
+        r"%USERDOMAIN%\%USERNAME%") in runbookText
     else:
       check "sudo mkdir -p " & hostWideStateDir in runbookText
     check hostWideEndpointDir in runbookText

@@ -37,3 +37,8 @@ tests/compatibility/t_protocol_codec.nim
 tests/unit/t_version.nim
 tests/unit/t_standalone_capture_rules.nim
 tests/unit/t_packaging_contract.nim
+# Windows-SPECIFIC rather than platform-neutral, and here because it needs
+# neither a daemon nor sqlite3: the host-state-directory DACL rule, row by
+# row, against real directories whose ACLs `icacls` writes. Nothing else on
+# this job exercises the Windows half of that trust check.
+tests/unit/t_host_state_directory_rules.nim
