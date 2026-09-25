@@ -42,3 +42,8 @@ tests/unit/t_packaging_contract.nim
 # row, against real directories whose ACLs `icacls` writes. Nothing else on
 # this job exercises the Windows half of that trust check.
 tests/unit/t_host_state_directory_rules.nim
+# The owner id: pinned SID-hash vectors plus THIS process's id checked
+# against the SID `whoami /user` reports. Needs neither a daemon nor
+# sqlite3, and its Windows arm is the only place the named-pipe owner rule
+# is exercised on this job.
+tests/unit/t_owner_identity.nim
