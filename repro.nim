@@ -42,6 +42,7 @@
 import std/[os]
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 # ``shell(...)``, used by the documentation-book block at the end of
 # ``build:``. ``"sh"`` is already declared in ``uses:`` below, so the tool the
 # action runs through is provisioned by the same resolver as ``nim`` and
@@ -115,6 +116,9 @@ package runquota:
   # the way ``config.nims`` always finds it -- ``SHM_LEASE_SRC`` or the
   # workspace sibling -- so it needs nothing here.
   devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
     activity "default"
     task "test",
       command = "just test",
