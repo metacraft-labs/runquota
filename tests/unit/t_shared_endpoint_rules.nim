@@ -54,19 +54,31 @@ proc scratchDir(name: string): string =
 # endpoint is a named pipe with no directory, which `docs/database.md`
 # §"Provisioning the host-wide state directory and the rendezvous" records
 # as "— (named pipes)" with no owner, group or mode. Those cases are reported
-# skipped on Windows. The fixed-endpoint cases have a Windows arm, and the
-# per-user SEGMENT cases that put a mode on a file FAIL on Windows rather
-# than skip, because the segments have a Windows design and no Windows
-# implementation yet (`RunQuota-Shared-Memory-Structures.md`, "Windows arm:
-# designed only").
+# skipped on Windows. The fixed-endpoint cases have a Windows arm, and so do
+# the per-user SEGMENT cases that put a mode on a file: a Windows segment's
+# mode is the projection of its DACL onto owner / group / everybody else
+# (`runquota_ipc/segment_mode`, and `RunQuota-Shared-Memory-Structures.md`
+# §"Segment files and their mode on Windows"), so the same modes are set and
+# the same refusals are required of the same `segmentTrust`.
 
-template posixSegmentFile(body: untyped) =
-  when defined(posix):
+template segmentFileCase(body: untyped) =
+  ## The on-disk half of a segment case. POSIX modes where the kernel stores
+  ## one; the DACL's projection on Windows. Anywhere else there is no segment
+  ## to put a mode on, and the case FAILS rather than passing by doing
+  ## nothing.
+  when defined(posix) or defined(windows):
     body
   else:
-    checkpoint("shared-memory segments have no Windows implementation " &
-      "(RunQuota-Shared-Memory-Structures.md: Windows arm designed only)")
+    checkpoint("no segment-file mode on this platform")
     fail()
+
+proc setMode(path: string; mode: int): bool =
+  ## ``chmod(2)`` on POSIX; on Windows, the protected DACL that projects onto
+  ## ``mode``. The same call the shipped code makes (`setSegmentFileMode`).
+  when defined(posix):
+    chmod(path.cstring, Mode(mode)) == 0
+  else:
+    setSegmentFileMode(path, mode)
 
 when defined(posix):
   proc modeOf(path: string): int =
@@ -539,13 +551,13 @@ suite "shared_endpoint_per_user_state_is_unaffected":
     check endpointDirectoryMode == 0o750
 
   test "a per-user segment at the RENDEZVOUS modes is REFUSED":
-    posixSegmentFile:
+    segmentFileCase:
       let root = scratchDir("segmode")
       defer: removeDir(root)
       for mode in [endpointSocketMode, 0o640, 0o660, 0o750]:
         let path = root / ("ring" & $mode & ".seg")
         writeFile(path, "x")
-        check chmod(path.cstring, Mode(mode)) == 0
+        check setMode(path, mode)
         let trust = segmentTrust(path, segmentPerUser)
         check trust.reason == trustBadMode
         check path in trust.message
@@ -560,14 +572,20 @@ suite "shared_endpoint_per_user_state_is_unaffected":
     ## No chgrp: the file keeps whatever group it was born with, which
     ## differs by host and by `TMPDIR`, and the point is that the per-user
     ## rule does not care WHICH group it is.
-    posixSegmentFile:
+    segmentFileCase:
       let root = scratchDir("seggrp")
       defer: removeDir(root)
       let path = root / "budget.seg"
       writeFile(path, "x")
-      check chmod(path.cstring, Mode(0o600)) == 0
-      check groupOf(path) >= 0
+      check setMode(path, 0o600)
+      when defined(posix):
+        check groupOf(path) >= 0
+      else:
+        # A Windows file's group is a SID in its security descriptor, the
+        # counterpart of `st_gid`; it has one whether or not any entry of
+        # the DACL names it.
+        check readFileSecurity(path).group.len > 0
       check segmentTrust(path, segmentPerUser).reason == trustOk
 
-      check chmod(path.cstring, Mode(0o640)) == 0
+      check setMode(path, 0o640)
       check segmentTrust(path, segmentPerUser).reason == trustBadMode

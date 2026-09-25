@@ -94,6 +94,7 @@ when defined(windows):
   proc closeHandleW(hObject: WinHandle): WINBOOL {.stdcall, dynlib: "kernel32.dll", importc: "CloseHandle".}
 
 import runquota_ipc/types as ipcTypes
+import runquota_ipc/segment_mode
 import runquota_core
 import runquota_protocol
 when defined(windows):
@@ -101,6 +102,7 @@ when defined(windows):
   export windowsSecurity
 
 export ipcTypes
+export segment_mode
 
 const libraryName* = "runquota_ipc"
 
@@ -931,6 +933,64 @@ proc endpointDirectoryTrust*(endpoint: Endpoint;
     PathTrust(reason: trustOk, path: "", mode: -1, ownerUid: -1, groupGid: -1,
               message: "")
 
+when defined(windows):
+  proc windowsSegmentTrust(path: string; requiredMode: int): PathTrust =
+    ## ``inspectPath`` for a segment FILE on Windows: the same checks in the
+    ## same order -- existence, type, OWNERSHIP, then mode -- over the owner
+    ## SID and the DACL's projected mode, with the same refusal wording so a
+    ## message reads the same on every platform.
+    result = PathTrust(reason: trustOk, path: path, mode: -1, ownerUid: -1,
+                       groupGid: -1, ownerSid: "", message: "")
+    let label = "segment"
+    if path.len == 0:
+      result.reason = trustMissing
+      result.message = "runquota " & label & ": no path was given"
+      return
+    if not fileExists(path) and not dirExists(path) and
+        not symlinkExists(path):
+      result.reason = trustMissing
+      result.message = "runquota " & label & " " & path & ": does not exist"
+      return
+    let security = readFileSecurity(path)
+    if not security.readable or security.mode < 0:
+      result.reason = trustUnreadable
+      result.message = "runquota " & label & " " & path &
+        ": cannot be inspected (its security descriptor is unreadable)"
+      return
+    result.mode = security.mode
+    result.ownerSid = sidText(security.owner)
+    # A symlink is refused as the wrong type, for the reason `lstat` is used
+    # on POSIX: following it would verify whatever it points at.
+    if symlinkExists(path) or not fileExists(path):
+      result.reason = trustWrongType
+      result.message = "runquota " & label & " " & path & ": mode " &
+        modeText(result.mode) & " is not a regular file" &
+        "; refusing to use it as a rendezvous path"
+      return
+    let own = processOwnerSids()
+    if security.owner notin own:
+      var mine: seq[string] = @[]
+      for sid in own: mine.add(sidText(sid))
+      result.reason = trustForeignOwner
+      result.message = "runquota " & label & " " & path &
+        ": refusing a path owned by SID " & result.ownerSid &
+        " with mode " & modeText(result.mode) &
+        "; this process runs as SID " & mine.join(" / ") &
+        ", and a rendezvous point another user owns is a rendezvous point " &
+        "another user controls"
+      return
+    let writable = (result.mode and 0o022) != 0
+    if result.mode != requiredMode:
+      result.reason = trustBadMode
+      result.message = "runquota " & label & " " & path &
+        ": refusing mode " & modeText(result.mode) & ", required " &
+        modeText(requiredMode) &
+        (if writable:
+          "; it is group- or world-writable, so another user can replace " &
+            "what lives there"
+        else:
+          "; the mode was not verified as created and MUST NOT be assumed")
+
 proc segmentTrust*(path: string; scope: SegmentScope;
                    expectedOwnerUid = -1'i64): PathTrust =
   ## Whether a shared-memory segment file may be mapped. Exposed now, and
@@ -944,6 +1004,10 @@ proc segmentTrust*(path: string; scope: SegmentScope;
   ## ring did NOT. So no ``RendezvousPolicy`` reaches this code: the owner
   ## is the calling user, the group is not consulted at all, and the mode
   ## comes from ``requiredSegmentMode``.
+  ##
+  ## WINDOWS: the same rule over the DACL's projection (`segment_mode`),
+  ## with the owner compared as a SID. ``expectedOwnerUid`` has no meaning
+  ## there; "this process's own" is the token's default owner or its user.
   when defined(posix):
     let owner =
       if expectedOwnerUid >= 0: expectedOwnerUid else: int64(getuid())
@@ -951,6 +1015,8 @@ proc segmentTrust*(path: string; scope: SegmentScope;
       requiredMode = requiredSegmentMode(scope),
       expectedOwnerUid = owner,
       label = "segment")
+  elif defined(windows):
+    windowsSegmentTrust(path, requiredSegmentMode(scope))
   else:
     PathTrust(reason: trustOk, path: path, mode: -1, ownerUid: -1, groupGid: -1,
               message: "")

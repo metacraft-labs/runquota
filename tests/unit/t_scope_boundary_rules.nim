@@ -49,11 +49,12 @@ import runquota_observation_store
 # are reported skipped there.
 #
 # The SEGMENT cases that put a file on disk and read its mode are NOT
-# restricted: the shared-memory segments have a Windows design and no Windows
-# implementation yet (`RunQuota-Shared-Memory-Structures.md`, "Windows arm:
-# designed only"), so on Windows they FAIL, saying so, rather than pass or
-# skip. The segment-scope constants and the host identity cases run
-# everywhere.
+# restricted. On Windows a segment's mode is the projection of its DACL onto
+# owner / group / everybody else (`runquota_ipc/segment_mode`, and
+# `RunQuota-Shared-Memory-Structures.md` §"Segment files and their mode on
+# Windows"), so the same modes are set there and the same refusals are
+# required of the same `segmentTrust`; ownership is compared as a SID. The
+# segment-scope constants and the host identity cases run everywhere.
 
 when defined(posix):
   proc groupOf(path: string): int64 =
@@ -321,15 +322,38 @@ else:
       test name:
         skip()
 
-template posixSegmentFile(body: untyped) =
-  ## The on-disk half of a segment case: POSIX file modes. See the note
-  ## above -- on Windows this is an unimplemented arm and FAILS.
-  when defined(posix):
+template segmentFileCase(body: untyped) =
+  ## The on-disk half of a segment case: POSIX file modes, or the DACL's
+  ## projection on Windows. See the note above. Anywhere else there is no
+  ## segment to put a mode on, and the case FAILS rather than passing by
+  ## doing nothing.
+  when defined(posix) or defined(windows):
     body
   else:
-    checkpoint("shared-memory segments have no Windows implementation " &
-      "(RunQuota-Shared-Memory-Structures.md: Windows arm designed only)")
+    checkpoint("no segment-file mode on this platform")
     fail()
+
+when defined(windows):
+  proc modeOf(path: string): int =
+    ## The DACL's projection -- what `segmentTrust` itself reads.
+    segmentFileMode(path)
+
+proc setSegmentPerms(path: string; perms: set[FilePermission]) =
+  ## ``setFilePermissions`` where the kernel stores a mode. On Windows that
+  ## call only toggles the read-only attribute, so the same permission set is
+  ## written as the protected DACL that projects onto it, through the call
+  ## the shipped code makes (`setSegmentFileMode`).
+  when defined(posix):
+    setFilePermissions(path, perms)
+  else:
+    var mode = 0
+    for (perm, bit) in [(fpUserRead, 0o400), (fpUserWrite, 0o200),
+        (fpUserExec, 0o100), (fpGroupRead, 0o040), (fpGroupWrite, 0o020),
+        (fpGroupExec, 0o010), (fpOthersRead, 0o004), (fpOthersWrite, 0o002),
+        (fpOthersExec, 0o001)]:
+      if perm in perms: mode = mode or bit
+    doAssert setSegmentFileMode(path, mode), "could not give " & path &
+      " mode " & modeText(mode)
 
 suite "scope_boundary_rules_segment_scopes":
   # THE THREE STRUCTURES DO NOT SHARE ONE RULE. These are separate tests
@@ -339,17 +363,17 @@ suite "scope_boundary_rules_segment_scopes":
 
   test "per-user segments are 0600":
     check requiredSegmentMode(segmentPerUser) == 0o600
-    posixSegmentFile:
+    segmentFileCase:
       let root = scratchDir("peruser")
       defer: removeDir(root)
       let path = root / "budget.seg"
       writeFile(path, "x")
-      setFilePermissions(path, {fpUserRead, fpUserWrite})
+      setSegmentPerms(path, {fpUserRead, fpUserWrite})
       check modeOf(path) == 0o600
       check segmentTrust(path, segmentPerUser).reason == trustOk
 
   test "a group- or world-writable per-user segment is REFUSED, and named":
-    posixSegmentFile:
+    segmentFileCase:
       let root = scratchDir("segwide")
       defer: removeDir(root)
       for (perms, mode) in [
@@ -359,7 +383,7 @@ suite "scope_boundary_rules_segment_scopes":
             fpOthersRead, fpOthersWrite}, 0o666)]:
         let path = root / ("ring-" & $mode & ".seg")
         writeFile(path, "x")
-        setFilePermissions(path, perms)
+        setSegmentPerms(path, perms)
         check modeOf(path) == mode
         let trust = segmentTrust(path, segmentPerUser)
         check trust.reason == trustBadMode
@@ -378,18 +402,18 @@ suite "scope_boundary_rules_segment_scopes":
     check segmentIsGroupReadable(segmentHostWide)
     check (requiredSegmentMode(segmentHostWide) and 0o040) != 0
 
-    posixSegmentFile:
+    segmentFileCase:
       let root = scratchDir("hostwide")
       defer: removeDir(root)
       let path = root / "stats.seg"
       writeFile(path, "x")
-      setFilePermissions(path, {fpUserRead, fpUserWrite, fpGroupRead})
+      setSegmentPerms(path, {fpUserRead, fpUserWrite, fpGroupRead})
       check modeOf(path) == 0o640
       check segmentTrust(path, segmentHostWide).reason == trustOk
 
       # The same file at 0600 is REFUSED for the host-wide scope: a table no
       # second user can read is a table that has stopped being host-wide.
-      setFilePermissions(path, {fpUserRead, fpUserWrite})
+      setSegmentPerms(path, {fpUserRead, fpUserWrite})
       check modeOf(path) == 0o600
       let tooTight = segmentTrust(path, segmentHostWide)
       check tooTight.reason == trustBadMode
@@ -408,12 +432,12 @@ suite "scope_boundary_rules_segment_scopes":
   test "the host-wide table still refuses a group-WRITABLE mode":
     # Group-readable is the exception; group-writable is not. The reason
     # the table needs no isolation is that no client can write it.
-    posixSegmentFile:
+    segmentFileCase:
       let root = scratchDir("hostwritable")
       defer: removeDir(root)
       let path = root / "stats.seg"
       writeFile(path, "x")
-      setFilePermissions(path, {fpUserRead, fpUserWrite, fpGroupRead,
+      setSegmentPerms(path, {fpUserRead, fpUserWrite, fpGroupRead,
         fpGroupWrite})
       check modeOf(path) == 0o660
       let trust = segmentTrust(path, segmentHostWide)
@@ -422,23 +446,52 @@ suite "scope_boundary_rules_segment_scopes":
       check "group- or world-writable" in trust.message
 
   test "a segment owned by another uid is REFUSED":
-    posixSegmentFile:
-      let foreign = foreignOwnedDirectory()
-      check foreign.len > 0
-      if foreign.len > 0:
-        # A real regular file owned by another uid, inside it.
+    segmentFileCase:
+      when defined(posix):
+        let foreign = foreignOwnedDirectory()
+        check foreign.len > 0
+        if foreign.len > 0:
+          # A real regular file owned by another uid, inside it.
+          var victim = ""
+          for candidate in [foreign / "bin" / "sh", foreign / "sh",
+                            "/bin/sh", "/usr/bin/env"]:
+            if fileExists(candidate) and ownerOf(candidate) != int64(getuid()):
+              victim = candidate
+              break
+          check victim.len > 0
+          if victim.len > 0:
+            let trust = segmentTrust(victim, segmentPerUser)
+            check trust.reason == trustForeignOwner
+            check victim in trust.message
+            check ("owned by uid " & $ownerOf(victim)) in trust.message
+            check modeText(trust.mode) in trust.message
+
+      else:
+        # A real regular file this host already has, owned by a SID that is
+        # neither this token's default owner nor its user: the system binaries
+        # belong to TrustedInstaller. Foreign ownership is the thing under
+        # test, so it is required rather than assumed, and the check must fire
+        # AS AN OWNERSHIP problem, naming the owner and the mode it read.
+        let own = processOwnerSids()
         var victim = ""
-        for candidate in [foreign / "bin" / "sh", foreign / "sh",
-                          "/bin/sh", "/usr/bin/env"]:
-          if fileExists(candidate) and ownerOf(candidate) != int64(getuid()):
+        var victimOwner = ""
+        let system32 = getEnv("SystemRoot", r"C:\Windows") / "System32"
+        for candidate in [system32 / "cmd.exe", system32 / "notepad.exe",
+                          system32 / "kernel32.dll"]:
+          if not fileExists(candidate): continue
+          let security = readFileSecurity(candidate)
+          if security.readable and security.owner.len > 0 and
+              security.owner notin own:
             victim = candidate
+            victimOwner = sidText(security.owner)
             break
         check victim.len > 0
         if victim.len > 0:
           let trust = segmentTrust(victim, segmentPerUser)
           check trust.reason == trustForeignOwner
           check victim in trust.message
-          check ("owned by uid " & $ownerOf(victim)) in trust.message
+          check trust.ownerSid == victimOwner
+          check ("owned by SID " & victimOwner) in trust.message
           check modeText(trust.mode) in trust.message
 
 suite "scope_boundary_rules_host_identity":
