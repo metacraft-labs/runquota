@@ -1,0 +1,29 @@
+# THE TOOL-STORE AUTHORITY'S PINS: which toolchain the static-helper gate
+# accepts when it runs in a reprobuild dev shell rather than in `nix develop`.
+#
+# This file is to the tool-store arm what `flake.lock` is to the Nix arm: the
+# committed, reviewed statement of WHICH compiler the gate may use. A change of
+# toolchain is therefore a change to this file, made on purpose, and never
+# something the dev shell's resolution decides on its own -- a dev shell that
+# provisions anything else is REFUSED, by name, and the refusal says which line
+# to change here.
+#
+# Each identity is the `lockIdentity` reprobuild records in the prefix's
+# `.reprobuild-tarball-receipt.json`, which ends in the SHA-256 of the release
+# archive the prefix was realised from. The gate checks the receipt against
+# this line, then hashes the archive itself and extracts the compiler it uses
+# FRESH from that archive, so what compiles and scans is the pinned bytes and
+# not whatever a mutable prefix now holds. The values are reprobuild's own
+# (`repro_dsl_stdlib/packages/{nim,gcc,git}.nim` at reprobuild
+# 090a9cbf6); they are copied here rather than read from there because the
+# point of a pin is that the gate does not ask the thing it is checking.
+#
+# Hosts with no line here have no tool-store authority, and the gate says so
+# instead of running: on Linux and macOS the repro dev shell is the flake's
+# (`repro.nim`: `useFlakeDevShell()`), whose `runquota-static-helper-gate` is
+# the Nix arm.
+#
+# <host>          <tool> <lockIdentity>
+windows-x86_64    nim    tarball:nim@2.2.10:sha256:fe0686a9b298e5b13d0a983df37e002a8c6320f8b16cc45a51d15cf4046a109f
+windows-x86_64    gcc    tarball:gcc-winlibs@16.1.0:sha256:62fb8588d2deee7d662dbcbd386702adbf19643764c971c38aa4839472eee232
+windows-x86_64    git    tarball:git@2.54.0:sha256:bea006a6cc69673f27b1647e84ab3a68e912fbc175ab6320c5987e012897f311

@@ -69,19 +69,80 @@ proc reportScan(scan: SourceScan): bool =
     stderr.writeLine("Nim source has lexical errors")
   result = scan.refTokens.len == 0 and scan.lexicalErrors == 0
 
+when defined(windows):
+  # WINDOWS: `expandFilename` is `GetFullPathNameW`, which normalises a
+  # path LEXICALLY and never follows a symbolic link or junction -- unlike
+  # POSIX `realpath`, which this scanner's root policy was written against.
+  # Without the final-path resolution below, a module reached through a
+  # link inside the repository would be judged by where the LINK sits, so
+  # a link escaping to an untrusted root would pass as a repository file.
+  import std/winlean
+
+  proc getFinalPathNameByHandleW(handle: Handle; buffer: WideCString;
+                                 size: DWORD; flags: DWORD): DWORD {.
+    stdcall, dynlib: "kernel32", importc: "GetFinalPathNameByHandleW".}
+
+  proc finalPath(path: string): string =
+    ## Where ``path`` really is: every link and junction on the way
+    ## resolved, the true case of every component, no 8.3 short names --
+    ## the Windows answer to `realpath`.
+    let handle = createFileW(newWideCString(path), 0'i32,
+      FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0)
+    if handle == INVALID_HANDLE_VALUE:
+      raise newException(IOError,
+        "cannot open for final-path resolution: " & path)
+    defer: discard closeHandle(handle)
+    var buffer = newWideCString("", 32768)
+    let length = getFinalPathNameByHandleW(handle, buffer, 32767, 0)
+    if length == 0 or length >= 32767:
+      raise newException(IOError, "cannot resolve the final path of: " & path)
+    result = $buffer
+    const uncPrefix = r"\\?\UNC\"
+    const longPrefix = r"\\?\"
+    if result.startsWith(uncPrefix):
+      result = r"\\" & result[uncPrefix.len .. ^1]
+    elif result.startsWith(longPrefix):
+      result = result[longPrefix.len .. ^1]
+
+proc canonicalPath(path: string): string =
+  ## POSIX: `realpath`. Windows: the final path, which is what `realpath`
+  ## answers there.
+  when defined(windows):
+    finalPath(expandFilename(absolutePath(path)))
+  else:
+    expandFilename(absolutePath(path))
+
 proc canonicalDirectory(path, description: string): string =
   if path.len == 0:
     raise newException(ValueError, description & " must not be empty")
-  result = expandFilename(absolutePath(path))
+  result = canonicalPath(path)
   if getFileInfo(result, followSymlink = false).kind != pcDir:
     raise newException(ValueError, description & " is not a directory: " & path)
 
 proc canonicalFile(path, description: string): string =
   if path.len == 0:
     raise newException(ValueError, description & " must not be empty")
-  result = expandFilename(absolutePath(path))
+  result = canonicalPath(path)
   if getFileInfo(result, followSymlink = false).kind != pcFile:
     raise newException(ValueError, description & " is not a regular file: " & path)
+
+proc spelledCanonically(dependency, canonical: string): bool =
+  ## Whether the compiler wrote ``dependency`` in canonical form.
+  ##
+  ## POSIX: byte-equal to its `realpath`, because the compiler canonicalises
+  ## with `realpath` itself. WINDOWS: equal to its own LEXICAL full path.
+  ## The compiler canonicalises with `GetFullPathNameW` there, so a module
+  ## reached through a link is written as the link's path, and a search path
+  ## spelt with an 8.3 short name or another case stays spelt that way;
+  ## demanding final-path equality would refuse such a manifest for a reason
+  ## that says nothing about trust. Lexical equality still refuses what the
+  ## check exists for -- `..`, `.`, a relative or forward-slashed spelling --
+  ## and every policy decision is taken on ``canonical``, the final path.
+  when defined(windows):
+    dependency == expandFilename(dependency)
+  else:
+    dependency == canonical
 
 proc isWithin(path, root: string): bool =
   path == root or path.startsWith(root & DirSep)
@@ -136,7 +197,7 @@ proc scanClosure(
       )
 
     let canonical = canonicalFile(dependency, "compiler dependency")
-    if dependency != canonical:
+    if not spelledCanonically(dependency, canonical):
       raise newException(
         ValueError,
         "compiler dependency path is not canonical: " & dependency &

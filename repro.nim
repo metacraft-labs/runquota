@@ -94,6 +94,14 @@ package runquota:
     # coreutils (find, sort, timeout, ...) on the script's PATH.
     "bash >=4"
 
+    # ``git``, which the static-helper gate's tool-store authority
+    # (``scripts/static_helper_gate_toolstore.sh``, the arm ``just test`` runs
+    # outside ``nix develop`` on Windows) uses to prove its source snapshot is
+    # the tracked tree. It is pinned there, by identity, alongside ``nim`` and
+    # ``gcc`` (``scripts/static_helper_gate_toolstore.pins``); on Windows this
+    # realises the same PortableGit archive ``bash`` and ``sh`` come from.
+    "git >=2"
+
     # THE ``sqlite3`` COMMAND-LINE TOOL, a runtime dependency of the
     # observation store and of ``runquota_persistence``: both reach SQLite by
     # spawning it rather than linking a library, so that its absence is a
