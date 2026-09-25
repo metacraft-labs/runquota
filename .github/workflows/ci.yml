@@ -166,12 +166,20 @@ jobs:
           env-flavor: windows-diy
           gh-token: ${{ steps.ci_token.outputs.token }}
 
-      # THE CHECKOUT IS DELIBERATELY BARE. No sibling repositories and no
-      # `SHM_LEASE_SRC`, so `config.nims` resolves neither -- which is exactly
-      # the environment fee60f4's defect was found in, and the reason this job
-      # sees it. If a Windows build ever legitimately needs `nim-shm-lease`,
-      # this step fails and the fix is to provide it here, not to weaken the
-      # gate.
+      # THE CHECKOUT IS BARE, AND ONE DEPENDENCY IS PROVIDED BY NAME. No
+      # sibling repositories, so `config.nims` can resolve nothing by
+      # accident of layout -- the environment fee60f4's defect was found in.
+      # This step used to end "if a Windows build ever legitimately needs
+      # `nim-shm-lease`, this step fails and the fix is to provide it here,
+      # not to weaken the gate", and that day came: the published stats
+      # table's Windows arm reuses `nim-shm-lease`'s anchor exactly as the
+      # POSIX arms do. So it is provided here, at the revision `flake.lock`
+      # pins -- the one the Nix legs build against -- and through
+      # `SHM_LEASE_SRC`, never as a sibling.
+      - name: Provide nim-shm-lease at the pinned revision
+        shell: pwsh
+        run: ./scripts/provide_shm_lease.ps1 -Destination (Join-Path $env:RUNNER_TEMP "nim-shm-lease")
+
       - name: Build every entrypoint natively
         shell: pwsh
         run: |

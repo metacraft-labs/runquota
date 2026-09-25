@@ -36,21 +36,26 @@
 ## import it -- so it is type-checked either way; it is merely absent from the
 ## generated C.)
 ##
-## HERMETICITY, AND WHY IT IS NOT OPTIONAL HERE. The check runs with
-## `SHM_LEASE_SRC` (and `REPROBUILD_SRC`) removed from the child environment,
-## from a working directory three levels below the repository root. Both
-## facts are load-bearing rather than tidy-mindedness: `config.nims` resolves
-## `shm_lease` from `SHM_LEASE_SRC` -- which the Nix dev shell exports, so
-## `nix develop --command just test` has it set -- and then from
-## `../nim-shm-lease/src` and `../../nim-shm-lease/src` relative to the
-## compiler's working directory, which every developer workspace satisfies.
-## Left alone, BOTH fallbacks resolve and the publisher's unguarded
-## `shm_lease` import type-checks in either direction, so the gate would
-## report green against the very defect fee60f4 fixed. Removed, the gate sees
-## what a fresh CI checkout of this repository alone sees, which is the
-## environment the defect was found in. Nothing in this tree needs
-## `shm_lease` when targeting Windows -- the publisher is an inert stub
-## there -- so a failure to resolve it is by itself the finding.
+## HERMETICITY, AND WHAT CHANGED ABOUT IT. The check runs from a working
+## directory three levels below the repository root, with `REPROBUILD_SRC`
+## removed and `SHM_LEASE_SRC` set EXPLICITLY to the one `nim-shm-lease` this
+## tree builds against -- resolved the way `config.nims` resolves it, from
+## this repository's root rather than from wherever the compiler happens to
+## run -- so the compiler reaches that dependency through the variable and
+## through no accident of the workspace layout.
+##
+## It used to REMOVE `SHM_LEASE_SRC`, and the reason is worth keeping. When
+## the gate was written nothing in this tree needed `shm_lease` for Windows:
+## the published stats table was an inert stub there, so an unguarded
+## `shm_lease` import in it (fee60f4) was a defect, and the way to see one was
+## to make `shm_lease` unresolvable. The table now has a Windows arm, and it
+## reuses `nim-shm-lease`'s anchor exactly as the POSIX arms do -- so for
+## Windows `nim-shm-lease` is a DEPENDENCY, not an accident, and a gate that
+## hid it would fail every correct tree. `.github/workflows/ci.yml` said in
+## advance what to do then ("the fix is to provide it here, not to weaken the
+## gate"), and this is that: the dependency is provided, by name, and what the
+## gate asserts -- every entrypoint and every library type-checks for
+## Windows -- is unchanged.
 ##
 ## WHAT IT DOES NOT COVER. `nim check` type-checks; it does not run the C
 ## compiler or the linker, and it uses the HOST's stdlib sources, so a
@@ -113,11 +118,26 @@ proc gateTargets(root: string): seq[CheckTarget] =
       label: lib,
       projectFile: root / "libs" / lib / "src" / (lib & ".nim"))
 
-proc hermeticChildEnv(): StringTableRef =
-  ## The current environment MINUS the two variables that would let the
-  ## compiler resolve a sibling checkout. See the module docstring: with
-  ## `SHM_LEASE_SRC` left in place the gate cannot see the publisher defect
-  ## at all.
+proc shmLeaseSource(root: string): string =
+  ## The `nim-shm-lease` source this tree builds against, found the way
+  ## `config.nims` finds it -- `SHM_LEASE_SRC`, then the workspace siblings --
+  ## but anchored at the REPOSITORY ROOT and returned absolute, or "" when
+  ## there is none. "" is a finding, not a skip: the Windows arm of the
+  ## published stats table imports it.
+  let fromEnv = getEnv("SHM_LEASE_SRC")
+  if fromEnv.len > 0 and fileExists(fromEnv / "shm_lease" / "anchor.nim"):
+    return absolutePath(fromEnv)
+  for candidate in [root / ".." / "nim-shm-lease" / "src",
+                    root / ".." / ".." / "nim-shm-lease" / "src"]:
+    if fileExists(candidate / "shm_lease" / "anchor.nim"):
+      return absolutePath(candidate).normalizedPath()
+  ""
+
+proc hermeticChildEnv(root: string): StringTableRef =
+  ## The current environment with `REPROBUILD_SRC` removed and
+  ## `SHM_LEASE_SRC` set to exactly the dependency `shmLeaseSource` found --
+  ## so the compiler reaches `nim-shm-lease` by name, and never through a
+  ## path that happens to resolve from its working directory.
   const mode =
     when defined(windows): modeCaseInsensitive else: modeCaseSensitive
   result = newStringTable(mode)
@@ -125,6 +145,9 @@ proc hermeticChildEnv(): StringTableRef =
     if key == "SHM_LEASE_SRC" or key == "REPROBUILD_SRC":
       continue
     result[key] = value
+  let shmLease = shmLeaseSource(root)
+  if shmLease.len > 0:
+    result["SHM_LEASE_SRC"] = shmLease
 
 proc runChecks(root: string; targets: seq[CheckTarget]): seq[CheckOutcome] =
   ## Type-check every target for Windows, a bounded number at a time, and
@@ -143,7 +166,7 @@ proc runChecks(root: string; targets: seq[CheckTarget]): seq[CheckOutcome] =
   let workDir = root / "build" / "windows-compile-gate" / "cwd"
   createDir(workDir)
   let cacheRoot = root / "build" / "nimcache" / "windows-compile-gate"
-  let childEnv = hermeticChildEnv()
+  let childEnv = hermeticChildEnv(root)
 
   var workers = osproc.countProcessors()
   if workers < 2:
@@ -219,9 +242,18 @@ suite "windows_compile_gate":
     for target in targets:
       check fileExists(target.projectFile)
 
-  test "the child environment cannot reach a sibling nim-shm-lease checkout":
-    let childEnv = hermeticChildEnv()
-    check not childEnv.hasKey("SHM_LEASE_SRC")
+  test "the child environment names nim-shm-lease explicitly, and nothing else":
+    # THE DEPENDENCY IS PRESENT, BY NAME. Without it every target that
+    # reaches the published stats table fails for a reason that is not a
+    # Windows defect, and the report below would say so -- this says it first
+    # and names the cause.
+    let childEnv = hermeticChildEnv(root)
+    check shmLeaseSource(root).len > 0
+    check childEnv.hasKey("SHM_LEASE_SRC")
+    if childEnv.hasKey("SHM_LEASE_SRC"):
+      let source = childEnv["SHM_LEASE_SRC"]
+      check source.isAbsolute
+      check fileExists(source / "shm_lease" / "anchor.nim")
     check not childEnv.hasKey("REPROBUILD_SRC")
     # The removal only means something if PATH survived it: an empty
     # environment would fail every check for an unrelated reason and look

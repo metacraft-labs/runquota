@@ -103,6 +103,14 @@ jobs:
             exit 1
           fi
 
+      - name: Provide nim-shm-lease at the pinned revision
+        # `runquotad` imports `nim-shm-lease` on Windows too (the published
+        # stats table's anchor). Cloned as the workspace SIBLING, at the
+        # revision `flake.lock` pins: `config.nims` finds it there whether or
+        # not the build forwards `SHM_LEASE_SRC`, which the script also sets.
+        shell: pwsh
+        run: ./scripts/provide_shm_lease.ps1 -Destination ../nim-shm-lease
+
       - name: Build the shipping binaries
         # The ROOT project's two `nim.c` edges, which are what
         # `apps/entrypoints.txt` names and what `scripts/build_apps.sh`
