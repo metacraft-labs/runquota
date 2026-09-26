@@ -150,6 +150,17 @@ proc applyMigrations(store: ObservationStore; fromVersion: int64): bool =
   store.schemaVersion = current
   true
 
+proc pendingObservationStore*(path: string): ObservationStore =
+  ## A store whose open has not happened yet: ``ssVerifying``, capture off.
+  ## For a caller that runs ``openObservationStore`` somewhere it can afford
+  ## to wait -- the daemon does it on a thread of its own, so that a large
+  ## store's ``quick_check`` does not keep its endpoint unbound -- and needs
+  ## something honest to hold in the meantime. Never touches ``path``.
+  ObservationStore(path: path, status: ssVerifying,
+    report: "runquota observation store " & path &
+      ": verifying; capture starts once the store has been checked",
+    schemaVersion: -1)
+
 proc openObservationStore*(path: string; createParent = true): ObservationStore =
   ## Opens (creating if necessary) the store at ``path``. Never raises.
   ##

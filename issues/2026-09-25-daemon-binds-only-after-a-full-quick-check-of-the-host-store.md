@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | open |
+| Status | fixed on branch `fix/listen-before-store-check` (awaiting merge to `dev`) |
 | Recorded | 2026-09-25 |
 | Observed in | runquota @ b561f93 (the revision reprobuild `dev` pins); the code is unchanged at `dev` 24654b5 |
 | Area | `libs/runquota_observation_store` (`openObservationStore`, `integrityDetail`); `libs/runquota_daemon` (daemon construction) |
@@ -83,3 +83,60 @@ still pays something proportional to the store.
 - `docs/database.md`, "Corruption handling" and "What exists today".
 - reprobuild: the private-daemon helpers in its e2e/integration tests (the
   `ensureRunQuotaDaemon` copies) and `repro_core/paths.runquotaEndpointPath`.
+
+## Resolution
+
+Took the first suggested direction, and without changing the startup
+contract.
+
+- **Root cause.** `serve` (`libs/runquota_daemon`) called `initDaemon`, whose
+  object constructor called `openObservationStore(...)` -- and with it
+  `integrityDetail`'s whole-file `pragma quick_check` -- before
+  `bindEndpoint`.
+- **Change.** `serve` now builds the daemon with `initDaemon(config,
+  deferCapture = true)`, which holds a `pendingObservationStore` (new status
+  `ssVerifying`, capture off, file untouched); binds; prints and flushes the
+  listening line; starts the worker pool (and reports `SERVICE_RUNNING` on
+  Windows); and only then starts `captureOpenerMain`, a thread that runs
+  `openCapture` (the old store/identity/profile/writer block of `initDaemon`,
+  unchanged, lifted out) WITHOUT the daemon lock, installs the result under
+  it with `installCapture`, and prints the second and third startup lines.
+  `initDaemon(config)` with the default still opens synchronously.
+- **What the spec required, and what was kept.** `docs/database.md`,
+  "Corruption handling" (OS-4): a failing store "degrades to no capture and
+  the daemon keeps serving leases" -- so leases never depended on the check,
+  and are now served during it. The check itself still runs in full on every
+  start, and nothing is written to or read from the store before it passes:
+  every store operation refuses a `verifying` store as it refuses a degraded
+  one. Sessions opened in that window are served and not recorded.
+- **Startup output.** Still exactly three lines, same order, same content;
+  only the first now appears before the check. `runquota inspect
+  observations` gains `store_status` (`verifying`, `open`, or a degradation).
+- **The opener thread outlives what it allocated.** Under ORC a chunk freed
+  by another thread dereferences its allocating thread's state, which dies
+  with that thread (`writer.nim`'s header). The opener allocates state that
+  lives as long as the daemon, so it parks after installing the store and
+  `serve` joins it only after the writer and the rest are torn down.
+- **A writer ordering race this exposed, fixed with it.** With the new
+  startup timing, `t_stats_table_publication` failed 4 of 8 runs (0 of 8 on
+  `dev`) with `executions.owner_uid names no users row`: the `users` upsert
+  and the execution were taken by two concurrent drains (the writer thread
+  and the aggregate publisher's flush), and the later-taken batch committed
+  first. `drainOnce` now holds a `drainLock` from take to settle, so batches
+  commit in the order they were taken; enqueues never take it. 10 of 10
+  runs passed afterwards. Why the new timing made the race likelier was not
+  established; the race itself predates this change.
+- **Documented** in `docs/database.md`, "When the endpoint appears",
+  including the two consequences: the owner ledger is seeded when the store
+  is installed, and a shutdown during verification waits for the check.
+- **Regression test.**
+  `tests/integration/t_endpoint_serves_before_store_verification.nim` holds
+  a real `BEGIN EXCLUSIVE` on a real rollback-journal store so the daemon's
+  `quick_check` waits on SQLite's busy handler. On `dev` 3b1de0f the daemon
+  was not reachable for the whole 3044 ms the lock was held; with the fix a
+  Hello is answered 56-520 ms after spawn (1494 ms once, at a load average
+  of 300) while the lock is still held, a lease
+  is granted, `store_status` is `verifying`, the session taken in that
+  window is absent from the store, and a session taken after the verdict is
+  recorded.
+

@@ -40,8 +40,8 @@ supplies the client-declared run boundaries the `runs` row is still missing.
 
 The execution spine (`runs`, `executions`), `hosts`, `host_profiles`,
 `ambient_samples` and `extension_registry` are created, migrated, written and
-read. The daemon opens the store at startup and reports on stdout whether
-capture is on.
+read. The daemon opens the store at startup — after binding its endpoint,
+see "When the endpoint appears" — and reports on stdout whether capture is on.
 
 **Domain extensions are live as a mechanism, with no extension yet using
 it.** A product declares an extension — an id, an owner, a schema version
@@ -163,6 +163,58 @@ attributed to another user — and a Hello whose declared uid disagrees with the
 peer credentials is refused rather than corrected. It is `NULL`, not `0`, where
 the transport cannot report credentials: `0` is root, and a wrong owner is
 worse than an absent one.
+
+### When the endpoint appears
+
+**The endpoint is bound before the store is opened, and leases are served
+while it is checked.** Opening an existing store runs `pragma quick_check`
+over the whole file (see "Corruption handling"), and the default store is
+host-wide and grows for as long as the host builds: at 287–337 MB the check
+measured 3–17 s warm and 148 s cold. `runquotad` used to do that before it
+bound its endpoint, so for all of it the daemon had no socket and had printed
+nothing, and a client that starts a daemon and waits a bounded time for it
+reported it unreachable.
+
+OS-4 already said the store is secondary to lease service — a store that fails
+its check degrades to no capture and the daemon keeps serving leases — so
+nothing about admission waits for the verdict. The order is now:
+
+1. The rendezvous directory is verified and the endpoint bound; the first
+   startup line (`runquotad listening …`) is printed and flushed.
+2. The worker pool starts and connections are served. On Windows,
+   `SERVICE_RUNNING` is reported here.
+3. On a thread of its own, the store is opened — check, migrations, host
+   identity, hardware profile — and the writer, ambient sampler and retention
+   sweeper are started. Then the second and third startup lines are printed,
+   with exactly the content they always had.
+
+What this keeps: the check still runs, in full, on every start, and **nothing
+is written into or read out of the store before it has passed**. Until then
+the store's status is `verifying` (`store_status` in `runquota inspect
+observations`, where `capture_enabled` is `false`), which every store operation
+refuses exactly as it refuses a degraded store. Sessions registered in that
+window are served and are not recorded; extension declarations in it are
+answered `unavailable`, as they are by a daemon with capture off.
+
+What a reader of the startup output should rely on: the **three lines are
+unchanged in number, order and content**, and a reader that consumes all three
+still learns the store's verdict from them. The socket existing now means "the
+daemon serves leases", no longer also "the store has been checked"; a reader
+that needs capture to be live must read the three lines (or ask
+`runquota inspect observations`) rather than infer it from the socket.
+
+Two consequences, stated rather than discovered:
+
+- **The owner ledger is seeded when the store is installed.** A Hello answered
+  during verification is judged against the owners seen by this daemon only;
+  an owner-id collision with an owner recorded by an EARLIER daemon is refused
+  from the moment the store is installed, not before.
+- **A shutdown during verification waits for the check.** The `sqlite3` child
+  running it is not interrupted; the daemon joins the thread before it stops
+  the writer threads that thread starts.
+
+`tests/integration/t_endpoint_serves_before_store_verification.nim` pins all of
+this against a store whose check is held up by a real exclusive lock.
 
 ### What the owner id is on each platform
 
@@ -889,7 +941,9 @@ As implemented:
   does and what it refuses.
 - **Corruption handling.** Corruption is detected at open with
   `pragma quick_check`, reported verbatim, and never repaired. The store
-  degrades to no capture and the daemon keeps serving leases.
+  degrades to no capture and the daemon keeps serving leases. The check does
+  not delay the endpoint: it runs after the endpoint is bound, and capture
+  starts only once it has passed (see "When the endpoint appears").
 - **Benchmarks.** Recording on the lease-finish path is an in-memory append:
   157–381 ns per row across seven repetitions on an aarch64 macOS host whose
   load average was 66–90 at the time. Nothing on that path opens a file, and

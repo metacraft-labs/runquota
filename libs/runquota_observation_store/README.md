@@ -14,6 +14,12 @@ Repository posture and state-boundary requirements: `../../docs/database.md`.
   `status` says whether capture is on, and whose `report` says why not.
   Callers check `captureEnabled` and carry on regardless — a build or a
   test run must never fail because observation is unavailable (OS-4).
+- `openObservationStore` on an existing file runs `pragma quick_check` over
+  all of it, which is seconds to minutes on a large store. A caller that
+  must not wait for that holds `pendingObservationStore(path)` instead —
+  status `verifying`, capture off, the file untouched — and replaces it
+  with the real open's result when that returns (`runquotad` does this so
+  its endpoint is not bound behind the check).
 - Rows in `executions` are immutable. A `before update` trigger aborts any
   attempt, including one made with `sqlite3` directly, and there is no
   update entry point (OS-3).
