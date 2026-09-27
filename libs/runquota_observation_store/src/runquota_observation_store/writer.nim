@@ -65,6 +65,10 @@ import runquota_core/process_owned
 
 var
   writerLock: Lock
+  drainLock: Lock
+    ## HELD ACROSS A WHOLE DRAIN PASS -- take, write, settle -- so that
+    ## batches COMMIT in the order they were TAKEN. Never taken by an
+    ## enqueue, so the recording path does not wait on it; see ``drainOnce``.
   writerSettledCond: Cond
     ## Broadcast whenever a drain pass has recorded the outcome of the rows
     ## it took. Waited on only by ``flushObservationWriter``; see there.
@@ -156,9 +160,35 @@ var
 # against a lock that was initialised single-threaded.
 # ``runquota_core/spawn_guard`` arms its process-wide lock the same way.
 initLock(writerLock)
+initLock(drainLock)
 initCond(writerSettledCond)
 
+proc drainOnceSerialized() {.gcsafe.}
+
 proc drainOnce() {.gcsafe.} =
+  ## ONE DRAIN AT A TIME, and the ordering rule above depends on it.
+  ##
+  ## Owners are drained ahead of runs and executions so that an execution's
+  ## ``owner_uid`` always names a ``users`` row "in the same batch or an
+  ## earlier one". An earlier batch TAKEN is not an earlier batch COMMITTED:
+  ## the writer's own thread and a flusher (the aggregate publisher, a
+  ## ``stats`` query) could each take a batch and spawn ``sqlite3`` for it
+  ## concurrently, and whichever finished first committed first. A batch
+  ## holding only an execution then reached the store before the batch
+  ## holding its owner, the schema refused it (``executions.owner_uid names
+  ## no users row``), and the whole execution was dropped and counted as a
+  ## write failure -- intermittently, and more often the more loaded the
+  ## host. ``drainLock`` makes take-to-settle one step. Enqueues never take
+  ## it, so OS-1's recording path is unaffected; a flusher that arrives
+  ## mid-pass waits for that pass, which its settle-wait already did.
+  {.cast(gcsafe).}:
+    acquire(drainLock)
+    try:
+      drainOnceSerialized()
+    finally:
+      release(drainLock)
+
+proc drainOnceSerialized() {.gcsafe.} =
   {.cast(gcsafe).}:
     # THE STATEMENTS COME BACK AS THIS THREAD'S OWN STRINGS. ``takeAll``
     # copies them out of process-owned storage, so what this proc frees on

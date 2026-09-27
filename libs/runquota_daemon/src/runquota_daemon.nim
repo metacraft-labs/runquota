@@ -283,7 +283,188 @@ proc startStatsPublisher*(daemon: var RunQuotaDaemon) =
   daemon.statsPublisher = createStatsPublisher(path, DefaultStatsSlotCount,
     requiredSegmentMode(segmentHostWide))
 
-proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
+type
+  CaptureSetup* = object
+    ## Everything opening the observation store decides, gathered WITHOUT
+    ## the daemon lock so that it can be computed while the daemon serves,
+    ## and handed over in one step by ``installCapture``.
+    store*: ObservationStore
+    hostId*: string
+    profileId*: string
+    identityReport*: string
+    users*: seq[UserRow]
+
+proc openCapture*(config: DaemonConfig; createParent: bool;
+                  bootId: string): CaptureSetup =
+  ## Opens the observation store -- including its open-time
+  ## ``pragma quick_check``, which reads the WHOLE file -- resolves the host
+  ## identity and hardware profile, and starts the writer, sampler and
+  ## sweeper threads that write into it. Touches no daemon state, so it can
+  ## run on any thread; ``config`` must be the daemon's effective config
+  ## (``observationDbPath`` already resolved).
+  ##
+  ## NOTHING IS WRITTEN INTO THE STORE BEFORE ITS CHECK HAS PASSED: every
+  ## writer is started below, and only on the ``captureEnabled`` arm.
+  result = CaptureSetup(store: nil, hostId: "", profileId: "",
+    identityReport: "", users: @[])
+  # OS-4: a store that will not open is reported and then ignored. The
+  # daemon keeps serving leases; only capture is lost.
+  #
+  # An explicitly named store may have its directory made for it; the
+  # DEFAULT one lives in the provisioned host-state directory, which the
+  # daemon must never create (see `openObservationStore`).
+  result.store = openObservationStore(config.observationDbPath,
+    createParent = createParent)
+  if result.store.captureEnabled:
+    # Identity first, and from the machine rather than from the database:
+    # `host_id` is not derived from the hostname, the address, or anything
+    # else that two machines can share (M10, OS-6).
+    #
+    # The directory is verified BEFORE the identity is read out of it. An
+    # id minted into, or read from, a directory somebody else can write is
+    # an id somebody else chose.
+    let stateRefusal = hostStateDirectoryRefusal(config)
+    let identity =
+      if stateRefusal.len > 0:
+        HostIdentity(hostId: "", persisted: false, report: stateRefusal,
+          path:
+            if config.hostIdentityFilePath.len > 0:
+              config.hostIdentityFilePath
+            else:
+              defaultHostIdentityFile())
+      else:
+        resolveHostIdentity(config.hostIdentityFilePath)
+    result.hostId = identity.hostId
+    if not identity.persisted:
+      # OS-6. AN IDENTITY THAT CANNOT BE PERSISTED IS A REFUSAL. The daemon
+      # says which path and why, and records nothing; `resolveHostIdentity`
+      # has already declined to invent an id, so `observationHostId` is
+      # empty and `observationCaptureEnabled` is false for the process's
+      # whole life.
+      #
+      # CAPTURE OFF RATHER THAN REFUSING TO START, and the reason is what
+      # RunQuota is FOR. Admission is the mission: a daemon that cannot
+      # record history can still keep a machine from thrashing itself to
+      # death, and refusing to admit anything because a statistics
+      # directory is missing would let an advisory subsystem take out the
+      # host's whole build capacity. It is also the response OS-4 already
+      # gives to the neighbouring failure -- a store that will not open
+      # degrades to no capture and the daemon carries on -- and two
+      # different answers to two indistinguishable operator-visible
+      # failures would be the surprising design, not this one.
+      result.identityReport =
+        "runquota observation store " & result.store.path &
+          ": capture disabled, no host identity; " & identity.report
+    elif result.store.ensureHostRow(identity.hostId,
+        bootId):
+      # The disk that matters to a build's duration is the one the work
+      # happens on, and the store lives beside it.
+      #
+      # DETECTION HAPPENS HERE AND NOWHERE ELSE. M10 left "the profile is
+      # detected once at startup and never again" for M11's sampler to
+      # revisit, and M11's answer is that it stays that way ON PURPOSE.
+      # Re-detecting on the sampler's cadence would buy almost nothing --
+      # adding RAM, swapping a disk, or upgrading the kernel all restart
+      # the machine and therefore this daemon -- and it would cost a
+      # `diskutil` process spawn per tick plus a standing invitation to
+      # the one residual M10 recorded: `swap_bytes` is quantized, not
+      # stable, so a macOS host whose dynamic pager crosses a GiB boundary
+      # forks its hardware profile, and periodic re-detection is precisely
+      # what would make that happen repeatedly. What this leaves uncovered
+      # is a daemon that outlives a hardware change without a restart --
+      # a live-migrated guest, in practice.
+      let hardware = detectHardwareProfile(
+        result.store.path.parentDir,
+        localCpuShareGroup(config))
+      result.profileId =
+        result.store.ensureHostProfile(identity.hostId, hardware)
+      startObservationWriter(result.store.path,
+        config.observationQueueCapacity)
+      result.users = result.store.readUsers()
+      # Ambient load sampling (M11, OS-6). Host-wide totals only: the
+      # daemon is a lease authority and does not inspect client process
+      # trees, so `self_*` comes from what clients report about themselves
+      # and `foreign_*` is the residual.
+      var ambientReport = "ambient sampling off"
+      if config.ambientSampleIntervalMillis > 0:
+        startAmbientSampler(result.store.path, identity.hostId,
+          config.ambientSampleIntervalMillis)
+        if ambientSamplerActive():
+          ambientReport = "ambient sampling every " &
+            $config.ambientSampleIntervalMillis &
+            "ms while a lease is live"
+      # RETENTION IS SCHEDULED HERE, AND THIS IS THE WHOLE OF WHAT M15 WAS
+      # MISSING. The bounds, the cascade and the crash-safe prune all
+      # existed and NOTHING CALLED THEM, so a daemon that ran for a year
+      # kept a year of rows. Capture being on by default made that a
+      # promise nobody meant to make.
+      #
+      # AFTER the writer and the sampler, and deliberately: the sweeper's
+      # idle gate reads the live-lease count `setAmbientLiveLeaseCount`
+      # publishes, and starting it before the components that produce the
+      # rows it bounds would put the one thread that deletes ahead of
+      # every thread that writes.
+      var retentionReport = "retention off"
+      if config.retentionSweepIntervalMillis > 0:
+        startRetentionSweeper(result.store.path, identity.hostId,
+          config.retentionPolicy,
+          config.retentionSweepIntervalMillis,
+          config.retentionMaxDeferredSweeps)
+        if retentionSweeperActive():
+          retentionReport = "retention every " &
+            $config.retentionSweepIntervalMillis & "ms when idle (" &
+            describe(config.retentionPolicy) & ")"
+      result.identityReport =
+        "runquota observation store " & result.store.path &
+          ": host " & identity.hostId & "; hardware profile " &
+          (if result.profileId.len > 0: result.profileId
+            else: "unavailable") & "; " & ambientReport & "; " &
+          retentionReport & "; " & identity.report
+    else:
+      result.hostId = ""
+      result.identityReport =
+        "runquota observation store " & result.store.path &
+          ": the host row could not be written; executions are not recorded"
+  elif config.writeStatsDisabled:
+    # NAMED AS A DECISION, not as an accident. Capture being off because
+    # the operator asked and capture being off because the store would not
+    # open are the same state to every consumer and completely different
+    # facts to the person reading the log, so the two must not print the
+    # same line. `openObservationStore("")` says "no path configured",
+    # which is true and useless here.
+    result.store.report =
+      "runquota observation store: capture disabled by --no-write-stats; " &
+        "no observations are recorded and no store file is opened"
+    result.identityReport =
+      "runquota observation store: host identity and hardware profile not " &
+        "recorded; capture disabled by --no-write-stats"
+  else:
+    result.identityReport =
+      "runquota observation store " & config.observationDbPath &
+        ": host identity and hardware profile not recorded; capture disabled"
+
+proc installCapture*(daemon: var RunQuotaDaemon; setup: sink CaptureSetup) =
+  ## Hands the result of ``openCapture`` to the daemon. The caller holds
+  ## whatever lock guards ``daemon``. From here on
+  ## ``observationCaptureEnabled`` answers with the store's real verdict;
+  ## before it, the store is ``ssVerifying`` and nothing is captured.
+  daemon.observationStore = setup.store
+  daemon.observationHostId = setup.hostId
+  daemon.observationProfileId = setup.profileId
+  daemon.observationIdentityReport = setup.identityReport
+  # The owner ledger learns what earlier daemons recorded. A Hello answered
+  # while the store was still being verified was judged against only the
+  # owners seen by THIS daemon; see `docs/database.md`, "When the endpoint
+  # appears".
+  daemon.owners.seed(setup.users)
+
+proc initDaemon*(config: DaemonConfig; deferCapture = false): RunQuotaDaemon =
+  ## ``deferCapture`` leaves the observation store UNOPENED (``ssVerifying``,
+  ## capture off) for the caller to open with ``openCapture`` and hand over
+  ## with ``installCapture``. ``serve`` does exactly that, on a thread of
+  ## its own, so that the store's open-time integrity check -- seconds to
+  ## minutes on a large host store -- is not on the path to the endpoint.
+  ## The default opens it here, synchronously, as it always has.
   var effectiveConfig = config
   effectiveConfig.normalizeTopology()
   # Resolved ONCE, here, and written back into the config the daemon keeps.
@@ -314,11 +495,10 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
     pressureFileCache: PressureFileCache(
       path: "", mtimeUnix: 0, sizeBytes: 0, raw: ""
     ),
-    # An explicitly named store may have its directory made for it; the
-    # DEFAULT one lives in the provisioned host-state directory, which the
-    # daemon must never create (see `openObservationStore`).
-    observationStore: openObservationStore(effectiveConfig.observationDbPath,
-      createParent = config.observationDbPath.len > 0),
+    # Not opened here: see `openCapture`, and `serve` for why the open is
+    # not on the path to the endpoint.
+    observationStore: pendingObservationStore(
+      effectiveConfig.observationDbPath),
     owners: initOwnerLedger(),
     observationHostId: "",
     observationProfileId: "",
@@ -335,135 +515,10 @@ proc initDaemon*(config: DaemonConfig): RunQuotaDaemon =
   )
   for row in loadLearnedEstimates(effectiveConfig.estimateDbPath):
     result.estimates[estimateTableKey(row.scope, row.commandStatsId)] = row
-  # OS-4: a store that will not open is reported and then ignored. The
-  # daemon keeps serving leases; only capture is lost.
-  if result.observationStore.captureEnabled:
-    # Identity first, and from the machine rather than from the database:
-    # `host_id` is not derived from the hostname, the address, or anything
-    # else that two machines can share (M10, OS-6).
-    #
-    # The directory is verified BEFORE the identity is read out of it. An
-    # id minted into, or read from, a directory somebody else can write is
-    # an id somebody else chose.
-    let stateRefusal = hostStateDirectoryRefusal(effectiveConfig)
-    let identity =
-      if stateRefusal.len > 0:
-        HostIdentity(hostId: "", persisted: false, report: stateRefusal,
-          path:
-            if effectiveConfig.hostIdentityFilePath.len > 0:
-              effectiveConfig.hostIdentityFilePath
-            else:
-              defaultHostIdentityFile())
-      else:
-        resolveHostIdentity(effectiveConfig.hostIdentityFilePath)
-    result.observationHostId = identity.hostId
-    if not identity.persisted:
-      # OS-6. AN IDENTITY THAT CANNOT BE PERSISTED IS A REFUSAL. The daemon
-      # says which path and why, and records nothing; `resolveHostIdentity`
-      # has already declined to invent an id, so `observationHostId` is
-      # empty and `observationCaptureEnabled` is false for the process's
-      # whole life.
-      #
-      # CAPTURE OFF RATHER THAN REFUSING TO START, and the reason is what
-      # RunQuota is FOR. Admission is the mission: a daemon that cannot
-      # record history can still keep a machine from thrashing itself to
-      # death, and refusing to admit anything because a statistics
-      # directory is missing would let an advisory subsystem take out the
-      # host's whole build capacity. It is also the response OS-4 already
-      # gives to the neighbouring failure -- a store that will not open
-      # degrades to no capture and the daemon carries on -- and two
-      # different answers to two indistinguishable operator-visible
-      # failures would be the surprising design, not this one.
-      result.observationIdentityReport =
-        "runquota observation store " & result.observationStore.path &
-          ": capture disabled, no host identity; " & identity.report
-    elif result.observationStore.ensureHostRow(identity.hostId,
-        result.observationBootId):
-      # The disk that matters to a build's duration is the one the work
-      # happens on, and the store lives beside it.
-      #
-      # DETECTION HAPPENS HERE AND NOWHERE ELSE. M10 left "the profile is
-      # detected once at startup and never again" for M11's sampler to
-      # revisit, and M11's answer is that it stays that way ON PURPOSE.
-      # Re-detecting on the sampler's cadence would buy almost nothing --
-      # adding RAM, swapping a disk, or upgrading the kernel all restart
-      # the machine and therefore this daemon -- and it would cost a
-      # `diskutil` process spawn per tick plus a standing invitation to
-      # the one residual M10 recorded: `swap_bytes` is quantized, not
-      # stable, so a macOS host whose dynamic pager crosses a GiB boundary
-      # forks its hardware profile, and periodic re-detection is precisely
-      # what would make that happen repeatedly. What this leaves uncovered
-      # is a daemon that outlives a hardware change without a restart --
-      # a live-migrated guest, in practice.
-      let hardware = detectHardwareProfile(
-        result.observationStore.path.parentDir,
-        localCpuShareGroup(effectiveConfig))
-      result.observationProfileId =
-        result.observationStore.ensureHostProfile(identity.hostId, hardware)
-      startObservationWriter(result.observationStore.path,
-        effectiveConfig.observationQueueCapacity)
-      result.owners.seed(result.observationStore.readUsers())
-      # Ambient load sampling (M11, OS-6). Host-wide totals only: the
-      # daemon is a lease authority and does not inspect client process
-      # trees, so `self_*` comes from what clients report about themselves
-      # and `foreign_*` is the residual.
-      var ambientReport = "ambient sampling off"
-      if effectiveConfig.ambientSampleIntervalMillis > 0:
-        startAmbientSampler(result.observationStore.path, identity.hostId,
-          effectiveConfig.ambientSampleIntervalMillis)
-        if ambientSamplerActive():
-          ambientReport = "ambient sampling every " &
-            $effectiveConfig.ambientSampleIntervalMillis &
-            "ms while a lease is live"
-      # RETENTION IS SCHEDULED HERE, AND THIS IS THE WHOLE OF WHAT M15 WAS
-      # MISSING. The bounds, the cascade and the crash-safe prune all
-      # existed and NOTHING CALLED THEM, so a daemon that ran for a year
-      # kept a year of rows. Capture being on by default made that a
-      # promise nobody meant to make.
-      #
-      # AFTER the writer and the sampler, and deliberately: the sweeper's
-      # idle gate reads the live-lease count `setAmbientLiveLeaseCount`
-      # publishes, and starting it before the components that produce the
-      # rows it bounds would put the one thread that deletes ahead of
-      # every thread that writes.
-      var retentionReport = "retention off"
-      if effectiveConfig.retentionSweepIntervalMillis > 0:
-        startRetentionSweeper(result.observationStore.path, identity.hostId,
-          effectiveConfig.retentionPolicy,
-          effectiveConfig.retentionSweepIntervalMillis,
-          effectiveConfig.retentionMaxDeferredSweeps)
-        if retentionSweeperActive():
-          retentionReport = "retention every " &
-            $effectiveConfig.retentionSweepIntervalMillis & "ms when idle (" &
-            describe(effectiveConfig.retentionPolicy) & ")"
-      result.observationIdentityReport =
-        "runquota observation store " & result.observationStore.path &
-          ": host " & identity.hostId & "; hardware profile " &
-          (if result.observationProfileId.len > 0: result.observationProfileId
-            else: "unavailable") & "; " & ambientReport & "; " &
-          retentionReport & "; " & identity.report
-    else:
-      result.observationHostId = ""
-      result.observationIdentityReport =
-        "runquota observation store " & result.observationStore.path &
-          ": the host row could not be written; executions are not recorded"
-  elif effectiveConfig.writeStatsDisabled:
-    # NAMED AS A DECISION, not as an accident. Capture being off because
-    # the operator asked and capture being off because the store would not
-    # open are the same state to every consumer and completely different
-    # facts to the person reading the log, so the two must not print the
-    # same line. `openObservationStore("")` says "no path configured",
-    # which is true and useless here.
-    result.observationStore.report =
-      "runquota observation store: capture disabled by --no-write-stats; " &
-        "no observations are recorded and no store file is opened"
-    result.observationIdentityReport =
-      "runquota observation store: host identity and hardware profile not " &
-        "recorded; capture disabled by --no-write-stats"
-  else:
-    result.observationIdentityReport =
-      "runquota observation store " & effectiveConfig.observationDbPath &
-        ": host identity and hardware profile not recorded; capture disabled"
+  if not deferCapture:
+    result.installCapture(openCapture(effectiveConfig,
+      createParent = config.observationDbPath.len > 0,
+      bootId = result.observationBootId))
 
 proc countLeases(daemon: RunQuotaDaemon; state: LeaseLifecycleState): uint32 =
   for lease in daemon.leases.values:
@@ -1202,6 +1257,10 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
   "{\"observations\":{" &
     "\"capture_enabled\":" & $(daemon.observationCaptureEnabled()) & "," &
     "\"store_path\":" & jsonEscape(daemon.observationStore.path) & "," &
+    # WHY capture is or is not on, which `capture_enabled` cannot say: in
+    # particular `verifying`, the window after the endpoint is bound and
+    # before the store's open-time check has returned.
+    "\"store_status\":" & jsonEscape($daemon.observationStore.status) & "," &
     "\"write_stats_disabled\":" & $(daemon.config.writeStatsDisabled) & "," &
     "\"accepted\":" & $daemon.observationsAccepted & "," &
     "\"rejected\":" & $daemon.observationsRejected & "," &
@@ -3450,6 +3509,119 @@ else:
       joinThread(shutdownWatcherThread)
       shutdownWatcherRunning = false
 
+# ---------------------------------------------------------------------------
+# The observation store is opened OFF the path to the endpoint.
+#
+# WHAT WAS WRONG. `serve` built the daemon -- and with it the store, whose
+# open runs `pragma quick_check` over the WHOLE existing file -- before it
+# bound the endpoint. The store is host-wide and grows for as long as the
+# host builds: at 287-337 MB the check took 3-17 s warm and 148 s cold, and
+# for all of it the daemon had no socket and had printed nothing. A client
+# that starts a daemon and waits a bounded time for it (reprobuild waits
+# 15 s) reported it unreachable.
+#
+# WHY DEFERRING IS ALLOWED. OS-4 (`docs/database.md`, "Corruption
+# handling"): a store that fails its check "degrades to no capture and the
+# daemon keeps serving leases". Lease service never depended on the verdict;
+# only capture does. So the endpoint binds and serves at once, and capture
+# starts when the verdict arrives.
+#
+# WHAT IS KEPT. The check still runs, in full, on every start, and nothing
+# is written into the store -- or read out of it -- before it has passed:
+# until `installCapture` the daemon holds a `ssVerifying` store, which every
+# store operation refuses exactly as it refuses a degraded one. Sessions
+# registered in that window are served and not recorded.
+#
+# THE STARTUP LINES DO NOT CHANGE. Still exactly three, in the same order,
+# with the same content: the listening line when the endpoint is bound, and
+# the store's two lines when its verdict is in. A reader that consumes all
+# three still learns the verdict from them; only the moment the first one
+# appears has moved.
+# ---------------------------------------------------------------------------
+
+var captureOpenerThread: Thread[void]
+var captureOpenerRunning = false
+var captureCreateParent = false
+  ## Written by `serve` before the thread is created, read only by it.
+
+# THE OPENER OUTLIVES EVERYTHING IT ALLOCATED, and that is why it does not
+# simply return once the store is installed. Under ORC every chunk belongs to
+# the thread that allocated it, and freeing it dereferences that thread's
+# allocator state, which dies with the thread (see the header of
+# `runquota_observation_store/writer.nim`). This thread allocates state that
+# lives for the daemon's whole life -- the store ref, the writer's path, the
+# sampler's and sweeper's globals -- and other threads free it: the shutdown
+# below resets the writer's path, a connection worker replaces a store report.
+# `initDaemon` used to do this work on the main thread, which lives to the
+# end. So the opener parks once its work is done, and `serve` releases and
+# joins it only after the last of that state has been torn down.
+var captureOpenerLock: Lock
+var captureOpenerCond: Cond
+var captureOpenerDone = false
+  ## The store is installed and the writer threads (if any) are started.
+var captureOpenerRelease = false
+  ## `serve` has torn down everything the opener allocated; it may exit.
+
+proc captureOpenerMain() {.thread, gcsafe.} =
+  ## Opens the store, installs the result, and prints the two startup lines
+  ## that report it. The slow part runs WITHOUT the daemon lock, so leases
+  ## are served throughout; only the hand-over takes the lock.
+  ##
+  ## A FAILURE HERE MUST NOT TAKE THE HOST'S LEASE AUTHORITY WITH IT (see
+  ## `connectionWorker`): it is reported as a store that could not be
+  ## opened, which is what OS-4 says a store failure is.
+  {.cast(gcsafe).}:
+    var config: DaemonConfig
+    var bootId = ""
+    acquire(sharedDaemon.lock)
+    try:
+      config = sharedDaemon.daemon.config
+      bootId = sharedDaemon.daemon.observationBootId
+    finally:
+      release(sharedDaemon.lock)
+    var setup: CaptureSetup
+    try:
+      setup = openCapture(config, captureCreateParent, bootId)
+    except CatchableError as error:
+      setup = CaptureSetup(
+        store: ObservationStore(path: config.observationDbPath,
+          status: ssUnwritable,
+          report: "runquota observation store " & config.observationDbPath &
+            ": could not be opened (" & error.msg.replace("\n", " ") &
+            "); capture disabled",
+          schemaVersion: -1),
+        hostId: "", profileId: "",
+        identityReport: "runquota observation store " &
+          config.observationDbPath &
+          ": host identity and hardware profile not recorded; capture " &
+          "disabled",
+        users: @[])
+    var storeLine = ""
+    var identityLine = ""
+    acquire(sharedDaemon.lock)
+    try:
+      # MOVED, not copied: the store ref must end this block owned by the
+      # daemon alone, so no reference count is left on this thread.
+      sharedDaemon.daemon.installCapture(move setup)
+      storeLine = sharedDaemon.daemon.observationStore.report
+      identityLine = sharedDaemon.daemon.observationIdentityReport
+    finally:
+      release(sharedDaemon.lock)
+    try:
+      echo storeLine
+      echo identityLine
+      flushFile(stdout)
+    except CatchableError:
+      discard
+    acquire(captureOpenerLock)
+    try:
+      captureOpenerDone = true
+      broadcast(captureOpenerCond)
+      while not captureOpenerRelease:
+        wait(captureOpenerCond, captureOpenerLock)
+    finally:
+      release(captureOpenerLock)
+
 const endpointRefusedExitCode* = 3
   ## `serve` returns this when the rendezvous directory is not trustworthy.
   ## Distinct from a usage error (2) so a supervisor can tell "you asked for
@@ -3469,7 +3641,9 @@ proc serve*(config: DaemonConfig): int =
     return endpointRefusedExitCode
   initLock(sharedDaemon.lock)
   initConnectionQueue()
-  sharedDaemon.daemon = initDaemon(config)
+  # THE STORE IS NOT OPENED HERE. See `captureOpenerMain`.
+  sharedDaemon.daemon = initDaemon(config, deferCapture = true)
+  captureCreateParent = config.observationDbPath.len > 0
   var listener: LocalListener
   try:
     listener = bindEndpoint(config.endpoint)
@@ -3520,8 +3694,11 @@ proc serve*(config: DaemonConfig): int =
   # including the one the operator turned off. A reader that has to guess
   # how many lines it will get is a reader that deadlocks on a daemon which
   # then goes quiet, so the count is fixed rather than conditional.
-  echo sharedDaemon.daemon.observationStore.report
-  echo sharedDaemon.daemon.observationIdentityReport
+  #
+  # The two lines after this one are the observation store's verdict, and
+  # they are printed by `captureOpenerMain` once there IS one -- see there.
+  # The listening line goes out now, on its own, so a reader that waits for
+  # it is not made to wait for the store.
   flushFile(stdout)
   # AFTER the endpoint is bound, because the waker has a socket to dial, and
   # before any worker exists, because the shutdown this arms is the one that
@@ -3532,10 +3709,12 @@ proc serve*(config: DaemonConfig): int =
     threads.add(default(Thread[void]))
     createThread(threads[^1], connectionWorker)
   # SERVICE_RUNNING IS REPORTED HERE AND NOWHERE EARLIER. The endpoint is
-  # bound, the rendezvous directory has been verified, the store has been
-  # opened or has said why it could not, and a worker pool exists to serve
-  # what the loop below accepts -- so this is the first moment at which
-  # "running" is true. Reporting it from the dispatcher thread instead would
+  # bound, the rendezvous directory has been verified, and a worker pool
+  # exists to serve what the loop below accepts -- so this is the first
+  # moment at which "running" is true. The observation store is NOT part of
+  # that: it may still be under its open-time check, and leases do not wait
+  # for it (OS-4), so neither does the SCM -- whose start timeout a cold
+  # check of a large store would otherwise exceed. Reporting it from the dispatcher thread instead would
   # make `sc start runquotad` succeed for a daemon that then refused its
   # endpoint and exited 3, which is precisely the class of failure the SCM
   # protocol exists to stop hiding.
@@ -3544,6 +3723,14 @@ proc serve*(config: DaemonConfig): int =
   # `when`: `windows_service`'s POSIX arm and its not-a-service path both
   # answer nothing.
   reportWindowsServiceRunning()
+  # AFTER the workers exist, so the daemon is already answering while the
+  # store is checked; the accept loop below must not wait for it either.
+  initLock(captureOpenerLock)
+  initCond(captureOpenerCond)
+  captureOpenerDone = false
+  captureOpenerRelease = false
+  createThread(captureOpenerThread, captureOpenerMain)
+  captureOpenerRunning = true
   try:
     # A FAILED ACCEPT IS USUALLY THE HOST TALKING, NOT THE LISTENER DYING.
     # `accept` reports the peer's problems as well as its own: ECONNABORTED
@@ -3613,6 +3800,20 @@ proc serve*(config: DaemonConfig): int =
     stopConnectionQueue()
     for i in 0 ..< threads.len:
       joinThread(threads[i])
+    # THE OPENER MUST HAVE FINISHED before the writer, sampler and sweeper
+    # are stopped below, because it is what starts them: stopping them first
+    # would let it start them again behind the shutdown. It also takes the
+    # daemon lock, so this wait comes before that lock is taken here. A
+    # shutdown that arrives during the store's check therefore waits for the
+    # check -- the one `sqlite3` child it is waiting on is not ours to kill
+    # mid-read. It is JOINED at the very end; see `captureOpenerLock`.
+    if captureOpenerRunning:
+      acquire(captureOpenerLock)
+      try:
+        while not captureOpenerDone:
+          wait(captureOpenerCond, captureOpenerLock)
+      finally:
+        release(captureOpenerLock)
     # BEFORE the daemon lock is taken below, and before the writer is
     # stopped: this thread takes that lock itself, so joining it from
     # inside would deadlock, and its final drain needs the observation
@@ -3638,6 +3839,19 @@ proc serve*(config: DaemonConfig): int =
       sharedDaemon.daemon.statsPublisher.close()
     finally:
       release(sharedDaemon.lock)
+      # LAST, after the writer's state has been reset and every thread that
+      # could free what the opener allocated has been joined.
+      if captureOpenerRunning:
+        acquire(captureOpenerLock)
+        try:
+          captureOpenerRelease = true
+          broadcast(captureOpenerCond)
+        finally:
+          release(captureOpenerLock)
+        joinThread(captureOpenerThread)
+        captureOpenerRunning = false
+        deinitCond(captureOpenerCond)
+        deinitLock(captureOpenerLock)
       listener.close()
       deinitLock(sharedDaemon.lock)
       deinitConnectionQueue()

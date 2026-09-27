@@ -44,6 +44,12 @@ type
     ssCorrupt = "degraded-corrupt"
     ssUnwritable = "degraded-unwritable"
     ssRefusedNewer = "refused-newer-schema"
+    ssVerifying = "verifying"
+      ## The store has not been opened YET: its open-time integrity check
+      ## is still running. Capture is off exactly as for every other
+      ## non-``ssOpen`` value -- nothing may be written into, or read out
+      ## of, a file whose check has not returned -- but it is not a
+      ## degradation, and it is replaced by the check's own verdict.
 
   HostRow* = object
     hostId*: string
