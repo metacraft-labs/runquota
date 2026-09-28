@@ -5,6 +5,14 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+# WiX ICE validation and administrative extraction require Windows Installer.
+# Keep validation enabled and surface runner service failures before linking.
+$installer = Get-Service -Name msiserver
+Write-Host "Windows Installer: status=$($installer.Status), startType=$($installer.StartType)"
+if ($installer.Status -ne 'Running') {
+  Start-Service -Name msiserver
+  $installer.WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+}
 $toolsDir = Join-Path $env:RUNNER_TEMP 'release-wix3'
 $zip = "$toolsDir.zip"
 Invoke-WebRequest 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip' -OutFile $zip
