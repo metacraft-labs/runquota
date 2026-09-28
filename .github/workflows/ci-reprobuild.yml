@@ -85,7 +85,7 @@ jobs:
           # Exercise the published bootstrap repairs before a new CLI release.
           # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
           repro-from-source: true
-          repro-build-pin: 2873da3136eba34268e784d7af2e1cfc0ea0f03d
+          repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: Refresh authentication before repro build
