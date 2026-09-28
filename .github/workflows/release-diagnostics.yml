@@ -1,6 +1,7 @@
 name: Release diagnostics
 
 on:
+  workflow_dispatch:
   push:
     branches: [fix/release-validation-failures]
 
@@ -10,7 +11,9 @@ permissions:
 
 jobs:
   linux:
-    runs-on: [self-hosted, linux, x64]
+    # Supplemental 0.1.0 diagnosis while the existing fleet run waits for
+    # capacity. Owner: zah. Normal Linux and release gates remain unchanged.
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
@@ -34,12 +37,15 @@ jobs:
           nix develop --command bash -c '
             scripts/build_apps.sh
             failed=0
-            for f in tests/unit/t_scope_boundary_rules.nim tests/integration/t_stats_table_concurrency.nim tests/integration/t_shared_endpoint_second_uid.nim libs/runquota_observation_store/tests/t_observation_flush_contract.nim tests/unit/t_observation_store_host_profile.nim; do
+            for f in tests/unit/t_scope_boundary_rules.nim tests/integration/t_stats_table_concurrency.nim tests/integration/t_shared_endpoint_second_uid.nim libs/runquota_observation_store/tests/t_observation_flush_contract.nim tests/unit/t_observation_store_host_profile.nim libs/runquota_observation_store/tests/t_linux_cpu_ticks.nim tests/integration/t_host_load_reading_invariants.nim; do
               nim c -r --threads:on --hints:off --out:build/test-bin/$(basename "$f" .nim) "$f" || failed=1
             done
             exit "$failed"
           '
   msi:
+    # Both payloads passed the push diagnostic at 939c38a. Repeat manually
+    # when investigating installer behavior; final releases always gate MSI.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, windows, arm64]
     timeout-minutes: 15
     steps:
