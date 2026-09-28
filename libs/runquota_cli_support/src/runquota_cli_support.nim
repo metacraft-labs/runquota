@@ -28,7 +28,10 @@ proc renderUsage*(programName: string): string =
     "  " & programName & " topology --json\n" &
     "  " & programName & " observations --json\n" &
     "  " & programName & " explain SESSION_ID\n" &
-    "  " & programName & " daemon start|status\n" &
+    "  " & programName & " daemon start [RUNQUOTAD_ARG...]\n" &
+    "    starts a detached runquotad (with those flags) unless one answers;\n" &
+    "    its output goes to --log-file, by default the per-user runquotad.log\n" &
+    "  " & programName & " daemon status\n" &
     "  " & programName & " stats-table [KEY]\n" &
     "  " & programName & " stats capture [--json]\n" &
     "  " & programName & " stats top [KEY] [--limit N] [--all-users] [--all-profiles] [--json]\n" &
@@ -95,25 +98,102 @@ proc daemonProgramPath*(): string =
   else:
     programName
 
-proc runDaemonStart(): int =
+proc userDaemonLogFile*(): string =
+  ## Where a daemon started by `runquota daemon start` writes its output.
+  ##
+  ## Per-user, because the user who ran the verb is the one who will look
+  ## for it, and nothing here is host state: the host-wide state directory
+  ## is provisioned by the install step and never created as a side effect
+  ## (see `hostWideStateDir`), and the Windows service's log has its own
+  ## fixed place (`windowsServiceLogFile`).
+  when defined(windows):
+    let base = getEnv("LOCALAPPDATA")
+    (if base.len > 0: base else: getHomeDir() / "AppData" / "Local") /
+      "runquota" / "runquotad.log"
+  else:
+    let base = getEnv("XDG_STATE_HOME")
+    (if base.len > 0: base else: getHomeDir() / ".local" / "state") /
+      "runquota" / "runquotad.log"
+
+when defined(windows):
+  import std/winlean
+
+  proc spawnDetachedDaemon(program: string; args: seq[string]) =
+    ## `CreateProcessW` with handle inheritance OFF.
+    ##
+    ## `osproc` always passes `bInheritHandles = TRUE`, and on Windows that
+    ## hands the child EVERY inheritable handle in this process, not just
+    ## the three standard ones it is given. This process's own stdout and
+    ## stderr are among them, so a daemon started through `osproc` held the
+    ## caller's pipe for its whole lifetime even with its own streams
+    ## redirected: measured 2026-09-28, `runquota daemon start ... | cat`
+    ## still never reached end of file. With inheritance off the daemon gets
+    ## no handles of ours at all, and `--log-file` gives it its streams.
+    const
+      DetachedProcess = 0x00000008'i32
+      CreateNewProcessGroup = 0x00000200'i32
+    var commandLine = quoteShellWindows(program)
+    for arg in args:
+      commandLine.add(' ')
+      commandLine.add(quoteShellWindows(arg))
+    var startup: STARTUPINFO
+    startup.cb = int32(sizeof(STARTUPINFO))
+    var info: PROCESS_INFORMATION
+    let wide = newWideCString(commandLine)
+    if createProcessW(nil, wide, nil, nil, 0,
+        DetachedProcess or CreateNewProcessGroup, nil, nil,
+        startup, info) == 0:
+      raiseOSError(osLastError(), "starting " & program)
+    discard closeHandle(info.hThread)
+    discard closeHandle(info.hProcess)
+
+proc runDaemonStart(daemonArgs: seq[string]): int =
+  ## Start a detached `runquotad`, unless one already answers.
+  ##
+  ## THE DAEMON GETS A LOG FILE, NOT THE CALLER'S STREAMS. It used to be
+  ## spawned with `poParentStreams`, so for its whole lifetime it held this
+  ## process's stdout and stderr: its startup lines landed in whatever
+  ## terminal happened to run the verb, and anything reading this verb's
+  ## output to end of file -- `runquota daemon start | tail`, `$(...)`, a CI
+  ## step, a supervisor capturing output -- waited until the daemon exited,
+  ## which is never. `--log-file` makes the daemon reopen its streams onto
+  ## the file before it prints anything.
+  ##
+  ## `daemonArgs` are passed to `runquotad` as given, so a caller can start
+  ## it with flags (an isolated `--socket`, `--no-write-stats`, ...) instead
+  ## of having to spawn it by hand to get them.
   try:
     discard printStatus(false)
     return 0
   except CatchableError:
     discard
-  let process = startProcess(
-    daemonProgramPath(),
-    args = [],
-    options = {poUsePath, poDaemon, poParentStreams}
-  )
-  process.close()
+  var args = daemonArgs
+  var logFile = userDaemonLogFile()
+  let at = args.find("--log-file")
+  if at >= 0 and at + 1 < args.len:
+    logFile = args[at + 1]
+  else:
+    args = @["--log-file", logFile] & args
+  when defined(windows):
+    spawnDetachedDaemon(daemonProgramPath(), args)
+  else:
+    # POSIX `osproc` gives the child fresh pipes on 0, 1 and 2, so none of
+    # this process's own descriptors is inherited there; `poDaemon` puts it
+    # in its own session.
+    let process = startProcess(
+      daemonProgramPath(),
+      args = args,
+      options = {poUsePath, poDaemon}
+    )
+    process.close()
   for _ in 0 ..< 40:
     try:
       discard printStatus(false)
+      echo "runquotad log: " & logFile
       return 0
     except CatchableError:
       sleep(50)
-  echo "runquotad did not become ready"
+  echo "runquotad did not become ready; see " & logFile
   1
 
 proc openPublishedTable*(): StatsTable =
@@ -621,8 +701,8 @@ proc runThinApp*(programName: string): int =
         if args.len == 2:
           return printInspection("explain", sessionId(parseUInt(args[1])))
       of "daemon":
-        if args.len == 2 and args[1] == "start":
-          return runDaemonStart()
+        if args.len >= 2 and args[1] == "start":
+          return runDaemonStart(args[2 .. ^1])
         if args.len == 2 and args[1] == "status":
           return printStatus(false)
       of "stats-table":
