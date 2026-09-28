@@ -1,0 +1,67 @@
+name: Release diagnostics
+
+on:
+  push:
+    branches: [fix/release-validation-failures]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  linux:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record actual host and storage boundaries
+        shell: bash
+        run: |
+          getconf _NPROCESSORS_ONLN
+          nproc
+          cat /proc/loadavg
+          findmnt -T /tmp -o TARGET,SOURCE,FSTYPE,MAJ:MIN
+          findmnt -T "$PWD" -o TARGET,SOURCE,FSTYPE,MAJ:MIN
+          lsblk -o NAME,TYPE,ROTA,MAJ:MIN
+          ls -l /sys/dev/block
+      - name: Setup Nix
+        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          nix-github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Exercise repaired fixtures and hardware detection
+        run: |
+          # shellcheck disable=SC2016 # Expanded by the inner shell.
+          nix develop --command bash -c '
+            scripts/build_apps.sh
+            failed=0
+            for f in tests/unit/t_scope_boundary_rules.nim tests/integration/t_stats_table_concurrency.nim tests/integration/t_shared_endpoint_second_uid.nim libs/runquota_observation_store/tests/t_observation_flush_contract.nim tests/unit/t_observation_store_host_profile.nim; do
+              nim c -r --threads:on --hints:off --out:build/test-bin/$(basename "$f" .nim) "$f" || failed=1
+            done
+            exit "$failed"
+          '
+  msi:
+    runs-on: [self-hosted, windows, arm64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 36381192176
+          pattern: release-windows-*
+          path: dist
+          merge-multiple: true
+      - name: Use the action runtime for the real executable smoke test
+        uses: actions/github-script@v7
+        with:
+          script: core.exportVariable('RELEASE_NODE', process.execPath)
+      # These are the native-tested e9e487a artifacts. This diagnostic job
+      # cannot publish them and does not replace a final full release run.
+      - name: Validate MSI payloads and diagnose retained files
+        shell: pwsh
+        run: ./scripts/release/verify-windows.ps1 -Dist dist -Version 0.1.0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-diagnostics-msi
+          path: test-logs/

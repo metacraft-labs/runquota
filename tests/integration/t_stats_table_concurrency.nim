@@ -234,84 +234,58 @@ suite "stats_table_concurrency":
       options = {poStdErrToStdOut})
     check waitForReady(ready, 8000)
 
-    # A THIRD process reads at an address chosen by `MAP_FIXED`, well away
-    # from wherever it would otherwise have landed.
+    let writerBase = uint(parseHexInt(readFile(ready).strip()))
+    # The child chooses a base and keeps an alternate mapping if that
+    # address happens to coincide with the publisher's.
     let readerOut = execProcess(driverBinary,
-      args = ["read-at", path, "mapped-key", "20000", $(64 * 1024 * 1024)],
+      args = ["read-at", path, "mapped-key", "20000", $(64 * 1024 * 1024),
+              toHex(writerBase, 16)],
       env = nil, options = {poStdErrToStdOut})
+    let readerReport = parseReport(readerOut)
+    require readerReport.hasKey("base")
+    let readerBase = uint(parseHexInt(readerReport["base"]))
 
-    # ...and this process reads it too, at its own base.
-    var table = openStatsTable(path)
-    check table.available
+    # Three simultaneous local mappings have three distinct bases. At most
+    # two can coincide with the other processes, so one must differ from
+    # both. This establishes the fixture even with ASLR disabled.
+    var views: array[3, StatsTable]
+    defer:
+      for view in views.mitems: view.close()
+    var selected = -1
+    for i in 0 ..< views.len:
+      views[i] = openStatsTable(path)
+      require views[i].available
+      let base = cast[uint](views[i].unsafeMappedBase())
+      if base != writerBase and base != readerBase:
+        selected = i
+        break
+    require selected >= 0
+    let table = addr views[selected]
     var estimate: PublishedEstimate
     var localHits = 0
     var localCoherent = 0
     for _ in 0 ..< 20000:
-      if table.lookupEstimate("mapped-key", estimate) == stlHit:
+      if table[].lookupEstimate("mapped-key", estimate) == stlHit:
         inc localHits
         if estimate.memoryBytes == estimate.sampleCount and
             estimate.memoryBytes == estimate.updatedUnixMillis:
           inc localCoherent
-    let localBase = cast[uint](table.unsafeMappedBase())
-    table.close()
+    let localBase = cast[uint](table[].unsafeMappedBase())
 
     let writerOutput = writer.outputStream.readToEnd()
     discard writer.waitForExit(15000)
     writer.close()
 
     let writerReport = parseReport(writerOutput)
-    let readerReport = parseReport(readerOut)
     echo "  bases: writer=" & writerReport.getOrDefault("base") &
       " reader=" & readerReport.getOrDefault("base") &
       " local=" & toHex(localBase, 16)
 
-    check writerReport.hasKey("base")
-    check readerReport.hasKey("base")
-    let writerBase = parseHexInt(writerReport["base"])
-    let readerBase = parseHexInt(readerReport["base"])
-
-    # THE ASSERTION THAT MAKES THE REST OF THIS TEST EVIDENCE. If the three
-    # mappings coincided, "correct at different virtual bases" would have
-    # been asserted against one base.
-    #
-    # KNOWN TO FAIL ON SOME HOSTS, AND NOT BECAUSE OF A RACE. The middle
-    # clause is an ASSUMPTION ABOUT ADDRESS LAYOUT: it requires the writer
-    # PROCESS and this one to have been handed different bases for an
-    # anonymous mapping of the same size. Nothing in the stats table arranges
-    # that -- it is the kernel's placement plus ASLR, and two runs of the
-    # same driver binary under the same libc on a host with weak or disabled
-    # mmap randomisation land on the same base. Measured on one WSL2 host in
-    # September 2026: FIVE isolated runs, five failures, every one of them
-    # identically on the middle clause below -- `Check failed:
-    # uint(writerBase) != localBase` -- with the other clauses of this case
-    # passing. 0/5 green, and deterministic rather than intermittent. A sixth
-    # run, this one inside a full suite on the SAME host under load average
-    # 11.5, failed identically and printed the reason in this case's own
-    # `bases:` line:
-    #
-    #     writer=00007FFFF7E28000  reader=00007FFFF7AFE000
-    #     local =00007FFFF7E28000
-    #
-    # The writer process and this one were handed the SAME base, byte for
-    # byte, while the `MAP_FIXED` reader -- the only one of the three whose
-    # address the test chooses -- was elsewhere. It is therefore NOT
-    # load-sensitive and NOT flaky; any note describing it as either is
-    # wrong, and "on a quiet host it passes" is not true of this host. It is
-    # in the known-failing set at `10147ac` and is not a regression.
-    #
-    # WHAT THE REPAIR WOULD BE, recorded rather than attempted here: this
-    # case has to MAKE the bases differ instead of hoping for it. The
-    # third-process arm already does exactly that with `MAP_FIXED`
-    # (`read-at`), and the writer arm could take the same treatment -- or the
-    # clause could be narrowed to the two mappings the test actually
-    # controls, `writerBase != readerBase` and `readerBase != localBase`,
-    # with the uncontrolled pair dropped. Left alone deliberately: changing
-    # what this case asserts is a separate change from the one this commit
-    # makes, and silently weakening a clause to get a green is how a suite
-    # stops meaning anything.
+    require writerReport.hasKey("base")
+    check uint(parseHexInt(writerReport["base"])) == writerBase
     check writerBase != readerBase
-    check uint(writerBase) != localBase
-    check uint(readerBase) != localBase
+    check writerBase != localBase
+    check readerBase != localBase
 
     # Every process read coherent entries from its own base.
     check readerReport.hasKey("hits")

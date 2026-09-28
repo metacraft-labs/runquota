@@ -89,15 +89,29 @@ foreach ($target in $targets) {
     Write-Host ($_ | Format-List * -Force | Out-String)
     throw
   } finally {
-    for ($cleanupAttempt = 0; $cleanupAttempt -lt 5; $cleanupAttempt++) {
+    # Capture the owner of any retained image before retrying deletion. This
+    # stays scoped to this validation's unique directory, including x64 images
+    # running under ARM64 emulation.
+    $owned = @(Get-CimInstance Win32_Process | Where-Object {
+      $_.ExecutablePath -and $_.ExecutablePath.StartsWith($work, [StringComparison]::OrdinalIgnoreCase)
+    })
+    Write-Host "Payload processes after smoke: $($owned.Count)"
+    $owned | Select-Object ProcessId, ParentProcessId, ExecutablePath | Format-Table | Out-String | Write-Host
+    Get-ChildItem -LiteralPath $work -Recurse -File | ForEach-Object {
+      Write-Host "Cleanup file: $($_.FullName); attributes=$($_.Attributes)"
+    }
+    for ($cleanupAttempt = 0; $cleanupAttempt -lt 30; $cleanupAttempt++) {
       try {
         Remove-Item -LiteralPath $work -Recurse -Force
         break
       } catch {
-        if ($cleanupAttempt -eq 4) {
+        if ($cleanupAttempt -eq 29) {
           if ($null -eq $checkError) { throw }
           Write-Warning "MSI scratch cleanup also failed: $_"
-        } else { Start-Sleep -Milliseconds 500 }
+        } else {
+          Write-Host "Cleanup retry $cleanupAttempt`: $_"
+          Start-Sleep -Seconds 1
+        }
       }
     }
   }

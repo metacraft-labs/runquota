@@ -130,7 +130,7 @@ else:
     ## the classic shape of a control that cannot fail.
     let nonce = $getCurrentProcessId() & "-" & $int(epochTime() * 1000.0) &
       "-" & label
-    let workDir = "/private/tmp" / ("rqnix" & nonce)
+    let workDir = "/tmp" / ("rqnix" & nonce)
     createDir(workDir)
     discard chmod(workDir.cstring, Mode(0o755))
     let scriptPath = workDir / "build.sh"
@@ -165,7 +165,7 @@ else:
     ##
     ## The scratch directory cannot be removed here -- the build is still
     ## reading its script -- so it is remembered and cleaned up once the
-    ## process is gone. A suite that leaves litter in `/private/tmp` on every
+    ## process is gone. A suite that leaves litter in `/tmp` on every
     ## run is a suite nobody will keep running.
     let (workDir, expression) = prepareBuild(label, body)
     backgroundWorkDirs.add(workDir)
@@ -231,7 +231,8 @@ else:
 
   suite "shared_endpoint_second_uid_preflight":
     test "the probe and the shipped binaries are placed where a second uid can reach them":
-      ## `/private/tmp`, not the build tree: a macOS home directory is
+      ## Shared `/tmp` exists on macOS and Linux. A private TMPDIR or
+      ## the build tree can be inaccessible to a second uid: a macOS home directory is
       ## `0750`, so a Nix build user cannot traverse into it and every
       ## `exec` of a binary under it fails with EACCES. (Observed: the first
       ## version of this file ran the shipped CLI straight out of
@@ -239,7 +240,7 @@ else:
       check fileExists(probeSource)
       check fileExists(daemonPath())
       check fileExists(cliPath())
-      toolDir = "/private/tmp" / ("rqbin" & $getCurrentProcessId())
+      toolDir = "/tmp" / ("rqbin" & $getCurrentProcessId())
       removeDir(toolDir)
       createDir(toolDir)
       check chmod(toolDir.cstring, Mode(0o755)) == 0
@@ -282,7 +283,7 @@ else:
         let report = parseReport(runAsSecondUid("ids", script(
           "set -e",
           "export PATH=/usr/bin:/bin",
-          probeBinary & " /private/tmp/rq-no-such-socket > \"$out\" 2>&1")))
+          probeBinary & " /tmp/rq-no-such-socket > \"$out\" 2>&1")))
         check report.hasKey("uid")
         if report.hasKey("uid"):
           builderUid = int64(parseBiggestInt(report["uid"]))
@@ -305,7 +306,7 @@ else:
         echo "  NOT RUN: the preflight above did not produce a second uid"
         check false
       else:
-        let root = "/private/tmp" / ("rqsu" & $getCurrentProcessId())
+        let root = "/tmp" / ("rqsu" & $getCurrentProcessId())
         removeDir(root)
         createDir(root)
         check chmod(root.cstring, Mode(0o755)) == 0
@@ -362,7 +363,7 @@ else:
           # The builder made these and only the builder can unmake them:
           # `ep` is 0750 in a group this process is not in, and `state` is
           # owned by the build user. Left behind they would be undeletable
-          # litter under /private/tmp.
+          # litter under /tmp.
           "rm -rf " & rv & "/ep " & rv & "/state"))
         let readyFlag = rv / "ready"
         try:
