@@ -85,7 +85,10 @@ package runquota:
     # paths still use. These are sufficient for the path-mode tool
     # resolver to succeed under ``nix develop``.
     "nim >=2.2 <3.0"
-    "gcc >=12"
+    when defined(macosx):
+      "clang"
+    else:
+      "gcc >=12"
     "just >=1"
     "sh"
 
@@ -114,15 +117,19 @@ package runquota:
     # (``packages/interfaces/sqlite3``).
     "sqlite3 >=3"
 
+    # The published stats table imports shm_lease/anchor. Carry the producer's
+    # source identity and import root into each typed Nim compile.
+    "nim-shm-lease"
+
     # Not yet here from the flake's dev shell: the lint tools (``shellcheck``
     # has no Windows realization; ``shfmt``, ``typos``, ``repomix`` and
     # ``nixfmt`` are not reachable from ``uses:``), so ``just lint`` still
     # needs ``nix develop`` or a PATH that has them.
 
   # ``repro shell`` / ``repro exec -- <cmd>``: the tools in ``uses:`` above,
-  # provisioned per ``defaultToolProvisioning``. ``nim-shm-lease`` is found
-  # the way ``config.nims`` always finds it -- ``SHM_LEASE_SRC`` or the
-  # workspace sibling -- so it needs nothing here.
+  # provisioned per ``defaultToolProvisioning``. The source-library producer
+  # above supplies nim-shm-lease to engine builds; config.nims retains its
+  # explicit environment/sibling lookup for direct Nim and Just invocations.
   devEnv:
     when not defined(windows):
       useFlakeDevShell()

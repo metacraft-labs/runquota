@@ -85,8 +85,15 @@ jobs:
           # Exercise the published bootstrap repairs before a new CLI release.
           # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
           repro-from-source: true
-          repro-build-pin: 13052f77a1648ca3783ff947b6ea5cf6e90fdf9d
+          repro-build-pin: 4adfd0e7302082989775da840998043582c9a439
           gh-token: ${{ steps.ci_token.outputs.token }}
+
+      - name: Refresh authentication before repro build
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bf8a7f7d9d74967b536c903f8ca12ab78256af8b
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
 
       - name: repro build
         # Builds the conventional `build` collection declared in
@@ -95,15 +102,36 @@ jobs:
         # reprobuild engine identically to `just build`.
         run: dev-exec repro build
 
+      - name: Refresh authentication before repro test
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bf8a7f7d9d74967b536c903f8ca12ab78256af8b
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
       - name: repro test
         # Materialises the `test` collection.
         run: dev-exec repro test
+
+      - name: Refresh authentication before just build (cross-check)
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bf8a7f7d9d74967b536c903f8ca12ab78256af8b
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
 
       - name: just build (cross-check)
         # Re-runs the legacy `just build` path inside the same env so
         # we catch silent divergences between `repro build` outputs
         # and what the dev shell + Justfile produce today.
         run: dev-exec just build
+
+      - name: Refresh authentication before just test (cross-check)
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bf8a7f7d9d74967b536c903f8ca12ab78256af8b
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
 
       - name: just test (cross-check)
         run: dev-exec just test
