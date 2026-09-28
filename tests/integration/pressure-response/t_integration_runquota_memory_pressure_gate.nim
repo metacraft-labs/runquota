@@ -1,3 +1,6 @@
+## Real daemon and SQLite integration; no mocks. The persistence probe opens
+## the database read-only so polling cannot create the asynchronous writer's
+## database before its schema and journal are initialized.
 import std/[os, osproc, strutils, unittest]
 
 import runquota_client
@@ -130,37 +133,59 @@ proc finishLaunched(lease: var RunQuotaLease; child: var LaunchedProcess;
   child.close()
   lease.finish(peakMemoryBytes = peakMemoryBytes, processCount = processCount)
 
-proc persistedEstimate(dbPath, commandStatsId: string): uint64 =
+proc persistedEstimate(dbPath, commandStatsId: string):
+    tuple[value: uint64, diagnostic: string] =
   ## The same defect `runquota_persistence.runSqlite` had, in the test that
   ## checks its output: `execProcess` reads stdout and no other stream, and the
   ## explicit `options` replaces its `poStdErrToStdOut` default, so `sqlite3`'s
   ## diagnostics sat on a pipe nobody read. Past the 65_536 bytes a pipe holds
   ## that is a hang, not a failure.
   try:
-    let output = runCapturedProcess(
+    let captured = runCapturedProcess(
       "sqlite3",
       args = [
-        dbPath,
+        "-readonly", dbPath,
         "select conservative_memory_bytes from learned_estimates " &
           "where command_stats_id = '" & commandStatsId & "' limit 1;"
       ],
       options = {poUsePath}
-    ).output.strip()
+    )
+    if not captured.ok:
+      result.diagnostic = "sqlite3 exit " & $captured.exitCode & ": " &
+        captured.failure & captured.error
+      return
+    let output = captured.output.strip()
     if output.len == 0:
-      return 0'u64
-    parseUInt(output.splitLines()[0])
-  except CatchableError:
-    0'u64
+      result.diagnostic = "query returned no learned estimate"
+      return
+    result.value = parseUInt(output.splitLines()[0])
+  except CatchableError as error:
+    result.diagnostic = error.msg
 
 proc waitForPersistedEstimate(dbPath, commandStatsId: string): uint64 =
+  var lastDiagnostic = ""
   for _ in 0 ..< 100:
-    let value = persistedEstimate(dbPath, commandStatsId)
-    if value > 0:
-      return value
+    let probe = persistedEstimate(dbPath, commandStatsId)
+    if probe.value > 0:
+      return probe.value
+    lastDiagnostic = probe.diagnostic
     sleep(50)
-  raise newException(OSError, "learned estimate was not persisted")
+  raise newException(OSError,
+    "learned estimate was not persisted: " & lastDiagnostic)
 
 suite "integration_runquota_memory_pressure_gate":
+  test "polling does not create the writer's absent database":
+    let socketDir = getTempDir() / ("runquota-estimate-probe-" & $getCurrentProcessId())
+    if dirExists(socketDir): removeScratchRoot(socketDir)
+    createDir(socketDir)
+    defer: removeScratchRoot(socketDir)
+    let dbPath = socketDir / "absent.sqlite"
+    require findExe("sqlite3").len > 0
+    let probe = persistedEstimate(dbPath, "not-written-yet")
+    check probe.value == 0
+    check "unable to open database file" in probe.diagnostic
+    check not fileExists(dbPath)
+
   test "real daemon gates memory-heavy work and persists learned estimates":
     let socketDir = getTempDir() / ("runquota-m4-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"

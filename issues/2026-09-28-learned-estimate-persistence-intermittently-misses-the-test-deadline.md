@@ -12,7 +12,7 @@
 A full `nix develop --profile /tmp/runquota-3170fba-validation-shell --command just test`
 passes admission, in-memory estimate inspection and learned-budget assertions,
 then the pressure test raises `learned estimate was not persisted` after 100
-SQLite polls. The other 94 test programs and the static-helper gate pass.
+SQLite polls. The other 95 test programs and the static-helper gate pass.
 Five immediate unmodified repeats and 25 diagnostic repeats pass.
 
 The original probe discards SQLite exit status and stderr, and removes the
@@ -31,10 +31,29 @@ before changing a timeout or the writer.
 
 ## Evidence
 
-- `/tmp/runquota-3170fba-full-macos.log`: 94/95 programs and the static helper checks pass.
+- `/tmp/runquota-3170fba-full-macos.log`: 95/96 programs and the static helper checks pass.
 - `/tmp/runquota-pressure-repeat-baseline.log`: five original repeats pass.
 - `/tmp/runquota-pressure-diag-runs.log`: 25 diagnostic repeats pass.
 - Refreshed `origin/dev` at `f4f0f93`, already an ancestor of the measured source,
   and searched current and deleted issues for learned-estimate persistence and
   the memory-pressure test. The observation-store flush issue concerns a separate
   writer and does not explain this failure.
+
+## Additional evidence and probe repair
+
+Native macOS CI at `3170fba` passes all 96 programs and static helpers in
+job `109081684248`; CPU attribution records 38.3% initial host use and a
+measured/known-load ratio of 1.032. One hundred further diagnostic repeats
+pass. Two query invocations report `database is locked`; other early queries
+report a missing table. No writer failure was reproduced, so these do not
+establish the original timeout's cause.
+
+The query probe did have an independently testable defect: opening a missing
+SQLite file in default mode creates it before the asynchronous writer does.
+Open it read-only, assert that polling leaves an absent database absent, and
+retain SQLite exit/stderr diagnostics on timeout. Keep the same 100 polls and
+every pressure, admission and persisted-value assertion. The new regression
+fails when `-readonly` is removed: SQLite creates the absent database and
+reports a missing table. Both cases pass at `a889665` plus this probe repair;
+the real-daemon case also passes in the negative control. The original
+intermittent timeout remains open until it is attributed.
