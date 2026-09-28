@@ -65,9 +65,8 @@ when not defined(posix):
     test "a member connects and is served; a non-member is refused by the KERNEL":
       skip()
 else:
-  import std/[options, os, osproc, posix, strutils, tables, times, unittest]
+  import std/[os, osproc, posix, strutils, tables, times, unittest]
 
-  import runquota_observation_store
   import daemon_binary
 
   const probeSource = "tests/support/rendezvous_probe.nim"
@@ -218,15 +217,6 @@ else:
         except ValueError:
           discard
 
-  proc waitForExecutionRows(path: string; atLeast: int): int =
-    for _ in 0 ..< 100:
-      let store = openObservationStore(path)
-      if store.captureEnabled:
-        result = store.readExecutions().len
-        if result >= atLeast:
-          return
-      sleep(100)
-
   # ---------------------------------------------------------------------------
   # Fixture, computed once from this host's real uids and real group lists.
   # ---------------------------------------------------------------------------
@@ -327,12 +317,18 @@ else:
         let socketPath = rv / "ep" / "d.sock"
         let dbPath = rv / "state" / "obs.sqlite"
         let stopFlag = rv / "stop"
+        let auditFlag = rv / "audit"
+        let ownerReport = rv / "execution-owners"
+        let auditError = rv / "audit-error"
+        let sqlite = findExe("sqlite3")
+        require sqlite.len > 0
 
         # PATH is set explicitly: a Nix builder gets `PATH=/path-not-set`,
         # and the observation store shells out to `sqlite3`.
         var daemon = startAsSecondUid("daemon", script(
           "set -e",
-          "export PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+          "export PATH=" & quoteShell(parentDir(sqlite) &
+            ":/usr/bin:/bin:/usr/sbin:/sbin"),
           "export RUNQUOTA_ENDPOINT_GROUP=" & $memberGid,
           "mkdir -p " & rv & "/state",
           "chmod 0755 " & rv & "/state",
@@ -353,11 +349,19 @@ else:
           "  /bin/sleep 0.1",
           "  j=$((j+1))",
           "done",
-          "/usr/bin/stat -f 'sock_mode=%Lp\nsock_uid=%u\nsock_gid=%g' " &
+          probeBinary & " --stat " &
             socketPath & " > " & rv & "/socket-stat 2>&1 || true",
           "echo ready > " & rv & "/ready",
           "i=0",
           "while [ $i -lt 900 ]; do",
+          # Inspect persisted attribution as the database's real owner. The
+          # outsider must not need write access to the daemon's SQLite files.
+          "  if [ -e " & auditFlag & " ]; then",
+          "    " & quoteShell(sqlite) & " -readonly -batch -noheader " &
+            dbPath & " 'select owner_uid from executions;' > " &
+            ownerReport & ".tmp 2> " & auditError & " || true",
+          "    mv " & ownerReport & ".tmp " & ownerReport,
+          "  fi",
           "  [ -e " & stopFlag & " ] && break",
           "  kill -0 $pid 2>/dev/null || break",
           "  /bin/sleep 0.2",
@@ -474,16 +478,23 @@ else:
             # "read from the client's declaration" were indistinguishable by
             # the recorded value.
             check "m13d-second-uid-ok" in section(clientText, "lease")
-            check waitForExecutionRows(dbPath, 1) >= 1
-            let store = openObservationStore(dbPath)
-            check store.captureEnabled
-            let executions = store.readExecutions()
-            check executions.len >= 1
-            if executions.len >= 1 and clientUid.len > 0:
-              check executions[0].ownerUid ==
-                some(int64(parseBiggestInt(clientUid)))
-              check executions[0].ownerUid != some(int64(getuid()))
-              check executions[0].ownerUid != some(daemonUid)
+            writeFile(auditFlag, "audit\n")
+            var owners: seq[string] = @[]
+            for _ in 0 ..< 100:
+              if fileExists(ownerReport):
+                let report = readFile(ownerReport).strip()
+                if report.len > 0:
+                  owners = report.splitLines()
+                  break
+              sleep(100)
+            if owners.len == 0:
+              if fileExists(auditError): echo readFile(auditError)
+              if fileExists(rv / "daemon.log"): echo readFile(rv / "daemon.log")
+            check owners.len >= 1
+            for owner in owners:
+              check owner == clientUid
+              check owner != $int64(getuid())
+              check owner != $daemonUid
         finally:
           writeFile(stopFlag, "stop\n")
           discard daemon.waitForExit(120_000)

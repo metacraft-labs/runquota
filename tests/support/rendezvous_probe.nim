@@ -67,6 +67,15 @@ proc errnoName(code: cint): string =
 
 when isMainModule:
   let args = commandLineParams()
+  if args.len == 2 and args[0] == "--stat":
+    var info: Stat
+    if lstat(args[1].cstring, info) != 0 or not S_ISSOCK(info.st_mode):
+      echo "socket stat failed: errno=" & $errno
+      quit 1
+    echo "sock_mode=" & toOct(int(info.st_mode) and 0o777, 3)
+    echo "sock_uid=" & $int64(info.st_uid)
+    echo "sock_gid=" & $int64(info.st_gid)
+    quit 0
   if args.len < 1:
     echo "usage: rendezvous_probe SOCKET [DECLARED_UID]"
     quit 2

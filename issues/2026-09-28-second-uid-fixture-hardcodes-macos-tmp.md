@@ -42,3 +42,15 @@ Linux does not include the effective primary group in `getgroups()`. The
 fixture must include `getegid()` in both sides' credential sets and require
 a nonempty group list before indexing. The member connection and the
 nonmember's raw kernel `EACCES` remain the assertions.
+
+## Owner-side audit follow-up at d3b2a54
+
+[The next Linux run](https://github.com/metacraft-labs/runquota/actions/runs/36433103226/job/108964048627)
+passes the distinct-UID preflight, permitted client, spoof refusal and raw
+kernel denial. Its remaining failures are fixture observations: the socket
+audit uses BSD `stat -f`, and opening the store from the outsider account
+disables that reader's capture. Use `lstat` in the existing owner-side probe
+and execute a read-only SQLite attribution audit as the daemon's owner. Put
+the selected SQLite executable on that builder's PATH; do not depend on a
+host `/usr/bin/sqlite3`. Keep all mode, owner and group assertions, require
+persisted rows, and compare their owners with all three real credentials.
