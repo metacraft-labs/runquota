@@ -1,7 +1,7 @@
 {
   "product": "runquota",
   "versionFile": "runquota.nimble",
-  "packageName": "metacraft-runquota",
+  "packageName": "runquota",
   "commands": [
     "runquota",
     "runquotad"
@@ -19,8 +19,9 @@
       "assets": [
         "{product}-{version}-linux-x86_64.tar.gz",
         "{product}-{version}-linux-x86_64.json",
-        "metacraft-runquota_{version}-1_amd64.deb",
-        "metacraft-runquota-{version}-1.x86_64.rpm"
+        "runquota_{version}-1_amd64.deb",
+        "runquota-{version}-1.x86_64.rpm",
+        "runquota-{version}-1-x86_64.pkg.tar.gz"
       ]
     },
     {
@@ -33,8 +34,9 @@
       "assets": [
         "{product}-{version}-linux-aarch64.tar.gz",
         "{product}-{version}-linux-aarch64.json",
-        "metacraft-runquota_{version}-1_arm64.deb",
-        "metacraft-runquota-{version}-1.aarch64.rpm"
+        "runquota_{version}-1_arm64.deb",
+        "runquota-{version}-1.aarch64.rpm",
+        "runquota-{version}-1-aarch64.pkg.tar.gz"
       ]
     },
     {
@@ -58,7 +60,9 @@
       ],
       "assets": [
         "{product}-{version}-windows-x86_64.zip",
-        "{product}-{version}-windows-x86_64.json"
+        "{product}-{version}-windows-x86_64.json",
+        "runquota-{version}-windows-x86_64.msi",
+        "runquota-{version}-windows-x86_64-scoop.json"
       ]
     },
     {
@@ -70,13 +74,27 @@
       ],
       "assets": [
         "{product}-{version}-windows-aarch64.zip",
-        "{product}-{version}-windows-aarch64.json"
+        "{product}-{version}-windows-aarch64.json",
+        "runquota-{version}-windows-aarch64.msi",
+        "runquota-{version}-windows-aarch64-scoop.json"
       ]
     }
   ],
   "recommends": [
     "sqlite3"
   ],
-  "systemdUnit": "packaging/runquotad.service",
-  "serviceName": "runquotad"
+  "systemdUnit": "build/release-authoring/runquotad.service",
+  "serviceName": "runquotad",
+  "distributionMetadata": "build/release-authoring/distribution.json",
+  "archMetadata": "build/release-authoring/PKGINFO",
+  "versionChecks": [
+    {
+      "file": "libs/runquota_core/src/runquota_core.nim",
+      "pattern": "RunQuotaVersion\\*\\s*=\\s*\"([^\"]+)\""
+    },
+    {
+      "file": "packaging/runquota_dist.nim",
+      "pattern": "RunQuotaPackageVersion\\*\\s*=\\s*\"([^\"]+)\""
+    }
+  ]
 }

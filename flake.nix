@@ -7,6 +7,21 @@
     flake-parts.follows = "nixos-modules/flake-parts";
     git-hooks.follows = "nixos-modules/git-hooks-nix";
 
+    # Pure package renderers used by release_metadata.nim. Pin their sources
+    # independently of the operator's installed repro executable.
+    release-packaging-src = {
+      url = "github:metacraft-labs/reprobuild/a04cf4d2191086a22151f03d974fa0cd46e3533a";
+      flake = false;
+    };
+    release-nimcrypto-src = {
+      url = "github:cheatfate/nimcrypto/69eec0375dd146aede41f920c702c531bfe89c6b";
+      flake = false;
+    };
+    release-bearssl-src = {
+      url = "git+https://github.com/status-im/nim-bearssl?submodules=1&rev=9a4eed052abbded2d94feaf3f5bbd95a30ec4671";
+      flake = false;
+    };
+
     # THE SHARED-MEMORY LIBRARY, and M13b is the first thing in this repo
     # that needs it. `runquota_stats_table` -- the published aggregate
     # table -- reuses `shm_lease/anchor` (boot id, process start time, the
@@ -348,8 +363,12 @@
               pkgs.binutils
               pkgs.dpkg
               pkgs.rpm
+              pkgs.libarchive
             ];
             SHM_LEASE_SRC = shmLeaseSrc;
+            RELEASE_PACKAGING_SRC = inputs.release-packaging-src;
+            RELEASE_NIMCRYPTO_SRC = inputs.release-nimcrypto-src;
+            RELEASE_BEARSSL_SRC = inputs.release-bearssl-src;
             shellHook = pre-commit-check.shellHook;
           };
         };
