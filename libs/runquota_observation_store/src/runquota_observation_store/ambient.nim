@@ -381,15 +381,28 @@ elif defined(windows):
     const
       maxBracketMillis = 20'i64
       bracketAttempts = 8
+    #
+    # THE BRACKET IS TAKEN AT TIME-CRITICAL PRIORITY: on a busy host
+    # `GetSystemTimes` otherwise waits behind every runnable thread, for
+    # seconds, and no number of retries brings the bracket back under a
+    # tick. See `raiseForCounterRead` in `windows_host` for the measurements.
     var busy, total: int64
-    for _ in 0 ..< bracketAttempts:
-      let opened = unixMillisNow()
-      if not systemCpuMillis(busy, total):
-        result.detail = "GetSystemTimes failed"
-        return
-      result.atUnixMillis = unixMillisNow()
-      if result.atUnixMillis - opened <= maxBracketMillis:
-        break
+    var cpuRead = false
+    let priority = raiseForCounterRead()
+    try:
+      for _ in 0 ..< bracketAttempts:
+        let opened = unixMillisNow()
+        cpuRead = systemCpuMillis(busy, total)
+        if not cpuRead:
+          break
+        result.atUnixMillis = unixMillisNow()
+        if result.atUnixMillis - opened <= maxBracketMillis:
+          break
+    finally:
+      restoreAfterCounterRead(priority)
+    if not cpuRead:
+      result.detail = "GetSystemTimes failed"
+      return
     let memory = memoryFigures()
     if not memory.ok:
       result.detail = "GlobalMemoryStatusEx failed"
