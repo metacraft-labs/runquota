@@ -33,3 +33,12 @@ while retaining distinct credentials. Pass `--option sandbox false` only to
 their Nix invocations; this does not change global Nix settings, build users,
 group membership, the positive client control or kernel refusal assertions.
 The native Linux rerun remains required.
+
+## Linux primary-group follow-up at 1cc64a3
+
+[The native diagnostic](https://github.com/metacraft-labs/runquota/actions/runs/36430831818/job/108956273767)
+now reaches a distinct build uid. Its supplementary group list is empty;
+Linux does not include the effective primary group in `getgroups()`. The
+fixture must include `getegid()` in both sides' credential sets and require
+a nonempty group list before indexing. The member connection and the
+nonmember's raw kernel `EACCES` remain the assertions.

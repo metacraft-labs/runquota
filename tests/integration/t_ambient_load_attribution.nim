@@ -907,6 +907,8 @@ suite "ambient_load_attribution":
         (cpu: 0.25, rss: 500_000_000'i64)]
       const declaredCpu = 7.5 + 2.25 + 0.25
       const declaredRss = 4_500_000_000'i64
+      let hostMemoryBytes = readHostLoad().memTotalBytes
+      require hostMemoryBytes > 0
 
       var leases: seq[RunQuotaLease] = @[]
       for i, figures in declared:
@@ -927,9 +929,15 @@ suite "ambient_load_attribution":
       # `self`; the assertions below pin `self` to the declared sum to the
       # bit, so it cannot.
       let cores = max(1, cpuinfo.countProcessors())
-      let busyNow = hostBusyPct()
+      let busyNow = waitForHeadroom(30)
       check busyNow >= 0.0
-      load = startLoad(spinnersForHeadroom(busyNow, cores))
+      require busyNow <= maxBusyForMeasurement
+      # A two-thread floor on a 32-core host cannot exceed a 10% declaration.
+      # Reserve enough spinners for twice the declared share; the measured
+      # getrusage positive control below still proves they actually ran.
+      let minimumSpinners = int(2.0 * declaredCpu * float(cores) / 100.0) + 1
+      load = startLoad(max(minimumSpinners,
+        spinnersForHeadroom(busyNow, cores)))
       load.burn(true)
       sleep(settleMillis)
       let reporting = observe(2500)
@@ -980,7 +988,12 @@ suite "ambient_load_attribution":
         check row.cpuBusyPct > declaredCpu
         check row.foreignCpuPct == row.cpuBusyPct - declaredCpu
         check row.foreignCpuPct > 0.0
-        check row.foreignRssBytes > 0
+        # A quiet host can use less than the declared 4.5 GB. That is a valid
+        # zero residual, covered by the same clamp as the runaway arm. Assert
+        # the exact subtraction instead of assuming a host baseline. The
+        # preceding memory-load test supplies the real positive control.
+        check row.foreignRssBytes == max(0'i64,
+          hostMemoryBytes - row.memAvailableBytes - declaredRss)
 
       for row in clampedRows:
         check row.selfCpuPct == declaredCpu + 400.0

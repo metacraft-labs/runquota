@@ -29,9 +29,13 @@ import runquota_protocol
 proc groupList(): string =
   var buffer: array[0 .. 255, Gid]
   let count = getgroups(cint(buffer.len), addr buffer)
-  var parts: seq[string] = @[]
+  # Linux getgroups reports supplementary groups only. The effective primary
+  # group also grants filesystem access, even when a Nix builder has no extras.
+  var parts: seq[string] = @[$int64(getegid())]
   for i in 0 ..< max(0, int(count)):
-    parts.add($int64(buffer[i]))
+    let group = $int64(buffer[i])
+    if group notin parts:
+      parts.add(group)
   parts.join(",")
 
 proc rawConnect(path: string): tuple[fd: SocketHandle; code: cint] =

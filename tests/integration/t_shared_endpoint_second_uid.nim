@@ -92,6 +92,7 @@ else:
     lstat(path.cstring, info) == 0 and S_ISSOCK(info.st_mode)
 
   proc myGroups(): seq[int64] =
+    result.add(int64(getegid()))
     var buffer: array[0 .. 255, Gid]
     let count = getgroups(cint(buffer.len), addr buffer)
     for i in 0 ..< max(0, int(count)):
@@ -298,7 +299,7 @@ else:
           # A SECOND UID, not this one. Without this the whole file would be
           # a single-uid run wearing a costume.
           check builderUid != int64(getuid())
-          check builderGroups.len > 0
+          require builderGroups.len > 0
           memberGid = builderGroups[0]
           echo "  second uid " & $builderUid & " groups " & $builderGroups
           echo "  member gid " & $memberGid & ", this uid " &
