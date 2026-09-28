@@ -52,7 +52,7 @@ jobs:
           substituters: ${{ vars.SUBSTITUTERS }}
           nix-github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run linters
-        run: nix develop --command just lint
+        run: nix develop --profile "$RUNNER_TEMP/runquota-lint-shell" --command just lint
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -78,7 +78,10 @@ jobs:
           substituters: ${{ vars.SUBSTITUTERS }}
           nix-github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run tests
-        run: nix develop --command just test
+        # Keep the complete environment rooted for the job. On the shared
+        # macOS hosts an unrooted helper disappeared from /nix/store while
+        # the suite was running. RUNNER_TEMP is removed after the job.
+        run: nix develop --profile "$RUNNER_TEMP/runquota-test-shell" --command just test
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4

@@ -77,8 +77,8 @@ for recipe in build test lint format fmt t bump-version build-package verify-pac
   just --summary | tr ' ' '\n' | grep -Fxq "${recipe}" || fail "missing Justfile recipe ${recipe}"
 done
 
-require_contains .github/workflows/ci.yml "run: nix develop --command just lint"
-require_contains .github/workflows/ci.yml "run: nix develop --command just test"
+require_contains .github/workflows/ci.yml 'run: nix develop --profile "$RUNNER_TEMP/runquota-lint-shell" --command just lint'
+require_contains .github/workflows/ci.yml 'run: nix develop --profile "$RUNNER_TEMP/runquota-test-shell" --command just test'
 require_contains .github/workflows/ci.yml "run: nix build .#default"
 require_contains .github/workflows/ci.yml "if: always()"
 require_contains .github/workflows/ci.yml "actions/upload-artifact@v4"
