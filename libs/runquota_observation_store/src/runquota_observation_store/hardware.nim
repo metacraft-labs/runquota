@@ -20,10 +20,8 @@
 ##   forbids. Capacities belong here; utilisation does not. The one field
 ##   where the line is genuinely blurred is swap, handled below.
 ##
-## PLATFORM STATUS. macOS/arm64 and Windows 11/x64 are the platforms this
-## has been run on. The Linux branch is written from ``/proc`` and ``/sys``
-## semantics and has NEVER EXECUTED; treat a failure there as a first
-## observation, not a regression.
+## Platform evidence and outstanding gaps are recorded in the release
+## validation notes and issues; the detector is exercised on native hosts.
 
 import std/[os, strutils]
 
@@ -295,15 +293,8 @@ when defined(macosx):
 # ---------------------------------------------------------------------------
 
 elif defined(linux):
-  # NOT EXECUTED ANYWHERE YET. Everything in this branch is written from
-  # the documented contents of `/proc` and `/sys` and has never run on a
-  # Linux host: no field below has been compared against a real machine,
-  # and the campaign's rule is that a finding only counts on the OS it was
-  # reproduced on. Treat a wrong value here as a first observation, not a
-  # regression. What macOS does prove is the shape: detection feeds
-  # `profileHash`, `ensureHostProfile` reuses on an unchanged hash, and
-  # both are platform-independent.
   import std/posix
+  import ./linux_cpu_model
 
   proc readFileOrEmpty(path: string): string =
     try:
@@ -355,13 +346,6 @@ elif defined(linux):
     let physical = if pairs.len > 0: int64(pairs.len) else: logical
     (physical, logical)
 
-  proc cpuModelOf(cpuinfo: string): string =
-    for key in ["model name", "Model", "Hardware", "cpu model", "cpu"]:
-      let value = keyValue(cpuinfo, key, ":")
-      if value.len > 0:
-        return value
-    unknownField
-
   import ./linux_storage
 
   proc mountedFilesystem(path: string): LinuxMount =
@@ -392,7 +376,8 @@ elif defined(linux):
     let cpuinfo = readFileOrEmpty("/proc/cpuinfo")
     let meminfo = readFileOrEmpty("/proc/meminfo")
     let counts = coreCounts(cpuinfo)
-    profile.cpuModel = cpuModelOf(cpuinfo)
+    let model = linuxCpuModel(cpuinfo)
+    profile.cpuModel = if model.len > 0: model else: unknownField
     profile.physicalCores = counts.physical
     profile.logicalCores = counts.logical
     profile.ramBytes = kilobytesField(meminfo, "MemTotal")

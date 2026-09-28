@@ -45,3 +45,12 @@ implementer/part identity directly, without guessing a marketing name. Keep
 distinct heterogeneous CPU identities in deterministic order. Exercise the
 parser with actual kernel-format input and repeat the complete native ARM64
 suite, retaining the existing assertions.
+
+## Repair validation
+
+The candidate based on `2ddbf11` extracts the CPU parser into
+`linux_cpu_model.nim`, retains textual names, and falls back to sorted distinct
+ARM implementer/part/variant/revision identities. Missing identity stays unknown.
+Nine parser cases and all eleven native macOS host-profile cases pass locally;
+the Linux ARM64 detector typechecks. The old parser from `74aacfe` fails the
+new ARM64 regression. Complete native Linux ARM64 validation remains pending.

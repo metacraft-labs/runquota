@@ -131,6 +131,7 @@ suite "observation_store_host_profile":
     # And detection actually detected something: an all-`unknown` profile
     # is stable too, and would make every assertion above vacuous.
     check first.cpuModel != unknownField
+    echo "  detected CPU model: ", first.cpuModel
     check first.arch != unknownField
     check first.os != unknownField
     check first.osVersion != unknownField
