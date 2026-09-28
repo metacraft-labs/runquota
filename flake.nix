@@ -230,8 +230,7 @@
             module-eval =
               pkgs.runCommand "runquota-module-eval"
                 {
-                  darwinActivation =
-                    darwinEval.config.system.activationScripts.runquotadStateDir.text;
+                  darwinActivation = darwinEval.config.system.activationScripts.runquotadStateDir.text;
                   # The VALUES, not the attribute names: nix-darwin
                   # declares every launchd key whether or not it was set,
                   # so a grep over the names would pass against a module
@@ -316,6 +315,7 @@
 
           devShells.default = pkgs.mkShell {
             packages = [
+              pkgs.nodejs
               staticHelperGate
               pkgs.just
               pkgs.nim2
@@ -341,6 +341,13 @@
               # CLI and not just the library.
               pkgs.sqlite
               pkgs.typos
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.zig
+              pkgs.patchelf
+              pkgs.binutils
+              pkgs.dpkg
+              pkgs.rpm
             ];
             SHM_LEASE_SRC = shmLeaseSrc;
             shellHook = pre-commit-check.shellHook;

@@ -1,0 +1,14 @@
+[Unit]
+Description=RunQuota host-wide resource lease authority
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/runquotad
+Restart=on-failure
+StateDirectory=runquota
+RuntimeDirectory=runquota
+
+# Installation does not enable the service. Configure the host's resource
+# capacity before explicitly starting the single host-wide authority.
+[Install]
+WantedBy=multi-user.target

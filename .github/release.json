@@ -1,0 +1,82 @@
+{
+  "product": "runquota",
+  "versionFile": "runquota.nimble",
+  "packageName": "metacraft-runquota",
+  "commands": [
+    "runquota",
+    "runquotad"
+  ],
+  "license": "MIT",
+  "summary": "Host-wide resource lease coordinator",
+  "targets": [
+    {
+      "id": "linux-x86_64",
+      "runner": [
+        "self-hosted",
+        "linux",
+        "x64"
+      ],
+      "assets": [
+        "{product}-{version}-linux-x86_64.tar.gz",
+        "{product}-{version}-linux-x86_64.json",
+        "metacraft-runquota_{version}-1_amd64.deb",
+        "metacraft-runquota-{version}-1.x86_64.rpm"
+      ]
+    },
+    {
+      "id": "linux-aarch64",
+      "runner": [
+        "self-hosted",
+        "linux",
+        "arm64"
+      ],
+      "assets": [
+        "{product}-{version}-linux-aarch64.tar.gz",
+        "{product}-{version}-linux-aarch64.json",
+        "metacraft-runquota_{version}-1_arm64.deb",
+        "metacraft-runquota-{version}-1.aarch64.rpm"
+      ]
+    },
+    {
+      "id": "darwin-aarch64",
+      "runner": [
+        "self-hosted",
+        "macos",
+        "arm64"
+      ],
+      "assets": [
+        "{product}-{version}-darwin-aarch64.tar.gz",
+        "{product}-{version}-darwin-aarch64.json"
+      ]
+    },
+    {
+      "id": "windows-x86_64",
+      "runner": [
+        "self-hosted",
+        "windows",
+        "x64"
+      ],
+      "assets": [
+        "{product}-{version}-windows-x86_64.zip",
+        "{product}-{version}-windows-x86_64.json"
+      ]
+    },
+    {
+      "id": "windows-aarch64",
+      "runner": [
+        "self-hosted",
+        "windows",
+        "arm64"
+      ],
+      "assets": [
+        "{product}-{version}-windows-aarch64.zip",
+        "{product}-{version}-windows-aarch64.json"
+      ]
+    }
+  ],
+  "recommends": [
+    "sqlite3"
+  ],
+  "systemdUnit": "packaging/runquotad.service",
+  "serviceName": "runquotad"
+}

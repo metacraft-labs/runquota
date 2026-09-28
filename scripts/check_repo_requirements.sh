@@ -136,8 +136,11 @@ require_file scripts/verify_package.sh
 require_file scripts/verify_windows_package.ps1
 require_file scripts/check_windows_scrubbed_launch.ps1
 require_file tests/unit/t_packaging_contract.nim
-require_file .github/workflows/publish-windows.yml
-require_file .github/workflows/publish-linux.yml
+require_file .github/workflows/release.yml
+require_file .github/release.json
+require_file scripts/release/build.sh
+require_file scripts/release/build.ps1
+require_file scripts/release/smoke.cjs
 
 # EVERY JOB CARRIES ITS OWN CEILING. `runs-on:` appears exactly once per job,
 # which is what makes this a per-job count rather than a grep for the key
@@ -152,24 +155,20 @@ if [ "${ci_ceilings}" -lt "${ci_jobs}" ]; then
   fail "ci.yml has ${ci_jobs} jobs but only ${ci_ceilings} timeout-minutes"
 fi
 
-# THE SAME CEILING RULE, APPLIED TO THE PUBLISH WORKFLOWS. The rule above
-# predates them and named `ci.yml` literally, so the two workflows added
-# for packaging were carrying their ceilings by the author's care rather
-# than by anything that would notice their absence. A publish job that
-# hung would hold one of this organisation's two Windows slots until the
-# repository-wide 6h default expired -- which is the failure the ceiling
-# exists to bound, and it is worse here than in `ci.yml` because a
-# publish runs on a tag nobody is watching.
-for wf in .github/workflows/publish-windows.yml .github/workflows/publish-linux.yml; do
-  wf_jobs="$(grep -cE '^    runs-on:' "${wf}" || true)"
-  wf_ceilings="$(grep -cE '^    timeout-minutes: [0-9]+$' "${wf}" || true)"
-  if [ "${wf_jobs}" -lt 1 ]; then
-    fail "${wf} yielded ${wf_jobs} jobs; refusing to pass on an empty sweep"
-  fi
-  if [ "${wf_ceilings}" -lt "${wf_jobs}" ]; then
-    fail "${wf} has ${wf_jobs} jobs but only ${wf_ceilings} timeout-minutes"
-  fi
-done
+# Release jobs and their timeouts now live in the shared workflow, whose own
+# contract suite checks every job. Require an immutable, matching tooling pin.
+release_ref="$(sed -n 's/.*release-tools.yml@\([0-9a-f]\{40\}\)$/\1/p' .github/workflows/release.yml)"
+tooling_ref="$(sed -n 's/.*tooling-ref: \([0-9a-f]\{40\}\)$/\1/p' .github/workflows/release.yml)"
+if [ -z "$release_ref" ] || [ "$release_ref" != "$tooling_ref" ]; then
+  fail "release.yml must pin matching shared workflow and tooling commits"
+fi
+require_contains .github/workflows/release.yml "workflow_dispatch:"
+require_contains .github/workflows/release.yml "tags:"
+require_contains .github/release.json "linux-x86_64"
+require_contains .github/release.json "linux-aarch64"
+require_contains .github/release.json "darwin-aarch64"
+require_contains .github/release.json "windows-x86_64"
+require_contains .github/release.json "windows-aarch64"
 
 for pattern in "repomix/" "bench-results/" "nimcache/" "result"; do
   require_contains .gitignore "${pattern}"
