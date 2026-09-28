@@ -26,18 +26,15 @@
     },
     {
       "id": "linux-aarch64",
-      "runner": [
-        "self-hosted",
-        "linux",
-        "arm64"
-      ],
+      "runner": "eph-linux-arm64",
       "assets": [
         "{product}-{version}-linux-aarch64.tar.gz",
         "{product}-{version}-linux-aarch64.json",
         "runquota_{version}-1_arm64.deb",
         "runquota-{version}-1.aarch64.rpm",
         "runquota-{version}-1-aarch64.pkg.tar.gz"
-      ]
+      ],
+      "runnerReason": "Temporary route through the live m3 scale set; central Tart pool cannot drive this backend (infra 5878095c, central-garm.nix)."
     },
     {
       "id": "darwin-aarch64",
@@ -96,5 +93,6 @@
       "file": "packaging/runquota_dist.nim",
       "pattern": "RunQuotaPackageVersion\\*\\s*=\\s*\"([^\"]+)\""
     }
-  ]
+  ],
+  "unsignedReleaseVersion": "0.1.0"
 }
