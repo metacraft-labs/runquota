@@ -20,6 +20,11 @@ on:
   pull_request:
     branches: [main, dev, stable]
 
+# Cancel superseded PR checks while preserving every mainline run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   reprobuild:
     name: ${{ matrix.os }}-${{ matrix.arch }} — repro build/test ${{ contains(matrix.runner, 'windows') && contains(matrix.runner, 'arm64') && '(x64 emulation)' || '' }}
@@ -42,7 +47,9 @@ jobs:
           - os: windows
             arch: arm64
             runner: [self-hosted, windows, arm64]
-    runs-on: ${{ matrix.runner }}
+    # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
+    # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
+    runs-on: ${{ contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner }}
     env:
       # Reprobuild and its monitor currently target x64 on Windows, including
       # the existing emulated lane on ARM64 hosts. Native release payloads
