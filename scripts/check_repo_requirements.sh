@@ -99,7 +99,7 @@ require_contains .github/workflows/ci.yml "actions/upload-artifact@v4"
 # pinning the old spelling -- so `just lint` has failed on its FIRST script,
 # for everyone, ever since. Assert the spelling the workflows actually use.
 require_contains .github/workflows/ci.yml "windows-compile-gate:"
-require_contains .github/workflows/ci.yml "runs-on: [self-hosted, windows, x64]"
+require_contains .github/workflows/ci.yml "runs-on: windows-2025"
 require_contains .github/workflows/ci.yml "shell: pwsh"
 require_file tests/windows/portable_tests.txt
 require_file tests/unit/t_windows_compile_gate.nim

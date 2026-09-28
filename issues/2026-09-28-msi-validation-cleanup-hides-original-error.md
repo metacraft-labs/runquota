@@ -26,3 +26,14 @@ Preserve the original exception, add stage diagnostics, retain a directly owned
 process handle and exit status for Windows Installer, and retry transient cleanup
 failures briefly. Run the unchanged full validation requirements again on a
 native Windows ARM64 runner. Do not suppress a failed payload or ICE check.
+
+## Repair verification, 2026-09-28
+
+Diagnostic workflow `36425300183`, scripts at `939c38a`, verifies the previously
+native-tested `e9e487a` artifacts for both Windows architectures. ICEs, all
+20 MSI table assertions, extracted payload hashes, real client/daemon/lease
+execution and unchanged MSI hashes pass. No payload processes remain after
+smoke. The x64 image stays undeletable for about 22 seconds on ARM64 Windows,
+then removal succeeds; ARM64 cleanup succeeds immediately. A bounded 30-second
+retry replaces the insufficient 2-second window. The retaining component is
+not identified; the evidence does not show a leaked RunQuota process.

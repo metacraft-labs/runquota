@@ -254,12 +254,8 @@ when defined(macosx):
       result.detail = "kernel reported a zero capacity"
 
 elif defined(linux):
-  # NOT EXECUTED ANYWHERE YET. Written from the documented contents of
-  # `/proc`; no field below has been compared against a real Linux
-  # machine. Treat a wrong value here as a first observation, not a
-  # regression. What macOS proves is the shape: every interface named
-  # below is host-wide, the attribution downstream is platform-independent,
-  # and neither reads a per-process file.
+  import ./linux_cpu_ticks
+
   proc readFileOrEmpty(path: string): string =
     try:
       if fileExists(path): readFile(path) else: ""
@@ -315,22 +311,9 @@ elif defined(linux):
   proc readHostLoad*(): HostLoadReading =
     result = unavailableReading("linux-proc", "")
     let stat = readFileOrEmpty("/proc/stat")
-    var busyTicks = 0'i64
-    var idleTicks = 0'i64
-    for line in stat.splitLines():
-      let fields = line.splitWhitespace()
-      if fields.len < 5 or fields[0] != "cpu":
-        continue
-      # The aggregate `cpu` line only: the `cpuN` lines below it are the
-      # same time counted a second time, per core.
-      for i in 1 ..< fields.len:
-        let value =
-          try: parseBiggestInt(fields[i])
-          except ValueError: 0'i64
-        # Fields 4 and 5 after the label are idle and iowait; iowait is
-        # not busy CPU, so both are idle capacity here.
-        if i == 4 or i == 5: idleTicks += value else: busyTicks += value
-      break
+    let cpu = parseLinuxCpuTicks(stat)
+    let busyTicks = cpu.busy
+    let idleTicks = cpu.idle
     if busyTicks + idleTicks <= 0:
       result.detail = "/proc/stat carried no aggregate cpu line"
       return

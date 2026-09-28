@@ -148,7 +148,11 @@ jobs:
     # service then leaves this gate queued or pending, not green. There is no
     # skip-as-pass branch.
     timeout-minutes: 90
-    runs-on: [self-hosted, windows, x64]
+    # Temporary 0.1.0 validation exception: the persistent runner cannot
+    # remove a retained shim DLL, and both self-hosted x64 VM pools are
+    # declaratively paused. Track return to the fleet in issues/2026-09-28-
+    # windows-checkout-blocked-by-retained-shim.md. Owner: zah.
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
 
