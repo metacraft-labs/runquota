@@ -15,6 +15,14 @@ architecture, runtime dependencies and functional behavior.
 
 The archive includes `runquota` and `runquotad`. The smoke check starts an isolated daemon and executes a real lease through the client. Linux also emits an Arch package; Windows emits MSI and Scoop authoring from the existing `packaging/runquota_dist.nim`. Service capacity remains an explicit operator configuration step.
 
+Both Windows targets execute their own native ZIP payload checks. A separate
+Windows ARM64 job then validates both MSI packages: transferred hashes, full
+WiX ICE checks, actual MSI tables, administrative extraction, and equality with
+the tested ZIP files. It also runs the extracted clients and daemons. Assembly
+depends on this job succeeding. The linker defers ICE checks because the x64
+runner service account cannot execute Windows Installer actions; missing
+Installer access in the validation job is a failure, never a skipped check.
+
 Each target emits JSON evidence naming the source commit, pinned dependency
 revisions, smoke result, signing state and artifact hashes. The assembly step
 checks the exact asset set and hashes after upload, then signs `SHA256SUMS`
