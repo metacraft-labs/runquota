@@ -1189,6 +1189,24 @@ suite "observation_socket_write_path":
 
       # And admission is untouched.
       discard client.completeOneExecution("degraded-three")
+
+      # DEGRADED-THREE IS SETTLED BEFORE THE STORE IS WRITABLE AGAIN, or
+      # the read-back below measures a race instead of the degraded window.
+      # Its rows were queued before its finish was acknowledged, but the
+      # writer drains them on its own 25 ms cadence, so without this they
+      # could still be queued when the permissions are restored -- and a
+      # drain that landed between the restore and the read committed them,
+      # legitimately, to a store that was by then writable: two rows, about
+      # one run in four on a loaded Windows host. A stats query is the one
+      # thing with a settle contract ("every row queued before this call is
+      # committed or counted lost", `flushObservationWriter`), so one is
+      # asked here, while the store still refuses writes, and the loss it
+      # forces is then asserted rather than assumed.
+      discard client.queryStats(statsSubjectDistribution, "degraded-three")
+      let settled = client.observations()
+      check settled["dropped"].getInt() > degraded["dropped"].getInt()
+      check settled["write_failures"].getInt() >
+        degraded["write_failures"].getInt()
       client.close()
 
       setFilePermissions(state, {fpUserRead, fpUserWrite, fpUserExec})
