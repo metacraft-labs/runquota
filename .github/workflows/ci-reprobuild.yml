@@ -67,9 +67,13 @@ jobs:
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@6d607047dc8b99753f1b16cf37982506de65b373
         with:
           env-flavor: reprobuild
+          # Exercise the published bootstrap repairs before a new CLI release.
+          # ARM64 Windows retains its current path pending the backend work.
+          repro-from-source: ${{ matrix.os != 'windows' || matrix.arch != 'arm64' }}
+          repro-build-pin: e8804eb367f979c810cc440b901a9506f23b9ae5
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: repro build
