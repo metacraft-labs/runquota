@@ -39,7 +39,12 @@
 ## typed-tool resolver instead of the out-of-band ``build_sibling
 ## ../runquota`` shell step in ``scripts/run_tests.sh``.
 
-import std/[os]
+import std/[algorithm, os, sets, strutils]
+import ct_test_nim_unittest
+import repro_resources/run_edge
+import ./repro_support/timeout
+when defined(posix):
+  import ./repro_support/process_tools
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
@@ -96,6 +101,15 @@ package runquota:
     # On Windows this is Git for Windows' bash, whose launcher also puts its
     # coreutils (find, sort, timeout, ...) on the script's PATH.
     "bash >=4"
+    "timeout"
+    "sleep"
+    "mkdir"
+    when not defined(windows):
+      "dirname"
+      "uname"
+      "ps"
+      "find"
+      "nix"
 
     # ``git``, which the static-helper gate's tool-store authority
     # (``scripts/static_helper_gate_toolstore.sh``, the arm ``just test`` runs
@@ -199,6 +213,61 @@ package runquota:
       actionId = "runquota.apps.runquotad"))
 
     discard collect("apps", runquotaAppsActions)
+
+    # Match scripts/run_tests.sh: sorted, complete discovery with unique output
+    # names. Compile each program separately; both shipping apps precede every
+    # execution edge because integration tests start real daemons and clients.
+    const backendCompiler = (when defined(macosx): "clang" else: "gcc")
+    const exeSuffix = (when defined(windows): ".exe" else: "")
+    var testSources: seq[string] = @[]
+    var libraryPaths: seq[string] = @[]
+    for kind, path in walkDir("libs"):
+      if kind == pcDir and dirExists(path / "src"):
+        libraryPaths.add(path / "src")
+    libraryPaths.sort()
+    for root in ["tests", "libs"]:
+      for source in walkDirRec(root):
+        let normalized = source.replace('\\', '/')
+        if normalized.endsWith(".nim") and normalized.extractFilename.startsWith("t") and
+            (root == "tests" or "/tests/t" in normalized):
+          testSources.add(normalized)
+    testSources.sort()
+    for i, source in testSources:
+      if source.extractFilename == "t_ambient_load_attribution.nim":
+        testSources.delete(i)
+        testSources.add(source)
+        break
+    doAssert testSources.len > 0, "No RunQuota tests found"
+    var names = initHashSet[string]()
+    var testBuilds, testRuns: seq[BuildActionDef] = @[]
+    for source in testSources:
+      let name = source.extractFilename.changeFileExt("")
+      doAssert name notin names, "Duplicate test binary name: " & name
+      names.incl(name)
+      let output = "build/test-bin/" & name & exeSuffix
+      let compiled = buildNimUnittest.build(
+        source = source, binary = output, paths = libraryPaths,
+        extraInputs = @["config.nims", "tests/support"],
+        actionId = "runquota.test_build." & name)
+      appendRegisteredActionToolIdentityRefs(compiled.action.id, [backendCompiler])
+      testBuilds.add(compiled.action)
+      # Preserve the native harness's bound, kill grace and closed stdin.
+      # GNU timeout places the child tree in its own process group.
+      let executed = shell(
+        command = "timeout --kill-after=10 600 " & quoteShell(output) & " </dev/null",
+        after = runquotaAppsActions & @[compiled.action] &
+          (if name == "t_ambient_load_attribution": testBuilds & testRuns else: @[]),
+        extraInputs = @[output, "build/bin/runquota" & exeSuffix,
+                         "build/bin/runquotad" & exeSuffix],
+        actionId = "runquota.test_execute." & name)
+      appendRegisteredActionToolIdentityRefs(executed.id,
+        ["timeout", "sleep", "nim", backendCompiler, "sqlite3", "sh", "bash", "git", "mkdir"])
+      when not defined(windows):
+        appendRegisteredActionToolIdentityRefs(executed.id, ["dirname", "uname", "ps", "find", "nix"])
+      run("test-" & name, build = executed.id, owningPackage = "runquota")
+      testRuns.add(executed)
+    discard collect("test-builds", testBuilds)
+    discard collect("test", testRuns)
 
     # -------------------------------------------------------------------
     # Documentation (docs/book-isonim) as build-graph edges.
