@@ -104,6 +104,13 @@ else:
     # as the NEW CLI, where `--no-out-link` does not exist.
     findExe("nix-build", followSymlinks = false)
 
+  proc buildArgs(expression: string): seq[string] =
+    # These builds provide distinct real credentials while sharing the host's
+    # rendezvous socket. A Linux Nix sandbox has a private /tmp and cannot
+    # reach that socket or the fixture binaries. This per-invocation option
+    # leaves Nix's build-user separation and the kernel permission checks intact.
+    @["--no-out-link", "--option", "sandbox", "false", expression]
+
   proc script(lines: varargs[string]): string =
     ## Joined with EXPLICIT newlines, and that is not a style preference. Nim
     ## strips the leading newline of every triple-quoted literal, so a shell
@@ -142,7 +149,7 @@ else:
     ## Runs `body` as a Nix build user and returns what it wrote to `$out`.
     let (workDir, expression) = prepareBuild(label, body)
     let built = execProcess(nixBuildExe(),
-      args = ["--no-out-link", expression],
+      args = buildArgs(expression),
       env = nil, options = {poStdErrToStdOut})
     var storePath = ""
     for line in built.splitLines():
@@ -169,7 +176,7 @@ else:
     ## run is a suite nobody will keep running.
     let (workDir, expression) = prepareBuild(label, body)
     backgroundWorkDirs.add(workDir)
-    startProcess(nixBuildExe(), args = ["--no-out-link", expression],
+    startProcess(nixBuildExe(), args = buildArgs(expression),
       options = {poStdErrToStdOut})
 
   proc cleanBackgroundWorkDirs() =

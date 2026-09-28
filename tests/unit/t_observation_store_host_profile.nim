@@ -31,6 +31,8 @@
 import std/[nativesockets, options, os, sequtils, strutils, unittest]
 
 import runquota_observation_store
+when defined(linux):
+  import runquota_observation_store/linux_storage
 
 proc scratchDir(name: string): string =
   result = getTempDir() / ("runquota-m10-" & name & "-" &
@@ -135,7 +137,17 @@ suite "observation_store_host_profile":
     check first.kernelVersion != unknownField
     check first.virtualization in ["bare-metal", "vm", "container"]
     check first.fsType != unknownField
-    check first.diskClass != dcUnknown
+    when defined(linux):
+      let mount = linuxMountForPath(readFile("/proc/self/mountinfo"),
+        expandFilename(getTempDir()))
+      echo "  storage: ", mount, " class=", first.diskClass
+      if dirExists("/sys/dev/block" / mount.deviceNumber):
+        check first.diskClass != dcUnknown
+      # ZFS, tmpfs and overlay mounts may expose no block device in sysfs.
+      # Their unknown storage class is honest; the disk resolver's fixture
+      # tests independently require real NVMe, MMC and HDD classifications.
+    else:
+      check first.diskClass != dcUnknown
     # `logicalCores >= 1`, `physicalCores >= 1` and `swapBytes >= 0` are
     # deliberately NOT asserted here: `detectHardwareProfile` floors the two
     # core counts at 1 and `quantizeSwapBytes` floors swap at 0, so all three

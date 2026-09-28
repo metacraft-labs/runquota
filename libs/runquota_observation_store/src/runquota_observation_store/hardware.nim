@@ -362,47 +362,15 @@ elif defined(linux):
         return value
     unknownField
 
-  proc mountedFilesystem(path: string): tuple[fsType, device: string] =
-    ## The longest mount point in `/proc/self/mountinfo` that is a prefix
-    ## of `path`. Longest wins because mounts nest.
-    var probe = if path.len > 0: path else: "/"
+  import ./linux_storage
+
+  proc mountedFilesystem(path: string): LinuxMount =
+    var probe = if path.len > 0: absolutePath(path) else: "/"
     while probe.len > 1 and not fileExists(probe) and not dirExists(probe):
       probe = probe.parentDir
-    result = (unknownField, "")
-    var bestLength = -1
-    for line in readFileOrEmpty("/proc/self/mountinfo").splitLines():
-      let halves = line.split(" - ", maxsplit = 1)
-      if halves.len != 2:
-        continue
-      let left = halves[0].split()
-      let right = halves[1].split()
-      if left.len < 5 or right.len < 2:
-        continue
-      let mountPoint = left[4]
-      if not (probe == mountPoint or probe.startsWith(
-          if mountPoint.endsWith("/"): mountPoint else: mountPoint & "/")):
-        continue
-      if mountPoint.len > bestLength:
-        bestLength = mountPoint.len
-        result = (right[0], right[1])
-
-  proc diskClassOf(fsType, device: string): DiskClass =
-    if networkFsType(fsType):
-      return dcNetwork
-    if not device.startsWith("/dev/"):
-      return dcUnknown
-    var name = device[5 .. ^1]
-    if name.startsWith("nvme"):
-      return dcNvme
-    # Strip a partition suffix: sda1 -> sda, mmcblk0p1 -> mmcblk0.
-    while name.len > 1 and name[^1] in {'0' .. '9'}:
-      name.setLen(name.len - 1)
-    let rotational =
-      readFileOrEmpty("/sys/block/" & name & "/queue/rotational").strip()
-    case rotational
-    of "1": dcHdd
-    of "0": dcSsd
-    else: dcUnknown
+    if fileExists(probe) or dirExists(probe):
+      probe = expandFilename(probe)
+    linuxMountForPath(readFileOrEmpty("/proc/self/mountinfo"), probe)
 
   proc virtualizationOf(): string =
     if fileExists("/.dockerenv") or
@@ -447,7 +415,9 @@ elif defined(linux):
     let mounted = mountedFilesystem(referencePath)
     profile.fsType =
       if mounted.fsType.len > 0: mounted.fsType else: unknownField
-    profile.diskClass = diskClassOf(mounted.fsType, mounted.device)
+    profile.diskClass =
+      if networkFsType(mounted.fsType): dcNetwork
+      else: linuxBlockDiskClass(mounted.deviceNumber)
 
 # ---------------------------------------------------------------------------
 # Windows

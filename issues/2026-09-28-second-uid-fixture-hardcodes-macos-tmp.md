@@ -23,3 +23,13 @@ These are normal-suite findings; the release payload checks passed separately.
 
 Refreshed `origin/dev` (`f4f0f93`) and `origin/agents` (`906800c`). Searched
 open issues, issue history and RunQuota milestone records before recording.
+
+## Linux follow-up at 28d1fbb
+
+The hosted Linux diagnostic reaches the Nix build user, but that build cannot
+open the fixture script under host `/tmp`: Linux sandboxing supplies a private
+temporary directory. These fixtures must share a filesystem and Unix socket
+while retaining distinct credentials. Pass `--option sandbox false` only to
+their Nix invocations; this does not change global Nix settings, build users,
+group membership, the positive client control or kernel refusal assertions.
+The native Linux rerun remains required.

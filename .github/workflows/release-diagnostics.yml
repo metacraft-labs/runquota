@@ -35,9 +35,12 @@ jobs:
         run: |
           # shellcheck disable=SC2016 # Expanded by the inner shell.
           nix develop --command bash -c '
+            echo "Nix environment TMPDIR=$TMPDIR"
+            findmnt -T "$TMPDIR" -o TARGET,SOURCE,FSTYPE,MAJ:MIN
+            cat /proc/self/mountinfo
             scripts/build_apps.sh
             failed=0
-            for f in tests/unit/t_scope_boundary_rules.nim tests/integration/t_stats_table_concurrency.nim tests/integration/t_shared_endpoint_second_uid.nim libs/runquota_observation_store/tests/t_observation_flush_contract.nim tests/unit/t_observation_store_host_profile.nim libs/runquota_observation_store/tests/t_linux_cpu_ticks.nim tests/integration/t_host_load_reading_invariants.nim; do
+            for f in tests/unit/t_scope_boundary_rules.nim tests/integration/t_stats_table_concurrency.nim tests/integration/t_shared_endpoint_second_uid.nim libs/runquota_observation_store/tests/t_observation_flush_contract.nim tests/unit/t_observation_store_host_profile.nim libs/runquota_observation_store/tests/t_linux_storage.nim libs/runquota_observation_store/tests/t_linux_cpu_ticks.nim tests/integration/t_host_load_reading_invariants.nim tests/integration/t_ambient_load_attribution.nim; do
               nim c -r --threads:on --hints:off --out:build/test-bin/$(basename "$f" .nim) "$f" || failed=1
             done
             exit "$failed"
