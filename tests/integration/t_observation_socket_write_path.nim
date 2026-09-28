@@ -1189,6 +1189,12 @@ suite "observation_socket_write_path":
 
       # And admission is untouched.
       discard client.completeOneExecution("degraded-three")
+      # A stats query flushes all earlier observations before replying. Keep
+      # the store read-only across that barrier; lease completion only queues
+      # its row, so restoring permissions earlier lets the writer commit it.
+      discard client.queryStats(statsSubjectExecutions)
+      degraded = client.observations()
+      check degraded["dropped"].getInt() >= 3
       client.close()
 
       setFilePermissions(state, {fpUserRead, fpUserWrite, fpUserExec})
