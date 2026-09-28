@@ -164,11 +164,20 @@ jobs:
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
           owner: metacraft-labs
 
-      - name: Setup Windows dev environment
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+      - name: Check out the pinned release toolchain setup
+        uses: actions/checkout@v4
         with:
-          env-flavor: windows-diy
-          gh-token: ${{ steps.ci_token.outputs.token }}
+          repository: metacraft-labs/metacraft-github-actions
+          ref: f450cb0d688fb7d15cd475c792b1c9b6acae87c5
+          path: .release-tools
+          token: ${{ steps.ci_token.outputs.token }}
+          persist-credentials: false
+
+      - name: Install checksum-pinned Nim and LLVM-MinGW
+        shell: pwsh
+        env:
+          RELEASE_TARGET: windows-x86_64
+        run: ./.release-tools/release-tools/setup-windows.ps1
 
       # THE CHECKOUT IS BARE, AND ONE DEPENDENCY IS PROVIDED BY NAME. No
       # sibling repositories, so `config.nims` can resolve nothing by
@@ -204,6 +213,7 @@ jobs:
             $path = $fields[1]
             Write-Host "== nim c $path"
             & nim c `
+              --cc:clang "--clang.exe:$env:RELEASE_CC" "--clang.linkerexe:$env:RELEASE_CC" `
               --threads:on `
               --hints:off `
               --nimcache:"build/nimcache/$name" `
@@ -303,6 +313,7 @@ jobs:
             $name = [System.IO.Path]::GetFileNameWithoutExtension($test)
             Write-Host "== nim c -r $test"
             & nim c -r `
+              --cc:clang "--clang.exe:$env:RELEASE_CC" "--clang.linkerexe:$env:RELEASE_CC" `
               --threads:on `
               --hints:off `
               --nimcache:"build/nimcache/$name" `
