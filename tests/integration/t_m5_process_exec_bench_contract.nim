@@ -496,6 +496,7 @@ suite "m5_process_exec_bench_contract":
     # The script's diagnostics are now readable, so a failed build says why
     # instead of failing three opaque metric assertions below.
     if not captured.ok:
+      checkpoint("run-m5-benchmark.sh stdout: " & captured.output)
       checkpoint("run-m5-benchmark.sh stderr: " & captured.error)
     check captured.failure.len == 0
     check captured.exitCode == 0
