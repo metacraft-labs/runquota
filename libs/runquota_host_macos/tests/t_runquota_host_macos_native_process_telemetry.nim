@@ -61,7 +61,7 @@ when defined(macosx):
       result = startProcess(
         getAppFilename(),
         args = args,
-        options = {poStdErrToStdOut}
+        options = {poParentStreams}
       )
     finally:
       delEnv(FixtureModeEnv)
@@ -124,12 +124,17 @@ when defined(macosx):
     doAssert ballast[ballast.high - (ballast.high mod 4096)] >= 0'u8
     0
 
-  proc waitForFile(path: string) =
+  proc waitForFile(path: string;
+      children: openArray[tuple[name: string, process: Process]]) =
     let deadline = epochTime() + 5.0
     while not fileExists(path) and epochTime() < deadline:
       sleep(10)
     if not fileExists(path):
-      raise newException(OSError, "fixture did not report ready: " & path)
+      var detail = "fixture did not report ready: " & path
+      for child in children:
+        detail.add("; " & child.name & " pid=" & $child.process.processID &
+          " exit=" & $child.process.peekExitCode())
+      raise newException(OSError, detail)
 
   proc fixturePids(path: string): seq[int] =
     for value in readFile(path).splitWhitespace():
@@ -231,9 +236,10 @@ suite "runquota_host_macos native process telemetry":
         if dirExists(fixtureDir):
           removeDir(fixtureDir)
 
-      waitForFile(rootReadyPath)
-      waitForFile(branchReadyPath)
-      waitForFile(sentinelReadyPath)
+      let children = [("root", root), ("sentinel", sentinel)]
+      waitForFile(rootReadyPath, children)
+      waitForFile(branchReadyPath, children)
+      waitForFile(sentinelReadyPath, children)
       let rootPids = fixturePids(rootReadyPath)
       let branchPids = fixturePids(branchReadyPath)
       let sentinelPids = fixturePids(sentinelReadyPath)
