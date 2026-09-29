@@ -34,6 +34,8 @@
 ## diagnosing it once.
 
 import std/os
+when defined(windows):
+  import std/[monotimes, times]
 
 proc scratchEntryCount*(root: string): int =
   ## How many entries are under ``root`` right now. A fingerprint, not an
@@ -54,10 +56,13 @@ proc removeScratchRoot*(root: string) =
   ## ON WINDOWS A FILE THAT IS STILL OPEN CANNOT BE DELETED, and stopping the
   ## daemon there is `TerminateProcess`: its `sqlite3` children are not
   ## signalled with it and finish the statement they were given, holding the
-  ## database open for that long. Nothing about that is visible as the tree
-  ## CHANGING, so the settle wait below cannot see it; the removal itself is
-  ## the only probe, and a sharing violation is retried within the same
-  ## bound. Past it the error is raised exactly as before.
+  ## database open for that long. Windows ARM's XtaCache.exe also retains
+  ## finished x64 executable images while maintaining its translation cache.
+  ## The real owner control at shared-actions 6cd12df observes it retaining
+  ## hello.bin/passing.exe past two seconds, then releasing them without any
+  ## process being killed. Entry counts cannot observe either kind of lock.
+  ## Retry removal within a separate 30-second monotonic bound; a persistent
+  ## lock still raises the original error. Ordinary cleanup adds no delay.
   const
     SettleStepMillis = 25
     SettleBudgetMillis = 2000
@@ -71,15 +76,14 @@ proc removeScratchRoot*(root: string) =
     sleep(SettleStepMillis)
     waited += SettleStepMillis
   when defined(windows):
-    var retried = 0
+    let removeDeadline = getMonoTime() + initDuration(seconds = 30)
     while true:
       try:
         removeDir(root)
         return
       except OSError:
-        if retried >= SettleBudgetMillis:
+        if getMonoTime() >= removeDeadline:
           raise
         sleep(SettleStepMillis)
-        retried += SettleStepMillis
   else:
     removeDir(root)

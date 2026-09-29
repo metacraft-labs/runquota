@@ -1,6 +1,6 @@
 # Windows ARM-host test cleanup cannot remove finished executable images
 
-Status: open. Observed at RunQuota `177e2af`.
+Status: in progress. Observed at RunQuota `177e2af` and `a9d9f40`.
 
 ## Observed
 
@@ -31,3 +31,21 @@ Refreshed dev `e9f9011`, searched open and deleted issues for cleanup, scratch
 roots and retention. The MSI cleanup issue covers installer extraction; the
 compiler-directory issue concerns read-only directory modes. Neither establishes
 why these test executable images remain undeletable.
+
+## Attributed owner and repair
+
+Control [36628087037](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36628087037)
+at shared `6cd12df`, RunQuota `a9d9f40`, io-mon `e8df820` identifies the
+Windows translation-cache service `C:\Windows\System32\XtaCache.exe`
+(PID 2544) as the real owner of `hello.bin`, `passing.exe` and a SQLite
+fixture executable after the original two-second deadline. Restart Manager
+also identifies each live test's own PID, validating the owner query.
+The failing removals succeed 80, 1242, 1873 and 3902 ms later, without killing
+or restarting any process. The diagnostic retains each original failure.
+All three native comparisons pass. Evidence:
+`/tmp/runquota-cleanup-6cd-arm-evidence`.
+
+Give Windows removal a separate 30-second monotonic retry bound. Retain the
+directory-settle check and every functional assertion, and keep cleanup fatal
+if the lock persists. Validate the three actual fixtures on both Windows hosts
+before closing this issue. This changes test teardown, not daemon behavior.
