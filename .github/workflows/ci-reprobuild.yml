@@ -15,6 +15,7 @@ name: CI (reprobuild)
 # host without any other repo-side change.
 
 on:
+  workflow_dispatch:
   merge_group:
     types: [checks_requested]
   push:
@@ -120,7 +121,7 @@ jobs:
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@68033518cb0b508994b7ebb5211158f6d72b6e20
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@6991ebb8e108423b32b2afe8031346db2bf087e1
         with:
           env-flavor: reprobuild
           # Exercise the published bootstrap repairs before a new CLI release.
