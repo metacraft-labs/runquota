@@ -18,7 +18,13 @@
         "runquota_{version}-1_amd64.deb",
         "runquota-{version}-1.x86_64.rpm",
         "runquota-{version}-1-x86_64.pkg.tar.gz"
-      ]
+      ],
+      "hostedRunner": "ubuntu-24.04",
+      "runnerMigration": {
+        "version": "0.1.0",
+        "owner": "zah",
+        "followup": "https://github.com/metacraft-labs/metacraft-specs/blob/latest/issues/2026-09-24-ci-runner-mode-policy-conflicts-with-hosted-runner-ban.md"
+      }
     },
     {
       "id": "linux-aarch64",
@@ -47,7 +53,13 @@
       "assets": [
         "{product}-{version}-darwin-aarch64.tar.gz",
         "{product}-{version}-darwin-aarch64.json"
-      ]
+      ],
+      "hostedRunner": "macos-26",
+      "runnerMigration": {
+        "version": "0.1.0",
+        "owner": "zah",
+        "followup": "https://github.com/metacraft-labs/metacraft-specs/blob/latest/issues/2026-09-24-ci-runner-mode-policy-conflicts-with-hosted-runner-ban.md"
+      }
     },
     {
       "id": "windows-x86_64",
