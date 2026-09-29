@@ -726,8 +726,9 @@ when defined(windows):
   # std/osproc can apply it via the `env` table parameter.
   proc windowsChildEnv(spec: CommandSpec): StringTableRef =
     # Windows: start from the current process env, then layer overrides.
-    when compiles(newStringTable()):
-      result = newStringTable()
+    # Windows names are case-insensitive: an inherited Path and a PATH
+    # override must describe one value in the child's environment block.
+    result = newStringTable(modeCaseInsensitive)
     for k, v in envPairs():
       result[k] = v
     for entry in spec.env:
