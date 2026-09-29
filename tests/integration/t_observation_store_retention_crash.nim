@@ -553,6 +553,8 @@ suite "observation_store_retention_crash":
         break
       sleep(1)
     check rolePid > 0
+    let group = openGroup(rolePid)
+    defer: closeGroup(group)
 
     # THE TRIGGER, AND IT IS THE OPEN TRANSACTION ITSELF. A second
     # connection asking for `begin immediate` with no timeout is refused
@@ -588,9 +590,13 @@ suite "observation_store_retention_crash":
     # statement-at-a-time implementation has committed most of the cascade
     # and the store is visibly half-pruned; one transaction has committed
     # nothing.
+    var killed = false
     for _ in 0 ..< 5_000_000:
       observedWal = walBytes(path)
       if observedWal >= killThreshold:
+        # No logging, assertion formatting or handle acquisition between
+        # observing the threshold and killing the real SQLite process group.
+        killed = killGroup(group)
         break
     echo "  kill trigger: writeLocked after " & $probes & " probe(s), wal=" &
       $observedWal & " of " & $killThreshold & " target bytes"
@@ -598,9 +604,10 @@ suite "observation_store_retention_crash":
 
     # THE WHOLE GROUP, so the `sqlite3` child executing the batch dies with
     # its caller instead of committing after it.
-    let group = openGroup(rolePid)
-    defer: closeGroup(group)
-    check killGroup(group)
+    if not killed:
+      # Still clean up a missed window; it remains a failed crash control.
+      discard killGroup(group)
+    check killed
     discard role.waitForExit(10_000)
     check not role.running
     role.close()

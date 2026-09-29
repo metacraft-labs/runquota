@@ -42,9 +42,11 @@
 ## report its own failure, so the work runs in a re-executed child that the
 ## parent waits on with a bounded deadline, turning a hang into a red result.
 ##
-## No mocks: the production helper spawns the production ``sqlite3``.
+## No mocks: the production helper spawns the production ``sqlite3``. The
+## contention regression holds a real read transaction, then releases it while
+## the production estimate writer initializes WAL and commits its first row.
 
-import std/[os, osproc, strutils, tempfiles, unittest]
+import std/[os, osproc, streams, strutils, tempfiles, unittest]
 
 import runquota_core/child_process
 import runquota_persistence
@@ -53,6 +55,7 @@ import ../../../tests/support/child_watchdog
 
 const
   FloodFlag = "--estimate-sqlite-flood-child"
+  ReaderBarrierFlag = "--estimate-reader-barrier"
 
   ## A single statement `sqlite3` cannot prepare. It echoes the offending text
   ## back on stderr, so the diagnostic is as long as the statement: 300_000
@@ -130,6 +133,18 @@ proc oversizedBatchSql(rows: int): string =
 if paramCount() >= 3 and paramStr(1) == FloodFlag:
   runFloodChild(paramStr(2), paramStr(3))
   quit(0)
+if paramCount() == 3 and paramStr(1) == ReaderBarrierFlag:
+  # sqlite3 invokes this only after BEGIN and SELECT acquired its read lock.
+  writeFile(paramStr(2), "ready")
+  for _ in 0 ..< 1500:
+    if fileExists(paramStr(3)):
+      quit(0)
+    sleep(10)
+  quit(1)
+
+proc releaseReader(path: string) {.thread.} =
+  sleep(350)
+  writeFile(path, "release")
 
 suite "estimate store sqlite streams":
   test "a diagnostic past the pipe buffer neither wedges nor reaches stdout":
@@ -214,6 +229,52 @@ suite "estimate store sqlite streams":
     let readBack = runSqlite(dbPath, "select count(*) from probe;")
     check readBack.ok
     check readBack.output.strip() == $OversizedBatchRows
+
+  test "a temporary reader does not discard the first estimate batch":
+    let work = createTempDir("runquota_estimate_reader_", "")
+    defer: removeDir(work)
+    let dbPath = work / "estimates.db"
+    let row = LearnedEstimateRow(scope: "reader-control",
+      commandStatsId: "reader-command", conservativeMemoryBytes: 1024,
+      recentPeakMemoryBytes: 1000, sampleCount: 1, updatedUnixMillis: 1)
+    # A real, empty DELETE-mode store matches the failed first-WAL transition.
+    let seed = startEstimateStore(dbPath)
+    check enqueueEstimateWrite(seed, row)
+    stopEstimateStore(seed)
+    check runSqlite(dbPath,
+      "pragma journal_mode = delete; delete from learned_estimates;").ok
+    let ready = work / "reader-ready"
+    let release = work / "reader-release"
+    let reader = startProcess("sqlite3", args = ["-batch", "-bail", dbPath],
+      options = {poUsePath, poStdErrToStdOut})
+    defer:
+      if reader.running:
+        reader.terminate()
+        discard reader.waitForExit(5000)
+      reader.close()
+    reader.inputStream.write("begin;\nselect count(*) from learned_estimates;\n" &
+      ".shell " & quoteShell(getAppFilename()) & " " & ReaderBarrierFlag &
+      " " & quoteShell(ready) & " " & quoteShell(release) & "\nrollback;\n")
+    reader.inputStream.close()
+    for _ in 0 ..< 1000:
+      if fileExists(ready): break
+      if not reader.running: break
+      sleep(10)
+    require fileExists(ready)
+    let failuresBefore = estimateWriteFailures()
+    var releaser: Thread[string]
+    createThread(releaser, releaseReader, release)
+    let store = startEstimateStore(dbPath)
+    check enqueueEstimateWrite(store, row)
+    stopEstimateStore(store)
+    joinThread(releaser)
+    check reader.waitForExit(5000) == 0
+    check estimateWriteFailures() == failuresBefore
+    let persisted = loadLearnedEstimates(dbPath)
+    check persisted.len == 1
+    if persisted.len == 1:
+      check persisted[0].commandStatsId == row.commandStatsId
+      check persisted[0].conservativeMemoryBytes == row.conservativeMemoryBytes
 
   test "a batch the store cannot commit is counted, not discarded":
     ## `writeBatch`'s result used to be `discard`ed, so a batch that never ran

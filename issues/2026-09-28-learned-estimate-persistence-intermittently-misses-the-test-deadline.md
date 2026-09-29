@@ -81,3 +81,24 @@ omits SQLite's own error, so the rejected operation is not established.
 Shared diagnostic `d04a676` adds that error output without changing storage
 behavior, deadlines or assertions, and compares the same real binaries outside
 monitoring in run `36618038706`. Its source edits precede rebuilding the apps.
+
+At `cda06d2`, a local real-reader control copies that saved DELETE-mode
+database and drives the production estimate writer. With no reader, one row
+commits and the journal becomes WAL. In two controls holding a real SQLite
+read transaction for 350 ms, the writer exits before the reader is released,
+counts one dropped batch, and leaves zero rows in DELETE mode. This establishes
+a reader-contention defect, although the hosted run still needs its SQLite
+error to confirm the same immediate cause.
+
+Repair the estimate helper to use the observation helper's existing bounded
+five-second SQLite busy wait. Keep it on the background writer, preserve the
+failure counters and failed-store degradation, and use `.timeout` so no extra
+result row contaminates queries. Cover a real temporary read transaction with
+the production writer and verify the test fails when the timeout is removed.
+
+The new real-SQLite regression passes with that repair at `cda06d2` plus the
+patch. Against unchanged `cda06d2`, the identical test fails with one dropped
+batch and zero persisted rows; the other three stream tests pass in both
+controls. The separate saved-database comparison also commits its row after
+the 350 ms reader releases in both repaired controls. Hosted attribution and
+complete ordinary CI remain required.

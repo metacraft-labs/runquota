@@ -233,12 +233,13 @@ package runquota:
           testSources.add(normalized)
     testSources.sort()
     const measurementTests = [
+      "t_observation_store_retention_crash",
       "t_ambient_sample_atomicity",
       "t_host_load_reading_invariants",
       "t_completion_report_does_not_wait_on_the_store",
       "t_ambient_load_attribution",
       "t_runquota_host_macos_native_process_telemetry"]
-    # These programs saturate the CPU or measure live latency and process memory.
+    # These programs saturate the CPU or measure live timing and process memory.
     # Run them after compilation and the rest of the suite, one at a time,
     # so our own load generators do not invalidate another test's control.
     for name in measurementTests:
