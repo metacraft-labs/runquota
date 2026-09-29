@@ -272,25 +272,71 @@ proc walBytes(path: string): int64 =
   let wal = path & "-wal"
   if not fileExists(wal): 0'i64 else: getFileSize(wal)
 
+const walWriteLockByte = 120
+  ## The byte of `<db>-shm` that SQLite holds exclusively for the whole of a
+  ## write transaction in WAL mode: the first of the WAL-index lock bytes,
+  ## 120 through 127, in the documented WAL-index layout (the same offset on
+  ## the unix and Windows VFS). `begin immediate` takes it and `commit`
+  ## releases it, so it is held exactly while the prune's transaction is open.
+
+when defined(windows):
+  const
+    LockfileFailImmediately = 0x00000001'i32
+    LockfileExclusiveLock = 0x00000002'i32
+
+  proc shmLockFileEx(file: Handle; flags, reserved, lengthLow, lengthHigh: int32;
+                     overlapped: ptr OVERLAPPED): WINBOOL
+    {.stdcall, dynlib: "kernel32.dll", importc: "LockFileEx".}
+  proc shmUnlockFileEx(file: Handle; reserved, lengthLow, lengthHigh: int32;
+                       overlapped: ptr OVERLAPPED): WINBOOL
+    {.stdcall, dynlib: "kernel32.dll", importc: "UnlockFileEx".}
+
 proc writeLocked(path: string): bool =
-  ## Whether somebody else holds a write transaction on ``path`` RIGHT NOW.
-  ## ``.timeout 0`` so the probe reports the state instead of waiting for it
-  ## to pass.
+  ## Whether somebody else holds a write transaction on ``path`` RIGHT NOW,
+  ## read from the write-lock byte of its WAL index (`walWriteLockByte`).
   ##
-  ## An argument vector rather than a shell line: the quoting this used to
-  ## rely on is POSIX shell quoting, which cmd.exe does not do.
+  ## IN PROCESS, NOT BY STARTING `sqlite3`. This used to run
+  ## `sqlite3 -cmd ".timeout 0" <db> "begin immediate;"` per probe, and a
+  ## process start is what decided the test: the prune's transaction is open
+  ## for a few hundred milliseconds, and on a loaded Windows host one start
+  ## took a large part of that, so the probes could straddle the whole window
+  ## and the kill never fired ("Check failed: locked", seen at 2d4929a with
+  ## the kill then landing after the prune had finished). A lock query costs
+  ## microseconds, so the window is sampled rather than stepped over.
   ##
-  ## `begin immediate;` ALONE, with no `rollback` after it: the probe's
-  ## connection closes when the tool exits, which rolls back whatever it
-  ## began. The pair used to be sent together, and sqlite3 3.53 reports only
-  ## the LAST statement's error for a multi-statement argument -- so a
-  ## refused `begin` surfaced as "cannot rollback - no transaction is
-  ## active", the probe never saw "locked", and the kill never fired.
-  let outcome = runCapturedProcess(sqliteTool,
-    args = ["-batch", "-bail", "-cmd", ".timeout 0", path,
-            "begin immediate;"],
-    options = {poUsePath, poStdErrToStdOut})
-  outcome.exitCode != 0 and "locked" in outcome.output.toLowerAscii
+  ## POSIX asks with `F_GETLK`, which takes no lock at all. Windows has no
+  ## query-only lock call, so it tries the byte with `LockFileEx`, fail-
+  ## immediately, and releases it at once when it got it -- the same
+  ## momentary contention the `begin immediate` probe had, and the store's
+  ## own statements run under `.timeout 5000`, so a prune that meets it
+  ## waits rather than fails.
+  let shm = path & "-shm"
+  when defined(windows):
+    let file = createFileW(newWideCString(shm),
+      GENERIC_READ or GENERIC_WRITE,
+      FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+      nil, OPEN_EXISTING, 0, 0)
+    if file == INVALID_HANDLE_VALUE:
+      return false
+    defer: discard closeHandle(file)
+    var at: OVERLAPPED
+    at.offset = int32(walWriteLockByte)
+    if shmLockFileEx(file, LockfileFailImmediately or LockfileExclusiveLock,
+        0, 1, 0, addr at) == 0:
+      return true
+    discard shmUnlockFileEx(file, 0, 1, 0, addr at)
+    false
+  else:
+    let fd = posix.open(shm.cstring, O_RDWR)
+    if fd < 0:
+      return false
+    defer: discard posix.close(fd)
+    var lock: Tflock
+    lock.l_type = cshort(F_WRLCK)
+    lock.l_whence = cshort(SEEK_SET)
+    lock.l_start = Off(walWriteLockByte)
+    lock.l_len = Off(1)
+    fcntl(fd, F_GETLK, addr lock) == 0 and lock.l_type != cshort(F_UNLCK)
 
 proc startWalPin(path: string): Process =
   ## A reader holding an open snapshot, and the reason the measurement
@@ -518,13 +564,19 @@ suite "observation_store_retention_crash":
     var observedWal = 0'i64
     var locked = false
     var probes = 0
-    for _ in 0 ..< 4_000:
+    # BOUNDED BY TIME, not by a probe count: a probe is now microseconds, so
+    # the 4 000 probes that used to span several seconds of process starts
+    # would be over before the role had opened the store. The role exiting
+    # is the other way out, and the one a missed window takes.
+    let lockDeadline = epochTime() + 120.0
+    while true:
       probes += 1
       if writeLocked(path):
         locked = true
         break
-      if not role.running:
+      if not role.running or epochTime() > lockDeadline:
         break
+      sleep(1)
     check locked
     # THE SECOND HALF OF THE TRIGGER, AND THE ONE THAT DECIDES THIS TEST.
     # A transaction that has only just opened has written nothing, and
