@@ -362,7 +362,9 @@ proc spinnersForHeadroom(busyPct: float; cores: int): int =
   ## figure stays KNOWN either way, because it is read out of ``getrusage``
   ## afterwards rather than inferred from the thread count.
   let headroom = max(0.0, 100.0 - busyPct)
-  clamp(int(headroom * 0.45 / 100.0 * float(cores)), 2, max(2, cores div 2))
+  # Two spinners already consume two thirds of a three-core runner, exceeding
+  # this gate's 60% load ceiling. One remains a real measured workload.
+  clamp(int(headroom * 0.45 / 100.0 * float(cores)), 1, max(1, cores div 2))
 
 proc scratchDir(name: string): string =
   # Short on purpose. Nim's `Sockaddr_un_path_length` is 92 on macOS, and
