@@ -30,3 +30,14 @@ telemetry implementation defect or timeout repair is established yet.
 Refreshed dev `e9f9011`; searched current issues and deleted issue history for
 telemetry and `sentinel.ready`. No earlier record was found. The failure report
 is retained in `/tmp/runquota-8add-macos-repro-artifacts/`.
+
+## Focused controls
+
+At `8add804`, hosted diagnostic
+[36591592367](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36591592367)
+passes the original monitored target, five instrumented monitored repetitions,
+and direct execution of the same instrumented binary. Instrumentation sends
+child output to the parent's log and reports child mode/PID/exit status at the
+unchanged readiness deadline. No control reproduces the failure. Local native
+and monitored controls also pass. The next control keeps this instrumentation
+inside the complete ordinary graph, preserving its concurrent work.
