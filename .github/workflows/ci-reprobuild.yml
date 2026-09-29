@@ -103,7 +103,7 @@ jobs:
         # `repro.nim`. Verifies the primary shipping artefact (the
         # recorder binary or extension) materialises through the
         # reprobuild engine identically to `just build`.
-        run: dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'path' || 'nix' }}
+        run: dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
 
       - name: Refresh authentication before repro test
         uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
@@ -114,7 +114,7 @@ jobs:
 
       - name: repro test
         # Materialises the `test` collection.
-        run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'path' || 'nix' }}
+        run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
 
       - name: Refresh authentication before just build (cross-check)
         uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
