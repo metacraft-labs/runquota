@@ -13,6 +13,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  choose-macos:
+    # Native macOS jobs retain their full gates while the fleet repair lands.
+    # Owner: zah. Follow-up: metacraft-specs/issues/
+    # 2026-09-28-shared-macos-host-has-no-headroom-for-runquota-measurements.md
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: macos-26
+      fallback: '["self-hosted","macos","arm64"]'
+
   choose-linux:
     # The shared CI_RUNNER_MODE policy selects free hosted runners for public
     # repos by default and preserves the org-controlled self-hosted fallback.
@@ -22,7 +31,7 @@ jobs:
       fallback: '["self-hosted","linux","x64"]'
 
   lint:
-    needs: choose-linux
+    needs: [choose-linux, choose-macos]
     name: Lint
     strategy:
       fail-fast: false
@@ -40,7 +49,7 @@ jobs:
     timeout-minutes: 45
     # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
     # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
-    runs-on: ${{ contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
+    runs-on: ${{ contains(matrix.runner, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Nix
@@ -60,7 +69,7 @@ jobs:
           retention-days: 30
 
   test:
-    needs: choose-linux
+    needs: [choose-linux, choose-macos]
     name: Test
     strategy:
       fail-fast: false
@@ -69,7 +78,7 @@ jobs:
     timeout-minutes: 90
     # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
     # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
-    runs-on: ${{ contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
+    runs-on: ${{ contains(matrix.runner, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Nix
@@ -92,7 +101,7 @@ jobs:
           retention-days: 30
 
   nix-build:
-    needs: choose-linux
+    needs: [choose-linux, choose-macos]
     name: Nix Build
     strategy:
       fail-fast: false
@@ -101,7 +110,7 @@ jobs:
     timeout-minutes: 60
     # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
     # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
-    runs-on: ${{ contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
+    runs-on: ${{ contains(matrix.runner, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Nix
