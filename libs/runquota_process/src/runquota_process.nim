@@ -437,6 +437,16 @@ when defined(windows):
         cpuMicros = uint64(totalTicks div 10)
       processCount = uint32(max(int32(0), info.BasicInfo.TotalProcesses))
 
+proc shellScriptDir*(): string =
+  ## Where Windows launches stage a long ``sh -c`` program as a wrapper
+  ## script. A directory of its own, so a consumer that observes the
+  ## launched process's file accesses can recognise the wrapper as launch
+  ## machinery: its content is the ``-c`` program already present in argv,
+  ## and its per-launch random name would otherwise make every observation
+  ## of the same command differ. Build systems mirror this path; changing it
+  ## is a contract change.
+  getTempDir() / "runquota-shell"
+
 proc libraryInfo*(): processTypes.LibraryInfo =
   processTypes.LibraryInfo(name: libraryName)
 
@@ -831,8 +841,9 @@ when defined(windows):
     if shellStart < 0:
       return
 
+    createDir(shellScriptDir())
     let (scriptFile, scriptPath) = createTempFile(
-      "runquota-shell-", ".sh", getTempDir())
+      "runquota-shell-", ".sh", shellScriptDir())
     var scriptOpen = true
     try:
       scriptFile.write(argv[shellStart + 2])
