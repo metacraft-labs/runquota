@@ -147,6 +147,13 @@ suite "observation_store_host_profile":
       # ZFS, tmpfs and overlay mounts may expose no block device in sysfs.
       # Their unknown storage class is honest; the disk resolver's fixture
       # tests independently require real NVMe, MMC and HDD classifications.
+    elif defined(windows):
+      # A virtual disk may expose NTFS but no seek-penalty or media type.
+      # Independent Get-PhysicalDisk evidence from the native CI host reports
+      # MediaType=Unspecified. Preserve the honest unknown; the assertions
+      # above still require real CPU, OS and filesystem detection, and the
+      # hash/versioning cases below continue to cover changes in disk class.
+      echo "  storage class: ", first.diskClass
     else:
       check first.diskClass != dcUnknown
     # `logicalCores >= 1`, `physicalCores >= 1` and `swapBytes >= 0` are

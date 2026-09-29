@@ -37,9 +37,11 @@ Repository posture and state-boundary requirements: `../../docs/database.md`.
   and reuses the current row when the hash is unchanged, or closes it and
   opens a successor at the same instant when it is not. Executions already
   written keep pointing at the profile that was current when they ran.
-  **Detection has only ever run on macOS/arm64.** The Linux branch is
-  written from `/proc` and `/sys` and has never executed; there is no
-  Windows detection, only honest `unknown`s.
+  Detection uses native macOS APIs, Linux `/proc` and `/sys`, and Windows
+  system and storage APIs. Fields unavailable from the OS remain `unknown`;
+  for example, a Windows virtual disk can report its NTFS filesystem without
+  identifying its physical media as SSD or HDD. Unknown fields still take
+  part in the profile hash and change the profile when detection changes.
 - `declareExtension(store, declaration)` is how a product attaches its own
   facts. It creates the table from the declaration's forward-only ladder,
   migrates it when the client is newer, accepts an older client unchanged,
