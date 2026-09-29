@@ -165,7 +165,10 @@ fi
 require_contains .github/workflows/release.yml "workflow_dispatch:"
 require_contains .github/workflows/release.yml "tags:"
 require_contains .github/release.json "linux-x86_64"
-require_contains .github/release.json "linux-aarch64"
+# Linux ARM64 is explicitly deferred for the initial release.
+if ! grep -Eq '^[[:space:]]*version[[:space:]]*=[[:space:]]*"0\.1\.0"' runquota.nimble; then
+  require_contains .github/release.json "linux-aarch64"
+fi
 require_contains .github/release.json "darwin-aarch64"
 require_contains .github/release.json "windows-x86_64"
 require_contains .github/release.json "windows-aarch64"
