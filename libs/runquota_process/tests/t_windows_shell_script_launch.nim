@@ -57,6 +57,9 @@ suite "Windows shell command launch":
         let stagedFiles = child.temporaryLaunchFiles
         check stagedFiles.len == 1
         check fileExists(stagedFiles[0])
+        # Staged under its own directory, which observers treat as launch
+        # machinery rather than an input.
+        check stagedFiles[0].parentDir == shellScriptDir()
 
         let completion = child.waitForCompletion(10_000)
         child.close()
@@ -97,6 +100,9 @@ suite "Windows shell command launch":
         let stagedFiles = child.temporaryLaunchFiles
         check stagedFiles.len == 1
         check fileExists(stagedFiles[0])
+        # Staged under its own directory, which observers treat as launch
+        # machinery rather than an input.
+        check stagedFiles[0].parentDir == shellScriptDir()
 
         let completion = child.waitForCompletion(10_000)
         child.close()
