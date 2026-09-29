@@ -1,7 +1,7 @@
 ## Real daemon and SQLite integration; no mocks. The persistence probe opens
 ## the database read-only so polling cannot create the asynchronous writer's
 ## database before its schema and journal are initialized.
-import std/[os, osproc, strutils, unittest]
+import std/[os, osproc, streams, strutils, unittest]
 
 import runquota_client
 import runquota_core
@@ -222,6 +222,7 @@ suite "integration_runquota_memory_pressure_gate":
       ],
       options = {poStdErrToStdOut}
     )
+    var persistenceFailed = false
     try:
       waitForDaemon(socketPath)
 
@@ -291,7 +292,16 @@ suite "integration_runquota_memory_pressure_gate":
       check repeatedDecision.lease.resources.memory.value >= learnedConservative
       check client.inspectionJson("estimates").contains("learned-stat")
 
-      let persisted = waitForPersistedEstimate(estimateDb, "learned-stat")
+      let persisted = try:
+          waitForPersistedEstimate(estimateDb, "learned-stat")
+        except OSError:
+          persistenceFailed = true
+          try:
+            checkpoint("daemon observation counters: " & client.inspectionJson("observations"))
+            checkpoint("daemon learned estimates: " & client.inspectionJson("estimates"))
+          except CatchableError as diagnosticError:
+            checkpoint("daemon inspection failed: " & diagnosticError.msg)
+          raise
       check persisted >= learnedConservative
 
       var warningLease = session.waitForGrant(102)
@@ -316,6 +326,18 @@ suite "integration_runquota_memory_pressure_gate":
       if daemon.running:
         daemon.terminate()
         discard daemon.waitForExit(3000)
+      if daemon.running:
+        daemon.kill()
+        discard daemon.waitForExit(3000)
+      if persistenceFailed and not daemon.running:
+        checkpoint("daemon output: " & daemon.outputStream.readAll())
+        let evidenceDir = getCurrentDir() / "build" / "diagnostics" /
+          ("estimate-persistence-" & $getCurrentProcessId())
+        createDir(evidenceDir)
+        for suffix in ["", "-wal", "-shm"]:
+          if fileExists(estimateDb & suffix):
+            copyFile(estimateDb & suffix, evidenceDir / ("estimates.sqlite" & suffix))
+        checkpoint("preserved estimate database: " & evidenceDir)
       daemon.close()
       if dirExists(socketDir):
         removeScratchRoot(socketDir)

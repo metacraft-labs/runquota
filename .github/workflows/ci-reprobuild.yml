@@ -28,6 +28,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  choose-windows:
+    # Shared public-repository routing, with the existing fleet fallback.
+    # Native tests require distinct owner/group SIDs for their publication arm;
+    # see issues/2026-09-29-windows-ci-bypasses-declared-tool-store.md.
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: windows-2025
+      fallback: '["self-hosted","windows","x64"]'
+
   choose-windows-arm:
     # Existing x64-emulation suite on a native ARM64 host; no backend port.
     # Temporary migration owner: zah. Follow-up: metacraft-specs/issues/
@@ -55,7 +64,7 @@ jobs:
       fallback: '["self-hosted","linux","x64"]'
 
   reprobuild:
-    needs: [choose-linux, choose-macos, choose-windows-arm]
+    needs: [choose-linux, choose-macos, choose-windows, choose-windows-arm]
     name: ${{ matrix.os }}-${{ matrix.arch }} — repro build/test ${{ contains(matrix.runner, 'windows') && contains(matrix.runner, 'arm64') && '(x64 emulation)' || '' }}
     strategy:
       fail-fast: false
@@ -81,7 +90,7 @@ jobs:
     # metacraft-specs/issues/2026-09-29-macos-tart-source-bootstrap-exhausts-guest-disk.md
     # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
     # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
-    runs-on: ${{ contains(matrix.runner, 'windows') && contains(matrix.runner, 'arm64') && fromJSON(needs.choose-windows-arm.outputs.runs_on) || contains(matrix.runner, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
+    runs-on: ${{ contains(matrix.runner, 'windows') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-windows.outputs.runs_on) || contains(matrix.runner, 'windows') && contains(matrix.runner, 'arm64') && fromJSON(needs.choose-windows-arm.outputs.runs_on) || contains(matrix.runner, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
     env:
       # Reprobuild and its monitor currently target x64 on Windows, including
       # the existing emulated lane on ARM64 hosts. Native release payloads
@@ -111,7 +120,7 @@ jobs:
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@d966f7a27c5bfad2fecfc9ff4361e292dffeb0dd
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@68033518cb0b508994b7ebb5211158f6d72b6e20
         with:
           env-flavor: reprobuild
           # Exercise the published bootstrap repairs before a new CLI release.
@@ -204,6 +213,7 @@ jobs:
         with:
           name: reprobuild-logs-${{ matrix.os }}-${{ matrix.arch }}
           path: |
+            build/diagnostics/
             .repro/build/*/build-failure-report.json
             .repro/build/*/build-engine-cache/actions/
           include-hidden-files: true

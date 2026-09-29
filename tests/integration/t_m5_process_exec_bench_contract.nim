@@ -486,8 +486,13 @@ suite "m5_process_exec_bench_contract":
     require benchmarkEnv.hasKey("SHM_LEASE_SRC")
     let sharedDaemon = daemonPath()
     let sharedDaemonHash = secureHashFile(sharedDaemon)
+    # CreateProcess searches System32 before PATH for a bare program name.
+    # Resolve the provisioned tool explicitly so it cannot select the WSL stub.
+    let benchmarkBash = findExe("bash")
+    require benchmarkBash.len > 0
+    checkpoint("benchmark Bash: " & benchmarkBash)
     let captured = runCapturedProcess(
-      "bash",
+      benchmarkBash,
       args = ["scripts/run-m5-benchmark.sh", "process", "--quick"],
       workingDir = benchmarkRoot,
       env = benchmarkEnv,
