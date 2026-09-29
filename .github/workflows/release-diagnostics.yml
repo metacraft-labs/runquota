@@ -2,6 +2,11 @@ name: Release diagnostics
 
 on:
   workflow_dispatch:
+    inputs:
+      msi-only:
+        type: boolean
+        default: false
+        description: Run only the retained-image MSI diagnostic
   push:
     branches: [fix/release-validation-failures]
 
@@ -11,6 +16,7 @@ permissions:
 
 jobs:
   linux:
+    if: github.event_name != 'workflow_dispatch' || !inputs.msi-only
     # Supplemental 0.1.0 diagnosis while the existing fleet run waits for
     # capacity. Owner: zah. Normal Linux and release gates remain unchanged.
     runs-on: ubuntu-24.04
@@ -56,7 +62,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: 36381192176
+          run-id: 36435050729
           pattern: release-windows-*
           path: dist
           merge-multiple: true
@@ -64,7 +70,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: core.exportVariable('RELEASE_NODE', process.execPath)
-      # These are the native-tested e9e487a artifacts. This diagnostic job
+      # These are the native-tested d6d65ad artifacts. This diagnostic job
       # cannot publish them and does not replace a final full release run.
       - name: Validate MSI payloads and diagnose retained files
         shell: pwsh

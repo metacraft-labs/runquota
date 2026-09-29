@@ -100,12 +100,22 @@ foreach ($target in $targets) {
     Get-ChildItem -LiteralPath $work -Recurse -File | ForEach-Object {
       Write-Host "Cleanup file: $($_.FullName); attributes=$($_.Attributes)"
     }
-    for ($cleanupAttempt = 0; $cleanupAttempt -lt 30; $cleanupAttempt++) {
+    # Windows ARM64 can retain an emulated x64 image after its process exits.
+    # Measure the wait and collect file users; keep cleanup bounded and fatal.
+    $cleanupTimer = [Diagnostics.Stopwatch]::StartNew()
+    for ($cleanupAttempt = 0; $cleanupAttempt -lt 120; $cleanupAttempt++) {
       try {
         Remove-Item -LiteralPath $work -Recurse -Force
+        Write-Host "MSI scratch removed after $($cleanupTimer.Elapsed.TotalSeconds) seconds"
         break
       } catch {
-        if ($cleanupAttempt -eq 29) {
+        if ($cleanupAttempt -eq 0 -or $cleanupAttempt -eq 119) {
+          foreach ($retained in Get-ChildItem -LiteralPath $work -Recurse -Filter '*.exe') {
+            try { & "$PSScriptRoot/inspect-file-users.ps1" -FilePath $retained.FullName }
+            catch { Write-Warning "File-user diagnostic failed: $_" }
+          }
+        }
+        if ($cleanupAttempt -eq 119) {
           if ($null -eq $checkError) { throw }
           Write-Warning "MSI scratch cleanup also failed: $_"
         } else {
