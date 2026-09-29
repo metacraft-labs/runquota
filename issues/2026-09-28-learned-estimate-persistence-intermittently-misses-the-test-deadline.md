@@ -57,3 +57,12 @@ fails when `-readonly` is removed: SQLite creates the absent database and
 reports a missing table. Both cases pass at `a889665` plus this probe repair;
 the real-daemon case also passes in the negative control. The original
 intermittent timeout remains open until it is attributed.
+
+Linux x64 job `109368774241` at `292e578` reproduces the timeout in the native
+cross-check with the repaired read-only probe: `query returned no learned
+estimate`. The fixture still discards the daemon's output during cleanup.
+Preserve daemon inspection counters, shutdown output and the SQLite files on
+failure so the next occurrence can distinguish a dropped writer batch from a
+delayed one. Keep the same persistence deadline and value assertion. A local
+real-reader transaction held for 350 ms at `2dd0407` does not reproduce a drop;
+do not change the SQLite writer based on that unconfirmed explanation.

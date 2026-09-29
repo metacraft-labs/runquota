@@ -72,3 +72,22 @@ first, then run these programs sequentially. Retain every assertion and
 latency/coverage threshold. A new native run must establish whether this
 removes the observed interference; it is not evidence about the unexplained
 exit statuses or disk classification.
+
+At `c99e76d`, ordinary Windows x64 job `109388919586` now gets through
+SQLite provisioning. The NetworkService runner cannot express `0640` or
+`0660` over files whose primary group is also their owner, so six segment
+publication/scope programs fail. This refusal is intentional under
+[Segment files and their mode on Windows](../../reprobuild-specs/RunQuota-Shared-Memory-Structures.md):
+the optional stats table remains unpublished in that account context.
+Use the same shared runner selector as the other public CI lanes for Windows
+x64 (`windows-2025`, with the existing self-hosted fallback). Preserve all
+publication and access assertions on the distinct-owner/group native account.
+The separate 50-handle increase in the connection-abort test still needs
+attribution; the runner selection does not establish that it is fixed.
+
+The `292e578` PowerShell diagnostic completes at `36558849865`: SQLite works,
+and direct/timeout controls of the four measurement programs mostly pass.
+Completion latency uses an unsuitable wall clock (recorded separately).
+The benchmark fails with an access violation inside the full monitored graph
+and exit 1 in both controls; retain stdout too and compare pinned PortableGit
+against the hosted Git Bash before attributing that difference.
