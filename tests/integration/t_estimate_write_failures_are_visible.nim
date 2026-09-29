@@ -31,6 +31,7 @@ import std/[json, os, osproc, streams, strutils, times, unittest]
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
 import runquota_core
+import runquota_persistence
 import runquota_protocol
 import daemon_binary
 import daemon_endpoint
@@ -199,14 +200,26 @@ suite "estimate_write_failures_are_visible":
       var session = client.registerSession("estimate-write-ok", "0.1.0")
       for i in 0 ..< Completions:
         completeOne(session, uint64(8 + i) * MiB)
-      # Long enough for several drain passes to have come and gone.
-      sleep(500)
+      # THE WRITES ARE WAITED FOR, NOT A FIXED TIME. The zero below is only
+      # a statement about work that happened once the store really holds the
+      # rows, so that is the condition: a row read back from the file. This
+      # was `sleep(500)`, and every drain pass starts `sqlite3` twice (schema,
+      # then batch); on a saturated Windows host that alone outlasted the
+      # half second, so the file did not exist yet and the case failed on
+      # the host's load rather than on the store.
+      let deadline = epochTime() + 60.0
+      var landed: seq[LearnedEstimateRow] = @[]
+      while true:
+        if fileExists(estimateDb):
+          landed = loadLearnedEstimates(estimateDb)
+        if landed.len > 0 or epochTime() > deadline:
+          break
+        sleep(25)
+      check landed.len > 0
+      check landed.len == 0 or landed[0].commandStatsId == StatsKey
       let counters = estimateCounters(client)
       check counters.failures == 0
       check counters.rows == 0
-      # ...and the store really was written, so the zero is a report about
-      # work that happened rather than about work that never started.
-      check fileExists(estimateDb)
       session.closeSession()
       client.close()
     finally:
