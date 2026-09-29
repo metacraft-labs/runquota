@@ -91,3 +91,21 @@ Completion latency uses an unsuitable wall clock (recorded separately).
 The benchmark fails with an access violation inside the full monitored graph
 and exit 1 in both controls; retain stdout too and compare pinned PortableGit
 against the hosted Git Bash before attributing that difference.
+
+## Atomicity process exit at `8add804`
+
+[Windows x64 job 109446770868](https://github.com/metacraft-labs/runquota/actions/runs/36580081181/job/109446770868)
+now passes 194 of 198 actions, including all 100 cached build actions. The
+atomicity program prints its sole passing assertion: 81 checked rows, 457
+steps, seven distinct self values and zero violations. Its monitored
+`sh -c 'timeout --kill-after=10 600 ... </dev/null'` action nevertheless exits
+127, blocking the three subsequent measurement programs. There is no stderr.
+This repeats the unexplained shell-exit shape previously seen in the host-load
+fixture; it does not establish a failed atomicity assertion or its cause.
+
+Preserve every measurement and deadline. Compare real unchanged binaries
+through native execution, the declared shell/timeout, and the monitored graph,
+recording hashes and each process's actual exit status. The failed graph
+remains failed even when a direct control passes. Refreshed dev `e9f9011` and
+searched open/deleted exit-127 issues before extending this record. The report
+is retained locally in `/tmp/runquota-8add-windows-repro-artifacts/`.
