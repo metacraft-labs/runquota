@@ -29,3 +29,9 @@ graph. Ordinary CI and its legacy cross-check remain required.
 Refreshed dev `e9f9011` and agents `822c3c5`; searched current and deleted
 issues for SQLite and provisioning before recording. The earlier POSIX
 override issue concerned a different platform and retained Windows PATH mode.
+
+The benchmark fixture now builds the real copied source in a private temporary
+tree and verifies the shared daemon's hash is unchanged. It retains the real
+compiler, benchmark, daemon and all output assertions. This addresses the
+observed attempt to overwrite an executable used by concurrent tests; the
+Windows rerun remains required.
