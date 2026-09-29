@@ -109,3 +109,17 @@ recording hashes and each process's actual exit status. The failed graph
 remains failed even when a direct control passes. Refreshed dev `e9f9011` and
 searched open/deleted exit-127 issues before extending this record. The report
 is retained locally in `/tmp/runquota-8add-windows-repro-artifacts/`.
+
+At `8add804`, focused control
+[36594776988](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36594776988)
+reproduces atomicity exit 127 in all three monitored graphs, after the
+unchanged assertion passes. The same binary (SHA256
+`d754304e05ccca9b3a250bcaebaac761ba879833a6cbf0bab43713a2d480b9de`)
+exits zero directly, through declared timeout, through declared sh, and
+through sh plus timeout. The host-load binary also passes those four modes.
+This attributes the discrepancy to monitored execution, not to a failed
+atomicity check or a missing executable in the unmonitored shell. Control
+[36599148160](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36599148160)
+compares each invocation through Reprobuild's internal monitor driver and
+retains finalized event streams. Both are diagnostics, not substitutes for
+ordinary CI.
