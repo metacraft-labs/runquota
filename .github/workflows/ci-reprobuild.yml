@@ -82,7 +82,7 @@ jobs:
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@8743c591ccbd97a32de64550b306b87c4d9158c7
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@923f8ec27bfa4735a68242cd6d0e8bf75e1eebdd
         with:
           env-flavor: reprobuild
           # Exercise the published bootstrap repairs before a new CLI release.
