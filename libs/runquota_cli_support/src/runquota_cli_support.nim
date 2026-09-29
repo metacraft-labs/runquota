@@ -177,14 +177,11 @@ proc runDaemonStart(daemonArgs: seq[string]): int =
   when defined(windows):
     spawnDetachedDaemon(daemonProgramPath(), args)
   else:
-    # POSIX `osproc` gives the child fresh pipes on 0, 1 and 2, so none of
-    # this process's own descriptors is inherited there; `poDaemon` puts it
-    # in its own session.
-    let process = startProcess(
-      daemonProgramPath(),
-      args = args,
-      options = {poUsePath, poDaemon}
-    )
+    # Use the lease launcher's existing descriptor hygiene. std/osproc gives
+    # the child new standard streams but leaks other inheritable descriptors,
+    # including duplicated write ends of the caller's output pipe. Redirecting
+    # only stdout/stderr in runquotad cannot release those duplicates.
+    var process = launchProcess(commandSpec(@[daemonProgramPath()] & args))
     process.close()
   for _ in 0 ..< 40:
     try:

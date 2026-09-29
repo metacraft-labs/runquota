@@ -89,10 +89,18 @@ proc stopDaemon(pid: int) =
     discard execCmd("kill -9 " & $pid)
 
 suite "runquota daemon start":
-  let root = createTempDir("rq-daemon-start-", "")
-  let socketPath = root / "d.sock"
-  let logFile = root / "daemon.log"
+  var root, socketPath, logFile: string
   var pid = 0
+
+  setup:
+    root = createTempDir("rq-daemon-start-", "")
+    # The real POSIX endpoint requires owner-only storage. createTempDir
+    # follows the caller's umask and CI commonly creates 0755 directories.
+    when defined(posix):
+      setFilePermissions(root, {fpUserRead, fpUserWrite, fpUserExec})
+    socketPath = root / "d.sock"
+    logFile = root / "daemon.log"
+    pid = 0
 
   teardown:
     stopDaemon(pid)
