@@ -498,11 +498,8 @@ const
     ## one row of what the machine actually delivers. Measured during a full
     ## suite run it landed on exactly the floor.
   cadenceWindowMillis = cadenceWindowTicks * cadenceMillis
-  cadenceFlushedTicks = 4 * defaultAmbientFlushSamples
-    ## The ticks whose batch has certainly closed by the end of the window.
-    ## Not yet the budget: what a tick was ELIGIBLE to write is measured
-    ## inside the test, because sampling is gated on a lease and the ticks
-    ## before one was granted could never have written anything.
+    ## The window is timed FROM THE LEASE GRANT, and so is the budget the
+    ## test derives from it: see ``eligibleTicks`` there.
   cadenceLossAllowance = 2
     ## One in ``cadenceLossAllowance`` of the eligible ticks may write no
     ## row. Ticks are lost to a stale kernel snapshot, to a counter going
@@ -1076,15 +1073,9 @@ suite "ambient_load_attribution":
         "m11-cadence-exec", milliCpu(1000),
         bytes(256'u64 * 1024'u64 * 1024'u64)))
       check lease.active
-      # THE BUDGET, MEASURED. Of the ticks whose batch has certainly
-      # closed, the ones that fired before this instant could never have
-      # written a row -- sampling is gated on a live lease and there was
-      # none -- and the very first tick of all is a baseline whatever else
-      # is true. What is left is what the window really offered, and it is
-      # a measurement of this run rather than an assumption about how
-      # quickly a daemon starts and grants.
-      eligibleTicks = cadenceFlushedTicks - 1 -
-        int((epochTime() - daemonStartedAt) * 1000.0 / float(cadenceMillis))
+      # Taken AFTER the grant returned, so the daemon granted it no later
+      # than this: a budget measured from here can only be an undercount.
+      let leaseGrantedAt = epochTime()
 
       # M13 CLOSES M11'S DEFERRAL (1), AND THIS IS WHERE IT SHOWS.
       #
@@ -1105,6 +1096,31 @@ suite "ambient_load_attribution":
         uint64(reportedAt))
 
       sleep(cadenceWindowMillis)
+      # THE BUDGET, MEASURED, over the interval rows could come from. A tick
+      # writes a row only if a lease was live across the interval it
+      # measures, so nothing before `leaseGrantedAt` counts; a row is
+      # visible only once its batch has flushed, so nothing after this
+      # instant counts either. Between the two the cadence fired at least
+      # `floor(D / cadenceMillis)` times. Of those, up to
+      # `defaultAmbientFlushSamples` may not be on disk yet: the ones in the
+      # batch that has not closed -- batches are counted from the sampler's
+      # own start, not from the grant, so it is anywhere in its fill -- or,
+      # at the instant one does close, the whole batch whose write is still
+      # in flight. One more is the baseline, if the grant came before the
+      # sampler's first tick. What is left is what the window really
+      # offered: 39 for a window of exactly `cadenceWindowMillis`.
+      #
+      # IT USED TO BE MEASURED FROM THE PROCESS'S CREATION, and that mixed
+      # two origins: `4 * defaultAmbientFlushSamples` was the closed ticks
+      # of the window that starts at the GRANT, and the time from
+      # `daemonStartedAt` to the grant was then subtracted from it as if the
+      # window had started at the process. The longer the daemon took to
+      # start and grant, the smaller the budget, and past 7.8 seconds it
+      # went negative -- `eligible=-22` after a twelve-second start on a
+      # loaded host, a figure no sampler could be held to or measured by.
+      let storeReadAt = epochTime()
+      eligibleTicks = int((storeReadAt - leaseGrantedAt) * 1000.0 /
+        float(cadenceMillis)) - defaultAmbientFlushSamples - 1
       let store = openObservationStore(dbPath)
       check store.captureEnabled
       rowsWhileRunning = store.readAmbientSamples()
