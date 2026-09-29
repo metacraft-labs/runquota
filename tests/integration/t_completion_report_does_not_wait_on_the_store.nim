@@ -55,7 +55,7 @@
 ## Unix-domain socket, the shipped client library, the daemon's own
 ## inspection subject, and the segment the daemon really wrote.
 
-import std/[json, os, osproc, streams, strutils, times, unittest]
+import std/[json, monotimes, os, osproc, streams, strutils, times, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
@@ -132,7 +132,7 @@ proc timeOneCompletion(session: var RunQuotaSession; statsKey: string;
   var request = resourceRequest("completion-latency", milliCpu(100),
     bytes(1'u64 * MiB))
   request.commandStatsId = statsKey
-  let start = epochTime()
+  let start = getMonoTime()
   var lease = session.requestLease(request)
   doAssert lease.active
   lease.markStarting()
@@ -140,7 +140,7 @@ proc timeOneCompletion(session: var RunQuotaSession; statsKey: string;
   lease.finish(outcome = succeeded(), peakMemoryBytes = peakBytes,
     processCount = 1'u32)
   lease.release()
-  result = (epochTime() - start) * 1000.0
+  result = float((getMonoTime() - start).inNanoseconds) / 1_000_000.0
 
 proc median(values: seq[float]): float =
   doAssert values.len > 0
