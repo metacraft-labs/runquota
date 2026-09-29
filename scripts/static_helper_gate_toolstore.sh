@@ -189,21 +189,30 @@ resolve_prefix() {
   dir="${exe%/*}"
   # A prefix's executables sit at most three levels below its root
   # (`bin/`, `cmd/`, `mingw64/bin/`, `usr/bin/`).
+  #
+  # Stripping `/mingw64` leaves the EMPTY string, which is the MSYS root `/`.
+  # Git for Windows' own git is `/mingw64/bin/git`, inside the prefix that IS
+  # the MSYS root, so that case is the dev shell's git, not an edge: before it
+  # was spelled out, the receipt at `/` was found and then recorded as an
+  # empty prefix, and the dev shell's own git was refused as "not in a
+  # reprobuild tool-store prefix". `${prefix%/}` below keeps the receipt path
+  # from becoming `//...`, which MSYS reads as a UNC path.
   for _ in 1 2 3 4; do
     if [ -f "${dir}/.reprobuild-tarball-receipt.json" ]; then
-      prefix="${dir}"
+      prefix="${dir:-/}"
       break
     fi
+    [ -n "${dir}" ] || break
     dir="${dir%/*}"
   done
   [ -n "${prefix}" ] ||
     fail "${program} on PATH (${exe}) is not in a reprobuild tool-store prefix:" \
       "no .reprobuild-tarball-receipt.json above it"
-  method="$(receipt_field "${prefix}/.reprobuild-tarball-receipt.json" installMethod)" ||
+  method="$(receipt_field "${prefix%/}/.reprobuild-tarball-receipt.json" installMethod)" ||
     exit 1
   [ "${method}" = tarball ] ||
     fail "${program} on PATH comes from a ${method} prefix, not a tarball one: ${prefix}"
-  lock="$(receipt_field "${prefix}/.reprobuild-tarball-receipt.json" lockIdentity)" ||
+  lock="$(receipt_field "${prefix%/}/.reprobuild-tarball-receipt.json" lockIdentity)" ||
     exit 1
   [ "${lock}" = "${expected}" ] ||
     fail "${program} on PATH (${exe}) is ${lock}; the gate is pinned to" \

@@ -106,6 +106,29 @@ when isMainModule:
     discard redirectStdioToFile(windowsServiceLogFile)
 
   let args = commandLineParams()
+
+  # `--log-file PATH`: the file a DETACHED run writes to (`runquota daemon
+  # start` passes one). Applied before anything below can print: a detached
+  # daemon's inherited streams are either the starting process's -- which it
+  # must not hold, or a caller reading that process's output to end of file
+  # waits for the daemon to exit -- or pipes nobody reads. Parsed ahead of the
+  # main loop for that reason, and skipped there. Under the SCM the service
+  # log above already owns the streams.
+  var logFile = ""
+  for j in 0 ..< args.len - 1:
+    if args[j] == "--log-file":
+      logFile = args[j + 1]
+  if logFile.len > 0 and not runningAsService:
+    try:
+      let dir = parentDir(logFile)
+      if dir.len > 0:
+        createDir(dir)
+    except CatchableError:
+      discard
+    if not stdout.reopen(logFile, fmAppend) or
+        not stderr.reopen(logFile, fmAppend):
+      quit 2
+
   if args.len == 1 and args[0] in ["--version", "-V"]:
     echo "runquotad " & versionString()
     quit 0
@@ -121,7 +144,7 @@ when isMainModule:
   except HostConfigError as err:
     echo "runquotad: " & err.msg
     quit 2
-  let usage = "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N]"
+  let usage = "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--log-file PATH]"
   var i = 0
   while i < args.len:
     case args[i]
@@ -204,6 +227,12 @@ when isMainModule:
       if i + 1 >= args.len:
         quit 2
       config.observationDbPath = args[i + 1]
+      i += 2
+    of "--log-file":
+      # Applied before argument parsing; see `logFile` above.
+      if i + 1 >= args.len:
+        echo usage
+        quit 2
       i += 2
     of "--no-write-stats":
       # THE OFF SWITCH, and the only one. Capture is on without any flag
