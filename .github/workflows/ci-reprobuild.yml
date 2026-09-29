@@ -129,8 +129,8 @@ jobs:
           repro-from-source: true
           repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
           repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
-          # Preserve native child architectures and every Windows exit-code bit.
-          repro-io-mon-pin: 5421a9b10d7729f151b810db170a7bc3510ca614
+          # Distinguish emulated x64 from native ARM children and preserve exit bits.
+          repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: Refresh authentication before repro build
