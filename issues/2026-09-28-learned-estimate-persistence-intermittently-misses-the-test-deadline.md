@@ -66,3 +66,18 @@ failure so the next occurrence can distinguish a dropped writer batch from a
 delayed one. Keep the same persistence deadline and value assertion. A local
 real-reader transaction held for 350 ms at `2dd0407` does not reproduce a drop;
 do not change the SQLite writer based on that unconfirmed explanation.
+
+## Windows ARM-host evidence
+
+At RunQuota `177e2af`, ordinary job
+[109548617782](https://github.com/metacraft-labs/runquota/actions/runs/36609966396/job/109548617782)
+reproduces the failure with io-mon `5421a9b`. The in-memory learned estimate
+exists, but daemon counters report one failed estimate batch containing one
+row. The retained database passes integrity checking, contains the expected
+schema and no learned rows, and remains in DELETE journal mode. This is a
+counted write failure, rather than merely a slow read-side probe. The log still
+omits SQLite's own error, so the rejected operation is not established.
+
+Shared diagnostic `d04a676` adds that error output without changing storage
+behavior, deadlines or assertions, and compares the same real binaries outside
+monitoring in run `36618038706`. Its source edits precede rebuilding the apps.
