@@ -21,6 +21,16 @@ type
     stdoutLimit*: int
     stderrLimit*: int
     createProcessGroup*: bool
+    isolateEnvironment*: bool
+      ## When true the child starts from `env` ALONE: nothing is inherited
+      ## from the launcher's own environment. Negative-sense so the zero value
+      ## keeps the historical behaviour (inherit, then layer `env` on top) for
+      ## every caller that builds a `CommandSpec` without naming it.
+      ##
+      ## For a caller that composes the whole environment itself, so that a
+      ## child's inputs cannot include variables it never declared (reprobuild
+      ## Dev-Env-Warm-Entry.md §2). Such a caller must pass everything the
+      ## child needs, `PATH` included.
 
   LaunchResult* = object
     processId*: uint64
