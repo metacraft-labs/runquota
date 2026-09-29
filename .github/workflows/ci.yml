@@ -1,37 +1,28 @@
 name: CI
 
 on:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, dev, stable]
   pull_request:
 
-# WHY THE LINUX x64 LEG NAMES `eph-linux-x64-g2` AND NOT `eph-linux-x64`.
-#
-# `eph-linux-x64` is the scale set on high-mem-server, and that host is the one
-# the fleet's capacity shortage is concentrated on (infra
-# docs/CI-Runner-Fleet-Status.md §1.1: its ceiling is host CPU, not slots).
-# `eph-linux-x64-g2` is gpu-server-002's scale set — same `vmh-linux-runner`
-# golden, same shared host /nix/store, a Samsung 980 PRO NVMe root instead of a
-# RAID5 of consumer QLC SSDs, and four slots that were measurably going unused.
-#
-# Measured 2026-09-11 by sweeping the queued jobs of every repo in the
-# workspace: `eph-linux-x64` was carrying ~290 jobs queued at a mean age of
-# 7-15 h (max 45 h), of which 14 were this repo's; `eph-linux-x64-g2` had ZERO
-# queued and `eph-linux-x64-g1` was draining at a 37-minute mean. This is
-# item 2 of that document's "what would actually add capacity" list.
-#
-# ONLY THE THREE NIX-ONLY JOBS BELOW MOVED. `ci-reprobuild.yml` deliberately
-# stays on `eph-linux-x64`: the GPU hosts do not set `incusReprobuildStore`, so
-# they do not mount /srv/repro-store (see infra
-# machines/server/gpu-server-001/garm-runners.nix), and a reprobuild job must
-# not be moved off the host that has it.
 # Cancel superseded PR checks while preserving every mainline run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
+  choose-linux:
+    # The shared CI_RUNNER_MODE policy selects free hosted runners for public
+    # repos by default and preserves the org-controlled self-hosted fallback.
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: ubuntu-24.04
+      fallback: '["self-hosted","linux","x64"]'
+
   lint:
+    needs: choose-linux
     name: Lint
     strategy:
       fail-fast: false
@@ -49,7 +40,7 @@ jobs:
     timeout-minutes: 45
     # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
     # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
-    runs-on: ${{ contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner }}
+    runs-on: ${{ contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Nix
@@ -69,6 +60,7 @@ jobs:
           retention-days: 30
 
   test:
+    needs: choose-linux
     name: Test
     strategy:
       fail-fast: false
@@ -77,7 +69,7 @@ jobs:
     timeout-minutes: 90
     # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
     # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
-    runs-on: ${{ contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner }}
+    runs-on: ${{ contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Nix
@@ -100,6 +92,7 @@ jobs:
           retention-days: 30
 
   nix-build:
+    needs: choose-linux
     name: Nix Build
     strategy:
       fail-fast: false
@@ -108,7 +101,7 @@ jobs:
     timeout-minutes: 60
     # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
     # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
-    runs-on: ${{ contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner }}
+    runs-on: ${{ contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Nix

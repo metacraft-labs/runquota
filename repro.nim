@@ -232,14 +232,24 @@ package runquota:
             (root == "tests" or "/tests/t" in normalized):
           testSources.add(normalized)
     testSources.sort()
-    for i, source in testSources:
-      if source.extractFilename == "t_ambient_load_attribution.nim":
-        testSources.delete(i)
-        testSources.add(source)
-        break
+    const measurementTests = [
+      "t_ambient_sample_atomicity",
+      "t_host_load_reading_invariants",
+      "t_completion_report_does_not_wait_on_the_store",
+      "t_ambient_load_attribution"]
+    # These programs deliberately saturate the CPU or measure live latency.
+    # Run them after compilation and the rest of the suite, one at a time,
+    # so our own load generators do not invalidate another test's control.
+    for name in measurementTests:
+      for i, source in testSources:
+        if source.extractFilename.changeFileExt("") == name:
+          testSources.delete(i)
+          testSources.add(source)
+          break
     doAssert testSources.len > 0, "No RunQuota tests found"
     var names = initHashSet[string]()
     var testBuilds, testRuns: seq[BuildActionDef] = @[]
+    var testPrograms: seq[tuple[name, output: string, compiled: BuildActionDef]] = @[]
     for source in testSources:
       let name = source.extractFilename.changeFileExt("")
       doAssert name notin names, "Duplicate test binary name: " & name
@@ -251,12 +261,15 @@ package runquota:
         actionId = "runquota.test_build." & name)
       appendRegisteredActionToolIdentityRefs(compiled.action.id, [backendCompiler])
       testBuilds.add(compiled.action)
+      testPrograms.add((name, output, compiled.action))
+    for program in testPrograms:
+      let (name, output, compiled) = program
       # Preserve the native harness's bound, kill grace and closed stdin.
       # GNU timeout places the child tree in its own process group.
       let executed = shell(
         command = "timeout --kill-after=10 600 " & quoteShell(output) & " </dev/null",
-        after = runquotaAppsActions & @[compiled.action] &
-          (if name == "t_ambient_load_attribution": testBuilds & testRuns else: @[]),
+        after = runquotaAppsActions & @[compiled] &
+          (if name in measurementTests: testBuilds & testRuns else: @[]),
         extraInputs = @[output, "build/bin/runquota" & exeSuffix,
                          "build/bin/runquotad" & exeSuffix],
         actionId = "runquota.test_execute." & name)

@@ -261,15 +261,25 @@ suite "ambient sample atomicity":
 
     # The probe deliberately contends on the real sampler lock. Ten seconds
     # is a minimum observation window, not a promise of 101 scheduled writes.
-    # Keep all coverage floors and rows; extend a slow run up to one bounded
-    # monotonic deadline. Read only the atomic count until the writer joins.
+    # Keep every coverage floor: enough step writes alone do not prove the
+    # sampler recorded enough rows or distinct values. Inspect persisted rows
+    # through the real store while extending a slow run to the same bounded
+    # monotonic deadline. Read step records only after the writer joins.
     let started = getMonoTime()
     while true:
       let elapsed = (getMonoTime() - started).inMilliseconds
-      if elapsed >= MaxRunMillis or
-          (elapsed >= MinRunMillis and stepper.publishedSteps.load() >= MinSteps):
+      if elapsed >= MaxRunMillis:
         break
-      sleep(50)
+      if elapsed >= MinRunMillis and stepper.publishedSteps.load() >= MinSteps:
+        let observed = store.readAmbientSamples()
+        var sampledSelf: seq[float64] = @[]
+        for row in observed:
+          if row.selfCpuPct notin sampledSelf:
+            sampledSelf.add(row.selfCpuPct)
+        if observed.len >= MinCheckedRows and
+            sampledSelf.len >= MinDistinctSelfValues:
+          break
+      sleep(500)
     stopAmbientSampler()
 
     stepper.stop.store(true)

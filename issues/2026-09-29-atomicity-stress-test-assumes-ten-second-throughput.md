@@ -34,3 +34,19 @@ writer. This changes the fixture's scheduling allowance, not the sampler.
 at `0622770`, downloaded as `/tmp/runquota-062-linux-arm-repro.log`.
 Refreshed dev `f4f0f93` and searched current and deleted issue history for
 `atomicity`, `steps.len` and `churnRounds`; no prior record was found.
+
+At `2efa366`, macOS Reprobuild job `109349836460` passes 195 of 196 actions.
+The atomicity fixture records 810 steps but only 11 rows and two distinct
+self values, with zero violations. The earlier wait extends only until the
+step floor is met; it still stops before the sampler's coverage floors.
+Extend that same bounded wait until persisted rows also meet the existing
+15-row and five-value floors, using the real store read. Keep the sixty-second
+deadline and all final row/atomicity assertions; do not inspect the step
+records before joining their writer. Native validation remains required.
+
+At `2efa366` plus this repair, the real local program passes with 58 rows,
+769 steps, 50 distinct self values and zero violations. A temporary control
+changes only the sampler cadence from 100 ms to 2000 ms in each version:
+the old fixture fails its unchanged 15-row floor with five rows; the repaired
+fixture waits for 16 rows and passes with 16 distinct values and zero
+violations. Both controls compile and run the real sampler/store without mocks.

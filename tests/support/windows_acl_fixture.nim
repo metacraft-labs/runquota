@@ -16,7 +16,7 @@
 ## a refusal test into an acceptance.
 
 when defined(windows):
-  import std/[os, osproc, strutils]
+  import std/[os, osproc, strtabs, strutils]
 
   proc systemTool(name: string): string =
     ## A Windows system tool by ABSOLUTE path, never by PATH lookup. A dev
@@ -50,8 +50,18 @@ when defined(windows):
     ## pasted it would. ``/s`` strips only the outer quotes this adds, so
     ## the quotes inside the line reach ``cmd`` untouched -- which is what
     ## lets a test run the very string a refusal printed.
-    let (output, code) = execCmdEx("\"" & systemTool("cmd.exe") &
-      "\" /d /s /c \"" & commandLine & "\"", options = {poStdErrToStdOut})
+    let cmd = systemTool("cmd.exe")
+    # The printed operator command names Windows' icacls. Supply its OS
+    # directory in this child's environment even when the enclosing build
+    # exposes only declared archive tools. Preserve the command verbatim
+    # and leave the parent environment unchanged.
+    let childEnv = newStringTable(modeCaseInsensitive)
+    for key, value in envPairs():
+      childEnv[key] = value
+    childEnv["PATH"] = cmd.parentDir & $PathSep & getEnv("PATH")
+    let (output, code) = execCmdEx("\"" & cmd &
+      "\" /d /s /c \"" & commandLine & "\"", options = {poStdErrToStdOut},
+      env = childEnv)
     (code, output)
 
   proc icacls*(path: string; args: openArray[string]) =

@@ -43,3 +43,32 @@ there with `SeSecurityPrivilege` missing. The fixture now selects only
 and retains the daemon-refusal assertion. This matches the
 [Microsoft API contract](https://learn.microsoft.com/en-us/dotnet/api/system.security.accesscontrol.objectsecurity.setsecuritydescriptorsddlform?view=netframework-4.8.1)
 and needs a native Windows rerun. No account privileges are changed.
+
+Hosted Windows diagnostic `36547956528` at `7511801` with the real bootstrap
+daemon and declared SQLite passes 186 of 196 actions (nine fail, one blocks).
+The two child-identity fixtures call `findExe("cmd")` and receive an empty
+path. Use the test executable itself as the real exited/live child; retain
+the OS process identity and reaping assertions. The ACL helper finds cmd by
+absolute path, but the verbatim operator command cannot find `icacls` in its
+child PATH. Give only that child the resolved Windows system directory,
+preserving the printed command and all independent ACL checks.
+
+The atomicity fixture records 109 samples but only three distinct values,
+the same incomplete-coverage wait recorded in
+`2026-09-29-atomicity-stress-test-assumes-ten-second-throughput.md`.
+The remaining failures need attribution: one daemon startup misses its
+four-second bound; the completion latency control measures 2.0199 ms against
+2 ms; storage class is unknown on the hosted disk; the benchmark subprocess
+exits with access violation. The host-load fixture prints all three passing
+cases but its monitored shell exits 127. Its capacity and saturation assertions
+pass on this four-core host. These results do not validate the old service
+account's group ACL or 24-core saturation failures.
+
+The recipe currently permits the CPU-saturating host-load and atomicity
+programs to overlap the latency control and ordinary compiler/test work.
+Extend its existing end-of-suite scheduling for ambient-load attribution to
+all four measurement programs: finish all compilations and ordinary tests
+first, then run these programs sequentially. Retain every assertion and
+latency/coverage threshold. A new native run must establish whether this
+removes the observed interference; it is not evidence about the unexplained
+exit statuses or disk classification.
