@@ -29,3 +29,14 @@ second-UID, capture-ready and socket-readiness records. The original endpoint
 startup issue is resolved by `f4f0f93`; this is a fixture that still assumes the
 previous startup ordering. The separate learned-estimate timeout remains
 unattributed and is not closed by this finding.
+
+## Regression control
+
+At `2d8a790` plus the repair, a wrapper delays the first real SQLite
+invocation for this fixture by three seconds, then passes its arguments and
+streams unchanged to the pinned SQLite executable. No query result or UID is
+simulated. The original socket-only wait reproduces the CI failure:
+`owners.len was 0`. The repaired fixture passes all three cases under the
+same delay, including kernel refusal, spoof refusal and persisted attribution.
+The existing 60-second startup bound and 100 persistence polls are unchanged.
+Native Linux validation and the complete ordinary suite remain required.

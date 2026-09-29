@@ -41,6 +41,10 @@
 ## No mocks anywhere -- a real `runquotad`, real distinct uids, real
 ## groups, a real `connect(2)`, the shipped CLI taking a real lease, and
 ## `owner_uid` read back out of the SQLite file the daemon wrote.
+## Capture readiness is separate from socket readiness: sessions opened during
+## store verification are intentionally not recorded (docs/database.md,
+## "When the endpoint appears"). Wait for the capture-enabled startup line
+## before opening the session whose persisted owner this fixture checks.
 
 ## POSIX ONLY, BY DESIGN. The boundary under test is the rendezvous GROUP:
 ## membership admits a client through the directory's and the socket's group
@@ -378,11 +382,22 @@ else:
           # litter under /tmp.
           "rm -rf " & rv & "/ep " & rv & "/state"))
         let readyFlag = rv / "ready"
+        let daemonLog = rv / "daemon.log"
         try:
+          var captureReady = false
           for _ in 0 ..< 1200:
-            if fileExists(readyFlag): break
+            if fileExists(readyFlag) and fileExists(daemonLog):
+              for line in readFile(daemonLog).splitLines():
+                if line.startsWith("runquota observation store ") and
+                    line.endsWith("; capture enabled"):
+                  captureReady = true
+                  break
+              if captureReady: break
             sleep(50)
           check fileExists(readyFlag)
+          if not captureReady and fileExists(daemonLog):
+            echo readFile(daemonLog)
+          require captureReady
           if fileExists(readyFlag):
             let socketStat = parseReport(readFile(rv / "socket-stat"))
             let daemonUid = ownerOf(rv / "ep")
