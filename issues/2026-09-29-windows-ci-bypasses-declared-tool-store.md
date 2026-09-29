@@ -35,3 +35,11 @@ tree and verifies the shared daemon's hash is unchanged. It retains the real
 compiler, benchmark, daemon and all output assertions. This addresses the
 observed attempt to overwrite an executable used by concurrent tests; the
 Windows rerun remains required.
+
+The NULL-DACL fixture also used the one-argument .NET SDDL setter, which marks
+the audit ACL for persistence. At `822c3c5`, job `109318839771` fails exactly
+there with `SeSecurityPrivilege` missing. The fixture now selects only
+`AccessControlSections.Access`; it still creates the same permissive DACL
+and retains the daemon-refusal assertion. This matches the
+[Microsoft API contract](https://learn.microsoft.com/en-us/dotnet/api/system.security.accesscontrol.objectsecurity.setsecuritydescriptorsddlform?view=netframework-4.8.1)
+and needs a native Windows rerun. No account privileges are changed.

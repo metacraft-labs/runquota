@@ -97,10 +97,13 @@ when defined(windows):
 
   proc setNullDacl*(path: string) =
     ## Replaces ``path``'s DACL with a NULL one -- ``D:NO_ACCESS_CONTROL``,
-    ## which Windows reads as "Everyone: full control".
+    ## which Windows reads as "Everyone: full control". Change only the DACL:
+    ## the one-argument overload also marks the audit ACL for persistence,
+    ## which requires SeSecurityPrivilege even though this fixture sets none.
     discard powershell(
       "$s = New-Object System.Security.AccessControl.DirectorySecurity; " &
-      "$s.SetSecurityDescriptorSddlForm('D:NO_ACCESS_CONTROL'); " &
+      "$s.SetSecurityDescriptorSddlForm('D:NO_ACCESS_CONTROL', " &
+      "[System.Security.AccessControl.AccessControlSections]::Access); " &
       "[System.IO.Directory]::SetAccessControl(" & psQuote(path) & ", $s)")
 
   proc restrictToOwnerAndSystem*(path: string) =
