@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Status | in-progress; native regression control pending |
+| Status | in-progress; native old/fixed control passes; full consumer validation pending |
 | Recorded | 2026-09-29 |
 | Observed in | RunQuota `11548ab`; `windowsChildEnv` |
 | Area | libs/runquota_process/src/runquota_process.nim |
@@ -38,3 +38,16 @@ against old and repaired launchers on Windows before claiming the cause fixed.
 
 Refreshed dev `e9f9011` and searched current/deleted issues for environment,
 PATH and case-insensitive overrides; no prior issue was found.
+
+## Native Windows result
+
+Shared-actions run `36557091691` executes the same real-child regression
+against `11548ab` and `292e578`. The old launcher produces `matches=3` and
+`lookup=first-override`; the repaired launcher passes every assertion,
+including a single entry containing the last override. The regression uses
+the actual OS environment block and leaves the parent unchanged.
+
+Shared-actions PR 38 adds an explicit bootstrap dependency input and passes
+all seven contract CI jobs at `d966f7a`. This candidate selects `292e578`
+for the separately built Reprobuild launcher as well. Full Windows graph
+validation remains required before attributing the missing SQLite to it.
