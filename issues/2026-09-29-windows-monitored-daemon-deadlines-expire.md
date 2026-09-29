@@ -52,11 +52,21 @@ At RunQuota `19ee745`, io-mon `5e71adf`, diagnostic
 
 The companion graph moves only lifecycle and scheduled retention into the
 existing measurement lane after compilation and competing tests. Its outcome
-is still pending. These observations establish missed test windows, not a
-particular runtime cause. Keep every bound and assertion while checking that
-comparison. The ordinary Windows x64 Reprobuild job at `19ee745` passes the
-graph and native cross-check, so the failure is intermittent.
+passes all 198 actions: all 98 test programs actually launch, with caching
+disabled for their execution. The starting-lease helper returns its expected
+32 in 71 ms; the other helper waits take 32, 47 and 197 ms. Retention's measured
+prune window is 4863 ms and every original assertion passes. These are separate
+runners of the same class; the comparison supports controlling competing work,
+and does not establish a daemon defect. The ordinary Windows x64 Reprobuild job
+at `19ee745` also passes the graph and native cross-check, confirming the
+failure is intermittent.
 
-Evidence: `/tmp/runquota-windows-deadline-7c-parallel-evidence`. Refreshed dev
+Apply the two-program ordering change to `repro.nim` on every host, using its
+existing measurement lane. No deadline, assertion, capture or monitor policy
+changes. The full ordinary workflow at the resulting production commit remains
+required before closure.
+
+Evidence: `/tmp/runquota-windows-deadline-7c-parallel-evidence` and
+`/tmp/runquota-windows-deadline-7c-isolated-evidence`. Refreshed dev
 `e9f9011` and searched open/deleted deadline and readiness records before
 extending this issue.
