@@ -89,7 +89,7 @@
 ## whose own OFF baseline turned out to have been out of range, and then
 ## FAILS saying so rather than reporting a ratio it cannot support.
 
-import std/[algorithm, atomics, cpuinfo, os, osproc, random, streams,
+import std/[algorithm, atomics, cpuinfo, math, os, osproc, random, streams,
             strutils, times, unittest]
 
 when defined(windows):
@@ -929,20 +929,60 @@ suite "ambient_load_attribution":
       let busyNow = waitForHeadroom(30)
       check busyNow >= 0.0
       require busyNow <= maxBusyForMeasurement
-      # A two-thread floor on a 32-core host cannot exceed a 10% declaration.
-      # Reserve enough spinners for twice the declared share; the measured
-      # getrusage positive control below still proves they actually ran.
-      let minimumSpinners = int(2.0 * declaredCpu * float(cores) / 100.0) + 1
-      load = startLoad(max(minimumSpinners,
-        spinnersForHeadroom(busyNow, cores)))
+      # THE LOAD IS SIZED FOR WHAT THIS CASE NEEDS, which is to be larger
+      # than everything the admitted executions declared -- so that `self`
+      # staying at the declared figure is a statement about attribution
+      # rather than about there being nothing to attribute. It used to be
+      # sized by `spinnersForHeadroom` alone, which serves the tracking
+      # case (keep the host off full scale) and knows nothing of
+      # `declaredCpu`: on a 32-core host already 63% busy it started five
+      # spinners, the other work on the machine held each to 0.59 of a
+      # core, and the load reached 9.23% of the machine against a declared
+      # 10.0 -- a precondition that failed and was reported as an
+      # attribution assertion.
+      #
+      # So the floor is twice the declared share, in whole cores. The
+      # ceiling stays `spinnersForHeadroom`'s half of the machine, and not
+      # for the tracking case's reason: the sampler under test is a thread
+      # of THIS process, competing with the spinners, and a load sized to
+      # saturate the host starves it -- tried, at 28 spinners on 32 CPUs,
+      # it wrote two rows in a 2.5 s window. What the host's other work
+      # takes is not constant either, so a window whose load did not clear
+      # the declared figure is observed again, with the same load, a
+      # bounded number of times, the way the tracking case re-runs a block
+      # whose baseline was out of range.
+      let spinners = min(max(2, cores div 2), max(
+        spinnersForHeadroom(busyNow, cores),
+        int(ceil(2.0 * declaredCpu / 100.0 * float(cores)))))
+      load = startLoad(spinners)
       load.burn(true)
       sleep(settleMillis)
-      let reporting = observe(2500)
-      # The load really is larger than everything the admitted executions
-      # declared, so `self` staying at the declared figure is a statement
-      # about attribution rather than about there being nothing to
-      # attribute.
-      check ownCpuPct([reporting]) > declaredCpu
+      var reporting: Window
+      var ownCpu = 0.0
+      var attempts = 0
+      while true:
+        inc attempts
+        reporting = observe(2500)
+        ownCpu = ownCpuPct([reporting])
+        if ownCpu > declaredCpu or attempts >= blockAttempts:
+          break
+      echo "  m11 self: spinners=", spinners, " busyBefore=",
+        formatFloat(busyNow, ffDecimal, 1), "% own=",
+        formatFloat(ownCpu, ffDecimal, 2), "% declared=", declaredCpu,
+        "% attempts=", attempts
+      if not (ownCpu > declaredCpu):
+        # A PRECONDITION, AND IT SAYS SO. The machine would not give this
+        # process more than the executions declared, so nothing below can
+        # tell attribution from an absence of load. That is a failure --
+        # the case was not evaluated -- but not the failure of the
+        # assertion it would otherwise have been mistaken for.
+        checkpoint("PRECONDITION NOT MET: the synthetic load reached " &
+          formatFloat(ownCpu, ffDecimal, 2) & "% of the machine with " &
+          $spinners & " spinners on " & $cores & " logical CPUs (host " &
+          formatFloat(busyNow, ffDecimal, 1) & "% busy before), after " &
+          $attempts & " attempts; it must exceed the " & $declaredCpu &
+          "% the admitted executions declared")
+        fail()
 
       # Now the clamp, under real conditions rather than constructed ones:
       # one admitted execution reports more CPU and more memory than the
