@@ -307,3 +307,36 @@ agents `641d103`. Current release candidate `33add18` separately passes all
 ten native jobs and complete Windows x64 and macOS Reprobuild jobs; this
 focused recurrence remains an open intermittent issue, not a failed gate at
 that candidate.
+
+## Full execution after all 100 monitored compilations succeed
+
+Run `36753037680` at tooling `8fd4eff` completes on 2026-09-30 at
+20:18 UTC against RunQuota `8cf662c`, hooks `8f4d806` and disposable all-range
+hook-page preparation. All 100 monitored compile actions pass. Its test graph
+has 93 successful actions, 85 up-to-date actions, 12 failed executions and
+eight blocked executions:
+
+- Exit 124: host-state trust, process/exec contract, extension write path,
+  query interface, standalone backup, observation export and observation merge.
+- Exit 137: observation socket write path, after a daemon stream-read error;
+  the shell reports the timeout wrapper was killed.
+- Exit 1: observation flush contract, multi-session fairness, standalone
+  daemonless degradation and retention schedule.
+
+Fairness fails to open a daemon pipe. Standalone degradation includes access
+denied while removing a child executable. Flush-count and retention-cadence
+assertions also fail. Partial successful test output precedes the timeouts;
+it does not establish that the programs completed. No phase-130 hook trace
+accompanies these failures. They cannot be assigned the compiler stall's cause
+from a shared timeout symptom.
+
+These 12 programs are unchanged between `8cf662c` and candidate `a173baf`.
+The latter does select the separately validated root-exit capture repair in
+its CI bootstrap. Its ordinary checks and the current-source prepared graph
+`36763970172` at `f5a3d99` remain pending; this older result does not establish
+their outcome. No test assertion or production deadline is waived.
+
+Evidence: `/tmp/windows-arm-prepared-all-8fd-evidence` and bounded action
+summary `/tmp/windows-arm-prepared-all-8fd-summary.json`. The diagnostic shim
+hash is `BBB2E1EE4B77C96F6D527DBBEB3763BCA33996A3CA44DE515B31F4309507D21E`.
+Refreshed dev `2c50aaf` and agents `057a60f` before extending this record.
