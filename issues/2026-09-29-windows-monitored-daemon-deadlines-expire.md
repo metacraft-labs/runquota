@@ -220,3 +220,35 @@ poll loop. No timeout or product behavior is changed based on those durations.
 Evidence: `/tmp/runquota-readiness-30d-evidence` and
 `/tmp/runquota-readiness-30d-job.log`. Refreshed dev `2c50aaf` and agents
 `ef060dd` before extending this record.
+
+## Native helper expires before its first startup marker
+
+Bounded-output run `36745684530` at tooling `7729607` completes the focused
+monitored graph and all eight paired repetitions at RunQuota `7036462`.
+Every monitored repetition passes. Native repetitions 1–4 and 6–8 pass;
+native repetition 5 fails its normal supervisor-exit case. Across the retained
+logs, 127 of 128 lifecycle cases pass. Fixture and daemon hashes remain
+identical throughout each comparison.
+
+The failed helper has PID 1656, returns zero after 3105 ms against its unchanged
+3000 ms wait, and emits no helper-entry marker or later phase. The daemon
+reports zero granted leases. Nim's Windows timeout termination uses exit zero,
+which the expected normal exit alone cannot distinguish; the existing lease
+count assertion catches this failure. Its daemon was already ready after
+7642 ms of readiness polling. Every daemon in the comparison becomes ready;
+this is not the original missing-pipe failure.
+
+This occurrence is native, without the outer monitor. It establishes that
+this helper made no recorded progress before timeout termination; it does
+not yet distinguish Windows image/CRT startup from imported Nim module
+initialization or other scheduling delay. Capture process/thread startup
+state before the timeout kills a future failing helper. Preserve the actual
+lifecycle assertions and wait bound; do not attribute it to the ARM-host hook
+transaction based on a shared timeout symptom.
+
+Evidence: `/tmp/runquota-readiness-772-evidence/build/windows-readiness`,
+especially `native-5.log` and `results.json`. Daemon SHA-256 is
+`2650BB5E7659D33463678AB30B8CF0BA0EB24AEFBBC26F7EF4FD814D7FD5B515`;
+fixture SHA-256 is
+`CCCD5E8D61E0E33A61D97B6A185A8E85B11F9B4542BAACA19CF223F4E7D018E4`.
+Refreshed dev `2c50aaf` and agents `339ab1e` before extending this record.
