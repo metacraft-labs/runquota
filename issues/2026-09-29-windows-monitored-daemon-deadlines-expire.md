@@ -452,3 +452,36 @@ per-test logs, exact binary hashes and source pins. This observer still has
 the known live-parent-tree gap; do not attribute its ancestor phase readings
 to an absent test process. The later `2bed024` comparison addresses that
 observation gap and remains a separate run.
+
+## Bounded retention-query batching
+
+RunQuota `c6ddde6` changes only merge reads. Its seven unchanged merge cases
+pass locally with 762 real SQLite launches versus 1,114 at `a173baf`, using
+the same Apple SQLite 3.51.0 executable through a delegating wrapper. Its
+complete 28-binary observation-store subset passes with Nix SQLite 3.51.2
+and Nim 2.2.4. Full ordinary CI and the paired Windows comparison at tooling
+`8159a30` remain pending; no release candidate is selected from this alone.
+
+The separate scheduled-retention failure at `33add18` is a ten-second wait
+for `scFinished`. At `c6ddde6`, the first sweep opens the store, queries the
+registry, checks each extension table separately, counts executions,
+extension rows and carried rows separately, commits the existing deletion
+transaction, then counts hosts and profiles separately. Each query launches
+a new SQLite process. The passing small startup comparison above measures
+about 0.5 seconds per monitored launch on the ARM host; this motivates
+reducing launches, but does not establish the duration of any failed sweep.
+
+On a separate branch, batch the registry's existing-table lookup into one
+read, all doomed-row counts into one snapshot, and the final host/profile
+counts into one read. Preserve registered extension order, invalid-identifier
+rejection, the absent-extension-table behavior, opaque extension columns,
+host-qualified deletion predicates and the existing single write transaction.
+An unreadable count must fail explicitly before deletion. Preserve all
+sweeper cadence, deferral, locking, degradation and reporting behavior, and
+every test assertion and deadline. This implements the observation-store
+spec's Retention and OS-5/6 requirements with fewer child processes.
+
+Measure the unmodified retention-schedule suite first, then run the existing
+real SQLite extension, retention, retention-schedule and crash/atomicity gates
+against the change. Run Windows controls before selecting it for the release.
+Do not infer a fix for compiler hook-protection stalls from these results.
