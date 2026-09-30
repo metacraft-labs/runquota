@@ -361,3 +361,45 @@ and native/monitored repetitions remain pending. The known-phase child must
 remain alive after observation; a separate child exporting a different phase
 must fail the same phase assertion. The existing full current-source graph and
 ordinary release CI remain running independently.
+
+## Completed current-source observations
+
+Full graph `36763970172` at tooling `f5a3d99`, RunQuota `33add18` and
+hooks `def2464` completes with all 103 build actions successful. Its test
+graph reports 93 successful, 88 up-to-date, 14 failed and eight blocked
+actions. Nine failures return 124, two return 137 and three return 1.
+The failures include SQLite concurrent spawn, daemon startup/communication,
+publication, retention and export/merge. All-range page preparation therefore
+does not establish a complete repair. No phase-130 trace accompanies these
+runtime failures. Evidence: `/tmp/windows-arm-prepared-f5-evidence`.
+
+Focused comparison `36774529116` at tooling `8817d55` preserves binary hashes
+and the original protection behavior. All three native programs pass:
+retention in 22.2 seconds, export in 52.2 and merge in 61.2. Monitored retention
+passes in 220.5 seconds and export in 553.6; merge returns 124 after 636.8
+seconds including monitor completion. The retained streams contain 360, 878
+and 1026 process-spawn records respectively. Merge prints six successful
+assertions before timeout, so this run does not support a post-suite exit
+deadlock. The process-tree samples include initialized shims but omit the
+actual test PID recorded in the merged stream: a snapshot of live parent
+links is insufficient across the MSYS process transitions. Do not attribute
+the test's wait to those idle ancestors. Both real phase-reader controls pass,
+including rejection of phase 322 with status 13. Evidence:
+`/tmp/runquota-runtime-881-evidence`.
+
+### Next controlled comparison
+
+The source bootstrap at candidate `a173baf` and these diagnostic rebuilds use
+debug monitor shims. Compare the same fixed application/test binaries with
+debug and release-mode shims built from identical source pins and diagnostic
+stores. Keep native execution, all assertions, capture and the original
+600-second timeout. Record both shim hashes and complete results even if the
+debug arm fails. This tests the existing `IO_MON_BUILD_MODE` build option;
+it does not select a production change or waive a gate.
+
+Extend the read-only observer to select the exact test executable path, created
+after the invocation root, as an additional observation root. Label it as an
+image match rather than asserting an unobserved parent relationship. Preserve
+creation-time checks, known/wrong-phase controls and the ban on suspending
+observed threads. Ordinary candidate `a173baf` remains in its failed-job retry;
+four Reprobuild hosts and all ten native jobs already pass at that SHA.
