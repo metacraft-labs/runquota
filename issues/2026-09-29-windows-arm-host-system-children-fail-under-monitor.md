@@ -96,3 +96,19 @@ complete ordinary Reprobuild workflow remains the release gate.
 
 Evidence: `/tmp/runquota-arm-contention-ce-evidence`. Refreshed dev `2c50aaf`
 and agents `e67ce70` before extending the existing record.
+
+## Ordinary environment-repair candidate
+
+At RunQuota `48bb701`, [job 109933446531](https://github.com/metacraft-labs/runquota/actions/runs/36729033751/job/109933446531)
+fails compilation of `t_hardware_run_tool_streams`: GCC reports that it cannot
+start its `cc1.exe` child (`CreateProcess: No such file or directory`). Tests
+and native cross-checks are consequently skipped. This is the compiler-launch
+symptom reproduced in the separately instrumented hook-transaction investigation;
+this ordinary run carries no trace proving the same underlying cause. Its
+Windows x64 counterpart passes the complete monitored suite, native cross-check
+and all 12 static helper checks. Current candidate `33add18` remains in CI.
+
+Raw ARM log: `/tmp/runquota-48bb-windows-arm-complete.log`; failure artifact:
+`/tmp/runquota-48bb-arm-evidence`. Refreshed dev `2c50aaf` and agents `4ae8008`
+before recording these results. Neither failure nor the passing x64 result
+replaces native ARM64 release-payload validation.
