@@ -497,12 +497,13 @@ const windowsCancelledExitCode* = 1'u32
 
 proc commandSpec*(argv: openArray[string]; cwd = ""; env: openArray[string] = [];
                   stdoutLimit = DefaultOutputLimit; stderrLimit = DefaultOutputLimit;
-                  createProcessGroup = true): CommandSpec =
+                  createProcessGroup = true; inheritEnv = true): CommandSpec =
   for item in argv:
     result.argv.add(item)
   result.cwd = cwd
   for item in env:
     result.env.add(item)
+  result.inheritEnv = inheritEnv
   result.stdoutLimit = stdoutLimit
   result.stderrLimit = stderrLimit
   result.createProcessGroup = createProcessGroup
@@ -618,13 +619,16 @@ when defined(posix):
     ## place so no slice is materialised per comparison.
     entry.len > key.len and entry[key.len] == '=' and entry.startsWith(key)
 
-  proc childEnvEntries(overrides: openArray[string]): seq[string] =
+  proc childEnvEntries(overrides: openArray[string];
+                       inherit = true): seq[string] =
     ## The environment the child should exec with: the launcher's own
     ## environment with `overrides` layered on top. This reproduces what the
     ## in-child `putEnv` loop produced -- including that an entry with no name
     ## (`=value`) or no separator at all is not an assignment and is ignored --
-    ## except that it is computed before the fork.
-    let inherited = currentEnviron()
+    ## except that it is computed before the fork. With `inherit = false` the
+    ## launcher's own environment is not the base: the child gets `overrides`
+    ## alone (`CommandSpec.inheritEnv`).
+    let inherited = if inherit: currentEnviron() else: nil
     if inherited != nil:
       var index = 0
       while inherited[index] != nil:
@@ -725,11 +729,13 @@ when defined(windows):
   # Windows: build a flat KEY=VALUE list from inherited + override env so
   # std/osproc can apply it via the `env` table parameter.
   proc windowsChildEnv(spec: CommandSpec): StringTableRef =
-    # Windows: start from the current process env, then layer overrides.
+    # Windows: start from the current process env (unless the caller asked
+    # for exactly its own entries, `inheritEnv = false`), then layer overrides.
     when compiles(newStringTable()):
       result = newStringTable()
-    for k, v in envPairs():
-      result[k] = v
+    if spec.inheritEnv:
+      for k, v in envPairs():
+        result[k] = v
     for entry in spec.env:
       let eq = entry.find('=')
       if eq <= 0:
@@ -961,7 +967,7 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     # Everything the child needs between fork and exec is composed here, while
     # there is still a whole process to compose it in. After the fork the child
     # may only read what is already built.
-    let childEnv = childEnvEntries(spec.env)
+    let childEnv = childEnvEntries(spec.env, spec.inheritEnv)
     let program = resolveProgram(spec.argv[0], execSearchPath(childEnv))
     let shellArgv = shellFallbackArgv(program, spec.argv)
 

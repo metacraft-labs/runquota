@@ -18,6 +18,14 @@ type
     argv*: seq[string]
     cwd*: string
     env*: seq[string]
+    inheritEnv*: bool
+      ## When true (`commandSpec`'s default) the child starts from the
+      ## launcher's environment and `env` is layered over it. When false the
+      ## child's environment is EXACTLY `env`: nothing is inherited, so a
+      ## caller that must control what a process can observe (a build that
+      ## keys an action on the variables it reads) can do so. There is no
+      ## other removal channel — layering can replace a variable, never
+      ## unset one.
     stdoutLimit*: int
     stderrLimit*: int
     createProcessGroup*: bool
