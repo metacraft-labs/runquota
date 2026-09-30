@@ -22,3 +22,20 @@ Fetched dev `0bce530`, already included in the candidate, and searched open
 and deleted issues for ambient Windows failures, memory population and timeouts.
 The existing macOS memory issue concerns the measured resident-load ratio,
 not expiration before a result. No timeout repair is claimed yet.
+
+## Confirmed cause and candidate
+
+The same timeout recurs at `c371915`, job `109796870562` in `36687563185`.
+Control `36692312223` at shared actions `0a6fbed` compares the complete real
+fixture at that source on the same Windows x64 host and compiler. The original
+fills take 138,036, 143,352 and 156,377 ms; execution hits exit 124 during the
+fourth fill. The bulk system-random variant executes successfully with all
+five tests, nine allocations, assertions and the 600-second limit retained.
+The bulk fills take 1,899–1,967 ms and the measured memory ratio is 0.999.
+Both report a real launched action. The ARM-host comparison is still active.
+
+The candidate uses 4-MiB `std/sysrand.urandom` chunks, filling every byte
+without overflowing the Windows API's 32-bit length. A failed fill frees its
+mapping before propagating the error. The same bulk control passes all five
+real tests on macOS, with a 0.906 memory ratio and 1.5–1.6-second fills.
+Complete ordinary CI at the final candidate remains required.

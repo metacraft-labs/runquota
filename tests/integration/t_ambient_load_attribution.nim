@@ -89,8 +89,8 @@
 ## whose own OFF baseline turned out to have been out of range, and then
 ## FAILS saying so rather than reporting a ratio it cannot support.
 
-import std/[algorithm, atomics, cpuinfo, math, os, osproc, random, streams,
-            strutils, times, unittest]
+import std/[algorithm, atomics, cpuinfo, math, os, osproc, streams,
+            strutils, sysrand, times, unittest]
 
 when defined(windows):
   import std/winlean
@@ -204,23 +204,6 @@ when defined(windows):
   proc virtualFree(address: pointer; size: int; freeType: int32): WINBOOL
     {.stdcall, dynlib: "kernel32.dll", importc: "VirtualFree".}
 
-proc takeMemory(size: int; random: var Rand): MemoryLoad =
-  when defined(windows):
-    let base = virtualAlloc(nil, size, MemCommit or MemReserve, PageReadWrite)
-    doAssert base != nil, "VirtualAlloc of " & $size & " bytes failed"
-  else:
-    let base = mmap(nil, size, PROT_READ or PROT_WRITE,
-      MAP_PRIVATE or MAP_ANONYMOUS, -1, 0)
-    doAssert base != MAP_FAILED, "mmap of " & $size & " bytes failed"
-  # Populate every word with unpredictable bytes. One random byte per page
-  # leaves almost the entire allocation zero and compressible, so mapped
-  # bytes no longer describe the resident load this control claims to add.
-  doAssert size mod sizeof(uint64) == 0
-  let words = cast[ptr UncheckedArray[uint64]](base)
-  for index in 0 ..< size div sizeof(uint64):
-    words[index] = next(random)
-  MemoryLoad(base: base, size: size)
-
 proc release(load: var MemoryLoad) =
   if load.base != nil:
     when defined(windows):
@@ -228,6 +211,33 @@ proc release(load: var MemoryLoad) =
     else:
       discard munmap(load.base, load.size)
     load.base = nil
+
+proc takeMemory(size: int): MemoryLoad =
+  when defined(windows):
+    let base = virtualAlloc(nil, size, MemCommit or MemReserve, PageReadWrite)
+    doAssert base != nil, "VirtualAlloc of " & $size & " bytes failed"
+  else:
+    let base = mmap(nil, size, PROT_READ or PROT_WRITE,
+      MAP_PRIVATE or MAP_ANONYMOUS, -1, 0)
+    doAssert base != MAP_FAILED, "mmap of " & $size & " bytes failed"
+  # Populate every byte with unpredictable data. One random byte per page
+  # leaves almost the entire allocation zero and compressible, so mapped
+  # bytes no longer describe the resident load this control claims to add.
+  # Bulk system-random calls also avoid hundreds of millions of checked
+  # per-word PRNG calls in debug builds. Keep chunks below Windows' ULONG
+  # length limit: passing the whole 4-GiB allocation would wrap to zero.
+  result = MemoryLoad(base: base, size: size)
+  try:
+    let bytes = cast[ptr UncheckedArray[byte]](base)
+    var offset = 0
+    while offset < size:
+      let count = min(4 * 1024 * 1024, size - offset)
+      doAssert urandom(bytes.toOpenArray(offset, offset + count - 1)),
+        "could not populate the real memory load"
+      offset += count
+  except:
+    result.release()
+    raise
 
 # ---------------------------------------------------------------------------
 # Measurement helpers
@@ -751,14 +761,13 @@ suite "ambient_load_attribution":
       ## still counted pages the kernel had not finished reclaiming, and
       ## the arm read a systematic two thirds of the known load.
 
-    var random = initRand(0x11)
     var emptyWindows: seq[Window] = @[]
     var fullWindows: seq[Window] = @[]
     var memory = MemoryLoad()
     try:
       for _ in 0 ..< memoryCycles:
         emptyWindows.add(observe(800))
-        memory = takeMemory(int(knownBytes), random)
+        memory = takeMemory(int(knownBytes))
         sleep(settleMillis)
         fullWindows.add(observe(800))
         # Asserted while the allocation is STILL MAPPED: releasing it
