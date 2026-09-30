@@ -62,19 +62,72 @@ compile = 8
 fetch   = 2
 ```
 
-Every key is optional; an absent one keeps the default in the table below. A
-flag given on the command line overrides the file for that launch. The file is
-read once, at start: restart the daemon to apply a change.
+Every key is optional; an absent one keeps the built-in default: **75% of
+physical memory** and one core (`1000` milli-CPU) per logical processor. A
+flag given on the command line overrides the file for that launch.
 
 The reader accepts exactly this shape: a `schema` string, positive integers in
 `[machine]` and `[pools]`, `_` between digits, and `#` comments. Anything else
 is refused with the file and line, and the daemon exits **2** without starting,
 because a budget file that was half-read would look configured when it is not.
 A missing file is not an error, and the daemon never creates the file or its
-directory.
+directory. The installers create the directory and seed a file whose keys are
+all commented out (see [provisioning](/getting_started/provisioning)).
 
-A daemon that reprobuild starts for you reads the same file, and reprobuild
-passes budget flags only for the keys the file leaves unset.
+A daemon that reprobuild starts for you reads the same file. Reprobuild passes
+no memory flag unless `REPROBUILD_RUNQUOTA_MEMORY_BYTES` is set, and passes
+CPU and pool flags only for the keys the file leaves unset.
+
+### Changing it: `runquota config`
+
+```sh
+runquota config show                              # the file, the defaults, and what the daemon enforces
+runquota config set machine.memory_bytes 96GiB    # also 512MiB, 64GB, or a byte count
+runquota config set machine.cpu_milli 16000
+runquota config set pools.compile 8
+runquota config unset pools.compile               # back to the default
+runquota config reload                            # after editing the file by hand
+runquota config path
+```
+
+`set` and `unset` check the edited file with the daemon's own reader before
+writing anything, write it atomically (beside it, then renamed over it), keep
+every comment and every other line, and then ask the running daemon to
+**reload** it. They need the rights the install step gave the directory: an
+elevated prompt on Windows, root elsewhere. They never create the directory;
+on an unprovisioned host they say so and write nothing. `--file PATH` edits
+another file, and `--no-reload` skips the reload.
+
+### Reloading under a running daemon
+
+One daemon serves every workspace on the host, so restarting it to change a
+budget would drop every build's session at once. Instead the daemon re-reads
+its file when a client sends it `ReloadHostConfig` — which `runquota config
+reload` does, and `set`/`unset` do after writing. It is a message over the
+daemon's own endpoint, not a signal, so it works the same on Windows. The
+request carries no values: the daemon reads the file it was started with,
+which only administrators can write, so any client that may connect may ask.
+
+What a new budget does to leases already in flight:
+
+| Change | Granted leases | Queued leases |
+|---|---|---|
+| Grow | untouched | promoted now, if they fit; clients see the grant on their next poll |
+| Shrink | **never revoked** — they keep running, and the granted total may exceed the new budget | admitted against the new budget, so nothing new starts until the total falls below it |
+| Shrink below a queued lease's size | untouched | **denied** on its session's next poll, with the reason a fresh request of that size gets (`lease request exceeds machine memory budget: local`) — waiting could never end |
+| A pool removed from the file | untouched | denied, as above |
+
+A file that does not parse changes **nothing**: the reload is refused with the
+file and line, the budget in force stays the last one that parsed, and
+`runquota config reload` exits 1. A key a `runquotad` flag pinned for this
+launch keeps the flag's value; the reload answer lists such keys, so an edit
+that had no effect says so. `runquota topology --json` carries the budget in
+force, the `pools`, and a `host_config` object naming the file it came from,
+the number of reloads, and the keys the flags pin. The daemon logs one line
+per reload (`runquotad: host configuration reloaded: ...`).
+
+`runquotad --host-config PATH` names another file to read at start and on
+every reload — for a test's private daemon, never for the host's.
 
 ### Flags
 
@@ -82,13 +135,14 @@ passes budget flags only for the keys the file leaves unset.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--cpu-milli N` | detected cores × 1000 | Host CPU budget; `1000` is one core. |
-| `--memory-bytes N` | 16 GiB | Host memory budget. |
+| `--cpu-milli N` | logical processors × 1000 | Host CPU budget; `1000` is one core. Pins the value against a reload. |
+| `--memory-bytes N` | 75% of physical memory | Host memory budget. Pins the value against a reload. |
 | `--io-slots N` | `1` | Concurrent heavy-I/O slots. |
 | `--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]` | one implicit machine, `local` | A named capacity. Omitted I/O slots inherit `--io-slots`; an omitted share group defaults to the machine's own id. |
 | `--cpu-share-group ID=CPU_MILLI` | derived | A CPU cap shared across machines. |
 | `--pool NAME=UNITS` | none | An arbitrary named counter. |
 | `--socket PATH` | the rendezvous socket | Where to listen. A path you name here is created on demand; the host-wide one never is. |
+| `--host-config PATH` | the host file above | The budget file read at start and on every reload. |
 
 Memory pressure:
 
