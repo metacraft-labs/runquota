@@ -70,3 +70,21 @@ Evidence: `/tmp/runquota-windows-deadline-7c-parallel-evidence` and
 `/tmp/runquota-windows-deadline-7c-isolated-evidence`. Refreshed dev
 `e9f9011` and searched open/deleted deadline and readiness records before
 extending this issue.
+
+## Recurrence after ordering the measurement lane
+
+The complete Windows x64 Reprobuild [job 109865062746](https://github.com/metacraft-labs/runquota/actions/runs/36708690438/job/109865062746)
+at `70364629d5214bf4be9ac760d63e572fc257b111` passes the first seven
+crash-recovery cases but its final forced-supervisor-kill case fails before
+starting its helper. The daemon's named pipe does not appear within the same
+four-second startup wait (Windows error 2). The report records 193 successful
+actions, one failure and seven blocked measurement programs. The measurement
+lane already waits for all compiler and ordinary test actions at this commit;
+that ordering alone has not removed the intermittent startup failure.
+
+The fixture currently closes its daemon output pipe without reporting the
+child's output or whether it exited before readiness. Capture that evidence
+and compare repeated monitored/native runs of the same binaries before
+changing a deadline or runtime behavior. Keep every assertion and the full
+ordinary release gate. Refreshed dev `0bce530` and searched current/deleted
+readiness records; this is a recurrence of the existing issue.
