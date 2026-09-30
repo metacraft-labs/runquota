@@ -37,3 +37,13 @@ The original build failure report is retained under
 Fetched current dev `0bce530` and searched open/deleted compiler, timeout and
 nested-parallelism issues before filing. This is separate from the verified
 finished-image cleanup repair and the measured test-execution scheduling fix.
+
+## Two-action control did not eliminate the failure
+
+At RunQuota `8cf662c`, shared control `36644657089` (`a7c9c3f`) executes
+all 100 build actions with two outer actions admitted. Ninety-nine succeed;
+`t_forking_lease_completion` fails starting a C compiler with error 1460.
+The test stage does not run. Ordinary eight-action CI `36643299557` at the
+same source fails launching `as.exe` from GCC. Lower concurrency alone is not
+a repair. The control retains process counts and the full build report in
+artifact `runquota-windows-arm-build-budget`.
