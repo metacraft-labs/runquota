@@ -267,9 +267,17 @@ proc applyRetention*(store: ObservationStore; hostId: string;
   if result.detail.len > 0:
     return
 
-  result.hostsRetained = store.scalar("select count(*) from hosts;")
-  result.hostProfilesRetained =
-    store.scalar("select count(*) from host_profiles;")
+  let retained = store.runQuery("select (select count(*) from hosts), " &
+    "(select count(*) from host_profiles);")
+  if retained.len != 1 or retained[0].len != 2:
+    result.detail = "retention completed, but retained host counts could not be read"
+    return
+  try:
+    result.hostsRetained = parseBiggestInt(retained[0][0].strip())
+    result.hostProfilesRetained = parseBiggestInt(retained[0][1].strip())
+  except ValueError:
+    result.detail = "retained host counts could not be decoded"
+    return
   result.applied = true
 
 # ---------------------------------------------------------------------------
