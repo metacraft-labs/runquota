@@ -115,3 +115,32 @@ keeps every test and adds the startup checkpoints. Paired focused comparison
 uses the same instrumentation and one environment. Both use tooling `9ef9750`.
 The superseded `cea927f` and `3020d7e` diagnostics were cancelled explicitly;
 ordinary release gates and the independent ARM compiler trace continue.
+
+## Full-graph diagnostic correction
+
+Full graph `36723729088` at tooling `9ef9750` finishes with 179 successful
+actions, 14 failed programs and eight blocked programs. Its startup tracing
+writes five extra lines to every daemon's stdout. Other real fixtures use the
+three public startup lines as a readiness barrier, so they consume diagnostic
+lines instead and proceed before store verification. For example,
+`t_endpoint_serves_before_store_verification` prints the three diagnostic lines
+where it expects listening, capture and hardware-profile messages. The target
+crash-recovery program is blocked and never executes. This run does not
+reproduce or explain its original startup failure.
+
+Tooling `92c3b6d` enables those lines only in children of the instrumented
+crash-recovery fixture, using a process-local environment flag. The fixture
+already collects its own daemon output without parsing it as a barrier.
+Unrelated fixtures retain the ordinary startup protocol. Windows source checks
+pass for both instrumented sources. Against RunQuota `48bb701` plus this
+instrumentation, a real macOS store-verification test passes with all three
+ordinary startup lines, and all eight instrumented lifecycle cases pass.
+Evidence: `/tmp/runquota-readiness-scoped-control.log`.
+
+Replacement full graph
+[36731094289](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36731094289)
+uses tooling `92c3b6d` and the same exact RunQuota `7036462`, deadlines and
+assertions. The focused `9ef9750` comparison remains useful because it launches
+only the fixture that collects raw output, and is allowed to finish. The
+failed full-graph artifact is retained in `/tmp/runquota-readiness-9ef-full-evidence`.
+Refreshed dev `0bce530` and agents `fed6830` before recording this correction.
