@@ -403,3 +403,35 @@ image match rather than asserting an unobserved parent relationship. Preserve
 creation-time checks, known/wrong-phase controls and the ban on suspending
 observed threads. Ordinary candidate `a173baf` remains in its failed-job retry;
 four Reprobuild hosts and all ten native jobs already pass at that SHA.
+
+## Startup cost and bounded merge-query batching
+
+Small real-assembler comparison `36784367520` at tooling `90d1c40` passes
+all 80 launches on each Windows host, including child-specific COFF output,
+process-start, file-read and file-write assertions. On the ARM host, median
+direct launch times are 492 ms with the debug shim and 487 ms with the release
+shim; propagated launches take 928 and 906 ms. Native launches take 71 ms.
+This does not support treating release-mode compilation as the startup fix.
+Evidence: `/tmp/windows-shim-mode-90d-arm` and
+`/tmp/windows-shim-mode-90d-x64`. The full fixed-RunQuota comparison remains
+active separately at tooling `2bed024`.
+
+At RunQuota `a173baf`, each merge launches SQLite separately for each of five
+spine-table existence checks, each source/destination column listing, and
+each of seven before/after row counts. Batch those read-only operations into
+one table-list query, one requested-column query per database and one count
+query per snapshot. Keep metadata scoped to the requested tables; an unrelated
+virtual table must not become a new prerequisite. Preserve column order,
+extension discovery and opacity, every host/owner refusal, the existing single
+write transaction, report counts and canonical merge identity (OS-5/6/7 of
+the observation-store spec). Do not cache metadata across merges or modify
+source databases, test fixtures, assertions or deadlines.
+
+Validate against the existing real SQLite merge, owner, migration and export
+tests, comparing original and batched binaries with the same input and tool.
+Count real SQLite invocations through a delegating executable wrapper; the
+wrapper must execute the real SQLite binary and preserve its stdin, stdout,
+stderr and status. This is measurement, not a replacement SQL implementation.
+The complete ordinary release matrix is still required before selecting the
+new candidate. This batching addresses excessive launch count; it is not
+claimed as a repair for the independent hook-protection compiler stall.
