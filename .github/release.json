@@ -1,0 +1,102 @@
+{
+  "product": "runquota",
+  "versionFile": "runquota.nimble",
+  "packageName": "runquota",
+  "commands": [
+    "runquota",
+    "runquotad"
+  ],
+  "license": "MIT",
+  "summary": "Host-wide resource lease coordinator",
+  "targets": [
+    {
+      "id": "linux-x86_64",
+      "runner": "eph-linux-x64-release",
+      "assets": [
+        "{product}-{version}-linux-x86_64.tar.gz",
+        "{product}-{version}-linux-x86_64.json",
+        "runquota_{version}-1_amd64.deb",
+        "runquota-{version}-1.x86_64.rpm",
+        "runquota-{version}-1-x86_64.pkg.tar.gz"
+      ],
+      "hostedRunner": "ubuntu-24.04",
+      "runnerMigration": {
+        "version": "0.1.0",
+        "owner": "zah",
+        "followup": "https://github.com/metacraft-labs/metacraft-specs/blob/latest/issues/2026-09-24-ci-runner-mode-policy-conflicts-with-hosted-runner-ban.md"
+      }
+    },
+    {
+      "id": "darwin-aarch64",
+      "runner": [
+        "self-hosted",
+        "macos",
+        "arm64"
+      ],
+      "assets": [
+        "{product}-{version}-darwin-aarch64.tar.gz",
+        "{product}-{version}-darwin-aarch64.json"
+      ],
+      "hostedRunner": "macos-26",
+      "runnerMigration": {
+        "version": "0.1.0",
+        "owner": "zah",
+        "followup": "https://github.com/metacraft-labs/metacraft-specs/blob/latest/issues/2026-09-24-ci-runner-mode-policy-conflicts-with-hosted-runner-ban.md"
+      }
+    },
+    {
+      "id": "windows-x86_64",
+      "runner": [
+        "self-hosted",
+        "windows",
+        "x64"
+      ],
+      "hostedRunner": "windows-2025",
+      "runnerMigration": {
+        "version": "0.1.0",
+        "owner": "zah",
+        "followup": "https://github.com/metacraft-labs/metacraft-specs/blob/latest/issues/2026-09-24-ci-runner-mode-policy-conflicts-with-hosted-runner-ban.md"
+      },
+      "assets": [
+        "{product}-{version}-windows-x86_64.zip",
+        "{product}-{version}-windows-x86_64.json",
+        "runquota-{version}-windows-x86_64.msi",
+        "runquota-{version}-windows-x86_64-scoop.json"
+      ]
+    },
+    {
+      "id": "windows-aarch64",
+      "runner": "windows-11-arm",
+      "assets": [
+        "{product}-{version}-windows-aarch64.zip",
+        "{product}-{version}-windows-aarch64.json",
+        "runquota-{version}-windows-aarch64.msi",
+        "runquota-{version}-windows-aarch64-scoop.json"
+      ],
+      "runnerReason": "Temporary native Windows ARM64 release migration while the two-slot fleet queue is pending.",
+      "runnerMigration": {
+        "version": "0.1.0",
+        "owner": "zah",
+        "followup": "https://github.com/metacraft-labs/metacraft-specs/blob/latest/issues/2026-09-29-windows-arm64-release-runner-migration.md"
+      }
+    }
+  ],
+  "recommends": [
+    "sqlite3"
+  ],
+  "systemdUnit": "build/release-authoring/runquotad.service",
+  "serviceName": "runquotad",
+  "distributionMetadata": "build/release-authoring/distribution.json",
+  "archMetadata": "build/release-authoring/PKGINFO",
+  "versionChecks": [
+    {
+      "file": "libs/runquota_core/src/runquota_core.nim",
+      "pattern": "RunQuotaVersion\\*\\s*=\\s*\"([^\"]+)\""
+    },
+    {
+      "file": "packaging/runquota_dist.nim",
+      "pattern": "RunQuotaPackageVersion\\*\\s*=\\s*\"([^\"]+)\""
+    }
+  ],
+  "unsignedReleaseVersion": "0.1.0"
+}

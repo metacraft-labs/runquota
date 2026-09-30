@@ -105,11 +105,13 @@ if reprobuildSrc.len > 0:
 # on the import with the module name in it, which is the diagnosis.
 block shmLeasePath:
   let fromEnv = getEnv("SHM_LEASE_SRC")
-  if fromEnv.len > 0 and fileExists(fromEnv / "shm_lease" / "anchor.nim"):
+  # NimScript's os./ uses the target separator. During --os:windows checks
+  # on macOS/Linux these probes still access the host filesystem.
+  if fromEnv.len > 0 and fileExists(fromEnv & "/shm_lease/anchor.nim"):
     switch("path", fromEnv)
     break shmLeasePath
   for candidate in ["../nim-shm-lease/src", "../../nim-shm-lease/src"]:
-    if fileExists(candidate / "shm_lease" / "anchor.nim"):
+    if fileExists(candidate & "/shm_lease/anchor.nim"):
       switch("path", candidate)
       break shmLeasePath
 

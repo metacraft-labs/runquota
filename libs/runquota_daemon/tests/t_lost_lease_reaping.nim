@@ -42,6 +42,12 @@ import runquota_core
 import runquota_daemon {.all.}
 import runquota_daemon/child_identity
 
+when defined(windows):
+  # Use this real executable as the short-lived child. Its exit is the
+  # property under test; discovering an unrelated cmd.exe on PATH is not.
+  if commandLineParams() == @["--exited-child"]:
+    quit(0)
+
 const GiB = 1024'u64 * 1024'u64 * 1024'u64
 
 var scratchRoots: seq[string] = @[]
@@ -105,8 +111,7 @@ proc exitedChildPid(): uint64 =
   ## number cannot establish that the platform probe agrees with the OS.
   let child =
     when defined(windows):
-      startProcess(findExe("cmd"), args = ["/c", "exit", "0"],
-        options = {poUsePath})
+      startProcess(getAppFilename(), args = ["--exited-child"])
     else:
       startProcess("/bin/sh", args = ["-c", "exit 0"])
   result = uint64(child.processID)

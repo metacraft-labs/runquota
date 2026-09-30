@@ -160,7 +160,7 @@ else:
     except ValueError:
       result = -1
 
-proc failedConnectionCount(socketPath: string): int =
+proc observationsDoc(socketPath: string): JsonNode =
   ## `RUNQUOTA_SOCKET` goes in through the child's environment rather than
   ## as a `VAR=value cmd` shell prefix, which only a POSIX shell parses.
   let env = newStringTable(modeCaseSensitive)
@@ -171,8 +171,57 @@ proc failedConnectionCount(socketPath: string): int =
     env = env, options = {})
   doAssert probe.ok, "observations query failed: " & probe.output &
     probe.error & probe.failure
-  let doc = parseJson(probe.output)
-  doc["observations"]["connections_failed"].getInt
+  parseJson(probe.output)["observations"]
+
+proc failedConnectionCount(socketPath: string): int =
+  observationsDoc(socketPath)["connections_failed"].getInt
+
+proc takeOneLease(socketPath, label: string) =
+  ## A real lease, taken through the ordinary client library on the same
+  ## socket, start to finish.
+  var client = connect(endpointForPath(socketPath))
+  var session = client.registerSession(label, "0.1.0")
+  var request = resourceRequest(label & "-probe", milliCpu(1000),
+    bytes(64'u64 * MiB))
+  var lease = session.requestLease(request)
+  check lease.active
+  lease.markStarting()
+  lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
+  lease.finish(outcome = succeeded(), processCount = 1'u32)
+
+proc waitForSteadyState(socketPath: string) =
+  ## THE DESCRIPTOR BASELINE IS TAKEN FROM A DAEMON THAT HAS FINISHED
+  ## STARTING, and until this existed it was not.
+  ##
+  ## A daemon's descriptor count is not flat after its startup lines: some
+  ## of what it keeps for its whole life is opened lazily, and the delta
+  ## below cannot tell that from a leak. The ambient sampler is the one
+  ## that is on a TIMER -- its first reading comes one cadence after it
+  ## starts, and on Windows that reading opens the PDH query it keeps, 133
+  ## handles measured in one step, about 1.1 s after the startup lines.
+  ## The baseline used to be read immediately after those lines, so the
+  ## check failed exactly when the fifty connections, the lease and the
+  ## query below took longer than that one cadence, which on a loaded host
+  ## they did: 141 "leaked" handles, while two hundred aborted connections
+  ## on a warm daemon moved the count by none.
+  ##
+  ## So the baseline waits for the sampler's first reading (`ticks` is
+  ## counted in the same lock hold as the reading it takes), and then runs
+  ## the same served work the test does after the abuse -- one lease and
+  ## one `observations` query -- so that nothing that runs once per daemon
+  ## on those paths is inside the window either. What is left between the
+  ## two counts is the aborted connections.
+  var sampler = observationsDoc(socketPath)["ambient_sampling"]
+  if sampler["active"].getBool:
+    for _ in 0 ..< 200:
+      if sampler["ticks"].getInt >= 1:
+        break
+      sleep(50)
+      sampler = observationsDoc(socketPath)["ambient_sampling"]
+    doAssert sampler["ticks"].getInt >= 1,
+      "the daemon's ambient sampler never took its first reading: " & $sampler
+  takeOneLease(socketPath, "connfail-warmup")
+  discard failedConnectionCount(socketPath)
 
 suite "connection_failure_does_not_stop_the_daemon":
 
@@ -188,6 +237,7 @@ suite "connection_failure_does_not_stop_the_daemon":
     check endpointIsBound(socketPath)
 
     let pid = daemon.process.processID
+    waitForSteadyState(socketPath)
     let descriptorsBefore = openDescriptorCount(pid)
 
     for _ in 0 ..< AbortedConnections:
@@ -204,15 +254,7 @@ suite "connection_failure_does_not_stop_the_daemon":
     # through the ordinary client library on the same socket the abuse
     # arrived on.
     # ---------------------------------------------------------------------
-    var client = connect(endpointForPath(socketPath))
-    var session = client.registerSession("connfail", "0.1.0")
-    var request = resourceRequest("connfail-probe", milliCpu(1000),
-      bytes(64'u64 * MiB))
-    var lease = session.requestLease(request)
-    check lease.active
-    lease.markStarting()
-    lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
-    lease.finish(outcome = succeeded(), processCount = 1'u32)
+    takeOneLease(socketPath, "connfail")
 
     # ---------------------------------------------------------------------
     # AND IT COUNTED THEM. A daemon that survived by silently swallowing the

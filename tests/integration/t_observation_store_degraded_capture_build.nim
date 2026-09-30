@@ -173,7 +173,9 @@ suite "observation_store_degraded_capture_build":
       check profiles[0].cpuModel != unknownField
       check profiles[0].ramBytes > 0
       check profiles[0].logicalCores >= 1
-      check profiles[0].diskClass != dcUnknown
+      # Persist the detector's actual answer, including unavailable storage
+      # information on filesystems without a visible block device.
+      check profiles[0].diskClass == detectHardwareProfile(dir).diskClass
       check profiles[0].profileHash ==
         profileHash(hardwareProfile(profiles[0]))
       check daemon.startupLines[2].contains(profiles[0].profileId)

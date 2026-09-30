@@ -52,7 +52,7 @@
 ## forbids RunQuota from having an opinion about what an extension column
 ## MEANS; carrying and comparing it without one is the whole job.
 
-import std/[algorithm, os, strutils]
+import std/[algorithm, os, strutils, tables]
 
 import ./sha256, ./sqlite_cli
 
@@ -134,13 +134,49 @@ proc canonicalDump*(path: string): CanonicalDump =
     result.detail = "no such database: " & path
     return
 
+  # TWO `sqlite3` RUNS FOR THE WHOLE DATABASE, NOT TWO PER TABLE. Each run
+  # is a process spawn, and a spawn is the whole cost of this proc: about
+  # 30 ms on a quiet 32-CPU Windows host, and 160 ms on average -- six
+  # seconds at worst -- on the same host with one other process holding
+  # every CPU, against microseconds for the queries themselves. The
+  # per-table form made a dump cost `2 * tables + 2` spawns, and
+  # `t_observation_store_export`, which dumps a store 49 times, spent
+  # 384 s of a 388 s run inside spawns under that load and was killed at
+  # its 600 s bound during a full suite on a host busier still. The dump
+  # TEXT is unchanged byte for byte, so every digest is too: only the
+  # number of processes it takes to compute one moved.
+  #
+  # The first run reads everything the second needs to be written: the
+  # user version, the schema objects and every table's columns, each kind
+  # of line tagged so they cannot be confused. Names in the column lines
+  # are hex, so no name can contain the separator. The second reads every
+  # table's rows, each row prefixed by its table's index.
   var lines: seq[string] = @[]
   var detail = ""
 
-  if not queryLines(path, "pragma user_version;", lines, detail):
+  if not queryLines(path,
+      "pragma user_version;\n" &
+      "select 'object" & canonicalFieldSeparator & "' || type || '" &
+        canonicalFieldSeparator & "' || name || '" &
+        canonicalFieldSeparator & "' || case when sql is null then '" &
+        canonicalNullRendering & "' else hex(sql) end from sqlite_master " &
+        "where substr(name, 1, 7) <> 'sqlite_' order by type, name;\n" &
+      "select 'column" & canonicalFieldSeparator & "' || hex(m.name) || '" &
+        canonicalFieldSeparator & "' || hex(i.name) " &
+        "from sqlite_master m, pragma_table_info(m.name) i " &
+        "where m.type = 'table' and substr(m.name, 1, 7) <> 'sqlite_' " &
+        "order by m.name, i.cid;",
+      lines, detail):
     result.detail = detail
     return
-  if lines.len != 1:
+  # THE SCHEMA, DISCOVERED. `substr` rather than `like`, because `_` is a
+  # LIKE wildcard and `name like 'sqlite_%'` would also exclude a table
+  # somebody called `sqliteXfoo`.
+  const
+    objectTag = "object" & canonicalFieldSeparator
+    columnTag = "column" & canonicalFieldSeparator
+  if lines.len == 0 or lines[0].startsWith(objectTag) or
+      lines[0].startsWith(columnTag):
     result.detail = "unreadable user_version"
     return
   try:
@@ -149,18 +185,25 @@ proc canonicalDump*(path: string): CanonicalDump =
     result.detail = "unreadable user_version: " & lines[0]
     return
 
-  # THE SCHEMA, DISCOVERED. `substr` rather than `like`, because `_` is a
-  # LIKE wildcard and `name like 'sqlite_%'` would also exclude a table
-  # somebody called `sqliteXfoo`.
-  if not queryLines(path,
-      "select type || '" & canonicalFieldSeparator & "' || name || '" &
-        canonicalFieldSeparator & "' || case when sql is null then '" &
-        canonicalNullRendering & "' else hex(sql) end from sqlite_master " &
-        "where substr(name, 1, 7) <> 'sqlite_' order by type, name;",
-      lines, detail):
-    result.detail = detail
-    return
-  var objectLines = lines
+  var objectLines: seq[string] = @[]
+  var columnsOf = initTable[string, seq[string]]()
+  for line in lines[1 .. ^1]:
+    if line.startsWith(objectTag):
+      objectLines.add(line[objectTag.len .. ^1])
+    elif line.startsWith(columnTag):
+      let parts = line[columnTag.len .. ^1].split(canonicalFieldSeparator)
+      if parts.len != 2:
+        result.detail = "unreadable column listing: " & line
+        return
+      try:
+        columnsOf.mgetOrPut(parseHexStr(parts[0]), @[]).add(
+          parseHexStr(parts[1]))
+      except ValueError:
+        result.detail = "unreadable column listing: " & line
+        return
+    else:
+      result.detail = "unexpected schema line: " & line
+      return
   objectLines.sort()
 
   var tableNames: seq[string] = @[]
@@ -179,22 +222,34 @@ proc canonicalDump*(path: string): CanonicalDump =
   for line in objectLines:
     body.add("object=" & line & "\n")
 
-  for table in tableNames:
-    if not queryLines(path,
-        "select name from pragma_table_info(" & encodeText(table) &
-          ") order by cid;", lines, detail):
-      result.detail = detail
-      return
-    let columns = lines
+  var rowsSql = ""
+  for index, table in tableNames:
+    let columns = columnsOf.getOrDefault(table)
     if columns.len == 0:
       result.detail = "table " & table & " reports no columns"
       return
-    body.add("table=" & table & "|" & columns.join(",") & "\n")
-    if not queryLines(path, "select " & canonicalRowExpression(columns) &
-        " from " & quoteIdentifier(table) & ";", lines, detail):
+    rowsSql.add("select '" & $index & canonicalFieldSeparator & "' || " &
+      canonicalRowExpression(columns) & " from " & quoteIdentifier(table) &
+      ";\n")
+  var rowsOf = newSeq[seq[string]](tableNames.len)
+  if rowsSql.len > 0:
+    if not queryLines(path, rowsSql, lines, detail):
       result.detail = detail
       return
-    var rows = lines
+    for line in lines:
+      let at = line.find(canonicalFieldSeparator)
+      var index = -1
+      if at > 0:
+        try: index = parseInt(line[0 ..< at])
+        except ValueError: index = -1
+      if index < 0 or index >= tableNames.len:
+        result.detail = "unexpected row line: " & line
+        return
+      rowsOf[index].add(line[at + 1 .. ^1])
+
+  for index, table in tableNames:
+    body.add("table=" & table & "|" & columnsOf[table].join(",") & "\n")
+    var rows = rowsOf[index]
     rows.sort()
     body.add("rowcount=" & table & "|" & $rows.len & "\n")
     result.rows += int64(rows.len)

@@ -137,7 +137,7 @@ suite "packaging contract":
     let at = distText.find("execArgs:")
     doAssert at >= 0, "the ServiceDef no longer sets execArgs at all"
     let line = distText[at ..< distText.find('\n', at)]
-    doAssert line.replace(" ", "") == "execArgs:@[],",
+    doAssert line.strip().replace(" ", "") == "execArgs:@[],",
       "ServiceDef.execArgs must stay empty — every renderer passes it " &
       "through verbatim, so one list has to be right for systemd, " &
       "launchd and the SCM at once. Found: " & line.strip()

@@ -1189,6 +1189,16 @@ suite "observation_socket_write_path":
 
       # And admission is untouched.
       discard client.completeOneExecution("degraded-three")
+      # A stats query flushes all earlier observations before replying. Keep
+      # the store read-only across that barrier; lease completion only queues
+      # its row, so restoring permissions earlier lets the writer commit it.
+      discard client.queryStats(statsSubjectExecutions)
+      let settled = client.observations()
+      check settled["dropped"].getInt() >= 3
+      # The loss the barrier forced is asserted, not assumed: degraded-three's
+      # own write failed too.
+      check settled["write_failures"].getInt() >
+        degraded["write_failures"].getInt()
       client.close()
 
       setFilePermissions(state, {fpUserRead, fpUserWrite, fpUserExec})

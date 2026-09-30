@@ -39,10 +39,16 @@
 ## typed-tool resolver instead of the out-of-band ``build_sibling
 ## ../runquota`` shell step in ``scripts/run_tests.sh``.
 
-import std/[os]
+import std/[algorithm, os, sets, strutils]
+import ct_test_nim_unittest
+import repro_resources/run_edge
+import ./repro_support/timeout
+when defined(posix):
+  import ./repro_support/process_tools
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
+import repro_dsl_stdlib/fs as dslfs
 # ``shell(...)``, used by the documentation-book block at the end of
 # ``build:``. ``"sh"`` is already declared in ``uses:`` below, so the tool the
 # action runs through is provisioned by the same resolver as ``nim`` and
@@ -85,7 +91,10 @@ package runquota:
     # paths still use. These are sufficient for the path-mode tool
     # resolver to succeed under ``nix develop``.
     "nim >=2.2 <3.0"
-    "gcc >=12"
+    when defined(macosx):
+      "clang"
+    else:
+      "gcc >=12"
     "just >=1"
     "sh"
 
@@ -93,6 +102,15 @@ package runquota:
     # On Windows this is Git for Windows' bash, whose launcher also puts its
     # coreutils (find, sort, timeout, ...) on the script's PATH.
     "bash >=4"
+    "timeout"
+    "sleep"
+    "mkdir"
+    when not defined(windows):
+      "dirname"
+      "uname"
+      "ps"
+      "find"
+      "nix"
 
     # ``git``, which the static-helper gate's tool-store authority
     # (``scripts/static_helper_gate_toolstore.sh``, the arm ``just test`` runs
@@ -114,15 +132,19 @@ package runquota:
     # (``packages/interfaces/sqlite3``).
     "sqlite3 >=3"
 
+    # The published stats table imports shm_lease/anchor. Carry the producer's
+    # source identity and import root into each typed Nim compile.
+    "nim-shm-lease"
+
     # Not yet here from the flake's dev shell: the lint tools (``shellcheck``
     # has no Windows realization; ``shfmt``, ``typos``, ``repomix`` and
     # ``nixfmt`` are not reachable from ``uses:``), so ``just lint`` still
     # needs ``nix develop`` or a PATH that has them.
 
   # ``repro shell`` / ``repro exec -- <cmd>``: the tools in ``uses:`` above,
-  # provisioned per ``defaultToolProvisioning``. ``nim-shm-lease`` is found
-  # the way ``config.nims`` always finds it -- ``SHM_LEASE_SRC`` or the
-  # workspace sibling -- so it needs nothing here.
+  # provisioned per ``defaultToolProvisioning``. The source-library producer
+  # above supplies nim-shm-lease to engine builds; config.nims retains its
+  # explicit environment/sibling lookup for direct Nim and Just invocations.
   devEnv:
     when not defined(windows):
       useFlakeDevShell()
@@ -192,6 +214,98 @@ package runquota:
       actionId = "runquota.apps.runquotad"))
 
     discard collect("apps", runquotaAppsActions)
+
+    # Match scripts/run_tests.sh: sorted, complete discovery with unique output
+    # names. Compile each program separately; both shipping apps precede every
+    # execution edge because integration tests start real daemons and clients.
+    const backendCompiler = (when defined(macosx): "clang" else: "gcc")
+    const exeSuffix = (when defined(windows): ".exe" else: "")
+    var testSources: seq[string] = @[]
+    var libraryPaths: seq[string] = @[]
+    for kind, path in walkDir("libs"):
+      if kind == pcDir and dirExists(path / "src"):
+        libraryPaths.add(path / "src")
+    libraryPaths.sort()
+    for root in ["tests", "libs"]:
+      for source in walkDirRec(root):
+        let normalized = source.replace('\\', '/')
+        if normalized.endsWith(".nim") and normalized.extractFilename.startsWith("t") and
+            (root == "tests" or "/tests/t" in normalized):
+          testSources.add(normalized)
+    testSources.sort()
+    const measurementTests = [
+      "t_e2e_runquota_client_exit_releases_lease",
+      "t_observation_retention_scheduled",
+      "t_observation_store_retention_crash",
+      "t_ambient_sample_atomicity",
+      "t_host_load_reading_invariants",
+      "t_completion_report_does_not_wait_on_the_store",
+      "t_ambient_load_attribution",
+      "t_runquota_host_macos_native_process_telemetry"]
+    # These programs saturate the CPU or measure startup, retention, live
+    # timing and process memory. Lifecycle helpers have bounded startup waits.
+    # Run them after compilation and the rest of the suite, one at a time,
+    # so our own load generators do not invalidate another test's control.
+    for name in measurementTests:
+      for i, source in testSources:
+        if source.extractFilename.changeFileExt("") == name:
+          testSources.delete(i)
+          testSources.add(source)
+          break
+    doAssert testSources.len > 0, "No RunQuota tests found"
+    var names = initHashSet[string]()
+    var testBuilds, testRuns: seq[BuildActionDef] = @[]
+    var testPrograms: seq[tuple[name, output: string, compiled: BuildActionDef]] = @[]
+    for source in testSources:
+      let name = source.extractFilename.changeFileExt("")
+      doAssert name notin names, "Duplicate test binary name: " & name
+      names.incl(name)
+      let output = "build/test-bin/" & name & exeSuffix
+      let compiled = buildNimUnittest.build(
+        source = source, binary = output, paths = libraryPaths,
+        extraInputs = @["config.nims", "tests/support"],
+        actionId = "runquota.test_build." & name)
+      appendRegisteredActionToolIdentityRefs(compiled.action.id, [backendCompiler])
+      testBuilds.add(compiled.action)
+      testPrograms.add((name, output, compiled.action))
+    for program in testPrograms:
+      let (name, output, compiled) = program
+      let isolatesEnvironment = name == "t_isolated_environment"
+      var executeAfter = runquotaAppsActions & @[compiled] &
+        (if name in measurementTests: testBuilds & testRuns else: @[])
+      var executePolicy = automaticMonitorPolicy(captureBreadth = mcbFullCapture)
+      if isolatesEnvironment:
+        # This fixture asserts the child's exact environment. An outer shim
+        # injects its own loader/session variables and changes that premise.
+        # Preserve every assertion and monitored compilation. The depfile
+        # supplies ordering, not complete runtime reads, so never cache this
+        # execution. See issues/2026-09-30-isolated-environment-fixture-
+        # inherits-monitor-injection.md and Monitor-Hook-Shim / Failure Semantics.
+        let depfile = "build/test-deps/" & name & ".d"
+        executeAfter.add(dslfs.unmonitorableActionDepfile(
+          output = depfile, inputs = @[output],
+          reason = "Exact child-environment fixture owns its environment; " &
+            "outer monitor injection adds variables. Execution always reruns.",
+          actionId = "runquota.test_dependencies." & name))
+        executePolicy = makeDepfilePolicy(depfile, suppressMonitorShimSeed = true)
+      # Preserve the native harness's bound, kill grace and closed stdin.
+      # GNU timeout places the child tree in its own process group.
+      let executed = shell(
+        command = "timeout --kill-after=10 600 " & quoteShell(output) & " </dev/null",
+        after = executeAfter,
+        extraInputs = @[output, "build/bin/runquota" & exeSuffix,
+                         "build/bin/runquotad" & exeSuffix],
+        cacheable = not isolatesEnvironment,
+        dependencyPolicy = executePolicy,
+        actionId = "runquota.test_execute." & name)
+      appendRegisteredActionToolIdentityRefs(executed.id,
+        ["timeout", "sleep", "nim", backendCompiler, "sqlite3", "sh", "bash", "git", "mkdir"])
+      when not defined(windows):
+        appendRegisteredActionToolIdentityRefs(executed.id, ["dirname", "uname", "ps", "find", "nix"])
+      run("test-" & name, build = executed.id, owningPackage = "runquota")
+      testRuns.add(executed)
+    discard collect("test-builds", testBuilds)
+    discard collect("test", testRuns)
 
     # -------------------------------------------------------------------
     # Documentation (docs/book-isonim) as build-graph edges.

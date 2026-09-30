@@ -455,8 +455,15 @@ suite "scope_boundary_rules_segment_scopes":
           var victim = ""
           for candidate in [foreign / "bin" / "sh", foreign / "sh",
                             "/bin/sh", "/usr/bin/env"]:
-            if fileExists(candidate) and ownerOf(candidate) != int64(getuid()):
-              victim = candidate
+            if not fileExists(candidate): continue
+            # /bin/sh and Nix profile binaries are often symlinks. The
+            # ownership test needs the regular target; symlink refusal has
+            # its own case above.
+            let resolved = expandFilename(candidate)
+            var info: Stat
+            if lstat(resolved.cstring, info) == 0 and S_ISREG(info.st_mode) and
+                int64(info.st_uid) != int64(getuid()):
+              victim = resolved
               break
           check victim.len > 0
           if victim.len > 0:

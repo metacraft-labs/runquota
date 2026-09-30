@@ -1239,6 +1239,29 @@ proc retentionJson(intervalMillis: int): string =
     "\"last_detail\":" & jsonEscape(retentionLastDetail()) &
   "}"
 
+proc ambientSamplingJson(intervalMillis: int): string =
+  ## THE SAMPLER, READABLE FROM OUTSIDE THE DAEMON, for the reason
+  ## `retentionJson` gives: it is work nobody asks for, on a timer, so "it
+  ## is sampling" and "it stopped" are the same state to every client.
+  ##
+  ## ``ticks`` counts cadence firings whether or not anything was written,
+  ## and a tick is counted in the same lock hold as the host reading it
+  ## takes, so ``ticks >= 1`` also says the first reading has completed.
+  ## That is a fact a caller outside the process can need: the first
+  ## reading is where the sampler lazily opens what it keeps for the
+  ## daemon's life (on Windows, a PDH query of some 130 handles), and a
+  ## caller measuring the daemon's resources has to be able to start after
+  ## it rather than across it.
+  "\"ambient_sampling\":{" &
+    "\"active\":" & $ambientSamplerActive() & "," &
+    "\"interval_millis\":" & $intervalMillis & "," &
+    "\"ticks\":" & $ambientSamplerTicks() & "," &
+    "\"taken\":" & $ambientSamplesTaken() & "," &
+    "\"written\":" & $ambientSamplesWritten() & "," &
+    "\"dropped\":" & $ambientSamplesDropped() & "," &
+    "\"failures\":" & $ambientSampleFailures() &
+  "}"
+
 proc observationsJson(daemon: RunQuotaDaemon): string =
   ## The write path's own honesty, readable from outside the daemon.
   ##
@@ -1332,7 +1355,8 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
     "\"estimate_write_failures\":" & $estimateWriteFailures() & "," &
     "\"estimate_write_failed_rows\":" & $estimateWriteFailedRows() & "," &
     aggregatePublicationJson() & "," &
-    retentionJson(daemon.config.retentionSweepIntervalMillis) &
+    retentionJson(daemon.config.retentionSweepIntervalMillis) & "," &
+    ambientSamplingJson(daemon.config.ambientSampleIntervalMillis) &
   "}}"
 
 # ---------------------------------------------------------------------------

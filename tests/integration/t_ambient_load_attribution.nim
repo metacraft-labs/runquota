@@ -89,8 +89,8 @@
 ## whose own OFF baseline turned out to have been out of range, and then
 ## FAILS saying so rather than reporting a ratio it cannot support.
 
-import std/[algorithm, atomics, cpuinfo, os, osproc, random, streams,
-            strutils, times, unittest]
+import std/[algorithm, atomics, cpuinfo, math, os, osproc, streams,
+            strutils, sysrand, times, unittest]
 
 when defined(windows):
   import std/winlean
@@ -204,25 +204,6 @@ when defined(windows):
   proc virtualFree(address: pointer; size: int; freeType: int32): WINBOOL
     {.stdcall, dynlib: "kernel32.dll", importc: "VirtualFree".}
 
-proc takeMemory(size: int; random: var Rand): MemoryLoad =
-  when defined(windows):
-    let base = virtualAlloc(nil, size, MemCommit or MemReserve, PageReadWrite)
-    doAssert base != nil, "VirtualAlloc of " & $size & " bytes failed"
-  else:
-    let base = mmap(nil, size, PROT_READ or PROT_WRITE,
-      MAP_PRIVATE or MAP_ANONYMOUS, -1, 0)
-    doAssert base != MAP_FAILED, "mmap of " & $size & " bytes failed"
-  # Touched at page granularity with unpredictable bytes: an untouched
-  # anonymous page is never backed at all, and a compressible one is taken
-  # by the macOS memory compressor -- either would leave the allocation
-  # invisible to a host-wide "available memory" figure.
-  let bytes = cast[ptr UncheckedArray[byte]](base)
-  var offset = 0
-  while offset < size:
-    bytes[offset] = byte(random.rand(255))
-    offset += 4096
-  MemoryLoad(base: base, size: size)
-
 proc release(load: var MemoryLoad) =
   if load.base != nil:
     when defined(windows):
@@ -230,6 +211,33 @@ proc release(load: var MemoryLoad) =
     else:
       discard munmap(load.base, load.size)
     load.base = nil
+
+proc takeMemory(size: int): MemoryLoad =
+  when defined(windows):
+    let base = virtualAlloc(nil, size, MemCommit or MemReserve, PageReadWrite)
+    doAssert base != nil, "VirtualAlloc of " & $size & " bytes failed"
+  else:
+    let base = mmap(nil, size, PROT_READ or PROT_WRITE,
+      MAP_PRIVATE or MAP_ANONYMOUS, -1, 0)
+    doAssert base != MAP_FAILED, "mmap of " & $size & " bytes failed"
+  # Populate every byte with unpredictable data. One random byte per page
+  # leaves almost the entire allocation zero and compressible, so mapped
+  # bytes no longer describe the resident load this control claims to add.
+  # Bulk system-random calls also avoid hundreds of millions of checked
+  # per-word PRNG calls in debug builds. Keep chunks below Windows' ULONG
+  # length limit: passing the whole 4-GiB allocation would wrap to zero.
+  result = MemoryLoad(base: base, size: size)
+  try:
+    let bytes = cast[ptr UncheckedArray[byte]](base)
+    var offset = 0
+    while offset < size:
+      let count = min(4 * 1024 * 1024, size - offset)
+      doAssert urandom(bytes.toOpenArray(offset, offset + count - 1)),
+        "could not populate the real memory load"
+      offset += count
+  except:
+    result.release()
+    raise
 
 # ---------------------------------------------------------------------------
 # Measurement helpers
@@ -297,8 +305,11 @@ proc inWindows(rows: seq[AmbientSampleRow]; windows: openArray[Window]):
     seq[AmbientSampleRow] =
   for row in rows:
     for window in windows:
-      if row.sampledAtUnixMillis >= window.fromMillis and
-          row.sampledAtUnixMillis <= window.toMillis:
+      # Timestamps are truncated to milliseconds. The two boundary bins can
+      # include a sample from before entry or after exit (and its immediate
+      # state change). Only strict interior bins belong wholly to this window.
+      if row.sampledAtUnixMillis > window.fromMillis and
+          row.sampledAtUnixMillis < window.toMillis:
         result.add(row)
         break
 
@@ -362,7 +373,9 @@ proc spinnersForHeadroom(busyPct: float; cores: int): int =
   ## figure stays KNOWN either way, because it is read out of ``getrusage``
   ## afterwards rather than inferred from the thread count.
   let headroom = max(0.0, 100.0 - busyPct)
-  clamp(int(headroom * 0.45 / 100.0 * float(cores)), 2, max(2, cores div 2))
+  # Two spinners already consume two thirds of a three-core runner, exceeding
+  # this gate's 60% load ceiling. One remains a real measured workload.
+  clamp(int(headroom * 0.45 / 100.0 * float(cores)), 1, max(1, cores div 2))
 
 proc scratchDir(name: string): string =
   # Short on purpose. Nim's `Sockaddr_un_path_length` is 92 on macOS, and
@@ -498,11 +511,8 @@ const
     ## one row of what the machine actually delivers. Measured during a full
     ## suite run it landed on exactly the floor.
   cadenceWindowMillis = cadenceWindowTicks * cadenceMillis
-  cadenceFlushedTicks = 4 * defaultAmbientFlushSamples
-    ## The ticks whose batch has certainly closed by the end of the window.
-    ## Not yet the budget: what a tick was ELIGIBLE to write is measured
-    ## inside the test, because sampling is gated on a lease and the ticks
-    ## before one was granted could never have written anything.
+    ## The window is timed FROM THE LEASE GRANT, and so is the budget the
+    ## test derives from it: see ``eligibleTicks`` there.
   cadenceLossAllowance = 2
     ## One in ``cadenceLossAllowance`` of the eligible ticks may write no
     ## row. Ticks are lost to a stale kernel snapshot, to a counter going
@@ -751,14 +761,13 @@ suite "ambient_load_attribution":
       ## still counted pages the kernel had not finished reclaiming, and
       ## the arm read a systematic two thirds of the known load.
 
-    var random = initRand(0x11)
     var emptyWindows: seq[Window] = @[]
     var fullWindows: seq[Window] = @[]
     var memory = MemoryLoad()
     try:
       for _ in 0 ..< memoryCycles:
         emptyWindows.add(observe(800))
-        memory = takeMemory(int(knownBytes), random)
+        memory = takeMemory(int(knownBytes))
         sleep(settleMillis)
         fullWindows.add(observe(800))
         # Asserted while the allocation is STILL MAPPED: releasing it
@@ -907,6 +916,8 @@ suite "ambient_load_attribution":
         (cpu: 0.25, rss: 500_000_000'i64)]
       const declaredCpu = 7.5 + 2.25 + 0.25
       const declaredRss = 4_500_000_000'i64
+      let hostMemoryBytes = readHostLoad().memTotalBytes
+      require hostMemoryBytes > 0
 
       var leases: seq[RunQuotaLease] = @[]
       for i, figures in declared:
@@ -927,17 +938,63 @@ suite "ambient_load_attribution":
       # `self`; the assertions below pin `self` to the declared sum to the
       # bit, so it cannot.
       let cores = max(1, cpuinfo.countProcessors())
-      let busyNow = hostBusyPct()
+      let busyNow = waitForHeadroom(30)
       check busyNow >= 0.0
-      load = startLoad(spinnersForHeadroom(busyNow, cores))
+      require busyNow <= maxBusyForMeasurement
+      # THE LOAD IS SIZED FOR WHAT THIS CASE NEEDS, which is to be larger
+      # than everything the admitted executions declared -- so that `self`
+      # staying at the declared figure is a statement about attribution
+      # rather than about there being nothing to attribute. It used to be
+      # sized by `spinnersForHeadroom` alone, which serves the tracking
+      # case (keep the host off full scale) and knows nothing of
+      # `declaredCpu`: on a 32-core host already 63% busy it started five
+      # spinners, the other work on the machine held each to 0.59 of a
+      # core, and the load reached 9.23% of the machine against a declared
+      # 10.0 -- a precondition that failed and was reported as an
+      # attribution assertion.
+      #
+      # So the floor is twice the declared share, in whole cores. The
+      # ceiling stays `spinnersForHeadroom`'s half of the machine, and not
+      # for the tracking case's reason: the sampler under test is a thread
+      # of THIS process, competing with the spinners, and a load sized to
+      # saturate the host starves it -- tried, at 28 spinners on 32 CPUs,
+      # it wrote two rows in a 2.5 s window. What the host's other work
+      # takes is not constant either, so a window whose load did not clear
+      # the declared figure is observed again, with the same load, a
+      # bounded number of times, the way the tracking case re-runs a block
+      # whose baseline was out of range.
+      let spinners = min(max(2, cores div 2), max(
+        spinnersForHeadroom(busyNow, cores),
+        int(ceil(2.0 * declaredCpu / 100.0 * float(cores)))))
+      load = startLoad(spinners)
       load.burn(true)
       sleep(settleMillis)
-      let reporting = observe(2500)
-      # The load really is larger than everything the admitted executions
-      # declared, so `self` staying at the declared figure is a statement
-      # about attribution rather than about there being nothing to
-      # attribute.
-      check ownCpuPct([reporting]) > declaredCpu
+      var reporting: Window
+      var ownCpu = 0.0
+      var attempts = 0
+      while true:
+        inc attempts
+        reporting = observe(2500)
+        ownCpu = ownCpuPct([reporting])
+        if ownCpu > declaredCpu or attempts >= blockAttempts:
+          break
+      echo "  m11 self: spinners=", spinners, " busyBefore=",
+        formatFloat(busyNow, ffDecimal, 1), "% own=",
+        formatFloat(ownCpu, ffDecimal, 2), "% declared=", declaredCpu,
+        "% attempts=", attempts
+      if not (ownCpu > declaredCpu):
+        # A PRECONDITION, AND IT SAYS SO. The machine would not give this
+        # process more than the executions declared, so nothing below can
+        # tell attribution from an absence of load. That is a failure --
+        # the case was not evaluated -- but not the failure of the
+        # assertion it would otherwise have been mistaken for.
+        checkpoint("PRECONDITION NOT MET: the synthetic load reached " &
+          formatFloat(ownCpu, ffDecimal, 2) & "% of the machine with " &
+          $spinners & " spinners on " & $cores & " logical CPUs (host " &
+          formatFloat(busyNow, ffDecimal, 1) & "% busy before), after " &
+          $attempts & " attempts; it must exceed the " & $declaredCpu &
+          "% the admitted executions declared")
+        fail()
 
       # Now the clamp, under real conditions rather than constructed ones:
       # one admitted execution reports more CPU and more memory than the
@@ -980,9 +1037,17 @@ suite "ambient_load_attribution":
         check row.cpuBusyPct > declaredCpu
         check row.foreignCpuPct == row.cpuBusyPct - declaredCpu
         check row.foreignCpuPct > 0.0
-        check row.foreignRssBytes > 0
+        # A quiet host can use less than the declared 4.5 GB. That is a valid
+        # zero residual, covered by the same clamp as the runaway arm. Assert
+        # the exact subtraction instead of assuming a host baseline. The
+        # preceding memory-load test supplies the real positive control.
+        check row.foreignRssBytes == max(0'i64,
+          hostMemoryBytes - row.memAvailableBytes - declaredRss)
 
       for row in clampedRows:
+        checkpoint("clamp sample=" & $row.sampledAtUnixMillis &
+          " window=" & $clamped.fromMillis & ".." & $clamped.toMillis &
+          " selfCpu=" & $row.selfCpuPct & " selfRss=" & $row.selfRssBytes)
         check row.selfCpuPct == declaredCpu + 400.0
         check row.selfRssBytes == declaredRss + 512_000_000_000'i64
         # Clamped at zero rather than allowed to go negative.
@@ -1063,15 +1128,9 @@ suite "ambient_load_attribution":
         "m11-cadence-exec", milliCpu(1000),
         bytes(256'u64 * 1024'u64 * 1024'u64)))
       check lease.active
-      # THE BUDGET, MEASURED. Of the ticks whose batch has certainly
-      # closed, the ones that fired before this instant could never have
-      # written a row -- sampling is gated on a live lease and there was
-      # none -- and the very first tick of all is a baseline whatever else
-      # is true. What is left is what the window really offered, and it is
-      # a measurement of this run rather than an assumption about how
-      # quickly a daemon starts and grants.
-      eligibleTicks = cadenceFlushedTicks - 1 -
-        int((epochTime() - daemonStartedAt) * 1000.0 / float(cadenceMillis))
+      # Taken AFTER the grant returned, so the daemon granted it no later
+      # than this: a budget measured from here can only be an undercount.
+      let leaseGrantedAt = epochTime()
 
       # M13 CLOSES M11'S DEFERRAL (1), AND THIS IS WHERE IT SHOWS.
       #
@@ -1092,6 +1151,31 @@ suite "ambient_load_attribution":
         uint64(reportedAt))
 
       sleep(cadenceWindowMillis)
+      # THE BUDGET, MEASURED, over the interval rows could come from. A tick
+      # writes a row only if a lease was live across the interval it
+      # measures, so nothing before `leaseGrantedAt` counts; a row is
+      # visible only once its batch has flushed, so nothing after this
+      # instant counts either. Between the two the cadence fired at least
+      # `floor(D / cadenceMillis)` times. Of those, up to
+      # `defaultAmbientFlushSamples` may not be on disk yet: the ones in the
+      # batch that has not closed -- batches are counted from the sampler's
+      # own start, not from the grant, so it is anywhere in its fill -- or,
+      # at the instant one does close, the whole batch whose write is still
+      # in flight. One more is the baseline, if the grant came before the
+      # sampler's first tick. What is left is what the window really
+      # offered: 39 for a window of exactly `cadenceWindowMillis`.
+      #
+      # IT USED TO BE MEASURED FROM THE PROCESS'S CREATION, and that mixed
+      # two origins: `4 * defaultAmbientFlushSamples` was the closed ticks
+      # of the window that starts at the GRANT, and the time from
+      # `daemonStartedAt` to the grant was then subtracted from it as if the
+      # window had started at the process. The longer the daemon took to
+      # start and grant, the smaller the budget, and past 7.8 seconds it
+      # went negative -- `eligible=-22` after a twelve-second start on a
+      # loaded host, a figure no sampler could be held to or measured by.
+      let storeReadAt = epochTime()
+      eligibleTicks = int((storeReadAt - leaseGrantedAt) * 1000.0 /
+        float(cadenceMillis)) - defaultAmbientFlushSamples - 1
       let store = openObservationStore(dbPath)
       check store.captureEnabled
       rowsWhileRunning = store.readAmbientSamples()

@@ -96,7 +96,10 @@ proc blockUntilKilled() =
     sleep(1000)
 
 proc sleepCommand(): string =
-  result = findExe("sleep")
+  # Nix can provide sleep as a symlink to the multicall coreutils executable.
+  # Preserve argv[0]: invoking the resolved `coreutils 30` exits immediately,
+  # leaving no live child whose reservation the crash test can retain.
+  result = findExe("sleep", followSymlinks = false)
   if result.len == 0:
     result = "/bin/sleep"
 

@@ -139,6 +139,68 @@ proc systemCpuMillis*(busy, total: var int64): bool =
   total = busyMillis + idleMillis
   true
 
+# ---------------------------------------------------------------------------
+# Reading the CPU counters promptly on a loaded host
+# ---------------------------------------------------------------------------
+#
+# `GetSystemTimes` IS SLOW EXACTLY WHEN THE HOST IS BUSY, and not because it
+# does much work. Measured on a 32-logical-CPU Windows 11 host with every CPU
+# held by a normal-priority spinner: the call took 1.45 s of wall time on
+# average (1.87 s worst of ten) while spending about 0.1 ms of CPU, and
+# `NtQuerySystemInformation(SystemProcessorPerformanceInformation)`, which it
+# is built on, behaved the same. With the calling thread at
+# `THREAD_PRIORITY_HIGHEST` the same call on the same saturated host took
+# 0.35 ms, and on a quiet host 0.24 ms at normal priority. The call waits
+# behind runnable threads -- consistent with it gathering each processor's
+# figures on that processor -- so its cost scales with the load it is there
+# to measure.
+#
+# That broke the reader in two ways. A reading on a full host took seconds,
+# so the sampler's fixed cadence stopped being one; and the bracket in
+# `readHostLoad`, which re-reads when the clock moved more than a system tick
+# across the call, retried up to eight times at over a second each, so one
+# reading took up to fourteen seconds and still stamped its counters with an
+# instant up to a second and a half away from the one they describe.
+#
+# So the counters are read at `THREAD_PRIORITY_TIME_CRITICAL`, the top of the
+# dynamic range in every non-realtime priority class, and the previous
+# priority is restored immediately. The raised window is the bracket alone --
+# two clock reads around one system call, well under a millisecond -- so what
+# the reader takes from the host it is measuring is negligible, which is OS-1.
+# No privilege is needed for it. With it, a whole `readHostLoad` on the same
+# saturated host took 12-21 ms, most of that the PDH collection, where it
+# had taken 0.7-14 s.
+
+proc getCurrentThread(): Handle
+  {.stdcall, dynlib: "kernel32.dll", importc: "GetCurrentThread".}
+proc getThreadPriority(thread: Handle): int32
+  {.stdcall, dynlib: "kernel32.dll", importc: "GetThreadPriority".}
+proc setThreadPriority(thread: Handle; priority: int32): WINBOOL
+  {.stdcall, dynlib: "kernel32.dll", importc: "SetThreadPriority".}
+
+const
+  ThreadPriorityTimeCritical = 15'i32
+  ThreadPriorityErrorReturn = 0x7FFFFFFF'i32
+
+type CountersPriority* = object
+  ## What `raiseForCounterRead` changed, for `restoreAfterCounterRead`.
+  saved: int32
+  raised: bool
+
+proc raiseForCounterRead*(): CountersPriority =
+  ## Raises the calling thread to time-critical priority for a counter
+  ## read. Never raises; if the priority cannot be read or set, nothing is
+  ## changed and the read simply runs at the caller's priority.
+  let thread = getCurrentThread()
+  result.saved = getThreadPriority(thread)
+  result.raised = result.saved != ThreadPriorityErrorReturn and
+    result.saved != ThreadPriorityTimeCritical and
+    setThreadPriority(thread, ThreadPriorityTimeCritical) != 0
+
+proc restoreAfterCounterRead*(state: CountersPriority) =
+  if state.raised:
+    discard setThreadPriority(getCurrentThread(), state.saved)
+
 const
   RelationProcessorCore = 0'i32
 

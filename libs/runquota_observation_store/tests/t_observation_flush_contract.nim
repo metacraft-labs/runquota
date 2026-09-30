@@ -20,44 +20,24 @@
 ## same exposure on the READ path, where the caller is a client that has just
 ## asked a question and would be told its own execution never happened.
 ##
-## HOW THIS TEST MAKES IT DETERMINISTIC. It does not race the writer
-## thread's 25 ms tick; it arranges both drainers itself.
-##
-##  * The statements are composed BEFORE the writer exists, so filling the
-##    queue is one lock and one memcpy per row and fits inside `writerMain`'s
-##    FIRST sleep -- it sleeps 25 ms before its first pass -- and the batch
-##    is therefore taken by one drain rather than split across two.
-##  * A second thread enters `flushObservationWriter` and the main thread
-##    waits for `observationWriterFlushes()` to show that it did, so the
-##    handoff is a condition rather than a guess, and only then sleeps
-##    `HandoffDelayMillis` to let the queue swap happen.
-##  * TWO CLAUSES REFUSE A VACUOUS RUN. `observationsWritten()` sampled the
-##    instant before the flush under test must be ZERO -- nothing had
-##    reached the database yet -- and the other thread's flush must have
-##    lasted longer than the handoff, which is what proves IT was the one
-##    holding the rows. A run where the window was shut fails on those
-##    clauses instead of passing while measuring nothing.
+## A real SQLite connection holds BEGIN IMMEDIATE while two callers flush.
+## Both calls must remain pending until that transaction releases its lock,
+## then each must see all accepted rows before either thread is joined.
+## No mocks: the barrier is a real database writer lock, not an assumed
+## minimum duration for a large batch on a particular disk.
 
-import std/[monotimes, options, os, strutils, tempfiles, times, unittest]
+import std/[atomics, monotimes, options, os, osproc, streams, strutils, tempfiles, times, unittest]
 
 import runquota_observation_store
 
 const
-  Rows = 1200
-    ## Two statements each. With `PaddingBytes` hex-encoded on the way to
-    ## `sqlite3` this is a batch of several megabytes, which takes far
-    ## longer to write than `HandoffDelayMillis`.
-  PaddingBytes = 1024
-  HandoffDelayMillis = 25
-    ## What the main thread waits after the other thread has entered its
-    ## flush. It has to outlast a queue swap -- a lock and 2400 pointer
-    ## moves -- and be dwarfed by the batch write that follows it.
-  MinimumWindowMillis = 100'i64
-    ## The margin below which this file declines to claim it measured
-    ## anything; see the head of the module.
+  Rows = 32
+  PaddingBytes = 64
+  BarrierWindowMillis = 200
   SmallCapacity = 16
 
 type DrainReport = object
+  done: Atomic[bool]
   flushMillis: int64
 
 proc paddingFor(index: int): string =
@@ -92,18 +72,11 @@ proc executionRowFor(index: int): ExecutionRow =
     captureCompleteness: ccComplete)
 
 proc inFlightDrain(report: ptr DrainReport) {.thread.} =
-  ## THE PASS THAT IS STILL IN FLIGHT when the main thread flushes. It is a
-  ## `flushObservationWriter` and not the writer thread only because this
-  ## way the window opens when the test says so; both reach the same
-  ## `drainOnce`, and the writer thread is welcome to take part of the
-  ## batch as well -- that only widens what the main thread must wait for.
   {.cast(gcsafe).}:
     let started = getMonoTime()
     flushObservationWriter()
     report.flushMillis = (getMonoTime() - started).inMilliseconds
-
-var report: DrainReport
-var drainThread: Thread[ptr DrainReport]
+    report.done.store(true, moRelease)
 
 suite "observation flush contract":
 
@@ -115,12 +88,16 @@ suite "observation flush contract":
     check store.captureEnabled
     check store.ensureHostRow("host-0", "boot-0")
 
-    # COMPOSED BEFORE THE WRITER EXISTS. `enqueueExtensionInsert` takes an
-    # already-composed statement and the queues hold BYTES, so these go in
-    # at memcpy speed. They are the same bytes `enqueueRunRow` and
-    # `enqueueExecutionRow` would have produced, in the order `drainOnce`
-    # emits -- each run immediately before the execution whose foreign key
-    # names it.
+    # Hold the database writer lock before accepting any rows. The SELECT
+    # is acknowledged over a pipe only after BEGIN IMMEDIATE has succeeded.
+    let blocker = startProcess("sqlite3",
+      args = ["-batch", "-noheader", "-bail", path],
+      options = {poUsePath, poStdErrToStdOut})
+    defer: blocker.close()
+    blocker.inputStream.write("BEGIN IMMEDIATE; SELECT 'locked';\n")
+    blocker.inputStream.flush()
+    require blocker.outputStream.readLine() == "locked"
+
     var statements: seq[string] = @[]
     for i in 0 ..< Rows:
       statements.add(runInsertStatement(runRowFor(i)))
@@ -135,40 +112,38 @@ suite "observation flush contract":
     check accepted == statements.len
 
     let flushesBefore = observationWriterFlushes()
-    report = DrainReport(flushMillis: 0)
-    createThread(drainThread, inFlightDrain, addr report)
-    # THE HANDOFF IS A CONDITION, NOT A GUESS: the counter is incremented
-    # inside `flushObservationWriter` before it drains, so once it moves the
-    # other thread is in the flush and about to take the queue.
-    var handoffWait = 0
-    while observationWriterFlushes() == flushesBefore and handoffWait < 2000:
+    var reports: array[2, DrainReport]
+    var threads: array[2, Thread[ptr DrainReport]]
+    for i in 0 ..< threads.len:
+      createThread(threads[i], inFlightDrain, addr reports[i])
+    let deadline = getMonoTime() + initDuration(seconds = 2)
+    while observationWriterFlushes() < flushesBefore + 2 and getMonoTime() < deadline:
       sleep(1)
-      handoffWait += 1
-    check observationWriterFlushes() > flushesBefore
-    sleep(HandoffDelayMillis)
+    check observationWriterFlushes() >= flushesBefore + 2
 
-    # NOTHING HAS REACHED THE DATABASE YET. Sampled the instant before the
-    # flush under test, this is what says the window really is open: the
-    # rows exist only inside a `sqlite3` that has not committed.
-    let writtenBeforeFlush = observationsWritten()
+    # Give both entered calls a scheduling window while the external writer
+    # lock makes it impossible for the accepted rows to commit. A flush
+    # that merely sees an empty queue would return during this window.
+    sleep(BarrierWindowMillis)
+    check observationsWritten() == 0'i64
+    for report in reports.mitems:
+      check not report.done.load(moAcquire)
 
-    let mainStarted = getMonoTime()
-    flushObservationWriter()
-    let mainMillis = (getMonoTime() - mainStarted).inMilliseconds
-
-    # READ BACK BEFORE THE JOIN, so that joining the other thread cannot be
-    # what makes the rows appear. This is the contract, whole.
-    let readBack = openObservationStore(path).readExecutions().len
-
-    joinThread(drainThread)
-    echo "  in-flight drain took ", report.flushMillis, " ms; the flush ",
-      "under test waited ", mainMillis, " ms; written before it: ",
-      writtenBeforeFlush, "; read back ", readBack, " of ", Rows
+    blocker.inputStream.write("COMMIT;\n.quit\n")
+    blocker.inputStream.flush()
+    blocker.inputStream.close()
+    check blocker.waitForExit(5000) == 0
+    for i in 0 ..< threads.len:
+      let settledBy = getMonoTime() + initDuration(seconds = 10)
+      while not reports[i].done.load(moAcquire) and getMonoTime() < settledBy:
+        sleep(1)
+      check reports[i].done.load(moAcquire)
+      # Read before joining either thread. Joining cannot supply the wait
+      # that the API itself promises to its caller.
+      check openObservationStore(path).readExecutions().len == Rows
+    for thread in threads.mitems: joinThread(thread)
     stopObservationWriter()
 
-    check writtenBeforeFlush == 0'i64
-    check report.flushMillis >= MinimumWindowMillis
-    check readBack == Rows
     check observationWriteFailures() == 0'i64
     check observationsWritten() == int64(statements.len)
 

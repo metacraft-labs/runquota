@@ -29,11 +29,12 @@
 ##      produced by a completion path that flushes.
 ##   2. **A keyed completion costs what a keyless one costs**, measured
 ##      against a live control on the SAME daemon in the SAME run. This is
-##      not a latency bound: it is a paired comparison whose two arms differ
-##      only in whether ``commandStatsId`` is set, which is the exact switch
-##      that used to select tens of milliseconds of store IO. The slack is
-##      enormous — three orders of magnitude below the defect — so drift on
-##      a busy host cannot reach it.
+##      a paired comparison whose two arms differ only in whether
+##      ``commandStatsId`` is set, which selected the synchronous store IO.
+##      Time the ``finish`` round trip itself: admission, starting, running
+##      and release are separate operations. Their combined latency is still
+##      printed so a slow lifecycle remains visible. The keyless completion
+##      must satisfy the same 2 ms control ceiling as before.
 ##      *(The keyless arm is also what the M13 benchmark measured for the
 ##      whole of its life, believing it was measuring the other one.)*
 ##   3. **Deferring publication did not make it stale.** The aggregate
@@ -55,7 +56,7 @@
 ## Unix-domain socket, the shipped client library, the daemon's own
 ## inspection subject, and the segment the daemon really wrote.
 
-import std/[json, os, osproc, streams, strutils, times, unittest]
+import std/[json, monotimes, os, osproc, streams, strutils, times, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
@@ -75,11 +76,9 @@ const
     ## stays under a second even when the defect is present.
   WarmupCompletions = 10
   LatencySlackMillis = 2.0
-    ## THE SLACK IS DELIBERATELY HUGE. The defect adds 20-70 ms per keyed
-    ## completion; a keyless completion costs about 0.05 ms. Two
-    ## milliseconds is forty times the quantity being compared and a
-    ## thirtieth of the smallest defect ever measured, so this clause
-    ## cannot flake into failure and cannot pass with the defect present.
+    ## The unchanged slack for the paired completion comparison and the
+    ## keyless completion's control ceiling. This applies to the report
+    ## round trip, not the sum of five lease operations.
 
 proc scratchRoot(name: string): string =
   # Short on purpose: `Sockaddr_un_path_length` is 92 on macOS.
@@ -125,22 +124,33 @@ proc stop(handle: var DaemonHandle) =
   handle.process.close()
 
 proc timeOneCompletion(session: var RunQuotaSession; statsKey: string;
-                       peakBytes: uint64): float =
-  ## The whole lifecycle, timed. `LeaseFinished` is the round trip under
-  ## test and the rest is shared by both arms, so a difference between the
-  ## arms is a difference in what the completion did.
+                       peakBytes: uint64):
+    tuple[reportMillis, lifecycleMillis: float] =
+  ## Measure the completion report independently of the rest of the lease.
+  ## Keep the whole lifecycle as a separate diagnostic measurement.
   var request = resourceRequest("completion-latency", milliCpu(100),
     bytes(1'u64 * MiB))
   request.commandStatsId = statsKey
-  let start = epochTime()
+  let start = getMonoTime()
   var lease = session.requestLease(request)
   doAssert lease.active
   lease.markStarting()
   lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
+  let reportStarted = getMonoTime()
   lease.finish(outcome = succeeded(), peakMemoryBytes = peakBytes,
     processCount = 1'u32)
+  let reportFinished = getMonoTime()
   lease.release()
-  result = (epochTime() - start) * 1000.0
+  result.reportMillis =
+    float((reportFinished - reportStarted).inNanoseconds) / 1_000_000.0
+  result.lifecycleMillis =
+    float((getMonoTime() - start).inNanoseconds) / 1_000_000.0
+
+proc recordCompletion(session: var RunQuotaSession; statsKey: string;
+                      reports, lifecycles: var seq[float]) =
+  let measured = timeOneCompletion(session, statsKey, 8'u64 * MiB)
+  reports.add(measured.reportMillis)
+  lifecycles.add(measured.lifecycleMillis)
 
 proc median(values: seq[float]): float =
   doAssert values.len > 0
@@ -229,14 +239,16 @@ suite "completion_report_does_not_wait_on_the_store":
 
       var keyed: seq[float] = @[]
       var keyless: seq[float] = @[]
+      var keyedLifecycles: seq[float] = @[]
+      var keylessLifecycles: seq[float] = @[]
       for i in 0 ..< Completions:
         # ORDER ALTERNATES so neither arm is systematically first.
         if (i and 1) == 0:
-          keyed.add(timeOneCompletion(session, KeyedStatsKey, 8'u64 * MiB))
-          keyless.add(timeOneCompletion(session, "", 8'u64 * MiB))
+          recordCompletion(session, KeyedStatsKey, keyed, keyedLifecycles)
+          recordCompletion(session, "", keyless, keylessLifecycles)
         else:
-          keyless.add(timeOneCompletion(session, "", 8'u64 * MiB))
-          keyed.add(timeOneCompletion(session, KeyedStatsKey, 8'u64 * MiB))
+          recordCompletion(session, "", keyless, keylessLifecycles)
+          recordCompletion(session, KeyedStatsKey, keyed, keyedLifecycles)
 
       let after = waitForPublicationsBeyond(client, before.published, 20_000)
 
@@ -270,8 +282,12 @@ suite "completion_report_does_not_wait_on_the_store":
       # ---------------------------------------------------------------
       let keyedMedian = median(keyed)
       let keylessMedian = median(keyless)
-      echo "  keyed p50 " & keyedMedian.formatFloat(ffDecimal, 4) &
+      echo "  completion keyed p50 " & keyedMedian.formatFloat(ffDecimal, 4) &
         " ms vs keyless p50 " & keylessMedian.formatFloat(ffDecimal, 4) & " ms"
+      echo "  lifecycle keyed p50 " &
+        median(keyedLifecycles).formatFloat(ffDecimal, 4) &
+        " ms vs keyless p50 " &
+        median(keylessLifecycles).formatFloat(ffDecimal, 4) & " ms"
       check keyedMedian <= keylessMedian + LatencySlackMillis
       # The control has to be a control: a keyless completion that itself
       # took milliseconds would make the comparison above vacuous.

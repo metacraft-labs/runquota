@@ -1,4 +1,7 @@
-import std/[json, os, osproc, strutils, unittest]
+## No mocks: real child processes, a real daemon, and the actual benchmark
+## build script. The benchmark gets its own source/output tree so it cannot
+## replace applications being exercised by concurrent integration tests.
+import std/[json, os, osproc, sha1, strtabs, strutils, tempfiles, unittest]
 
 when defined(posix):
   import std/posix
@@ -459,17 +462,51 @@ suite "m5_process_exec_bench_contract":
     # recipe runs it: executing the `.sh` directly relies on a shebang, which
     # only a POSIX kernel honours -- on Windows `CreateProcess` refused it and
     # the case failed before the benchmark ran.
+    let root = getCurrentDir()
+    let benchmarkRoot = createTempDir("runquota-m5-build-", "-fixture")
+    defer: removeScratchRoot(benchmarkRoot)
+    for name in ["apps", "libs", "scripts", "benchmarks"]:
+      copyDir(root / name, benchmarkRoot / name)
+    copyFile(root / "config.nims", benchmarkRoot / "config.nims")
+    # The benchmark invokes this script directly. Source copies need only
+    # this executable bit; copied directories retain their writable defaults.
+    setFilePermissions(benchmarkRoot / "scripts" / "build_apps.sh",
+      {fpUserRead, fpUserWrite, fpUserExec})
+    var benchmarkEnv = newStringTable(
+      when defined(windows): modeCaseInsensitive else: modeCaseSensitive)
+    for key, value in envPairs(): benchmarkEnv[key] = value
+    # Resolve the same real source dependency as config.nims before moving
+    # the build out of the checkout and away from its sibling directories.
+    for candidate in [getEnv("SHM_LEASE_SRC"),
+        root.parentDir / "nim-shm-lease" / "src",
+        root.parentDir.parentDir / "nim-shm-lease" / "src"]:
+      if candidate.len > 0 and fileExists(candidate / "shm_lease" / "anchor.nim"):
+        benchmarkEnv["SHM_LEASE_SRC"] = absolutePath(candidate)
+        break
+    require benchmarkEnv.hasKey("SHM_LEASE_SRC")
+    let sharedDaemon = daemonPath()
+    let sharedDaemonHash = secureHashFile(sharedDaemon)
+    # CreateProcess searches System32 before PATH for a bare program name.
+    # Resolve the provisioned tool explicitly so it cannot select the WSL stub.
+    let benchmarkBash = findExe("bash")
+    require benchmarkBash.len > 0
+    checkpoint("benchmark Bash: " & benchmarkBash)
     let captured = runCapturedProcess(
-      "bash",
+      benchmarkBash,
       args = ["scripts/run-m5-benchmark.sh", "process", "--quick"],
+      workingDir = benchmarkRoot,
+      env = benchmarkEnv,
       options = {poUsePath}
     )
     # The script's diagnostics are now readable, so a failed build says why
     # instead of failing three opaque metric assertions below.
     if not captured.ok:
+      checkpoint("run-m5-benchmark.sh stdout: " & captured.output)
       checkpoint("run-m5-benchmark.sh stderr: " & captured.error)
     check captured.failure.len == 0
     check captured.exitCode == 0
+    check secureHashFile(sharedDaemon) == sharedDaemonHash
+    require captured.ok
     let output = captured.output
     check hasMetricWithExtra(output, "raw-cwd-env fixture", "cwd_env=verified")
     check hasMetricWithExtra(output, "lease-cwd-env fixture", "cwd_env=verified")

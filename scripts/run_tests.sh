@@ -21,6 +21,25 @@
 #
 set -euo pipefail
 
+# macOS limits Unix-domain socket paths to 104 bytes. Nix can extend the
+# inherited /var/folders TMPDIR enough that a fixture's directory and socket
+# name exceed that limit. Keep one private, short root for the whole harness.
+if [[ ${OSTYPE:-} == darwin* ]]; then
+  runquota_test_tmp=$(mktemp -d /tmp/rqtest.XXXXXXXX)
+  export TMPDIR="$runquota_test_tmp"
+  cleanup_test_tmp() {
+    local status=$?
+    trap - EXIT
+    if (( status == 0 )); then
+      rm -rf -- "$runquota_test_tmp"
+    else
+      printf 'Test scratch retained at %s\n' "$runquota_test_tmp" >&2
+    fi
+    exit "$status"
+  }
+  trap cleanup_test_tmp EXIT
+fi
+
 mkdir -p build/test-bin build/nimcache
 
 # ---------------------------------------------------------------------------
