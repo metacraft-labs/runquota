@@ -136,10 +136,28 @@ package runquota:
     # source identity and import root into each typed Nim compile.
     "nim-shm-lease"
 
-    # Not yet here from the flake's dev shell: the lint tools (``shellcheck``
-    # has no Windows realization; ``shfmt``, ``typos``, ``repomix`` and
-    # ``nixfmt`` are not reachable from ``uses:``), so ``just lint`` still
-    # needs ``nix develop`` or a PATH that has them.
+    # The lint and formatting tools the flake's dev shell carries, defined in
+    # reprobuild-packages (``packages/interfaces/<name>``). Windows takes
+    # upstream's release archives for all four below.
+    "shellcheck"
+    "shfmt"
+    "typos"
+    # ``prek`` runs ``prek.toml`` -- the same ``just lint`` hook the flake's
+    # git-hooks.nix installs through pre-commit on Linux and macOS -- so the
+    # pre-commit hook also works from a Windows ``repro shell`` (install it
+    # once with ``repro exec -- prek install``). pre-commit itself stays the
+    # flake shell's: it is a Python application with no release binary.
+    "prek"
+    # No Windows realization exists for these two, and the reasons are
+    # recorded with each interface: nixfmt's executable depends on the
+    # Haskell ``unix`` package, which does not build on Windows, and nobody
+    # publishes a Windows binary; repomix is an npm package whose
+    # ``node_modules`` closure no realization shape can install yet.
+    # ``just format`` and ``just repomix`` say so on Windows rather than
+    # skipping silently.
+    when not defined(windows):
+      "nixfmt"
+      "repomix"
 
   # ``repro shell`` / ``repro exec -- <cmd>``: the tools in ``uses:`` above,
   # provisioned per ``defaultToolProvisioning``. The source-library producer
