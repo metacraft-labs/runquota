@@ -352,3 +352,12 @@ A real child exporting a known phase must prove the reader works and that the
 child remains alive afterward. These observations can distinguish incomplete
 shim initialization from later execution; they do not identify a Windows
 wait's cause or replace the full ordinary CI gate.
+
+Implemented as disposable tooling `8817d55` in run `36774529116`, using
+RunQuota `33add18`, hooks `def2464` and original hook protection. Windows x64
+C compilation/link with warnings as errors, Python/PowerShell syntax and
+workflow validation pass at that tooling commit. The real Windows controls
+and native/monitored repetitions remain pending. The known-phase child must
+remain alive after observation; a separate child exporting a different phase
+must fail the same phase assertion. The existing full current-source graph and
+ordinary release CI remain running independently.
