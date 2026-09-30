@@ -32,7 +32,12 @@ fills take 138,036, 143,352 and 156,377 ms; execution hits exit 124 during the
 fourth fill. The bulk system-random variant executes successfully with all
 five tests, nine allocations, assertions and the 600-second limit retained.
 The bulk fills take 1,899–1,967 ms and the measured memory ratio is 0.999.
-Both report a real launched action. The ARM-host comparison is still active.
+Both report a real launched action. The completed ARM-host comparison in
+that run also reproduces the original 600-second timeout during its third
+fill, after fills of 254,871 and 255,045 ms. Bulk filling passes all five real
+tests with all nine allocations, 1,625–1,729 ms fills and a 0.999 memory ratio.
+Candidate `8322c3f` incorporates that repair; its ordinary Windows x64 job
+is blocked before this fixture by the separate completion-latency control.
 
 The candidate uses 4-MiB `std/sysrand.urandom` chunks, filling every byte
 without overflowing the Windows API's 32-bit length. A failed fill frees its

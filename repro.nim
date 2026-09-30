@@ -48,6 +48,7 @@ when defined(posix):
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
+import repro_dsl_stdlib/fs as dslfs
 # ``shell(...)``, used by the documentation-book block at the end of
 # ``build:``. ``"sh"`` is already declared in ``uses:`` below, so the tool the
 # action runs through is provisioned by the same resolver as ``nim`` and
@@ -269,14 +270,33 @@ package runquota:
       testPrograms.add((name, output, compiled.action))
     for program in testPrograms:
       let (name, output, compiled) = program
+      let isolatesEnvironment = name == "t_isolated_environment"
+      var executeAfter = runquotaAppsActions & @[compiled] &
+        (if name in measurementTests: testBuilds & testRuns else: @[])
+      var executePolicy = automaticMonitorPolicy(captureBreadth = mcbFullCapture)
+      if isolatesEnvironment:
+        # This fixture asserts the child's exact environment. An outer shim
+        # injects its own loader/session variables and changes that premise.
+        # Preserve every assertion and monitored compilation. The depfile
+        # supplies ordering, not complete runtime reads, so never cache this
+        # execution. See issues/2026-09-30-isolated-environment-fixture-
+        # inherits-monitor-injection.md and Monitor-Hook-Shim / Failure Semantics.
+        let depfile = "build/test-deps/" & name & ".d"
+        executeAfter.add(dslfs.unmonitorableActionDepfile(
+          output = depfile, inputs = @[output],
+          reason = "Exact child-environment fixture owns its environment; " &
+            "outer monitor injection adds variables. Execution always reruns.",
+          actionId = "runquota.test_dependencies." & name))
+        executePolicy = makeDepfilePolicy(depfile, suppressMonitorShimSeed = true)
       # Preserve the native harness's bound, kill grace and closed stdin.
       # GNU timeout places the child tree in its own process group.
       let executed = shell(
         command = "timeout --kill-after=10 600 " & quoteShell(output) & " </dev/null",
-        after = runquotaAppsActions & @[compiled] &
-          (if name in measurementTests: testBuilds & testRuns else: @[]),
+        after = executeAfter,
         extraInputs = @[output, "build/bin/runquota" & exeSuffix,
                          "build/bin/runquotad" & exeSuffix],
+        cacheable = not isolatesEnvironment,
+        dependencyPolicy = executePolicy,
         actionId = "runquota.test_execute." & name)
       appendRegisteredActionToolIdentityRefs(executed.id,
         ["timeout", "sleep", "nim", backendCompiler, "sqlite3", "sh", "bash", "git", "mkdir"])

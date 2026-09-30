@@ -38,3 +38,20 @@ Fetched dev `0bce530` and agents `ed40495`; both are included locally. Searched
 open issues and complete issue history for `isolateEnvironment` and environment
 isolation; the existing Windows environment-case issue describes a different
 failure. The new test arrived with PR 33 at `ed40495`.
+
+## Candidate validation
+
+Linux x64 job `109851362121` at `ed40495` reproduces the identical names and
+assertion. On macOS, the unchanged fixture binary built from `ed40495` has
+SHA256 `ba790445792287b2296c6d86ed8c0648d652e0cf3f308df08e4a6ccf76248cb6`.
+It fails under released io-mon `53994c0` with `DYLD_INSERT_LIBRARIES` and
+`CT_SANDBOX_TOOLS_DIR` added, then passes both assertions in two native runs
+with identical bytes.
+
+The prepared recipe at `15ea4b5` plus the fixture-disposition patch passes
+Nim checking against Reprobuild `c14b1e6`. Two real invocations of
+`repro build .#runquota.test_execute.t_isolated_environment` both pass and
+report `launched: true`, `cacheDecision: cdNotCacheable`, and
+`dependencyPolicyKind: dgRecognizedFormat`. All compilation stays monitored;
+the exact child-environment assertion and 600-second execution bound are
+unchanged. The complete candidate matrix remains required.
