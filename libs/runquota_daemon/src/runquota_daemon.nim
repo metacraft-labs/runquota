@@ -3242,28 +3242,69 @@ proc connectionWorker() {.thread, gcsafe.} =
 # wakes when the handler writes to it, and opens one connection to this
 # daemon's own socket. `accept` returns it, the loop sees the flag, closes it
 # and breaks into the `finally` that was always there.
+#
+# AND A DIAL TRAVELS THROUGH THE FILESYSTEM, WHICH IS WHERE IT BROKE. An
+# AF_UNIX `connect` names the endpoint BY PATH, so the wake is only
+# deliverable while that path still resolves to this daemon's socket. Unlink
+# the socket -- which is what happens to every auto-started `runquotad`
+# whose caller's scratch directory is removed while the daemon outlives it --
+# and the dial fails with ENOENT, the waker exits having woken nobody, and
+# the accept loop stays parked in a socket that is otherwise in perfect
+# health. `kill -TERM` then runs the handler (so the signal is caught, not
+# blocked and not ignored) and never reaches the exit. Measured: of 22
+# leaked `runquotad` processes reaped on one host, the five that ignored
+# SIGTERM and needed SIGKILL were EXACTLY the five whose `--socket` path no
+# longer existed, and the main thread of a reproduction sits in
+# `__skb_wait_for_more_packets` -- `unix_accept` -- for as long as it is
+# left alone.
+#
+# SO THE WAKE NO LONGER GOES THROUGH THE ENDPOINT AT ALL. The handler writes
+# a second byte, into a SECOND pipe that nobody ever drains, and the accept
+# loop waits on `poll` over two descriptors -- the LISTENING SOCKET, whose
+# readability means "a connection is there to accept", and that pipe, whose
+# readability means "stop". Neither can be deleted from underneath the
+# process: one is the listener itself and the other never had a name. The
+# loop therefore calls `accept` only when a connection is already waiting,
+# and observes the flag whatever has happened to the rendezvous directory.
+# The dial is KEPT, because when the path does resolve it is the faster wake
+# of the two and it is what the Windows arm has instead of a pipe; it has
+# simply stopped being the only one.
 # ---------------------------------------------------------------------------
 
 when defined(posix):
   var
     shutdownRequested: Atomic[bool]
     shutdownPipe: array[0 .. 1, cint] = [cint(-1), cint(-1)]
+    acceptWakePipe: array[0 .. 1, cint] = [cint(-1), cint(-1)]
+      ## THE WAKE THAT DOES NOT GO THROUGH THE FILESYSTEM. Written by the
+      ## handler and READ BY NOBODY: the accept loop only ever `poll`s it,
+      ## so the byte stays in the pipe and every later wait returns at once.
+      ## That is what makes the wake immune to the one race a consumed token
+      ## would have -- a wake delivered before the loop reaches its wait
+      ## would otherwise be a wake lost, and this daemon's shutdown would
+      ## again depend on timing rather than on state.
     shutdownWakerThread: Thread[void]
     shutdownWakerRunning = false
     shutdownEndpointPath = ""
       ## Written once, before the waker exists, and read only by it.
 
   proc onShutdownSignal(sig: cint) {.noconv.} =
-    ## THE WHOLE OF WHAT RUNS IN SIGNAL CONTEXT.
+    ## THE WHOLE OF WHAT RUNS IN SIGNAL CONTEXT: one atomic store and two
+    ## non-blocking one-byte writes, all three async-signal-safe. The first
+    ## byte wakes the waker thread, which dials; the second wakes the accept
+    ## loop directly, and is the one that still arrives when the endpoint
+    ## path has been unlinked.
     shutdownRequested.store(true, moRelease)
+    var token = '\0'
     if shutdownPipe[1] >= 0:
-      var token = '\0'
       discard write(shutdownPipe[1], addr token, 1)
+    if acceptWakePipe[1] >= 0:
+      discard write(acceptWakePipe[1], addr token, 1)
 
   proc shutdownWasRequested(): bool =
     shutdownRequested.load(moAcquire)
 
-  proc ensureShutdownPipe(): bool =
+  proc ensureLongLivedPipe(fds: var array[0 .. 1, cint]): bool =
     ## THE PIPE IS CREATED ONCE AND NEVER CLOSED, and that is the whole of
     ## the fix for a write to a stale descriptor.
     ##
@@ -3280,8 +3321,7 @@ when defined(posix):
     ## Keeping the pair for the life of the process closes the window
     ## outright: the numbers are never free, so they can never be handed to
     ## anything else, and a late handler's byte lands in a pipe that the
-    ## next arming drains. Two descriptors, for a daemon that arms SIGTERM
-    ## once, is not a trade worth a race.
+    ## next arming drains.
     ##
     ## THE WRITE END IS NON-BLOCKING, so nothing in `onShutdownSignal` can
     ## block. A pipe holds 64 KiB and the handler writes one byte, so it
@@ -3291,17 +3331,33 @@ when defined(posix):
     ## failure mode it replaces costs nothing: a write refused for want of
     ## room means the pipe already HAS a byte in it, so the waker has
     ## already been woken and the wake this call was making is redundant.
-    if shutdownPipe[0] >= 0 and shutdownPipe[1] >= 0:
+    ##
+    ## SHARED BY BOTH WAKE PIPES, so the count in the paragraph above is now
+    ## four descriptors rather than two. The reasoning does not change with
+    ## the number: what is bought is that no handler can ever hold a
+    ## descriptor number that has been handed to something else, and four
+    ## numbers for a daemon that arms SIGTERM once is still not a trade
+    ## worth a race.
+    if fds[0] >= 0 and fds[1] >= 0:
       return true
-    if pipe(shutdownPipe) != 0:
-      shutdownPipe = [cint(-1), cint(-1)]
+    if pipe(fds) != 0:
+      fds = [cint(-1), cint(-1)]
       return false
-    let flags = fcntl(shutdownPipe[1], F_GETFL)
+    let flags = fcntl(fds[1], F_GETFL)
     if flags != -1:
-      discard fcntl(shutdownPipe[1], F_SETFL, flags or O_NONBLOCK)
+      discard fcntl(fds[1], F_SETFL, flags or O_NONBLOCK)
     true
 
-  proc drainShutdownPipe() =
+  proc ensureShutdownPipe(): bool =
+    ## The waker's pipe: one reader, which consumes what it takes.
+    ensureLongLivedPipe(shutdownPipe)
+
+  proc ensureAcceptWakePipe(): bool =
+    ## The accept loop's pipe: no reader at all, only `poll`. Same lifetime
+    ## rule and same non-blocking write end, for the same reasons.
+    ensureLongLivedPipe(acceptWakePipe)
+
+  proc drainPipe(readEnd: cint) =
     ## A WAKE TOKEN OUTLIVES THE ARMING THAT PRODUCED IT, and with a pipe
     ## that is never closed it would outlive it INTO THE NEXT ONE.
     ##
@@ -3319,17 +3375,28 @@ when defined(posix):
     ## reader while it runs. Draining at the disarm as well would tidy the
     ## ordinary leftover a little sooner and cover nothing this does not --
     ## a byte from a handler stranded past the disarm arrives after it.
-    if shutdownPipe[0] < 0:
+    if readEnd < 0:
       return
-    let flags = fcntl(shutdownPipe[0], F_GETFL)
+    let flags = fcntl(readEnd, F_GETFL)
     if flags == -1:
       return
-    if fcntl(shutdownPipe[0], F_SETFL, flags or O_NONBLOCK) == -1:
+    if fcntl(readEnd, F_SETFL, flags or O_NONBLOCK) == -1:
       return
     var scratch: array[64, char]
-    while read(shutdownPipe[0], addr scratch[0], scratch.len) > 0:
+    while read(readEnd, addr scratch[0], scratch.len) > 0:
       discard
-    discard fcntl(shutdownPipe[0], F_SETFL, flags)
+    discard fcntl(readEnd, F_SETFL, flags)
+
+  proc drainShutdownPipe() =
+    drainPipe(shutdownPipe[0])
+
+  proc drainAcceptWakePipe() =
+    ## AND THIS ONE MATTERS MORE THAN THE WAKER'S, because nothing else ever
+    ## empties it. A byte left by a previous arming would make the next
+    ## accept loop's very first wait return immediately and the daemon shut
+    ## itself down before serving anything -- so the arming empties it, at
+    ## the one moment there is provably no waiter to race with.
+    drainPipe(acceptWakePipe[0])
 
   proc dialOwnEndpoint(path: string) =
     ## One connection to our own socket, opened and dropped. It carries no
@@ -3386,6 +3453,57 @@ when defined(posix):
           break
       dialOwnEndpoint(shutdownEndpointPath)
 
+  proc waitForAcceptOrShutdown(acceptHandle: int) =
+    ## PARK UNTIL THERE IS A CONNECTION TO ACCEPT, OR UNTIL WE ARE STOPPING.
+    ## Returns with no answer of its own: the caller re-reads the flag and
+    ## calls `accept`, and both of those are the authority they always were.
+    ##
+    ## THIS IS THE GATE IN FRONT OF `accept`, and it exists because `accept`
+    ## itself cannot be woken by anything that does not arrive over the
+    ## endpoint. Waiting on the LISTENING DESCRIPTOR instead of on the
+    ## endpoint's NAME is the whole of the difference: unlinking the socket
+    ## file takes the name away and leaves the descriptor exactly as it was,
+    ## so a `poll` on it is still answerable when a `connect` to the path is
+    ## not.
+    ##
+    ## `POLLIN` ON A LISTENING AF_UNIX SOCKET MEANS "A COMPLETED CONNECTION
+    ## IS QUEUED", and a queued connection is not withdrawn by a peer that
+    ## goes away -- it is still handed out by `accept`, which then reads EOF.
+    ## So the `accept` that follows a readable listener does not block, and
+    ## the loop is not made to depend on that: a wait that somehow returned
+    ## early only puts the caller back where it was before this gate
+    ## existed.
+    ##
+    ## NO TIMEOUT, ON PURPOSE. A bounded wait would also fix the hang, and
+    ## would leave the daemon ticking for the rest of its life for a flag
+    ## that changes once. Both descriptors here are edges: the pipe is
+    ## readable from the instant the handler writes into it and stays
+    ## readable, because nobody drains it.
+    ##
+    ## EINTR IS A RETRY AND NOT A RESULT. Every other error returns, which
+    ## hands the caller back to `accept` and to the consecutive-failure
+    ## accounting that has always decided whether a listener is really dead.
+    if acceptHandle < 0:
+      # NOTHING TO WAIT ON, so the caller blocks in `accept` as it did
+      # before this existed -- the Windows named-pipe shape, and a listener
+      # with no socket. Never a spin: `accept` is still what follows.
+      return
+    var descriptors: array[0 .. 1, TPollfd]
+    descriptors[0].fd = cint(acceptHandle)
+    descriptors[0].events = POLLIN
+    descriptors[0].revents = 0
+    var counted = 1
+    if acceptWakePipe[0] >= 0:
+      descriptors[1].fd = acceptWakePipe[0]
+      descriptors[1].events = POLLIN
+      descriptors[1].revents = 0
+      counted = 2
+    while true:
+      if poll(addr descriptors[0], Tnfds(counted), -1.cint) >= 0:
+        return
+      if errno != EINTR:
+        return
+
   proc installShutdownHandler(endpointPath: string) =
     ## Arms SIGTERM. Called after the endpoint is bound, because the waker
     ## has to have something to dial.
@@ -3396,8 +3514,16 @@ when defined(posix):
       # flag nobody could act on would turn an immediate stop into a hang,
       # which is strictly worse than the default disposition it replaced.
       return
-    # NOTHING LEFT OVER FROM THE LAST ARMING; see `drainShutdownPipe`.
+    # THE SAME RULE FOR THE ACCEPT LOOP'S PIPE, and it is the one that
+    # carries the stop when the endpoint path has been unlinked. Without it
+    # the only wake left is the dial, which is exactly the arrangement that
+    # hung -- so a handler is not armed on half a mechanism either.
+    if not ensureAcceptWakePipe():
+      return
+    # NOTHING LEFT OVER FROM THE LAST ARMING; see `drainShutdownPipe` and
+    # `drainAcceptWakePipe`.
     drainShutdownPipe()
+    drainAcceptWakePipe()
     createThread(shutdownWakerThread, shutdownWakerMain)
     shutdownWakerRunning = true
     signal(SIGTERM, onShutdownSignal)
@@ -3487,6 +3613,17 @@ else:
           dialOwnEndpoint(shutdownEndpointPath)
           return
         sleep(50)
+
+  proc waitForAcceptOrShutdown(acceptHandle: int) =
+    ## NOTHING TO WAIT ON HERE, and that is a property of the transport
+    ## rather than an omission. A named-pipe listener has no descriptor
+    ## whose readability means "a client is waiting": `ConnectNamedPipe` IS
+    ## the wait, and the stop watcher wakes it by opening the pipe -- which
+    ## needs the pipe NAME and not a file on disk, so the hazard the POSIX
+    ## gate exists for (an unlinked socket) has no Windows form.
+    ## `acceptWaitHandle` answers -1 for every named-pipe listener, so this
+    ## is reached with nothing to do.
+    discard acceptHandle
 
   proc installShutdownHandler(endpointPath: string) =
     ## Arms the SCM stop watch. Called after the endpoint is bound, because
@@ -3747,12 +3884,25 @@ proc serve*(config: DaemonConfig): int =
     # interleaved with successful accepts, a dead listener fails every time.
     const MaxConsecutiveAcceptFailures = 64
     var consecutiveFailures = 0
+    # ASKED ONCE. The listener is bound for the life of this loop, so its
+    # descriptor does not change; re-deriving it per iteration would only
+    # add a variant-field read to the hot path.
+    let acceptHandle = listener.acceptWaitHandle
     while true:
+      # THE WAIT THAT MAKES THE FLAG OBSERVABLE. `accept` cannot be woken by
+      # anything that does not arrive over the endpoint, so the loop waits
+      # on the LISTENING DESCRIPTOR and on the shutdown wake pipe first, and
+      # calls `accept` only once a connection is really queued. This is what
+      # a SIGTERM reaches when the socket file has been unlinked -- the
+      # dialled wake cannot be delivered then, and before this gate existed
+      # the daemon stayed parked in `accept` until SIGKILL. See the section
+      # headed "SIGTERM, and the orderly shutdown it now reaches".
+      waitForAcceptOrShutdown(acceptHandle)
       # SIGTERM LEAVES BY THE SAME DOOR AS A DEAD LISTENER: it breaks the
       # loop, and everything below `finally` then happens exactly as it does
       # for every other way of ending. The flag is checked three times
-      # because there are three places the signal can land relative to a
-      # blocking `accept`.
+      # because there are three places the signal can land relative to the
+      # wait above and the `accept` below.
       if shutdownWasRequested():
         break
       var accepted: AcceptedConnection
