@@ -112,3 +112,11 @@ Raw ARM log: `/tmp/runquota-48bb-windows-arm-complete.log`; failure artifact:
 `/tmp/runquota-48bb-arm-evidence`. Refreshed dev `2c50aaf` and agents `4ae8008`
 before recording these results. Neither failure nor the passing x64 result
 replaces native ARM64 release-payload validation.
+
+The current RunQuota `33add18` repeats compiler-child launch failures in
+[job 109944771773](https://github.com/metacraft-labs/runquota/actions/runs/36732257074/job/109944771773):
+101 actions succeed, while the daemon and `t_observation_store_retention`
+compilations cannot start `cc1.exe`. Its Windows x64 job passes monitored
+build/test, all 100 native test programs and all 12 static helper checks.
+The ARM report again contains no hook checkpoints. Evidence is retained at
+`/tmp/runquota-33add-arm-evidence`; the shared hook investigation remains active.

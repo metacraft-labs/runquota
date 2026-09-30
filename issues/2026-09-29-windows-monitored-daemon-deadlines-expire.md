@@ -191,3 +191,32 @@ ordinary startup protocol is preserved for every other fixture. This is a
 passing complete graph, not a closure of the separately reproduced intermittent
 helper failures. Focused helper-phase run `36736205178` remains active.
 Evidence: `/tmp/runquota-readiness-92-full-evidence`.
+
+## Helper phases pass; diagnostic console output times out
+
+Run `36736205178` at tooling `30d78bd` preserves a passing focused graph and
+all 16 successful native/monitored repetitions at RunQuota `7036462`. Each
+repetition's retained log has all eight passing lifecycle cases: 128 cases
+in total, with identical fixture and daemon hashes throughout. The 64 observed
+helper exit waits range from 15 to 1106 ms, below their unchanged 3000 ms
+bound. All helpers reach their expected exit codes. This run does not reproduce
+the earlier intermittent helper failure.
+
+The Actions step nevertheless expires at 60 minutes while emitting the
+captured console text. The complete files and final `results.json` are
+already present, while the job log is still printing the first monitored
+repetition. Treat the workflow as failed, retaining the narrower completed
+test evidence. Tooling `7729607` bounds console tails to 12 lines per capture
+and removes duplicate tail printing; complete files remain artifacts and
+command exit status is preserved. Real file/output controls cover successful
+and failing commands, spaces in paths and invalid tail limits. PowerShell
+syntax passes. Replacement `36745684530` keeps all pairs and all existing
+fixture, action and workflow time limits.
+
+Daemon readiness polling is 80 attempts with 50 ms sleeps, not a strict
+four-second wall-clock deadline: an IPC connection call may itself block.
+This run records 53–7603 ms from spawn return to readiness, with no exhausted
+poll loop. No timeout or product behavior is changed based on those durations.
+Evidence: `/tmp/runquota-readiness-30d-evidence` and
+`/tmp/runquota-readiness-30d-job.log`. Refreshed dev `2c50aaf` and agents
+`ef060dd` before extending this record.
