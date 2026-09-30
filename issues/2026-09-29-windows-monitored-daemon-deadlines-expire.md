@@ -144,3 +144,26 @@ assertions. The focused `9ef9750` comparison remains useful because it launches
 only the fixture that collects raw output, and is allowed to finish. The
 failed full-graph artifact is retained in `/tmp/runquota-readiness-9ef-full-evidence`.
 Refreshed dev `0bce530` and agents `fed6830` before recording this correction.
+
+## Completed focused comparison and helper observation
+
+Focused run `36723733885` at tooling `9ef9750` finishes all eight paired
+repetitions against RunQuota `7036462`. The monitored graph and every
+monitored repetition pass. Native repetitions 1, 3, 5, 7 and 8 pass; repetitions
+2, 4 and 6 fail helper exit/status assertions before any lease is granted.
+Granted-abnormal helpers return zero instead of 31 twice, starting-abnormal
+returns zero instead of 32 once, and running-abnormal returns zero instead of
+33 once. All daemons reach readiness, so this does not reproduce the original
+missing daemon pipe. These results show a helper failure also without an outer
+monitor. At Reprobuild `c14b1e6`, `runActivatedCommand` starts the activated
+command directly; only the paired monitored mode invokes `internal io monitor`.
+The unchanged binary hashes are retained in `results.json`.
+
+The helper output was not retained in that comparison. Tooling `71d7fe7` adds
+flushed helper-entry, connection, registration, lease and child-spawn phases,
+and records elapsed waits and bounded available output. The original 3000 ms
+wait and all assertions remain. Windows source checks pass, and real macOS
+startup-protocol and all eight lifecycle cases pass against `33add18` plus
+this diagnostic. Focused replacement `36734357209` runs the same `7036462`
+candidate; corrected full graph `36731094289` continues independently.
+Refreshed dev `2c50aaf` and agents `44bc56c` before recording this evidence.

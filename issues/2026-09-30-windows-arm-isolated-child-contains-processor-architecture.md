@@ -1,6 +1,6 @@
 # Windows ARM-host isolated child contains PROCESSOR_ARCHITECTURE
 
-Status: focused repair verified at `48bb701`; complete CI and integration pending.
+Status: focused repair verified at `33add18`; complete CI and promotion pending.
 Observed at RunQuota `70364629d5214bf4be9ac760d63e572fc257b111`.
 
 ## Observed
@@ -96,3 +96,10 @@ mainline API; its old declarations and assertions remain intact. Complete
 native `36732251894` and Reprobuild `36732257074` validate that exact candidate.
 Its source-lock blob `f4eb79d702ea51496c6932f02e8af453457af0a0` is published
 and verified through manifests `b6ba16b`.
+
+The repeated control `36732223032` at tooling `5838377` passes on both hosts
+against `33add18`. Native x64 passes original and repaired fixtures; ARM again
+fails the original assertion and passes the repair. Restoring real inheritance
+makes the repaired fixture fail on both hosts. All six processes finish.
+Evidence is retained in `/tmp/runquota-environment-583-arm-evidence` and
+`/tmp/runquota-environment-583-x64-evidence`. Complete CI remains active.
