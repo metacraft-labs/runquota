@@ -146,3 +146,42 @@ Evidence: `/tmp/runquota-33add-pr35-arm-evidence` and
 `/tmp/runquota-33add-pr35-arm-complete.log`. Refreshed dev `2c50aaf` and agents
 `975ea1d` before adding this ordinary-CI result, preserving the concurrent
 sibling-manifest update.
+
+## Fixed binaries still fail with serial admission
+
+At exact RunQuota `48bb701`, tooling `b60cba4` completes all 21 executions in
+[36735013860](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36735013860):
+seven identical binaries run with admission caps eight, one and eight. The
+recorded hashes remain unchanged. Nine executions pass, two fail assertions,
+and ten return timeout status 124. The comparison finishes at 17:29:07 UTC;
+the workflow later reaches its 155-minute step deadline while returning output.
+The complete per-program results and logs survive in the uploaded artifact.
+
+| Program | Parallel first | Serial | Parallel second |
+| --- | --- | --- | --- |
+| Concurrent clients | pass | pass | pass |
+| Process benchmark | pass | pass | timeout |
+| Socket write path | assertion failure | pass | timeout |
+| Stats-table cache control | pass | pass | pass |
+| Retention schedule | assertion failure | timeout | timeout |
+| Store export | timeout | timeout | timeout |
+| Store merge | timeout | timeout | timeout |
+
+Serial export prints every successful case but still returns 124. Retention
+and merge also remain incomplete when run alone. This rules out serial
+admission as a sufficient repair. The outer wrapper includes launch and
+monitor finalization: its elapsed times are not individual SQLite-call or
+test-body timings. Later modes are also not fresh machines: runner cleanup
+finally terminates three surviving SQLite processes. No common runtime cause
+is established by this comparison.
+
+Validated depfile decoding with the reader at io-mon `983a113` finds 878
+process-start records in serial export versus 436 in its first parallel run;
+serial retention records 248. These counts show substantial process activity,
+but the format contains no timestamps and does not identify where time was
+spent. Preserve original deadlines and capture child state before selecting a
+store, monitor or fixture change.
+
+Evidence: `/tmp/runquota-arm-contention-b60-evidence` and
+`/tmp/runquota-arm-contention-b60-job.log`. Refreshed dev `2c50aaf` and agents
+`494ef31` before extending this existing issue.
