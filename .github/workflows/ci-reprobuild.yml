@@ -124,13 +124,14 @@ jobs:
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@96ac63b99d8d6c3a06ca43a9214abbc00f4ac01e
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@e42cbc75eeba13dc94ce8459ba21a301be935b6f
         with:
           env-flavor: reprobuild
           # Exercise the published bootstrap repairs before a new CLI release.
           # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
           repro-from-source: true
           repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
+          repro-posix-io-mon-pin: ${{ matrix.os == 'linux' && '3df08c24ee91900b950ed20a3827923d213f2a9c' || '' }}
           repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
           # Distinguish emulated x64 from native ARM children and preserve exit bits.
           repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
