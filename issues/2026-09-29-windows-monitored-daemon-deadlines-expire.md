@@ -267,3 +267,43 @@ the instrumented fixture at RunQuota `33add18`; the actual comparison retains
 `7036462`. The observer's standalone C control also compiles/links for Windows
 x64. Runtime controls and repeated comparisons remain pending in the new run.
 This changes only disposable diagnostics, not the release source.
+
+## Helper context and missing daemon readiness both recur
+
+At exact RunQuota `7036462`, tooling `8fd4eff` in
+[36753042655](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36753042655)
+passes the real observer controls and focused graph, then completes all eight
+native/monitored pairs at unchanged hashes. Of 128 lifecycle cases, 125 pass.
+The three failures are distinct observations:
+
+- Native repetition 3's running-lease helper exceeds the original 3000 ms
+  wait before its first flushed helper marker. At expiry its process has
+  15.625 ms of kernel CPU time and zero reported user CPU time. The main thread
+  is at `ntdll+0x163294`; eight unwind addresses are in ntdll and KernelBase.
+  No function-symbol identity or application-level cause is established.
+  The observer records the timeout before termination, and the existing
+  lease/status assertions fail as well.
+- Native repetition 5's daemon never prints its application-entry marker or
+  publishes its pipe before the unchanged readiness loop expires.
+- Monitored repetition 1 reproduces the same missing daemon output/pipe in
+  its final forced-supervisor-kill case. `startProcess` itself takes 3999 ms;
+  cleanup begins at 9074 ms measured from before that spawn.
+
+The other 126 daemon startups report readiness. This reproduces the original
+missing-pipe symptom without an outer monitor as well as with it. A stalled
+helper also appears in a native run; neither observation supports attributing
+all startup failures to monitor injection. The system instruction addresses
+alone do not establish a Winsock, loader or security-software cause.
+
+The real fast-child control returns 17. The real sleeping-child control
+expires at 3000 ms, records two thread contexts and is reaped with the expected
+zero timeout termination status. The diagnostic retains every original test
+assertion and deadline. Daemon hash:
+`7A7AAFE74FAB9176CA4984B83AF46061C90DEC7C229A1CD7E8220D3FA897AF38`;
+fixture hash: `BF0C865F8479550EBC456FEF79207E647EA33E31F726E221AA62345B270F1BFE`.
+
+Evidence: `/tmp/runquota-readiness-8fd-evidence`. Refreshed dev `2c50aaf` and
+agents `641d103`. Current release candidate `33add18` separately passes all
+ten native jobs and complete Windows x64 and macOS Reprobuild jobs; this
+focused recurrence remains an open intermittent issue, not a failed gate at
+that candidate.
