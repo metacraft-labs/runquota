@@ -73,3 +73,26 @@ fixture deadlines, assertions, monitoring and internal concurrency (including
 all 32 concurrent clients) remain intact. Hashes must remain equal across all
 three runs. This is a diagnostic of competing fixture work, not a selected
 CI scheduling repair. Complete ordinary validation remains required.
+
+## First comparison outcome and fixed-image correction
+
+At tooling `ce0d17e`, run `36726271653` executes every selected program in
+parallel-first mode. Concurrent clients, process benchmark and stats-table
+control pass. Store degradation again counts one dropped row; retention
+schedule misses its sweep bounds; export and merge stop at 600 seconds after
+their first three cases pass. Before execution, the graph evaluation legitimately
+rebuilds stats-table control and export on cache misses. The hash guard then
+stops the experiment before serial mode. There is no serial-versus-parallel
+result, and these failures do not establish a common contention cause.
+
+Tooling `b60cba4` builds the same RunQuota `48bb701` programs once, enters the
+activated environment once, and launches fixed executable images under the
+production monitor. It never invokes a compiler during comparison. Replacement
+`36735013860` records each program's start, finish, exit code and binary hashes
+for admission caps eight, one and eight. Original internal concurrency,
+assertions, closed stdin and the 600-second timeout/ten-second kill grace remain.
+Every program executes in every mode, regardless of earlier failures. The
+complete ordinary Reprobuild workflow remains the release gate.
+
+Evidence: `/tmp/runquota-arm-contention-ce-evidence`. Refreshed dev `2c50aaf`
+and agents `e67ce70` before extending the existing record.
