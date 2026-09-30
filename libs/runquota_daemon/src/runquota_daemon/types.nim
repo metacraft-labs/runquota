@@ -1,4 +1,4 @@
-import std/[options, tables]
+import std/[options, sets, tables]
 
 import runquota_core
 import runquota_ipc
@@ -42,6 +42,21 @@ type
   CpuShareGroup* = object
     id*: string
     cpuSlots*: MilliCpu
+
+  BudgetFlags* = object
+    ## The budget the COMMAND LINE pinned. A reload re-reads the host file and
+    ## changes everything else, but never these: a flag is the operator's
+    ## statement for this launch (precedence 1 in
+    ## `reprobuild-specs/RunQuota-Host-Configuration.md`), and a reload that
+    ## let a file edit override it would make the flag mean "until someone
+    ## edits the file".
+    memoryBytes*: Option[Bytes]      ## `--memory-bytes`
+    cpuSlots*: Option[MilliCpu]      ## `--cpu-milli`
+    pools*: Table[string, uint32]    ## `--pool NAME=UNITS`
+    machines*: bool
+      ## `--machine` was given: the topology is the command line's, so the
+      ## file's `[machine]` keys have nothing to size.
+    cpuShareGroups*: HashSet[string] ## `--cpu-share-group ID=...`
 
   DaemonConfig* = object
     endpoint*: Endpoint
@@ -93,6 +108,23 @@ type
       ## ``ambientSampleIntervalMillis`` above and for the same reason:
       ## "off" has to be a state an operator can name, in the config, in
       ## the startup report, and in a test.
+    hostConfigPath*: string
+      ## The host budget file this daemon reads at start and on every
+      ## `ReloadHostConfig`: `hostConfigPath` from
+      ## `runquota_daemon/host_config` unless `runquotad --host-config PATH`
+      ## named another (a test's private file). Empty: no file, and a reload
+      ## re-applies the built-in defaults and the flags.
+    builtinMemoryBytes*: Bytes
+    builtinCpuSlots*: MilliCpu
+      ## The defaults the file is laid over -- 75% of physical memory and
+      ## one core per logical processor -- kept so a reload can recompute the
+      ## budget from the bottom (defaults, then file, then flags) rather than
+      ## from whatever the last file left. Zero means "not recorded" (a
+      ## config built by hand), and the current value stands in for it.
+    budgetFlags*: BudgetFlags
+    hostConfigSource*: string
+      ## The file the budget in force was read from; empty when none existed.
+      ## Set at start by `runquotad` and by every reload.
     retentionMaxDeferredSweeps*: int
       ## How many consecutive sweeps a live lease may defer before one
       ## runs anyway. A prune competes for the disk the work runs on, so
@@ -308,6 +340,16 @@ type
       ## that the leak M11 recorded is actually closed rather than merely
       ## unreachable in the happy path.
     lostLeasesReaped*: uint64
+    pendingDenials*: Table[uint64, seq[LeaseDecision]]
+      ## Session id to the denials a reload decided for its queued leases,
+      ## delivered on that session's next `GrantNext`. The leases themselves
+      ## have already left the table (`reloadHostConfig`).
+    hostConfigReloads*: uint64
+      ## `ReloadHostConfig` requests that changed the budget in force (or
+      ## re-applied an unchanged one): the file parsed.
+    hostConfigReloadsRefused*: uint64
+      ## Reloads refused because the file did not parse or could not be read.
+      ## The budget in force is then the previous one, unchanged.
       ## ``supervisor_lost`` leases released because their child process is
       ## provably gone.
       ##

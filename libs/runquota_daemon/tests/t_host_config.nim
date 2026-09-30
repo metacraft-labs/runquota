@@ -15,6 +15,7 @@ import std/[options, os, strutils, tables, unittest]
 import runquota_core
 import runquota_daemon
 import runquota_daemon/host_config
+import runquota_daemon/host_memory
 import runquota_ipc
 
 const sample = """
@@ -111,3 +112,120 @@ suite "host config":
     check uint64(config.memoryBytes) == uint64(pristine.memoryBytes)
     check uint32(config.cpuSlots) == uint32(pristine.cpuSlots)
     check config.namedPoolCaps.len == pristine.namedPoolCaps.len
+
+suite "host config: the built-in memory budget":
+  test "is 75% of physical memory":
+    check DefaultMemoryBudgetPercent == 75'u64
+    check defaultMemoryBudgetBytes(128'u64 * 1024'u64 * 1024'u64 * 1024'u64) ==
+      96'u64 * 1024'u64 * 1024'u64 * 1024'u64
+    check defaultMemoryBudgetBytes(8'u64 * 1024'u64 * 1024'u64 * 1024'u64) ==
+      6'u64 * 1024'u64 * 1024'u64 * 1024'u64
+    # Not a multiple of 100: the remainder is carried, not dropped.
+    check defaultMemoryBudgetBytes(1001'u64) == 750'u64
+    check defaultMemoryBudgetBytes(high(uint64)) > high(uint64) div 4'u64 * 2'u64
+
+  test "falls back to the old constant only when memory cannot be read":
+    check defaultMemoryBudgetBytes(0'u64) == FallbackMemoryBudgetBytes
+    check FallbackMemoryBudgetBytes == 17_179_869_184'u64
+
+  test "is what defaultDaemonConfig uses on this host":
+    let physical = hostPhysicalMemoryBytes()
+    # Every platform RunQuota runs on reads it; a 0 here is a broken backend.
+    check physical > 0'u64
+    let config = defaultDaemonConfig(defaultEndpoint())
+    check uint64(config.memoryBytes) == defaultMemoryBudgetBytes(physical)
+    check uint64(config.builtinMemoryBytes) == uint64(config.memoryBytes)
+    check uint64(config.memoryBytes) < physical
+
+suite "host config: editing":
+  proc edited(text, key, value: string; unset = false): string =
+    let dir = getTempDir() / ("runquota-t-host-config-edit-" &
+      $getCurrentProcessId())
+    removeDir(dir)
+    createDir(dir)
+    defer: removeDir(dir)
+    writeFile(dir / "runquotad.toml", text)
+    var changed = false
+    editHostConfig(dir / "runquotad.toml", key, value, unset, changed)
+
+  test "set replaces the key's line and keeps every other line":
+    let after = edited(sample, "machine.memory_bytes", "64GiB")
+    check "memory_bytes = 68719476736   # 64 GiB" in after
+    check "103_079_215_104" notin after
+    check "# Budget for this workstation." in after
+    check "cpu_milli    = 16000" in after
+    let host = parseHostConfig(after, "t")
+    check host.memoryBytes == some(68_719_476_736'u64)
+    check host.pools["fetch"] == 2'u32
+
+  test "set adds a key to its table, and a table the file lacks":
+    let after = edited("schema = \"runquota.host-config.v1\"\n[machine]\n" &
+      "cpu_milli = 4000\n", "pools.link", "2")
+    let host = parseHostConfig(after, "t")
+    check host.pools["link"] == 2'u32
+    check host.cpuMilli == some(4000'u64)
+    let more = edited(after, "machine.memory_bytes", "1000")
+    let host2 = parseHostConfig(more, "t")
+    check host2.memoryBytes == some(1000'u64)
+    # Added inside [machine], not after [pools].
+    check more.find("memory_bytes") < more.find("[pools]")
+
+  test "unset removes the key and nothing else":
+    let after = edited(sample, "pools.compile", "", unset = true)
+    let host = parseHostConfig(after, "t")
+    check not host.pools.hasKey("compile")
+    check host.pools["fetch"] == 2'u32
+    check host.memoryBytes == some(103_079_215_104'u64)
+
+  test "refuses what the daemon would refuse, before writing anything":
+    for (key, value) in [("machine.memory", "1"), ("network.x", "1"),
+                         ("machine.memory_bytes", "0"),
+                         ("machine.memory_bytes", "-1"),
+                         ("machine.memory_bytes", "1.5GiB"),
+                         ("machine.cpu_milli", "4294967296"),
+                         ("pools.a b", "1"), ("pools.compile", "0")]:
+      var refused = false
+      try:
+        discard edited(sample, key, value)
+      except HostConfigError:
+        refused = true
+      checkpoint key & " = " & value
+      check refused
+
+  test "an absent file starts from the template, which changes no budget":
+    let host = parseHostConfig(HostConfigTemplate, "t")
+    check host.memoryBytes.isNone
+    check host.cpuMilli.isNone
+    check host.pools.len == 0
+    let dir = getTempDir() / ("runquota-t-host-config-new-" &
+      $getCurrentProcessId())
+    removeDir(dir)
+    createDir(dir)
+    defer: removeDir(dir)
+    var changed = false
+    let text = editHostConfig(dir / "runquotad.toml", "machine.cpu_milli",
+      "12000", false, changed)
+    check changed
+    check "# RunQuota host budget." in text
+    check parseHostConfig(text, "t").cpuMilli == some(12000'u64)
+    # Computing the edit wrote nothing.
+    check not fileExists(dir / "runquotad.toml")
+
+  test "writes atomically, and never creates the directory":
+    let dir = getTempDir() / ("runquota-t-host-config-write-" &
+      $getCurrentProcessId())
+    removeDir(dir)
+    expect HostConfigError:
+      writeHostConfigAtomically(dir / "runquotad.toml", sample)
+    check not dirExists(dir)
+    createDir(dir)
+    defer: removeDir(dir)
+    writeHostConfigAtomically(dir / "runquotad.toml", sample)
+    check readFile(dir / "runquotad.toml") == sample
+    writeHostConfigAtomically(dir / "runquotad.toml", HostConfigTemplate)
+    check readFile(dir / "runquotad.toml") == HostConfigTemplate
+    # No temporary file is left beside it.
+    var entries = 0
+    for _ in walkDir(dir):
+      inc entries
+    check entries == 1

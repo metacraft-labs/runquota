@@ -431,6 +431,13 @@ proc requestLeaseWaiting*(session: var RunQuotaSession; request: ResourceRequest
     let grants = session.pollNextGrant()
     for grant in grants:
       if grant.clientCandidateId == candidateId and not grant.queued:
+        # A DENIAL IS NOT A GRANT. A queued lease is denied on a later poll
+        # when a host-configuration reload shrank the budget below it
+        # (`reloadHostConfig` in `runquota_daemon`); returning its inactive
+        # lease here would hand the caller a lease it was never granted.
+        if not grant.lease.active:
+          session.client[].lastDiagnostic = grant.diagnostic
+          raise newException(RunQuotaClientError, grant.diagnostic.message)
         return grant.lease
     inc polls
     sleep(pollMillis)
@@ -713,6 +720,34 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
     lease.session[].client[].lastDiagnostic = diagnostic(diagProtocol, "invalid LeaseFinishedAck payload")
     raise newException(RunQuotaClientError, lease.session[].client[].lastDiagnostic.message)
   lease.state = leaseClientFinished
+
+proc reloadHostConfig*(client: var RunQuotaClient): HostConfigReloadedMessage =
+  ## Ask the daemon to re-read its host budget file and put it in force
+  ## (`ReloadHostConfig`). Raises `RunQuotaClientError` with the daemon's
+  ## reason when the file does not parse -- the budget in force is then
+  ## unchanged -- and when the daemon predates the message.
+  let requestId = client.requestFrame(rqReloadHostConfig, "")
+  let frame =
+    try:
+      client.readResponse(requestId)
+    except RunQuotaClientError as err:
+      if client.lastDiagnostic.code == diagProtocol:
+        # An older daemon refuses a message kind it does not know by closing
+        # the connection or answering "unsupported RQSP message".
+        client.lastDiagnostic = diagnostic(diagUnsupportedVersion,
+          "the running runquotad does not support ReloadHostConfig (" &
+          err.msg & "); it is older than this client, so restart it to " &
+          "apply the host configuration")
+        raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+      raise
+  if frame.header.messageKind != rqHostConfigReloaded:
+    client.lastDiagnostic = diagnostic(diagProtocol,
+      "daemon did not answer ReloadHostConfig")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  if not decodeHostConfigReloaded(frame.payload, result):
+    client.lastDiagnostic = diagnostic(diagProtocol,
+      "invalid HostConfigReloaded payload")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
 
 proc daemonStatus*(client: var RunQuotaClient;
                    timeoutMs = 0): DaemonStatusMessage =

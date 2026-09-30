@@ -38,6 +38,12 @@ type
     rqDeclareExtension = 30
     rqExtensionDeclared = 31
     rqExtensionRow = 32
+    rqReloadHostConfig = 33
+      ## Re-read the host budget file. The request carries NO VALUES: the
+      ## daemon reads the file it was started with, which only the host's
+      ## administrators can write, so any client that may connect may ask --
+      ## the answer can only be the budget the operator wrote down.
+    rqHostConfigReloaded = 34
 
   MessageKind* = RqspMessageKind
 
@@ -303,6 +309,34 @@ type
 
   ProtocolErrorMessage* = object
     diagnostic*: Diagnostic
+
+  NamedPoolCapWire* = object
+    name*: string
+    units*: uint32
+
+  HostConfigReloadedMessage* = object
+    ## The budget in force after a `ReloadHostConfig`. A file that does not
+    ## parse is answered with an `rqError` instead, and changes nothing.
+    configPath*: string
+      ## The file the daemon reads, whether or not it exists.
+    sourcePath*: string
+      ## The file the budget was read from; empty when there was none, and
+      ## the budget is the built-in defaults and the flags.
+    memoryBytes*: uint64      ## the local machine's memory budget
+    cpuMilli*: uint32         ## the local machine's CPU budget
+    pools*: seq[NamedPoolCapWire]
+    pinnedByFlags*: seq[string]
+      ## Host-file keys a `runquotad` flag overrides for this launch, as
+      ## `machine.memory_bytes` / `machine.cpu_milli` / `pools.NAME`, or
+      ## `machine` when `--machine` pinned the whole topology. The file's
+      ## value for these was read and is not in force.
+    promotedLeases*: uint32
+      ## Queued leases granted because the new budget had room for them.
+    memoryInUse*: uint64
+    cpuInUse*: uint32
+      ## What granted leases hold on the local machine. After a shrink this
+      ## can exceed the budget: granted leases are never revoked, and new
+      ## ones wait until it falls below.
 
   LeaseObservationMessage* = object
     ## What a client has MEASURED about one of its own live executions,

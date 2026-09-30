@@ -1,4 +1,4 @@
-import std/[algorithm, atomics, cpuinfo, locks, options, os, strutils,
+import std/[algorithm, atomics, cpuinfo, locks, options, os, sets, strutils,
   tables, times]
 
 when defined(posix):
@@ -12,6 +12,8 @@ import runquota_daemon/types as daemonTypes
 # every leg rather than only on the one that uses it.
 import runquota_daemon/windows_service
 import runquota_daemon/host_config
+import runquota_daemon/host_memory
+import runquota_daemon/reload_report
 import runquota_daemon/child_identity
 import runquota_codec
 import runquota_core
@@ -40,6 +42,7 @@ export daemonTypes
 # stdio redirection, because both have to happen before `serve` prints
 # its first line.
 export windows_service
+export reload_report
 
 const libraryName* = "runquota_daemon"
 
@@ -47,11 +50,23 @@ proc libraryInfo*(): daemonTypes.LibraryInfo =
   daemonTypes.LibraryInfo(name: libraryName)
 
 proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
+  ## The built-in budget is proportional to the host: one core per logical
+  ## processor, and `DefaultMemoryBudgetPercent` (75%) of physical memory --
+  ## the flat 16 GiB it replaced (`FallbackMemoryBudgetBytes`) survives only
+  ## for a host whose memory cannot be read. Decided 2026-09-30 in
+  ## `reprobuild-specs/RunQuota-Host-Configuration.md`: a constant is too
+  ## small for a workstation and too large for a laptop, and a host file
+  ## remains the way to say anything else.
+  let cpu = milliCpu(max(1, countProcessors()) * 1000)
+  let memory = bytes(defaultMemoryBudgetBytes(hostPhysicalMemoryBytes()))
   DaemonConfig(
     endpoint: endpoint,
     daemonId: uint64(getCurrentProcessId()),
-    cpuSlots: milliCpu(max(1, countProcessors()) * 1000),
-    memoryBytes: bytes(16'u64 * 1024'u64 * 1024'u64 * 1024'u64),
+    cpuSlots: cpu,
+    memoryBytes: memory,
+    hostConfigPath: host_config.hostConfigPath,
+    builtinMemoryBytes: memory,
+    builtinCpuSlots: cpu,
     ioSlots: 1'u32,
     machines: initTable[string, MachineCapacity](),
     cpuShareGroups: initTable[string, CpuShareGroup](),
@@ -83,6 +98,37 @@ proc applyHostConfig*(config: var DaemonConfig; host: HostConfig) =
     config.cpuSlots = milliCpu(host.cpuMilli.get)
   for name, units in host.pools:
     config.namedPoolCaps[name] = units
+
+proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
+  ## The budget from the bottom up: the built-in defaults, then `host`, then
+  ## the flags in `config.budgetFlags`. Used at start and by every reload, so
+  ## the two cannot disagree about precedence -- and a reload is computed
+  ## from the defaults rather than from whatever the previous file left,
+  ## which is what lets `runquota config unset` take a key back to its
+  ## default under a running daemon.
+  ##
+  ## Pools are the file's `[pools]` plus the `--pool` flags; a pool the file
+  ## no longer names is gone (its cap is 0, so new demands for it are
+  ## refused and leases already granted in it keep running).
+  if config.builtinMemoryBytes.value == 0:
+    config.builtinMemoryBytes = config.memoryBytes
+  if config.builtinCpuSlots.value == 0:
+    config.builtinCpuSlots = config.cpuSlots
+  let flags = config.budgetFlags
+  config.memoryBytes =
+    if flags.memoryBytes.isSome: flags.memoryBytes.get
+    elif host.memoryBytes.isSome: bytes(host.memoryBytes.get)
+    else: config.builtinMemoryBytes
+  config.cpuSlots =
+    if flags.cpuSlots.isSome: flags.cpuSlots.get
+    elif host.cpuMilli.isSome: milliCpu(host.cpuMilli.get)
+    else: config.builtinCpuSlots
+  var pools = initTable[string, uint32]()
+  for name, units in host.pools:
+    pools[name] = units
+  for name, units in flags.pools:
+    pools[name] = units
+  config.namedPoolCaps = pools
 
 proc machineCapacity*(id: string; cpuSlots: MilliCpu; memoryBytes: Bytes;
                       ioSlots: uint32; cpuShareGroup = ""): MachineCapacity =
@@ -970,6 +1016,23 @@ proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
     "}")
   result.add("]}")
 
+proc pinnedKeys*(flags: BudgetFlags): seq[string] =
+  ## The host-file keys a flag overrides for this launch, in the file's own
+  ## spelling (`HostConfigReloadedMessage.pinnedByFlags`).
+  if flags.machines:
+    result.add("machine")
+  else:
+    if flags.memoryBytes.isSome:
+      result.add("machine.memory_bytes")
+    if flags.cpuSlots.isSome:
+      result.add("machine.cpu_milli")
+  var names: seq[string] = @[]
+  for name in flags.pools.keys:
+    names.add(name)
+  names.sort()
+  for name in names:
+    result.add("pools." & name)
+
 proc topologyJson(daemon: RunQuotaDaemon): string =
   var machineIds: seq[string] = @[]
   for id in daemon.config.machines.keys:
@@ -1000,7 +1063,30 @@ proc topologyJson(daemon: RunQuotaDaemon): string =
       "\"id\":" & jsonEscape(group.id) & "," &
       "\"cpu_milli\":" & $group.cpuSlots.value &
     "}")
-  result.add("]}")
+  # WHERE THE BUDGET CAME FROM, beside the budget. A machine row alone does
+  # not say whether 94 GiB is the operator's file, a flag, or the 75% default,
+  # and that is the first question a refused lease raises.
+  var poolNames: seq[string] = @[]
+  for name in daemon.config.namedPoolCaps.keys:
+    poolNames.add(name)
+  poolNames.sort()
+  result.add("],\"pools\":[")
+  for i, name in poolNames:
+    if i > 0:
+      result.add(",")
+    result.add("{\"name\":" & jsonEscape(name) & ",\"units\":" &
+      $daemon.config.namedPoolCaps[name] & "}")
+  result.add("],\"host_config\":{" &
+    "\"path\":" & jsonEscape(daemon.config.hostConfigPath) & "," &
+    "\"source\":" & jsonEscape(daemon.config.hostConfigSource) & "," &
+    "\"reloads\":" & $daemon.hostConfigReloads & "," &
+    "\"reloads_refused\":" & $daemon.hostConfigReloadsRefused & "," &
+    "\"pinned_by_flags\":[")
+  for i, key in daemon.config.budgetFlags.pinnedKeys:
+    if i > 0:
+      result.add(",")
+    result.add(jsonEscape(key))
+  result.add("]}}")
 
 proc estimatesJson(daemon: RunQuotaDaemon): string =
   var keys: seq[string] = @[]
@@ -2378,6 +2464,118 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
       updated.queueDiagnostic = daemon.waitingDiagnostic(lease)
       daemon.leases[id] = updated
 
+proc reloadHostConfig*(daemon: var RunQuotaDaemon): HostConfigReloadedMessage =
+  ## Re-read the host budget file and put it in force, under a running
+  ## daemon (`reprobuild-specs/RunQuota-Host-Configuration.md`, "Changing
+  ## it under a running daemon").
+  ##
+  ## A FILE THAT DOES NOT PARSE CHANGES NOTHING: `readHostConfig` raises
+  ## `HostConfigError` before any field is touched, and the caller answers
+  ## with the file and line. The budget in force stays the last one that
+  ## parsed -- the same "a half-read budget is worse than none" rule that
+  ## stops the daemon at start, applied where stopping is not an option.
+  ##
+  ## WHAT A NEW BUDGET DOES TO LEASES, which is the whole of the decision:
+  ##
+  ## * GRANTED LEASES ARE NEVER REVOKED. A lease is a promise the client has
+  ##   already acted on -- its process is running -- and RunQuota neither
+  ##   spawns nor kills process trees. After a shrink the granted total can
+  ##   exceed the budget; `fitsNow` then admits nothing new until enough of
+  ##   them finish, exactly as if the host had been started at the smaller
+  ##   budget with that work already running.
+  ## * QUEUED LEASES ARE ADMITTED AGAINST THE NEW BUDGET. A grow promotes
+  ##   whatever now fits, here, before the reply; the clients see the grants
+  ##   on their next `GrantNext`.
+  ## * A QUEUED LEASE THE NEW BUDGET CAN NEVER HOLD IS DENIED, not left
+  ##   waiting: it is larger than the whole machine (or names a pool the file
+  ##   dropped), so waiting cannot end. It leaves the queue now -- a queued
+  ##   benchmark would otherwise keep gating every other lease -- and the
+  ##   denial is delivered on its session's next `GrantNext`, with the same
+  ##   reason `possible` gives a fresh request of that size.
+  ##
+  ## Flags still win: `budgetFlags` is re-applied over the file, and the
+  ## answer names what they pin so an operator who edited a pinned key is
+  ## told it had no effect.
+  let host = readHostConfig(daemon.config.hostConfigPath)
+  var next = daemon.config
+  next.resolveBudget(host)
+  if next.budgetFlags.machines:
+    # `--machine` pinned the topology; `config.cpuSlots`/`memoryBytes`
+    # describe its `local` machine (see `normalizeTopology`), not the file.
+    if next.machines.hasKey(DefaultMachineId):
+      let local = next.machines[DefaultMachineId]
+      next.cpuSlots = local.cpuSlots
+      next.memoryBytes = local.memoryBytes
+  elif next.machines.hasKey(DefaultMachineId):
+    var local = next.machines[DefaultMachineId]
+    local.cpuSlots = next.cpuSlots
+    local.memoryBytes = next.memoryBytes
+    next.machines[DefaultMachineId] = local
+    let group = local.cpuShareGroup
+    if group notin next.budgetFlags.cpuShareGroups and
+        next.cpuShareGroups.hasKey(group):
+      next.cpuShareGroups[group] = cpuShareGroup(group, next.cpuSlots)
+  next.hostConfigSource = host.sourcePath
+  daemon.config = next
+  inc daemon.hostConfigReloads
+
+  var doomed: seq[uint64] = @[]
+  for id, lease in daemon.leases.pairs:
+    if lease.state == leaseStateQueued:
+      var reason = ""
+      if not daemon.possible(lease.resources, reason):
+        doomed.add(id)
+  for id in doomed:
+    let lease = daemon.leases[id]
+    var reason = ""
+    discard daemon.possible(lease.resources, reason)
+    daemon.pendingDenials.mgetOrPut(lease.sessionId.value, @[]).add(
+      lease.leaseDecision(leaseDecisionDenied, diagnostic(diagDenied, reason,
+        "the host budget was reloaded while this lease was queued, and the " &
+        "budget in force can never hold it")))
+    daemon.removeLeaseFromTable(id)
+
+  let promoted = daemon.tryPromoteQueued()
+  let usage = daemon.machineUsage.getOrDefault(DefaultMachineId,
+    MachineUsage())
+  var pools: seq[NamedPoolCapWire] = @[]
+  var poolNames: seq[string] = @[]
+  for name in daemon.config.namedPoolCaps.keys:
+    poolNames.add(name)
+  poolNames.sort()
+  for name in poolNames:
+    pools.add(NamedPoolCapWire(name: name,
+      units: daemon.config.namedPoolCaps[name]))
+  HostConfigReloadedMessage(
+    configPath: daemon.config.hostConfigPath,
+    sourcePath: host.sourcePath,
+    memoryBytes: daemon.config.memoryBytes.value,
+    cpuMilli: daemon.config.cpuSlots.value,
+    pools: pools,
+    pinnedByFlags: daemon.config.budgetFlags.pinnedKeys,
+    promotedLeases: uint32(promoted.len),
+    memoryInUse: usage.memory,
+    cpuInUse: usage.cpu)
+
+proc grantNextDecisions*(daemon: var RunQuotaDaemon;
+                         sessionId: SessionId): seq[LeaseDecision] =
+  ## What a `GrantNext` from `sessionId` is answered with. Denials a reload
+  ## decided for this session's queued leases (`reloadHostConfig`) go out
+  ## first: they are final, and a client waiting on one of them has nothing
+  ## else to wait for. Then at most one grant not yet delivered.
+  discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
+  if daemon.pendingDenials.hasKey(sessionId.value):
+    result = daemon.pendingDenials[sessionId.value]
+    daemon.pendingDenials.del(sessionId.value)
+  for id, row in daemon.leases.pairs:
+    if row.sessionId.value == sessionId.value and
+        row.state == leaseStateGranted and not row.delivered:
+      var lease = row
+      lease.delivered = true
+      daemon.leases[id] = lease
+      result.add(lease.leaseDecision(leaseDecisionGranted))
+      break
+
 proc requireOwnedLease(daemon: RunQuotaDaemon; connection: var LocalConnection;
                        requestId: uint64; sessionId: SessionId;
                        id: LeaseId; lease: var LeaseRow): bool =
@@ -2436,6 +2634,7 @@ proc cleanupLostSession(daemon: var RunQuotaDaemon; sessionId: SessionId) =
   # visible in the data — the arithmetic stays self-consistent — which is
   # why it is reaped here rather than bounded by a timeout somewhere.
   daemon.reapSessionSelfReports(sessionId)
+  daemon.pendingDenials.del(sessionId.value)
   daemon.sessions.del(sessionId.value)
   discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
 
@@ -2487,6 +2686,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     # An orderly close is still a close: whatever the session reported and
     # did not end goes with it, by the same key the crash path uses.
     daemon.reapSessionSelfReports(msg.sessionId)
+    daemon.pendingDenials.del(msg.sessionId.value)
     daemon.sessions.del(msg.sessionId.value)
     connection.sendResponse(
       rqSessionClosed,
@@ -2635,16 +2835,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       connection.sendError(frame.header.requestId, diagnostic(
           diagInvalidArgument, "unknown session id"))
       return
-    discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
-    var decisions: seq[LeaseDecision] = @[]
-    for id, row in daemon.leases.pairs:
-      if row.sessionId.value == msg.sessionId.value and
-          row.state == leaseStateGranted and not row.delivered:
-        var lease = row
-        lease.delivered = true
-        daemon.leases[id] = lease
-        decisions.add(lease.leaseDecision(leaseDecisionGranted))
-        break
+    let decisions = daemon.grantNextDecisions(msg.sessionId)
     connection.sendResponse(
       rqLeaseDecisionBatch,
       frame.header.requestId,
@@ -2835,6 +3026,33 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
   of rqStatusRequest:
     connection.sendResponse(rqStatusResponse, frame.header.requestId,
         encodeStatus(daemon.status()))
+  of rqReloadHostConfig:
+    # NO AUTHORISATION BEYOND THE CONNECTION, on purpose: the request names
+    # no values. The daemon re-reads the one file it was started with, which
+    # only the host's administrators can write, so the worst a client can do
+    # is make the daemon enforce what the operator wrote down.
+    if frame.payload.len != 0:
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "ReloadHostConfig carries no payload"))
+      return
+    try:
+      let answer = daemon.reloadHostConfig()
+      try:
+        echo "runquotad: host configuration reloaded: " & reloadReport(answer)
+      except CatchableError:
+        discard
+      connection.sendResponse(rqHostConfigReloaded, frame.header.requestId,
+          encodeHostConfigReloaded(answer))
+    except HostConfigError as err:
+      inc daemon.hostConfigReloadsRefused
+      let message = "host configuration not reloaded, the budget in " &
+        "force is unchanged: " & err.msg
+      try:
+        echo "runquotad: " & message
+      except CatchableError:
+        discard
+      connection.sendError(frame.header.requestId, diagnostic(
+          diagInvalidArgument, message))
   of rqStatsQuery:
     # THE READ PATH, OVER THE SOCKET. Request/response with a variable-size
     # result, which is why it is here and not on the observation ring: the
