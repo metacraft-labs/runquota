@@ -77,7 +77,7 @@
 ## know it, which is exactly the claim the carried-row quarantine exists to
 ## avoid making.
 
-import std/[algorithm, options, os, strutils, times]
+import std/[algorithm, options, os, strutils, tables, times]
 
 import ./canonical, ./extensions, ./schema, ./sqlite_cli, ./store
 
@@ -135,13 +135,44 @@ proc linesOf(path, sql: string): seq[string] =
     if line.len > 0:
       result.add(line)
 
-proc tableExistsIn(path, table: string): bool =
-  scalarOf(path, "select count(*) from sqlite_master where type = 'table' " &
-    "and name = " & encodeText(table) & ";") == 1
+proc columnsOfTables(path: string; names: openArray[string]):
+    Table[string, seq[string]] =
+  ## Read just this merge's tables in one SQLite process. Hex preserves
+  ## opaque column names, including separators and newlines.
+  var requested: seq[string] = @[]
+  for name in names:
+    requested.add(encodeText(name))
+  result = initTable[string, seq[string]]()
+  if requested.len == 0:
+    return
+  for line in linesOf(path,
+      "select hex(m.name) || '|' || hex(i.name) from sqlite_master m, " &
+      "pragma_table_info(m.name) i where m.type = 'table' and m.name in (" &
+      requested.join(", ") & ") order by m.name, i.cid;"):
+    let parts = line.split('|')
+    if parts.len != 2:
+      return initTable[string, seq[string]]()
+    try:
+      result.mgetOrPut(parseHexStr(parts[0]), @[]).add(parseHexStr(parts[1]))
+    except ValueError:
+      return initTable[string, seq[string]]()
 
-proc columnsOf(path, table: string): seq[string] =
-  linesOf(path, "select name from pragma_table_info(" & encodeText(table) &
-    ") order by cid;")
+proc mergeCounts(path: string): seq[int64] =
+  ## One process and one read snapshot for users, the spine and quarantine.
+  var expressions: seq[string] = @[]
+  for table in @["users"] & @mergedSpineTables & @[carriedExtensionTable]:
+    expressions.add("(select count(*) from " & quoteIdentifier(table) & ")")
+  let outcome = runSqlite(path, "select " & expressions.join(", ") & ";")
+  if not outcome.ok:
+    return @[]
+  let parts = outcome.output.strip().split('|')
+  if parts.len != expressions.len:
+    return @[]
+  for part in parts:
+    try:
+      result.add(parseBiggestInt(part))
+    except ValueError:
+      return @[]
 
 proc sharedColumns(destination, source: seq[string]): seq[string] =
   ## The columns both sides have, in the DESTINATION's order. A source
@@ -159,8 +190,10 @@ proc hostDimensionDetail*(sourcePath: string): string =
   ##
   ## Three distinct failures, because they are three distinct ways to lose
   ## OS-6 and a reader of the refusal needs to know which one happened.
+  let sourceTables = linesOf(sourcePath,
+    "select name from sqlite_master where type = 'table';")
   for table in mergedSpineTables:
-    if not tableExistsIn(sourcePath, table):
+    if table notin sourceTables:
       return "source has no " & table & " table"
 
   let danglingHosts = scalarOf(sourcePath,
@@ -396,12 +429,18 @@ proc mergeObservationStore*(destination: ObservationStore;
     result.detail = owners
     return
 
-  let usersBefore = scalarOf(destination.path, "select count(*) from users;")
-  var before: seq[int64] = @[]
-  for table in mergedSpineTables:
-    before.add(scalarOf(destination.path, "select count(*) from " & table & ";"))
-  let carriedBefore = scalarOf(destination.path,
-    "select count(*) from " & carriedExtensionTable & ";")
+  let before = mergeCounts(destination.path)
+  if before.len == 0:
+    result.detail = "destination row counts could not be read"
+    return
+  var extensionTables: seq[string] = @[]
+  for table in sourceExtensionTables(sourcePath):
+    if isStorableIdentifier(table[extensionTablePrefix.len .. ^1]):
+      extensionTables.add(table)
+  let requestedTables = @mergedSpineTables & extensionTables
+  let sourceColumnsByTable = columnsOfTables(sourcePath, requestedTables)
+  let destinationColumnsByTable = columnsOfTables(destination.path,
+                                                requestedTables)
 
   # ATTACH cannot run inside a transaction, so the batch is attach, one
   # transaction, detach. Everything that writes is inside the transaction:
@@ -413,8 +452,8 @@ proc mergeObservationStore*(destination: ObservationStore;
   # refused by the destination's schema.
   sql.add(usersMergeStatement())
   for table in mergedSpineTables:
-    let columns = sharedColumns(columnsOf(destination.path, table),
-                                columnsOf(sourcePath, table))
+    let columns = sharedColumns(destinationColumnsByTable.getOrDefault(table),
+                                sourceColumnsByTable.getOrDefault(table))
     if columns.len == 0:
       result.detail = "no shared columns in " & table
       return
@@ -423,11 +462,9 @@ proc mergeObservationStore*(destination: ObservationStore;
       table & ";\n")
 
   var extensionRowsBefore = 0'i64
-  for table in sourceExtensionTables(sourcePath):
+  for table in extensionTables:
     let extensionId = table[extensionTablePrefix.len .. ^1]
-    if not isStorableIdentifier(extensionId):
-      continue
-    let sourceColumns = columnsOf(sourcePath, table)
+    let sourceColumns = sourceColumnsByTable.getOrDefault(table)
     if keyHostColumn notin sourceColumns or
         keyExecutionColumn notin sourceColumns:
       # Not joinable to the spine, so there is nothing to attach it to.
@@ -438,7 +475,7 @@ proc mergeObservationStore*(destination: ObservationStore;
     let receiverKnows = known.isSome and known.get.schemaVersion >= version and
       destination.extensionTableExists(table)
     if receiverKnows:
-      let columns = sharedColumns(columnsOf(destination.path, table),
+      let columns = sharedColumns(destinationColumnsByTable.getOrDefault(table),
                                   sourceColumns)
       if columns.len == 0:
         continue
@@ -464,11 +501,13 @@ proc mergeObservationStore*(destination: ObservationStore;
     result.detail = destination.lastError
     return
 
-  result.usersAdded = scalarOf(destination.path,
-    "select count(*) from users;") - usersBefore
+  let after = mergeCounts(destination.path)
+  if after.len == 0:
+    result.detail = "merge committed, but destination row counts could not be read"
+    return
+  result.usersAdded = after[0] - before[0]
   for i, table in mergedSpineTables:
-    let added = scalarOf(destination.path,
-      "select count(*) from " & table & ";") - before[i]
+    let added = after[i + 1] - before[i + 1]
     case table
     of "hosts": result.hostsAdded = added
     of "host_profiles": result.hostProfilesAdded = added
@@ -476,8 +515,7 @@ proc mergeObservationStore*(destination: ObservationStore;
     of "executions": result.executionsAdded = added
     of "ambient_samples": result.ambientSamplesAdded = added
     else: discard
-  result.carriedRowsAdded = scalarOf(destination.path,
-    "select count(*) from " & carriedExtensionTable & ";") - carriedBefore
+  result.carriedRowsAdded = after[^1] - before[^1]
   var extensionRowsAfter = 0'i64
   for extensionId in result.knownExtensions:
     extensionRowsAfter += scalarOf(destination.path,
