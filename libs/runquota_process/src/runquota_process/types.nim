@@ -22,8 +22,8 @@ type
     stderrLimit*: int
     createProcessGroup*: bool
     isolateEnvironment*: bool
-      ## When true the child starts from `env` ALONE: nothing is inherited
-      ## from the launcher's own environment. Negative-sense so the zero value
+      ## When true the launcher supplies `env` ALONE: nothing is inherited
+      ## from its own environment. Negative-sense so the zero value
       ## keeps the historical behaviour (inherit, then layer `env` on top) for
       ## every caller that builds a `CommandSpec` without naming it.
       ##
@@ -31,6 +31,9 @@ type
       ## child's inputs cannot include variables it never declared (reprobuild
       ## Dev-Env-Warm-Entry.md §2). Such a caller must pass everything the
       ## child needs, `PATH` included.
+      ## The OS loader may normalize reserved platform variables: Windows x64
+      ## emulation sets `PROCESSOR_ARCHITECTURE=AMD64` even for an explicit
+      ## block. Declare the target architecture when composing such a block.
 
   LaunchResult* = object
     processId*: uint64

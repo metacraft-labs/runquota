@@ -14,7 +14,7 @@
 ##
 ## MOCKS: none. Real processes, launched by the production launcher.
 
-import std/[os, strutils, unittest]
+import std/[algorithm, os, strutils, unittest]
 
 import runquota_process
 
@@ -22,6 +22,19 @@ const
   DumpArgument = "--dump-environment"
   LauncherOnly = "RQ_TEST_LAUNCHER_ONLY"
   Declared = "RQ_TEST_DECLARED"
+
+when defined(windows):
+  # x64-on-ARM Windows adds/normalizes this reserved variable even when
+  # CreateProcessW receives an explicit environment block. Declare the target
+  # architecture so the exact comparison still rejects every undeclared key.
+  const WindowsArchitecture =
+    when defined(amd64): "AMD64"
+    elif defined(arm64): "ARM64"
+    else: "x86"
+  const DeclaredEnvironment = [Declared & "=yes",
+    "PROCESSOR_ARCHITECTURE=" & WindowsArchitecture]
+else:
+  const DeclaredEnvironment = [Declared & "=yes"]
 
 if paramCount() == 1 and paramStr(1) == DumpArgument:
   for key, value in envPairs():
@@ -32,7 +45,7 @@ if paramCount() == 1 and paramStr(1) == DumpArgument:
 proc childEnvironment(isolate: bool): string =
   var child = launchProcess(commandSpec(
     [getAppFilename(), DumpArgument],
-    env = [Declared & "=yes"],
+    env = DeclaredEnvironment,
     isolateEnvironment = isolate))
   defer: child.close()
   let completion = child.waitForCompletion(timeout = 10_000)
@@ -46,15 +59,17 @@ suite "isolated child environment":
   test "an inheriting child sees the launcher's environment and the declared one":
     let dump = childEnvironment(isolate = false)
     check (LauncherOnly & "=leaks") in dump
-    check (Declared & "=yes") in dump
+    for entry in DeclaredEnvironment:
+      check entry in dump
 
   test "an isolated child sees ONLY the declared environment":
     let dump = childEnvironment(isolate = true)
     check (LauncherOnly & "=") notin dump
-    check (Declared & "=yes") in dump
-    var names: seq[string] = @[]
+    var entries: seq[string] = @[]
     for line in dump.splitLines():
-      let eq = line.find('=')
-      if eq > 0:
-        names.add(line[0 ..< eq])
-    check names == @[Declared]
+      if line.len > 0:
+        entries.add(line)
+    var expected = @DeclaredEnvironment
+    entries.sort()
+    expected.sort()
+    check entries == expected
