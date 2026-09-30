@@ -88,3 +88,30 @@ and compare repeated monitored/native runs of the same binaries before
 changing a deadline or runtime behavior. Keep every assertion and the full
 ordinary release gate. Refreshed dev `0bce530` and searched current/deleted
 readiness records; this is a recurrence of the existing issue.
+
+## Focused controls and complete-graph observation
+
+Diagnostic `36716116358` at tooling `cea927f` records a passing focused graph,
+one complete passing native/monitored pair and a second passing native run.
+The second monitored log contains all eight successful fixture assertions,
+but its wrapper exit was not recorded before cancellation, so it is not
+counted as a completed comparison. Every recorded daemon reaches its pipe
+within the original readiness bound; one monitored `startProcess` itself
+takes 5682 ms before the readiness wait starts. This does not reproduce the
+full-graph failure.
+
+The repeated `repro exec` environment setup consumes many minutes per sample.
+Tooling `9ef9750` enters that environment once for all eight pairs, and its
+startup-output collector reads only already-buffered bytes instead of waiting
+for EOF that a descendant could retain. These are diagnostic corrections, not
+established causes of the original readiness failure. Windows Nim checks pass
+for both instrumented sources, and both PowerShell scripts and the workflow
+pass syntax/lint checks.
+
+At exact RunQuota `7036462`, full-graph observation
+[36723729088](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36723729088)
+keeps every test and adds the startup checkpoints. Paired focused comparison
+[36723733885](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36723733885)
+uses the same instrumentation and one environment. Both use tooling `9ef9750`.
+The superseded `cea927f` and `3020d7e` diagnostics were cancelled explicitly;
+ordinary release gates and the independent ARM compiler trace continue.
