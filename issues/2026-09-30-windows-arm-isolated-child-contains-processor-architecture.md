@@ -1,6 +1,7 @@
 # Windows ARM-host isolated child contains PROCESSOR_ARCHITECTURE
 
-Status: open. RunQuota `70364629d5214bf4be9ac760d63e572fc257b111`.
+Status: focused repair verified at `48bb701`; complete CI and integration pending.
+Observed at RunQuota `70364629d5214bf4be9ac760d63e572fc257b111`.
 
 ## Observed
 
@@ -59,3 +60,20 @@ fixture and repaired fixture on both real hosts, then reintroduce environment
 inheritance as a negative control and require that control to fail.
 
 Refreshed dev `0bce530` and agents `5bba14b` before selecting this repair.
+
+## Real repair and negative-control validation
+
+[36725477372](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36725477372)
+at tooling `ac3f4f3` compares RunQuota `48bb701` with the unchanged fixture from
+`7036462`. Native x64 passes both original and repaired fixtures. The ARM host
+reproduces the original `PROCESSOR_ARCHITECTURE` failure and passes both
+repaired assertions. Reintroducing the real launcher inheritance path makes
+the repaired fixture fail on both hosts, rejecting the launcher sentinel and
+the extra parent entry. All six processes finish normally within their bounds.
+Each comparison uses a deliberately small synthetic parent environment, so
+the negative control cannot print CI credentials. Exact binary hashes and all
+logs are retained in the run artifacts.
+
+Both native macOS assertions also pass at `48bb701`; its Windows x64 and ARM64
+Nim source checks pass. The recipe's existing monitor isolation and uncached
+execution remain unchanged. No production launcher logic changes.

@@ -59,3 +59,17 @@ state and matched native/monitored controls. No deadlines or assertions are
 relaxed. Evidence is in `/tmp/runquota-703-windows-arm-evidence` and the full
 job log `/tmp/runquota-703-windows-arm.log`. Refreshed dev `0bce530` and agents
 `04a74d2` before extending this issue.
+
+## Test scheduling comparison
+
+The environment failure has a separate verified fixture repair at `48bb701`.
+The seven remaining failed programs are compared, unchanged, in
+[36726271653](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36726271653)
+at tooling `ce0d17e`. One monitored build supplies the same binaries for
+parallel, serial and parallel execution on one ARM host. The admission caps
+are eight, one and eight; the report's launch/completion trace can establish
+the actual overlap. Every execution is uncached and must really launch. The
+fixture deadlines, assertions, monitoring and internal concurrency (including
+all 32 concurrent clients) remain intact. Hashes must remain equal across all
+three runs. This is a diagnostic of competing fixture work, not a selected
+CI scheduling repair. Complete ordinary validation remains required.
