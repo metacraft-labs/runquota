@@ -517,5 +517,15 @@ still establishes the reduced SQLite-launch count. Evidence:
 Native CI `36788909146` at retention candidate `f93855c` passes all ten
 jobs. The x64 retention comparison `36788891396` at `cfff6c3` passes all
 12 cases; store-retention takes 67.7/68.2 seconds under monitoring, so that
-run does not establish a speedup. Its ARM comparison and ordinary full
-Reprobuild CI are still running. No test deadline or assertion changes.
+run does not establish a speedup. Its ARM comparison also passes all 12
+cases: monitored store-retention takes 280.5 seconds at `c6ddde6` and
+243.7 at `f93855c`; schedule takes 195.1/170.4 and extension tests
+180.8/164.3. All use the same compiler, SQLite and original debug monitor
+on the same worker. This is one ordered comparison, not a latency
+distribution. Evidence: `/tmp/runquota-retention-cfff-arm`.
+
+Full Reprobuild CI `36788912758` at `f93855c` passes both Linux jobs;
+macOS and Windows remain active. Separate candidate `7fd57f4` changes only
+the Windows hook pin to `d36cab8`, after that helper passes all 104 paired
+original/prepared Windows corpus cases. Its complete CI is `36792986046`
+and `36792989240`. No test deadline or assertion changes.
