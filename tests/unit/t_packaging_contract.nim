@@ -44,7 +44,9 @@
 ## inside a HELPER PROC prints its failure and lets the test report
 ## `[OK]`; this campaign has already been misled by that once.
 
-import std/[os, strutils, unittest]
+import std/[options, os, strutils, tables, unittest]
+
+import runquota_daemon/host_config
 
 const testSourceDir = currentSourcePath().parentDir()
 
@@ -187,3 +189,40 @@ suite "packaging contract":
       else:
         doAssert ch in {'0' .. '9', 'A' .. 'F'},
           "an UpgradeCode is upper-case hex: " & code
+
+  test "the seeded host file is the daemon's own template, byte for byte":
+    # Every package seeds `runquotad.toml` from `packaging/etc/`, and the
+    # daemon's `runquota config set` starts from `HostConfigTemplate` when
+    # there is no file. Two templates would be two answers to "what does a
+    # fresh host say"; and one the daemon's reader refused would make a
+    # fresh install refuse to start.
+    let packaged = readSource("packaging/etc/runquotad.toml")
+    doAssert packaged == HostConfigTemplate,
+      "packaging/etc/runquotad.toml differs from HostConfigTemplate in " &
+      "runquota_daemon/host_config; regenerate it from the constant"
+    let parsed = parseHostConfig(packaged, "packaging/etc/runquotad.toml")
+    doAssert parsed.memoryBytes.isNone and parsed.cpuMilli.isNone and
+      parsed.pools.len == 0,
+      "the seeded file must set no budget: installing it changes nothing"
+
+  test "the package provisions the host directory on Windows only":
+    let distText = readSource("packaging/runquota_dist.nim")
+    let recipe = readSource("packaging/repro.nim")
+    doAssert "result.hostDirectories = runQuotaHostDirectories(targetOs)" in
+      distText, "newRunQuotaDistribution no longer sets hostDirectories"
+    doAssert quotedValueAfter(distText, "HostConfigTemplatePath* =",
+      "the seeded file's build path") == "etc/runquotad.toml"
+    doAssert quotedValueAfter(distText, "HostConfigFileName* =",
+      "the seeded file's name") == extractFilename(hostConfigPath),
+      "the MSI would seed a file the daemon does not read"
+    # The POSIX conffile lands at /etc/runquota/<name>, which is where
+    # `hostConfigPath` points off Windows.
+    doAssert "component(crConfigFile, HostConfigTemplatePath," in recipe and
+      "subdir = \"runquota\"" in recipe,
+      "the POSIX packages no longer ship /etc/runquota/runquotad.toml"
+    let guid = quotedValueAfter(distText, "WindowsStateDirComponentGuid* =",
+      "the host directory's component GUID")
+    doAssert guid.len == 38 and guid[0] == '{' and guid[^1] == '}',
+      "not a {GUID}: " & guid
+    doAssert guid != quotedValueAfter(distText, "RunQuotaUpgradeCode* =",
+      "the MSI upgrade code"), "a component GUID must not be the UpgradeCode"

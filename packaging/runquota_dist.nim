@@ -76,6 +76,59 @@ const
     ## `runQuotaDaemonService`, whose `execArgs` is EMPTY. These three
     ## constants exist to be compared against the daemon's own
     ## compiled-in `hostWideStateDir`, not to be passed to it.
+    ##
+    ## On Windows the MSI also CREATES it (`runQuotaHostDirectories`),
+    ## because nothing else may: see `WindowsStateDirSddl`.
+
+  WindowsStateDirSddl* =
+    "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
+    ## The DACL the MSI gives `C:\ProgramData\runquota`: full control to
+    ## SYSTEM (the account the service runs as) and Administrators, read
+    ## and traverse (`0x1200a9`, icacls `RX`) to every user, and nothing
+    ## inherited (`P`). It is the documented one -- `docs/database.md`,
+    ## "On Windows: the owner and the DACL" -- and the one `runquotad`'s
+    ## own check accepts; `tests/unit/t_packaging_contract` holds the two
+    ## together. The directory's owner is the installer's (SYSTEM or
+    ## Administrators), which the daemon also accepts.
+    ##
+    ## PROTECTED IS THE POINT. `C:\ProgramData` hands every child
+    ## `BUILTIN\Users:(CI)(WD,AD,WEA,WA)`, so an inheriting directory lets
+    ## any local user create `host-id` or `runquotad.toml` before the
+    ## daemon or the operator does, and own it.
+
+  WindowsStateDirComponentGuid* = "{2075ECC8-613F-4369-8C21-83B06C259533}"
+    ## The Windows Installer component that creates the directory.
+    ## Generated once and pasted, like `RunQuotaUpgradeCode`, and for the
+    ## same reason it must never change.
+
+  HostConfigFileName* = "runquotad.toml"
+  HostConfigTemplatePath* = "etc/runquotad.toml"
+    ## The host budget file every package seeds, project-relative. Its
+    ## bytes are `HostConfigTemplate` in `runquota_daemon/host_config`
+    ## (`tests/unit/t_packaging_contract` refuses a drift): every key
+    ## commented out, so installing it changes no budget -- the daemon's
+    ## built-in default is 75% of physical memory -- and the operator
+    ## finds the file, and what it can say, where the daemon reads it.
+    ##
+    ## Seeded ONCE on every format: an MSI seed is `NeverOverwrite` and
+    ## `Permanent`, and the POSIX packages ship it as a conffile /
+    ## `%config(noreplace)` at `/etc/runquota/runquotad.toml`. After the
+    ## first install it is the operator's file, written with `runquota
+    ## config set`.
+
+func runQuotaHostDirectories*(targetOs: TargetOs): seq[HostDirectory] =
+  ## What the installer provisions outside the prefix. Windows only: the
+  ## POSIX packages' `/etc/runquota` comes from the conffile itself (dpkg
+  ## and rpm create it root-owned, 0755), and `/var/lib/runquota` belongs
+  ## to the daemon's service account, which the Nix modules create and a
+  ## deb or rpm does not yet (`docs/database.md`, "By hand").
+  if targetOs == toWindows:
+    result = @[HostDirectory(
+      path: WindowsStateDir,
+      windowsSddl: WindowsStateDirSddl,
+      windowsComponentGuid: WindowsStateDirComponentGuid,
+      seedFiles: @[HostSeedFile(name: HostConfigFileName,
+        buildPath: HostConfigTemplatePath)])]
 
 func runQuotaStateDir*(targetOs: TargetOs): string =
   ## The daemon's state root FOR THE TARGET. A per-target value rather
@@ -115,15 +168,16 @@ proc runQuotaDaemonService*(targetOs: TargetOs): ServiceDef =
   ##
   ## ## NOT started at boot, and that is a decision rather than caution
   ##
-  ## `defaultDaemonConfig` guesses this host's capacity —
-  ## `countProcessors() * 1000` milli-CPU and a flat 16 GiB — because it
-  ## has to answer something. Those are placeholders for the numbers an
-  ## operator measures, and a daemon started at boot with them would
-  ## begin governing a machine's build capacity against a budget nobody
-  ## chose, on the first reboot after installation. Installing the
-  ## software and handing it authority over a machine are two decisions,
-  ## and the package makes only the first. The runbook's post-install
-  ## step is where the second one is made.
+  ## `defaultDaemonConfig` sizes the budget from the host --
+  ## `countProcessors() * 1000` milli-CPU and 75% of physical memory
+  ## (decided 2026-09-30; it was a flat 16 GiB) -- because it has to
+  ## answer something. That is a better guess than the constant was, and
+  ## still a guess: a daemon started at boot would begin governing a
+  ## machine's build capacity against a budget nobody chose, on the first
+  ## reboot after installation. Installing the software and handing it
+  ## authority over a machine are two decisions, and the package makes
+  ## only the first. The seeded `runquotad.toml` (`HostConfigTemplatePath`)
+  ## and `runquota config set` are where the operator makes the second.
   ##
   ## ## `execArgs` IS EMPTY, deliberately
   ##
@@ -246,6 +300,7 @@ proc newRunQuotaDistribution*(version: string; targetOs: TargetOs;
   result.runtime.dlopenLeafNames = @[]
   result.runtime.wrapExecutables = false
   result.services = @[runQuotaDaemonService(targetOs)]
+  result.hostDirectories = runQuotaHostDirectories(targetOs)
   result.metadata = DistMetadata(
     summary: "RunQuota — a host-wide resource lease authority",
     description: "RunQuota bounds the load a machine accepts. One " &

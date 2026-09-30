@@ -103,6 +103,7 @@
                 system.stateVersion = 5;
                 system.primaryUser = hostState.user;
                 services.runquotad.enable = true;
+                services.runquotad.hostConfig.memoryBytes = 25769803776;
               }
             ];
           };
@@ -118,6 +119,11 @@
                 };
                 system.stateVersion = "24.05";
                 services.runquotad.enable = true;
+                services.runquotad.hostConfig = {
+                  memoryBytes = 103079215104;
+                  cpuMilli = 16000;
+                  pools.compile = 8;
+                };
               }
             ];
           };
@@ -245,7 +251,10 @@
             module-eval =
               pkgs.runCommand "runquota-module-eval"
                 {
-                  darwinActivation = darwinEval.config.system.activationScripts.runquotadStateDir.text;
+                  # Context discarded: with `hostConfig` set the script calls
+                  # `runquota config reload` from the aarch64-darwin package,
+                  # and this EVALUATION check must not demand that build.
+                  darwinActivation = builtins.unsafeDiscardStringContext darwinEval.config.system.activationScripts.runquotadStateDir.text;
                   # The VALUES, not the attribute names: nix-darwin
                   # declares every launchd key whether or not it was set,
                   # so a grep over the names would pass against a module
@@ -259,6 +268,11 @@
                       ;
                   };
                   nixosTmpfiles = builtins.toJSON nixosEval.config.systemd.tmpfiles.rules;
+                  # The host budget file each module renders, which the
+                  # daemon's strict reader must accept.
+                  nixosHostConfig = nixosEval.config.environment.etc."runquota/runquotad.toml".text;
+                  darwinHostConfig = darwinEval.config.environment.etc."runquota/runquotad.toml".text;
+                  nixosReload = builtins.unsafeDiscardStringContext nixosEval.config.systemd.services.runquotad.serviceConfig.ExecReload;
                   # `ExecStart` is dropped deliberately: it carries the
                   # x86_64-linux package's store path, and keeping it here
                   # would make this EVALUATION check demand a Linux BUILD.
@@ -267,6 +281,7 @@
                   nixosService = builtins.toJSON (
                     removeAttrs nixosEval.config.systemd.services.runquotad.serviceConfig [
                       "ExecStart"
+                      "ExecReload"
                     ]
                   );
                 }
@@ -286,6 +301,17 @@
                   grep -F '${hostState.endpointDirectories.linux}' nixos-tmpfiles
                   grep -F '${hostState.endpointDirectoryMode}' nixos-tmpfiles
                   grep -F '${hostState.group}' nixos-tmpfiles
+
+                  printf '%s' "$nixosHostConfig" > nixos-host-config
+                  grep -Fx 'schema = "runquota.host-config.v1"' nixos-host-config
+                  grep -Fx 'memory_bytes = 103079215104' nixos-host-config
+                  grep -Fx 'cpu_milli = 16000' nixos-host-config
+                  grep -Fx 'compile = 8' nixos-host-config
+                  grep -F 'd /etc/runquota 0755 root root -' nixos-tmpfiles
+                  printf '%s' "$nixosReload" | grep -F 'runquota config reload'
+                  printf '%s' "$darwinHostConfig" > darwin-host-config
+                  grep -Fx 'memory_bytes = 25769803776' darwin-host-config
+                  grep -F '/etc/runquota' darwin-activation
 
                   printf '%s' "$nixosService" > nixos-service
                   grep -F 'RuntimeDirectory' nixos-service

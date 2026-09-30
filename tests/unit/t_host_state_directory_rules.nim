@@ -158,6 +158,39 @@ when defined(windows):
 
     test "processUserSid is this process's own account":
       check processUserSid() == currentUserSid()
+
+    proc packagedSddl(): string =
+      ## `WindowsStateDirSddl` from `packaging/runquota_dist.nim`, read as
+      ## text: that file compiles only against reprobuild's packaging layer,
+      ## which this suite must not need.
+      let text = readFile(currentSourcePath().parentDir().parentDir()
+        .parentDir() / "packaging" / "runquota_dist.nim")
+      let at = text.find("WindowsStateDirSddl* =")
+      doAssert at >= 0, "packaging/runquota_dist.nim has no WindowsStateDirSddl"
+      let open = text.find('"', at)
+      result = text[open + 1 ..< text.find('"', open + 1)]
+      doAssert result.startsWith("D:P"), "not a protected DACL: " & result
+
+    test "the DACL the MSI writes on C:\\ProgramData\\runquota is ACCEPTED":
+      # The MSI creates the host state directory with this SDDL
+      # (`runQuotaHostDirectories`); a package whose directory the daemon
+      # then refused would install cleanly and record nothing. Applied here
+      # with .NET's ACL API, not RunQuota's, onto a directory that first
+      # carried the C:\ProgramData Users-write ACE the SDDL must replace.
+      let dir = scratchDir("msi")
+      defer: removeDir(dir)
+      grantUsersCreate(dir)
+      check judge(dir).reason == trustBadAcl
+      setDaclSddl(dir, packagedSddl())
+      check judge(dir).reason == trustOk
+
+    test "the same DACL with a Users write right is REFUSED":
+      # The acceptance above one ACE away from a refusal: Users granted
+      # Modify (0x1301bf) where the package grants read and traverse.
+      let dir = scratchDir("msi-writable")
+      defer: removeDir(dir)
+      setDaclSddl(dir, packagedSddl().replace("0x1200a9", "0x1301bf"))
+      check judge(dir).reason == trustBadAcl
 else:
   import std/[os, posix, strutils, unittest]
 
