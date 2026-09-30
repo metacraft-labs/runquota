@@ -340,3 +340,15 @@ Evidence: `/tmp/windows-arm-prepared-all-8fd-evidence` and bounded action
 summary `/tmp/windows-arm-prepared-all-8fd-summary.json`. The diagnostic shim
 hash is `BBB2E1EE4B77C96F6D527DBBEB3763BCA33996A3CA44DE515B31F4309507D21E`.
 Refreshed dev `2c50aaf` and agents `057a60f` before extending this record.
+
+## Next diagnostic: observe a live test tree without changing its wait
+
+Use the current release sources and validated capture repair for a focused
+export/merge/retention comparison. Keep the real monitor, test binaries,
+assertions and GNU timeout's 600-second bound. Periodically read CPU times and
+the diagnostic shim's exported initialization phase in that invocation's own
+process tree. The observer must neither suspend threads nor terminate targets.
+A real child exporting a known phase must prove the reader works and that the
+child remains alive afterward. These observations can distinguish incomplete
+shim initialization from later execution; they do not identify a Windows
+wait's cause or replace the full ordinary CI gate.
