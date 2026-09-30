@@ -34,3 +34,20 @@ clamp controls.
 Fetched dev `0bce530` and searched open and resolved clamp, timestamp,
 compression and window-boundary issues. Earlier CPU sizing and pooled-ratio
 issues describe different assertions and are retained separately.
+
+## Real comparison and candidate repair
+
+Control `36681906030` at shared `49df90b` compiles the original `8cf662c`
+fixture with post-measurement timestamp output, and a variant that fills every
+64-bit word with random data and selects strict interior millisecond bins.
+All four full fixture runs pass (two per variant). Thus this control does not
+reproduce the original failure. The original memory ratios are 0.302 and
+0.749; the populated variants measure 0.694 and 0.692. Every existing sample
+count, liveness band and exact arithmetic assertion is unchanged.
+
+The candidate applies those fixture corrections and retains sample/window
+identity in failed clamp assertions. A millisecond that straddles the window's
+end can also contain the immediately following report removal; it cannot
+unambiguously represent the earlier state. The complete native and monitored
+macOS suites remain required. Keep this issue open until those results arrive;
+do not claim this passing comparison alone proves the earlier root cause.

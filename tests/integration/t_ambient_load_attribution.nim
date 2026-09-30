@@ -212,15 +212,13 @@ proc takeMemory(size: int; random: var Rand): MemoryLoad =
     let base = mmap(nil, size, PROT_READ or PROT_WRITE,
       MAP_PRIVATE or MAP_ANONYMOUS, -1, 0)
     doAssert base != MAP_FAILED, "mmap of " & $size & " bytes failed"
-  # Touched at page granularity with unpredictable bytes: an untouched
-  # anonymous page is never backed at all, and a compressible one is taken
-  # by the macOS memory compressor -- either would leave the allocation
-  # invisible to a host-wide "available memory" figure.
-  let bytes = cast[ptr UncheckedArray[byte]](base)
-  var offset = 0
-  while offset < size:
-    bytes[offset] = byte(random.rand(255))
-    offset += 4096
+  # Populate every word with unpredictable bytes. One random byte per page
+  # leaves almost the entire allocation zero and compressible, so mapped
+  # bytes no longer describe the resident load this control claims to add.
+  doAssert size mod sizeof(uint64) == 0
+  let words = cast[ptr UncheckedArray[uint64]](base)
+  for index in 0 ..< size div sizeof(uint64):
+    words[index] = next(random)
   MemoryLoad(base: base, size: size)
 
 proc release(load: var MemoryLoad) =
@@ -297,8 +295,11 @@ proc inWindows(rows: seq[AmbientSampleRow]; windows: openArray[Window]):
     seq[AmbientSampleRow] =
   for row in rows:
     for window in windows:
-      if row.sampledAtUnixMillis >= window.fromMillis and
-          row.sampledAtUnixMillis <= window.toMillis:
+      # Timestamps are truncated to milliseconds. The two boundary bins can
+      # include a sample from before entry or after exit (and its immediate
+      # state change). Only strict interior bins belong wholly to this window.
+      if row.sampledAtUnixMillis > window.fromMillis and
+          row.sampledAtUnixMillis < window.toMillis:
         result.add(row)
         break
 
@@ -1035,6 +1036,9 @@ suite "ambient_load_attribution":
           hostMemoryBytes - row.memAvailableBytes - declaredRss)
 
       for row in clampedRows:
+        checkpoint("clamp sample=" & $row.sampledAtUnixMillis &
+          " window=" & $clamped.fromMillis & ".." & $clamped.toMillis &
+          " selfCpu=" & $row.selfCpuPct & " selfRss=" & $row.selfRssBytes)
         check row.selfCpuPct == declaredCpu + 400.0
         check row.selfRssBytes == declaredRss + 512_000_000_000'i64
         # Clamped at zero rather than allowed to go negative.
