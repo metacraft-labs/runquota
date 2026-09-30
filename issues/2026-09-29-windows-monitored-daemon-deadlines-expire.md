@@ -167,3 +167,16 @@ startup-protocol and all eight lifecycle cases pass against `33add18` plus
 this diagnostic. Focused replacement `36734357209` runs the same `7036462`
 candidate; corrected full graph `36731094289` continues independently.
 Refreshed dev `2c50aaf` and agents `44bc56c` before recording this evidence.
+
+## CRLF diagnostic repair
+
+Run `36734357209` at tooling `71d7fe7` stops before compiling or executing the
+fixture: its anchored helper-phase regex does not match CRLF checkout lines.
+This is a diagnostic defect, not a new RunQuota failure. Tooling `30d78bd`
+normalizes disposable source and here-string anchors together and preserves
+original bytes for cleanup. A real CRLF conversion of all four edited files
+at RunQuota `33add18` passes Windows source checks, the native macOS public
+startup-protocol control, and all eight instrumented lifecycle cases. Cleanup
+is checked against the original CRLF bytes. Replacement focused run
+`36736205178` uses the same RunQuota `7036462` and unchanged fixture bounds.
+The independently corrected full graph `36731094289` continues.
