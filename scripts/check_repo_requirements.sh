@@ -73,6 +73,15 @@ require_contains flake.nix "static-helpers"
 require_contains flake.nix "git-hooks.lib"
 require_contains flake.nix "shellHook = pre-commit-check.shellHook"
 
+# ONE PRE-COMMIT HOOK, WRITTEN DOWN TWICE. git-hooks.nix generates the
+# Linux/macOS hook config from flake.nix; prek.toml carries the same hook for
+# prek, which is how a Windows repro shell runs it (nothing generates the
+# YAML there). Both must run `just lint`, so changing one without the other
+# fails here.
+require_file prek.toml
+require_contains flake.nix 'entry = "just lint";'
+require_contains prek.toml 'entry = "just lint"'
+
 for recipe in build test lint format fmt t bump-version build-package verify-package bench bench-quick bench-runquota-process-execution bench-runquota-ipc repomix check-repo-requirements check-static-helpers; do
   just --summary | tr ' ' '\n' | grep -Fxq "${recipe}" || fail "missing Justfile recipe ${recipe}"
 done
