@@ -503,3 +503,19 @@ The native merge times are 28.7/27.7 seconds. Both variants use the same
 compiler, SQLite and original debug monitor on the same worker. This is one
 run, not a latency distribution. Evidence: `/tmp/runquota-merge-batch-815-x64`.
 The ARM-host comparison in that run is still active.
+
+## Both Windows merge comparisons pass
+
+Tooling `8159a30`, run `36786810296`, now passes all 12 cases on both
+Windows hosts. On the ARM host, monitored merge takes 565.1 seconds at
+`a173baf` and 416.4 at `c6ddde6`; export takes 444.8/408.4 and users
+294.6/231.0 seconds. Native merge takes 55.7/43.1 seconds. This is one
+ordered paired run, not a latency distribution; the independent local count
+still establishes the reduced SQLite-launch count. Evidence:
+`/tmp/runquota-merge-batch-815-arm` and `/tmp/runquota-merge-batch-815-x64`.
+
+Native CI `36788909146` at retention candidate `f93855c` passes all ten
+jobs. The x64 retention comparison `36788891396` at `cfff6c3` passes all
+12 cases; store-retention takes 67.7/68.2 seconds under monitoring, so that
+run does not establish a speedup. Its ARM comparison and ordinary full
+Reprobuild CI are still running. No test deadline or assertion changes.

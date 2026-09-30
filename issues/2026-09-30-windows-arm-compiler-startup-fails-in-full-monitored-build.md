@@ -85,3 +85,19 @@ The report again lacks hook phase traces, so it does not establish the blocked
 API or a missing compiler file. No further unchanged retry is selected.
 Merge/retention batching candidates address test execution overhead separately;
 they do not repair this compiler-startup boundary.
+
+## Isolated full-graph page-preparation candidate
+
+`7fd57f4` is based on the native-CI-green `f93855c` application tree and
+changes only the Windows hook bootstrap input to `d36cab8`. That helper
+candidate prepares code-page protection transitions before suspending peers;
+its complete original/prepared 26-test Windows corpus passes on both hosts
+(104 case runs total, tooling `6875d29`, run `36792017491`). Both source
+variants pass, so the short corpus does not reproduce or prove repair of the
+compiler stall. It is the prerequisite behavior check for the full graph.
+
+The exact RunQuota source lock is published, remote blob
+`383b2708b2ece78200177a3fc8610fe7b6ae4f66` verified. Complete candidate
+CI is `36792986046` / `36792989240`. PR 35 remains at `a173baf`; this
+experimental input is not selected for a release until the full results pass.
+The ordinary `f93855c` run is retained as the unchanged-protection baseline.
