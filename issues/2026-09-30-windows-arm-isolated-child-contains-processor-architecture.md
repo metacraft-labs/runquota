@@ -35,3 +35,27 @@ remains required.
 Fetched dev `0bce530` and agents `04a74d2`; both are included locally. Searched
 open issues and their full history for environment, isolation and ARM. The
 monitor-injection and case-variant records describe distinct mechanisms.
+
+## OS control and fixture repair
+
+Direct API [36724192457](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36724192457)
+at tooling `80e9c493c2692e830ebf2712275d6f0a2c418ae1` passes on both hosts.
+On native x64, a literal block containing only `RQ_TEST_DECLARED=yes` yields
+that one variable. On the ARM host, the same x64 program yields that variable
+and `PROCESSOR_ARCHITECTURE=AMD64`. An explicitly supplied architecture sentinel
+is preserved on native x64 but replaced with `AMD64` on ARM. The real
+inheriting-child control observes the launcher sentinel on both hosts. No
+RunQuota or monitoring code participates in this control.
+
+Repair the fixture by explicitly declaring its compile-target architecture
+on Windows (`AMD64` for x64 and `ARM64` for native ARM64), while retaining the
+exact comparison of all child keys and values against the declared entries.
+Keep the launcher-only leak control and the ten-second child completion bound.
+This avoids accepting undeclared variables or a broad platform allowlist.
+Clarify the API comment: RunQuota supplies the declared environment only; an
+OS loader can normalize reserved platform variables. No launcher runtime
+change is needed for the behavior reproduced here. Validate the unchanged
+fixture and repaired fixture on both real hosts, then reintroduce environment
+inheritance as a negative control and require that control to fail.
+
+Refreshed dev `0bce530` and agents `5bba14b` before selecting this repair.
