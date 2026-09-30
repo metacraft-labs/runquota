@@ -435,3 +435,20 @@ stderr and status. This is measurement, not a replacement SQL implementation.
 The complete ordinary release matrix is still required before selecting the
 new candidate. This batching addresses excessive launch count; it is not
 claimed as a repair for the independent hook-protection compiler stall.
+
+## Repeated full runtime observation
+
+Diagnostic `36778919434` at tooling `d35cfcc`, using RunQuota `33add18`,
+hooks `def2464` and io-mon `5e71adf`, completes native retention/export/merge
+in 20.1/48.2/55.2 seconds. Monitored export and merge pass in 495.9 and
+623.9 seconds including monitor cleanup. Monitored retention fails in
+194.6 seconds: `waitFor(scFinished, 1)` remains zero in the bounded busy-host
+deferral case. Every other retention assertion passes. The unchanged merge
+can therefore complete under monitoring, but it is close to its execution
+bound and is not reliably green across runs.
+
+Evidence: `/tmp/runquota-runtime-d35-evidence`, including result JSON,
+per-test logs, exact binary hashes and source pins. This observer still has
+the known live-parent-tree gap; do not attribute its ancestor phase readings
+to an absent test process. The later `2bed024` comparison addresses that
+observation gap and remains a separate run.
