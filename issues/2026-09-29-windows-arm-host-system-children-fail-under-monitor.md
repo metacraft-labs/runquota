@@ -120,3 +120,28 @@ compilations cannot start `cc1.exe`. Its Windows x64 job passes monitored
 build/test, all 100 native test programs and all 12 static helper checks.
 The ARM report again contains no hook checkpoints. Evidence is retained at
 `/tmp/runquota-33add-arm-evidence`; the shared hook investigation remains active.
+
+## Complete compilation reaches six execution failures at the same candidate
+
+PR 35 [job 109955361175](https://github.com/metacraft-labs/runquota/actions/runs/36735298536/job/109955361175)
+at `33add18` passes compilation, then reports 189 successful actions, six
+failed programs and eight blocked measurement programs. Four executions reach
+the unchanged 600-second bound: process benchmark contract, standalone
+daemonless degradation, observation-store export and observation-store merge.
+Stats-table publication misses its ten-second wait although a later socket
+query returns the expected estimate. The retention-schedule unit program
+misses its existing completion waits in five cases. These ordinary logs do
+not locate the blocked child or distinguish monitor startup from competing
+work. Preserve that distinction; no deadline increase is justified.
+
+The fixed-image serial/parallel comparison `36735013860` at `b60cba4` remains
+active. Separately, the full compiler trace with one prepared protection range
+at `5383510` moves its two observed stalls to `Ws2_32!connect`, still before
+writable protection; the hook issue owns that evidence. The replacement full
+graph `36753037680` at tooling `8fd4eff` prepares every queued install range
+while preserving suspension around writes and every test. No production hook
+repair is selected yet.
+
+Evidence: `/tmp/runquota-33add-pr35-arm-evidence` and
+`/tmp/runquota-33add-pr35-arm-complete.log`. Refreshed dev `2c50aaf` and agents
+`ee77724` before adding this ordinary-CI result.

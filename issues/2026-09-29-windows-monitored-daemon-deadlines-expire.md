@@ -252,3 +252,18 @@ especially `native-5.log` and `results.json`. Daemon SHA-256 is
 fixture SHA-256 is
 `CCCD5E8D61E0E33A61D97B6A185A8E85B11F9B4542BAACA19CF223F4E7D018E4`.
 Refreshed dev `2c50aaf` and agents `339ab1e` before extending this record.
+
+Tooling `8fd4eff` adds the next failure observer in `36753042655`. It waits
+on the real Windows process with the same 3000 ms bound; only after expiry
+it records process CPU time and up to eight thread contexts, with balanced
+suspend/resume calls and bounded unwind addresses. It then terminates with
+Nim's original exit zero and explicitly marks the expired wait as a failure.
+No raw stack contents, environment values or arguments are retained. A real
+fast child must preserve exit 17; a real sleeping child must time out and
+yield an actual thread context before the paired fixture comparison runs.
+
+PowerShell transformation and full Windows x64 C compilation/link pass for
+the instrumented fixture at RunQuota `33add18`; the actual comparison retains
+`7036462`. The observer's standalone C control also compiles/links for Windows
+x64. Runtime controls and repeated comparisons remain pending in the new run.
+This changes only disposable diagnostics, not the release source.
