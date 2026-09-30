@@ -47,3 +47,25 @@ The test stage does not run. Ordinary eight-action CI `36643299557` at the
 same source fails launching `as.exe` from GCC. Lower concurrency alone is not
 a repair. The control retains process counts and the full build report in
 artifact `runquota-windows-arm-build-budget`.
+
+## Capture-repaired candidate still has a compiler launch failure
+
+Ordinary Reprobuild run `36765565687` at release candidate `a173baf`
+finishes on 2026-09-30 at 21:05 UTC with 102 successful build actions and
+one failed action, `runquota.test_build.t_host_load_reading_invariants`.
+GCC 16.1 cannot start its `cc1.exe` child and reports
+`CreateProcess: No such file or directory`. No test action runs on this host.
+The declared toolchain successfully compiles the other programs; the report
+does not measure whether the compiler file existed at the failed launch.
+
+This candidate selects hooks `def2464`, including the independently validated
+root-exit capture repair, while retaining original hook protection and
+context polling. The ordinary report has no hook phase trace, so the matching
+launch symptom does not prove the same phase-130 cause. Linux x64/ARM64,
+macOS ARM64 and Windows x64 Reprobuild jobs pass; all ten native CI jobs pass.
+The current-source all-range diagnostic `36763970172` and the focused runtime
+observer `36774529116` remain active. No release tag has been created.
+
+Evidence: `/tmp/runquota-a173-arm-evidence/.repro/build/repro/build-failure-report.json`
+and `/tmp/runquota-a173-arm-complete.log`. Refreshed dev `2c50aaf` and agents
+`b83ad77` before recording this recurrence in the existing issue.
