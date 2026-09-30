@@ -28,3 +28,10 @@ current and deleted issues for readiness, PID markers and invalid integers.
 The existing macOS retention issue concerns a kill arriving after commit,
 not this file-publication race. Linux ARM64 is deferred from the first release;
 the fixture repair applies to every platform.
+
+## Candidate validation
+
+The repair writes and closes a sibling `.pending` file, then renames it to the
+ready pathname. The actual retention crash fixture passes on macOS at
+`3bd5ddb` plus that patch, with the real group kill and every recovery assertion
+retained. Full platform CI remains required; no deadline was changed.

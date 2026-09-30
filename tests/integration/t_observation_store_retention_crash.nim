@@ -181,7 +181,11 @@ proc runPruneRole(dbPath, readyPath: string) =
   enterOwnGroup()
   let store = openObservationStore(dbPath)
   doAssert store.captureEnabled, store.report
-  writeFile(readyPath, $getCurrentProcessId() & "\n")
+  # The parent's existence check must not observe the file between creation
+  # and writing its PID. Close the complete record before publishing its name.
+  let pendingReady = readyPath & ".pending"
+  writeFile(pendingReady, $getCurrentProcessId() & "\n")
+  moveFile(pendingReady, readyPath)
   discard store.pruneExecutions(crashHost, beyondNewest(keptExecutions))
   # Only reached if the kill never arrived. The parent asserts against this
   # file, so a window that was missed is visible rather than silent.
