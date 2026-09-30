@@ -69,3 +69,19 @@ observer `36774529116` remain active. No release tag has been created.
 Evidence: `/tmp/runquota-a173-arm-evidence/.repro/build/repro/build-failure-report.json`
 and `/tmp/runquota-a173-arm-complete.log`. Refreshed dev `2c50aaf` and agents
 `b83ad77` before recording this recurrence in the existing issue.
+
+## The unchanged retry fails a different compiler launch
+
+Attempt 2 of `36765565687`, still at `a173baf`, finishes on 2026-09-30
+at 22:46 UTC with 102 successful compilations and one failed action:
+`runquota.test_build.t_observation_write_path_rules`. Nim cannot complete
+the GCC invocation for `@pmath.nim.c` and reports Windows error 1460,
+`This operation returned because the timeout period expired`. No test stage
+executes. This recurrence is a different compilation from attempt 1.
+
+Evidence: `/tmp/runquota-a173-arm-retry.log` and
+`/tmp/runquota-a173-arm-retry-evidence/.repro/build/repro/build-failure-report.json`.
+The report again lacks hook phase traces, so it does not establish the blocked
+API or a missing compiler file. No further unchanged retry is selected.
+Merge/retention batching candidates address test execution overhead separately;
+they do not repair this compiler-startup boundary.

@@ -485,3 +485,21 @@ Measure the unmodified retention-schedule suite first, then run the existing
 real SQLite extension, retention, retention-schedule and crash/atomicity gates
 against the change. Run Windows controls before selecting it for the release.
 Do not infer a fix for compiler hook-protection stalls from these results.
+
+### Completed local and Windows x64 checks
+
+The retention change is `f93855c`, directly above merge change `c6ddde6`.
+At `f93855c`, all 34 observation-related binaries pass locally with Nim 2.2.4
+and Nix SQLite 3.51.2, including real extension rollback, retention, scheduled
+retention, crash/isolation and merge tests. Repository lint passes. Tests and
+deadlines are unchanged. Full CI and paired Windows retention controls are
+still required before selection.
+
+The merge comparison at tooling `8159a30` completes on Windows x64 with all
+12 original/batched, native/monitored cases passing. In that one paired run,
+the monitored merge suite takes 110.7 seconds at `a173baf` and 81.3 seconds
+at `c6ddde6`; export takes 91.6/80.0 seconds and users 62.8/48.9 seconds.
+The native merge times are 28.7/27.7 seconds. Both variants use the same
+compiler, SQLite and original debug monitor on the same worker. This is one
+run, not a latency distribution. Evidence: `/tmp/runquota-merge-batch-815-x64`.
+The ARM-host comparison in that run is still active.
