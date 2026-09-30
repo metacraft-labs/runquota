@@ -4,6 +4,18 @@ RunQuota implements the Metacraft repository requirements locally through:
 
 - `flake.nix` for dev shells, default package output, Nix checks, and
   pre-commit hook configuration through `git-hooks.nix`.
+- `prek.toml`, the same pre-commit hook (`just lint`) for prek, which the
+  reprobuild dev shell provides on every platform. It is how the hook runs on
+  Windows, where nothing generates git-hooks.nix's `.pre-commit-config.yaml`:
+  `repro exec -- prek install` once, then commit from `repro shell`.
+  `scripts/check_repo_requirements.sh` requires both definitions to run
+  `just lint`.
+- `repro.nim`'s `uses:` for the reprobuild dev shell's tools, including the
+  flake shell's lint and formatting tools (`shellcheck`, `shfmt`, `typos`,
+  `prek`; `nixfmt` and `repomix` on Linux and macOS only). `just format`
+  reports that it left `flake.nix` unformatted on Windows, and `just repomix`
+  refuses there by name: neither tool has a Windows realization, for reasons
+  recorded with each interface in reprobuild-packages.
 - `.envrc` using the repository flake.
 - `Justfile` targets for build, test, lint, format, version bumping,
   benchmarking, repomix snapshots, and static helper checks.

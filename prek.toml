@@ -1,0 +1,25 @@
+# The pre-commit hook, for prek.
+#
+# On Linux and macOS the flake's dev shell installs this repository's hook
+# through git-hooks.nix (`pre-commit-check` in flake.nix), which generates
+# `.pre-commit-config.yaml` -- a symlink into the Nix store, and gitignored --
+# and runs it with pre-commit. Nothing generates that file on Windows, so the
+# same hook is written down here for prek, which the repro dev shell provides
+# on every platform (`uses: "prek"` in repro.nim). prek reads `prek.toml`
+# before `.pre-commit-config.yaml`; pre-commit never reads it. The two
+# definitions must stay the same hook: scripts/check_repo_requirements.sh
+# requires both to run `just lint`.
+#
+# Install the hook from a repro shell with `prek install`; `git commit` then
+# runs `just lint`, which needs the shell's `just`, `bash` and `nim`, so
+# commit from inside the shell.
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "just-lint"
+name = "just lint"
+entry = "just lint"
+language = "system"
+pass_filenames = false
