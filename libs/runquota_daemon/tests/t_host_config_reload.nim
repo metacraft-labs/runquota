@@ -16,7 +16,7 @@
 ##
 ## NO MOCKS. A real `RunQuotaDaemon` object reads a real TOML file in a
 ## scratch directory; nothing serves an endpoint here, because these cases
-## drive admission directly. `tests/integration/t_host_config_reload.nim`
+## drive admission directly. `tests/integration/t_runquota_config_reload.nim`
 ## does the same through a real `runquotad` and the `runquota config` verb.
 
 import std/[options, os, strutils, tables, unittest]
