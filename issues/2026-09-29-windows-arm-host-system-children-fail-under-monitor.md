@@ -120,3 +120,69 @@ compilations cannot start `cc1.exe`. Its Windows x64 job passes monitored
 build/test, all 100 native test programs and all 12 static helper checks.
 The ARM report again contains no hook checkpoints. Evidence is retained at
 `/tmp/runquota-33add-arm-evidence`; the shared hook investigation remains active.
+
+## Complete compilation reaches six execution failures at the same candidate
+
+PR 35 [job 109955361175](https://github.com/metacraft-labs/runquota/actions/runs/36735298536/job/109955361175)
+at `33add18` passes compilation, then reports 189 successful actions, six
+failed programs and eight blocked measurement programs. Four executions reach
+the unchanged 600-second bound: process benchmark contract, standalone
+daemonless degradation, observation-store export and observation-store merge.
+Stats-table publication misses its ten-second wait although a later socket
+query returns the expected estimate. The retention-schedule unit program
+misses its existing completion waits in five cases. These ordinary logs do
+not locate the blocked child or distinguish monitor startup from competing
+work. Preserve that distinction; no deadline increase is justified.
+
+The fixed-image serial/parallel comparison `36735013860` at `b60cba4` remains
+active. Separately, the full compiler trace with one prepared protection range
+at `5383510` moves its two observed stalls to `Ws2_32!connect`, still before
+writable protection; the hook issue owns that evidence. The replacement full
+graph `36753037680` at tooling `8fd4eff` prepares every queued install range
+while preserving suspension around writes and every test. No production hook
+repair is selected yet.
+
+Evidence: `/tmp/runquota-33add-pr35-arm-evidence` and
+`/tmp/runquota-33add-pr35-arm-complete.log`. Refreshed dev `2c50aaf` and agents
+`975ea1d` before adding this ordinary-CI result, preserving the concurrent
+sibling-manifest update.
+
+## Fixed binaries still fail with serial admission
+
+At exact RunQuota `48bb701`, tooling `b60cba4` completes all 21 executions in
+[36735013860](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36735013860):
+seven identical binaries run with admission caps eight, one and eight. The
+recorded hashes remain unchanged. Nine executions pass, two fail assertions,
+and ten return timeout status 124. The comparison finishes at 17:29:07 UTC;
+the outer command does not return before the workflow reaches its 155-minute
+step deadline. The retained files do not locate that final wait. The complete
+per-program results and logs survive in the uploaded artifact.
+
+| Program | Parallel first | Serial | Parallel second |
+| --- | --- | --- | --- |
+| Concurrent clients | pass | pass | pass |
+| Process benchmark | pass | pass | timeout |
+| Socket write path | assertion failure | pass | timeout |
+| Stats-table cache control | pass | pass | pass |
+| Retention schedule | assertion failure | timeout | timeout |
+| Store export | timeout | timeout | timeout |
+| Store merge | timeout | timeout | timeout |
+
+Serial export prints every successful case but still returns 124. Retention
+and merge also remain incomplete when run alone. This rules out serial
+admission as a sufficient repair. The outer wrapper includes launch and
+monitor finalization: its elapsed times are not individual SQLite-call or
+test-body timings. Later modes are also not fresh machines: runner cleanup
+finally terminates three surviving SQLite processes. No common runtime cause
+is established by this comparison.
+
+Validated depfile decoding with the reader at io-mon `983a113` finds 878
+process-start records in serial export versus 436 in its first parallel run;
+serial retention records 248. These counts show substantial process activity,
+but the format contains no timestamps and does not identify where time was
+spent. Preserve original deadlines and capture child state before selecting a
+store, monitor or fixture change.
+
+Evidence: `/tmp/runquota-arm-contention-b60-evidence` and
+`/tmp/runquota-arm-contention-b60-job.log`. Refreshed dev `2c50aaf` and agents
+`494ef31` before extending this existing issue.

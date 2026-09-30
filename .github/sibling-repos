@@ -1,12 +1,19 @@
 # Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
 # revisions (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
 
-# The package catalog `repro.nim`'s `uses: "sqlite3"` resolves from (reprobuild
-# looks up names its stdlib does not bundle in a `reprobuild-packages` checkout
-# beside this one). Needed by the reprobuild-flavor job; the nix jobs take
-# sqlite from the flake. Pinned to the mainline branch until the catalog is in
-# the workspace lock.
-reprobuild-packages=dev
+# The package catalog `repro.nim`'s `uses: "sqlite3"` resolves from. sqlite3
+# is no longer bundled with reprobuild's stdlib; reprobuild looks it up in a
+# `reprobuild-packages` checkout beside this one, and a recipe that uses a moved
+# package with no catalog reachable does not compile. Only the reprobuild-flavor
+# job compiles `repro.nim`; the nix jobs never do (their `sqlite3` tool is
+# `pkgs.sqlite` in the dev shell).
+#
+# Pinned to an exact revision (reprobuild-packages dev 9d9176b) rather than
+# `=dev`, which clone-siblings warns makes the build not reproducible. The
+# catalog is not in any lock yet, so this entry is its only pin
+# (reprobuild-specs Provisioning-Contributions.md, "Catalog Lookup And
+# Provisioning"); move it when a catalog change is needed here.
+reprobuild-packages=9d9176bff5c5aee175efcaa5d667c9ed7b9b8043
 
 # RunQuota's published stats table requires this source-library interface.
 # Explicitly override the carried workspace pin until it includes the interface.
