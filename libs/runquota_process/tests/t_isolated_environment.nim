@@ -1,4 +1,4 @@
-## `CommandSpec.isolateEnvironment`: a child launched isolated sees the
+## `CommandSpec.inheritEnv = false`: a child launched isolated sees the
 ## declared environment and nothing the launcher inherited.
 ##
 ## A caller that composes an action's whole environment (reprobuild's
@@ -46,7 +46,7 @@ proc childEnvironment(isolate: bool): string =
   var child = launchProcess(commandSpec(
     [getAppFilename(), DumpArgument],
     env = DeclaredEnvironment,
-    isolateEnvironment = isolate))
+    inheritEnv = not isolate))
   defer: child.close()
   let completion = child.waitForCompletion(timeout = 10_000)
   check completion.exited
