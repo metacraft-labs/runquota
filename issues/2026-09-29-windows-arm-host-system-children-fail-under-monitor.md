@@ -154,8 +154,9 @@ At exact RunQuota `48bb701`, tooling `b60cba4` completes all 21 executions in
 seven identical binaries run with admission caps eight, one and eight. The
 recorded hashes remain unchanged. Nine executions pass, two fail assertions,
 and ten return timeout status 124. The comparison finishes at 17:29:07 UTC;
-the workflow later reaches its 155-minute step deadline while returning output.
-The complete per-program results and logs survive in the uploaded artifact.
+the outer command does not return before the workflow reaches its 155-minute
+step deadline. The retained files do not locate that final wait. The complete
+per-program results and logs survive in the uploaded artifact.
 
 | Program | Parallel first | Serial | Parallel second |
 | --- | --- | --- | --- |
