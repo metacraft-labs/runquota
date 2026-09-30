@@ -180,3 +180,14 @@ startup-protocol control, and all eight instrumented lifecycle cases. Cleanup
 is checked against the original CRLF bytes. Replacement focused run
 `36736205178` uses the same RunQuota `7036462` and unchanged fixture bounds.
 The independently corrected full graph `36731094289` continues.
+
+## Corrected full graph passes
+
+Complete run `36731094289` at tooling `92c3b6d` passes at RunQuota `7036462`:
+all 201 actions succeed and every one of the 99 test programs launches with
+`cdNotCacheable`. The instrumented crash-recovery fixture passes all eight
+cases; its daemon readiness measurements range from 132 to 173 ms. The
+ordinary startup protocol is preserved for every other fixture. This is a
+passing complete graph, not a closure of the separately reproduced intermittent
+helper failures. Focused helper-phase run `36736205178` remains active.
+Evidence: `/tmp/runquota-readiness-92-full-evidence`.
