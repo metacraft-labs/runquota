@@ -16,9 +16,10 @@ macOS monitored jobs pass at the same candidate.
 
 ## Expected and investigation
 
-[`CommandSpec.isolateEnvironment`](../libs/runquota_process/src/runquota_process/types.nim)
+[`CommandSpec.inheritEnv = false`](../libs/runquota_process/src/runquota_process/types.nim)
 requires the launcher to supply only the declared environment, inheriting
-nothing from its own environment. The real child assertion in
+nothing from its own environment (`isolateEnvironment` at the observed source).
+The real child assertion in
 [`t_isolated_environment`](../libs/runquota_process/tests/t_isolated_environment.nim)
 expects exactly the declared variable. Compare a literal Unicode environment
 block passed directly to Windows `CreateProcessW`, independently of RunQuota,
@@ -77,3 +78,21 @@ logs are retained in the run artifacts.
 Both native macOS assertions also pass at `48bb701`; its Windows x64 and ARM64
 Nim source checks pass. The recipe's existing monitor isolation and uncached
 execution remain unchanged. No production launcher logic changes.
+
+## Reconciliation with the current mainline API
+
+Dev `2c50aaf` introduces the same isolation capability as `inheritEnv = false`.
+Candidate `33add18739814c3886da1f69f8a4e18ab1e36faa` merges that commit into
+`48bb701`, using the mainline API in the exact-environment fixture. It retains
+the explicit Windows architecture, every exact key/value assertion, and the
+case-insensitive Windows override repair. Both fixtures pass all five cases
+on native macOS; a real inherited-environment mutation still fails the exact
+assertion. Windows x64/ARM64 source checks and repository lint pass at `33add18`.
+
+Windows [36732223032](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36732223032)
+at tooling `5838377` repeats the original/repaired/leaking comparison against
+`33add18`. Only the baseline's constructor argument is translated to the
+mainline API; its old declarations and assertions remain intact. Complete
+native `36732251894` and Reprobuild `36732257074` validate that exact candidate.
+Its source-lock blob `f4eb79d702ea51496c6932f02e8af453457af0a0` is published
+and verified through manifests `b6ba16b`.
