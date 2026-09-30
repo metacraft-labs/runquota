@@ -1297,6 +1297,38 @@ proc bindEndpoint*(endpoint: Endpoint): LocalListener =
   else:
     raise newException(OSError, "unsupported RunQuota endpoint")
 
+proc acceptWaitHandle*(listener: LocalListener): int =
+  ## THE DESCRIPTOR A CALLER MAY WAIT ON for "there is a connection to
+  ## accept", or -1 when this endpoint kind has none to offer.
+  ##
+  ## `acceptNativeConnection` PARKS THE CALLING THREAD, and a caller that
+  ## must also notice something which is not a connection -- a stop request,
+  ## say -- cannot afford to be inside it when that something happens. This
+  ## hands out the thing to wait on, so such a caller can wait on it
+  ## ALONGSIDE its own wake channel and call `accept` only once the wait has
+  ## said a connection is really there.
+  ##
+  ## WHY THE LISTENER AND NOT THE PATH. A wake that travels through the
+  ## filesystem -- open the endpoint by name and let `accept` return the
+  ## connection -- stops working the moment the endpoint file is unlinked,
+  ## while the listening socket itself goes on working perfectly. The
+  ## descriptor is the part of the endpoint that cannot be deleted from
+  ## underneath a running daemon, which is why it is what gets waited on.
+  ##
+  ## -1 IS AN ANSWER AND NOT AN ERROR. A named-pipe listener has no
+  ## descriptor whose readability means "a client is waiting":
+  ## `ConnectNamedPipe` is itself the wait there. A caller that gets -1 is
+  ## expected to fall back to blocking in `accept`, which is what it did
+  ## before it asked.
+  case listener.kind
+  of endpointUnixSocket:
+    when defined(windows):
+      -1
+    else:
+      if listener.socket == nil: -1 else: int(cint(listener.socket.getFd()))
+  else:
+    -1
+
 proc acceptConnection*(listener: var LocalListener): LocalConnection =
   case listener.kind
   of endpointUnixSocket:
