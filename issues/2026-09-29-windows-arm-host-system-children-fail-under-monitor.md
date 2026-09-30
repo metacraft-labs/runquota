@@ -144,4 +144,5 @@ repair is selected yet.
 
 Evidence: `/tmp/runquota-33add-pr35-arm-evidence` and
 `/tmp/runquota-33add-pr35-arm-complete.log`. Refreshed dev `2c50aaf` and agents
-`ee77724` before adding this ordinary-CI result.
+`975ea1d` before adding this ordinary-CI result, preserving the concurrent
+sibling-manifest update.
