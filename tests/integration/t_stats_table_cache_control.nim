@@ -224,26 +224,20 @@ suite "stats_table_cache_control":
 
       var client = connectDefault()
       completeOneExecution(client, CacheKey, ObservedPeakBytes)
+      # These real store queries settle the queued observation before the
+      # resident/emptied comparison. The publication suite separately tests
+      # automatic publication without a setup query.
+      let storeBefore = readStoreGates(client, CacheKey)
 
-      # Wait for the publication, so the RESIDENT state is really resident.
-      #
-      # THIS PROBE IS INCOMPLETE, recorded rather than repaired. `stlHit`
-      # says a SLOT bound to this key was found; it does not say the entry
-      # in it is KNOWN. An entry published with `knowledge == unknown` is a
-      # hit, so `resident` can be true over an entry that asserts nothing,
-      # and every comparison below would then be against a vacuous state.
-      # That is not hypothetical: an aggregate computed over rows that had
-      # not committed published exactly that, until
-      # `flushObservationWriter` was given a contract that says every row
-      # queued before a flush is committed when it returns. The complete
-      # condition is `stlHit` AND `estimate.knowledge == statsTableKnown`.
+      # A matching slot is resident only when it carries a known estimate.
       var table = openPublishedTable()
       var estimate: PublishedEstimate
       var resident = false
       for _ in 0 ..< 400:
         table.close()
         table = openPublishedTable()
-        if table.available and table.lookupEstimate(CacheKey, estimate) == stlHit:
+        if table.available and table.lookupEstimate(CacheKey, estimate) == stlHit and
+            estimate.knowledge == statsTableKnown:
           resident = true
           break
         sleep(25)
@@ -253,7 +247,6 @@ suite "stats_table_cache_control":
       # ---------------------------------------------------------------
       # STATE 1: RESIDENT.
       # ---------------------------------------------------------------
-      let storeBefore = readStoreGates(client, CacheKey)
       let clientBefore = readClientGate(client, CacheKey)
       let cliBefore = execProcess(cliPath(),
         args = ["acquire", "--cpu", "1000", "--mem", "1MiB",
