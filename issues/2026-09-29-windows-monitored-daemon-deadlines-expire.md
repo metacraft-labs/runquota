@@ -844,3 +844,32 @@ tool wrapper that delays failed execution writes while forwarding identical
 SQL and preserving real outputs/status, to reproduce the counter timing
 failure and verify the settled-write check. Run the complete fixtures and
 Windows source checks before selecting the candidate, then ordinary CI.
+
+### Synchronized fixture candidate and real delay controls
+
+Candidate `2d3897c` changes only the two fixtures above `b4a9c53`.
+The unwritable-store case queries the real stats barrier, then asserts both
+counters directly. The zero-syscall case verifies the recorded aggregate in
+setup; the separate automatic-publication case is unchanged. No product
+runtime code changes. Complete local socket-write and publication suites
+pass all ten and four cases. Both fixtures and the real SQLite proxy pass
+Windows Nim source checking; repository lint passes.
+
+The real proxy delays INSERTs into a read-only database by 6.5 seconds,
+then forwards the same SQL to Nix SQLite 3.51.2 and preserves its actual
+output/status. The unchanged fixture passes without delay, fails its loss
+counter assertion with delay, and the synchronized fixture passes with the
+same delay. The proxy records four delayed calls for the original case and
+five for the synchronized case. Full unchanged-delay-free fixture coverage
+then passes. Local evidence is
+`/tmp/runquota-observation-barrier-fix/build/observation-barrier-control`;
+`results.json` retains all five expected outcomes and each actual SQL input
+that was delayed. No API result or database result is mocked.
+
+The isolated source lock is published with matching blob
+`d9efbbf9bfe370ffc7f7b3156f3fe8fc6fceb0eb`. Complete native CI
+`36810841209` and Reprobuild CI `36810843817` are active. Windows paired
+tooling `7d4d24a` runs the same real-delay comparison in native and monitored
+modes on both Windows hosts, together with full socket-write coverage and
+both original/synchronized publication suites. Its Python/workflow checks
+pass. Results remain pending; the earlier candidates continue independently.
