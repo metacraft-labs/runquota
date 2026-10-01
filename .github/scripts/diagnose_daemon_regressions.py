@@ -137,8 +137,13 @@ def main():
                 results.append({"iteration": iteration + 1, "name": name,
                                 "native": direct, "monitored": observed})
                 (EVIDENCE / "results.json").write_text(json.dumps(results, indent=2))
-                if not WINDOWS and (direct != 0 or observed != 0):
-                    return
+                if not WINDOWS:
+                    # Other assertions remain failures in results.json, but a
+                    # setup race must not end the search for the daemon crash.
+                    text = ((EVIDENCE / (prefix + "-native.log")).read_text() +
+                            (EVIDENCE / (prefix + "-monitored.summary.json")).read_text())
+                    if "SIGSEGV" in text or "exit=139" in text:
+                        return
         print("All paired executions completed with identical binaries.", flush=True)
     finally:
         RECIPE.write_text(original)
