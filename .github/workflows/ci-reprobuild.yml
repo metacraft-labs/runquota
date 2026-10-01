@@ -162,6 +162,11 @@ jobs:
 
       - name: repro test
         # Materialises the `test` collection.
+        # Bound simultaneous test programs on the ARM host's x64 emulator.
+        # Each fixture keeps its own concurrency and deadlines. An empty
+        # value leaves Reprobuild's existing default on the other platforms.
+        env:
+          REPROBUILD_MAX_PARALLELISM: ${{ matrix.os == 'windows' && matrix.arch == 'arm64' && '2' || '' }}
         run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
 
       - name: Refresh authentication before just build (cross-check)
