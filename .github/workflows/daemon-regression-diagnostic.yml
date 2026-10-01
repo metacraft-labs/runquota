@@ -1,8 +1,6 @@
 name: Daemon regression diagnostic
 
 on:
-  push:
-    branches: [diagnose-daemon-regressions-2026-10-01]
   workflow_dispatch:
 
 permissions:

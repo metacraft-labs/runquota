@@ -1,0 +1,47 @@
+name: Daemon AddressSanitizer diagnostic
+
+on:
+  push:
+    branches: [diagnose-daemon-regressions-2026-10-01]
+    paths:
+      - .github/workflows/daemon-asan-diagnostic.yml
+      - .github/scripts/diagnose_daemon_asan.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shutdown:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mint installation token for the native environment
+        id: ci_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+      - name: Setup native Linux tools
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@41d0680bd78ca59ad110a261a20bcaa93a38fffd
+        with:
+          env-flavor: nix
+          gh-token: ${{ steps.ci_token.outputs.token }}
+      - name: Check the real shutdown cases with AddressSanitizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          dev-exec python3 .github/scripts/diagnose_daemon_asan.py
+      - name: Retain sanitizer controls and product diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-asan-linux
+          path: |
+            build/diagnostics/daemon-asan/*.log
+            build/diagnostics/daemon-asan/*.json
+          if-no-files-found: warn
+          retention-days: 7
