@@ -794,3 +794,10 @@ RunQuota SQLite or daemon waits to that race: RunQuota's captured SQLite
 calls already serialize process creation. Run complete ordinary CI at the
 new pin before selecting it for the release. Keep the current `15e4deb`
 run and SQLite progress control as independent observations.
+
+Candidate `b4a9c53` contains only that Windows CI helper-pin change above
+`15e4deb`. Workflow checks and repository lint pass. Its isolated source
+lock is published with matching local/remote blob
+`a7ece987315c3cb18c02ce0395f6743cbb44fe12`. Complete native run
+`36809230285` and Reprobuild run `36809232981` are active. Helper PR 12
+is merged as `59a2bac`, whose tree equals the validated `43b1835` source.
