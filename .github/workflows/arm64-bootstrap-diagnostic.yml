@@ -1,0 +1,72 @@
+name: ARM64 bootstrap diagnostic
+
+on:
+  push:
+    branches: [diagnose-arm64-bootstrap-2026-10-01]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: ARM64 bootstrap (${{ matrix.monitor.name }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        monitor:
+          - name: existing-pin
+            revision: 3df08c24ee91900b950ed20a3827923d213f2a9c
+          - name: promoted-dev
+            revision: 2d07041f60443dda8ead16454ec5f9e69e35753f
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mint installation token for source bootstrap
+        id: ci_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+      - name: Setup the pinned source bootstrap
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@41d0680bd78ca59ad110a261a20bcaa93a38fffd
+        with:
+          env-flavor: reprobuild
+          repro-from-source: true
+          repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
+          repro-posix-io-mon-pin: ${{ matrix.monitor.revision }}
+          repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
+          repro-stackable-hooks-pin: 43b1835128331fef09ecf64a614dbf46880dbe9f
+          gh-token: ${{ steps.ci_token.outputs.token }}
+      - name: Refresh build authentication
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+      - name: Build with the same product and compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/diagnostics
+          dev-exec repro build --tool-provisioning=nix 2>&1 | tee build/diagnostics/arm64-build.log
+      - name: Run the full existing test graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          dev-exec repro test --tool-provisioning=nix 2>&1 | tee build/diagnostics/arm64-test.log
+      - name: Retain compiler input and action evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-bootstrap-${{ matrix.monitor.name }}
+          path: |
+            build/diagnostics/
+            .repro/build/*/provider-work/nimcache-interface/**/*.c
+            .repro/build/*/build-failure-report.json
+            .repro/build/*/build-engine-cache/actions/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
