@@ -1,8 +1,9 @@
-"""Exercise the real daemon and shutdown assertions under AddressSanitizer.
+"""Compare the real daemon's worker storage before and after preallocation.
 
-No mocks. Real passing and use-after-free C programs first verify the sanitizer.
-The daemon keeps its normal Nim allocator; only compiler instrumentation changes.
-Leak reporting is disabled because this experiment targets invalid memory access.
+No mocks. Real passing and use-after-free C programs verify AddressSanitizer.
+Nim's malloc allocator exposes sequence lifetimes to the sanitizer. This is a
+separate diagnostic build, not a claim about ordinary allocator instrumentation.
+The existing real shutdown fixture and every assertion remain unchanged.
 """
 
 import hashlib
@@ -11,9 +12,21 @@ import os
 from pathlib import Path
 import subprocess
 
-
 ROOT = Path.cwd()
 OUT = ROOT / "build/diagnostics/daemon-asan"
+DAEMON = ROOT / "libs/runquota_daemon/src/runquota_daemon.nim"
+OLD = """  var threads: seq[Thread[void]] = @[]
+  for _ in 0 ..< connectionWorkerCount():
+    threads.add(default(Thread[void]))
+    createThread(threads[^1], connectionWorker)
+"""
+FIXED = """  # Nim's thread wrapper borrows the Thread object's address through its exit
+  # cleanup. Allocate every slot before starting workers so sequence growth
+  # cannot move a live worker's storage.
+  var threads = newSeq[Thread[void]](connectionWorkerCount())
+  for i in 0 ..< threads.len:
+    createThread(threads[i], connectionWorker)
+"""
 
 
 def run(label, command, environment, timeout=600):
@@ -33,7 +46,6 @@ def main():
     environment["ASAN_OPTIONS"] = "detect_leaks=0:abort_on_error=1"
     assert run("nim-version", ["nim", "--version"], environment) == 0
     assert run("gcc-version", ["gcc", "--version"], environment) == 0
-    # Build and execute real controls with the same compiler instrumentation.
     for name, body in [
         ("positive", "int value = *p; free((void *)p); return value == 7 ? 0 : 1;"),
         ("negative", "free((void *)p); return *p;"),
@@ -47,10 +59,8 @@ def main():
                    "-fno-omit-frame-pointer", str(source), "-o", str(binary)],
                    environment) == 0
         result = run(name, [str(binary)], environment)
-        if name == "positive":
-            assert result == 0
-        else:
-            assert result != 0
+        assert (result == 0) == (name == "positive")
+        if name == "negative":
             assert "heap-use-after-free" in (OUT / "negative.log").read_text()
 
     entries = []
@@ -60,28 +70,49 @@ def main():
             entries.append((name, source, "build/bin/" + name))
     entries.append(("shutdown", "tests/integration/t_sigterm_exits_with_the_socket_gone.nim",
                     "build/test-bin/t_sigterm_exits_with_the_socket_gone"))
-    for name, source, binary in entries:
-        Path(binary).parent.mkdir(parents=True, exist_ok=True)
-        command = ["nim", "c", "--cc:gcc", "--threads:on", "--debugger:native",
-                   "--passC:-fsanitize=address", "--passC:-fno-omit-frame-pointer",
-                   "--passL:-fsanitize=address", "--nimcache:build/nimcache/asan-" + name,
-                   "--out:" + binary, source]
-        assert run("compile-" + name, command, environment) == 0
-    def hashes():
-        return {binary: hashlib.sha256(Path(binary).read_bytes()).hexdigest()
-                for _, _, binary in entries}
-    baseline = hashes()
-    (OUT / "binary-hashes.json").write_text(json.dumps(baseline, indent=2))
-    results = []
-    for iteration in range(30):
-        result = run("shutdown-" + str(iteration + 1),
-                     [str(ROOT / entries[-1][2])], environment, timeout=120)
-        results.append(result)
-        (OUT / "results.json").write_text(json.dumps(results))
-        assert hashes() == baseline, "An instrumented binary changed between runs"
-        if result:
-            raise SystemExit(result)
-    print("All 30 real shutdown fixtures passed under AddressSanitizer.", flush=True)
+    original = DAEMON.read_text()
+    assert original.count(OLD) == 1
+    results = {}
+    try:
+        for variant in ["original", "preallocated"]:
+            DAEMON.write_text(original if variant == "original" else original.replace(OLD, FIXED))
+            (OUT / (variant + "-source-hash.json")).write_text(json.dumps({
+                "daemon_source_sha256": hashlib.sha256(DAEMON.read_bytes()).hexdigest(),
+                "allocator": "useMalloc",
+            }, indent=2))
+            for name, source, binary in entries:
+                Path(binary).parent.mkdir(parents=True, exist_ok=True)
+                command = ["nim", "c", "--cc:gcc", "--threads:on", "-d:useMalloc",
+                           "--debugger:native", "--passC:-fsanitize=address",
+                           "--passC:-fno-omit-frame-pointer", "--passL:-fsanitize=address",
+                           "--nimcache:build/nimcache/asan-" + variant + "-" + name,
+                           "--out:" + binary, source]
+                assert run(variant + "-compile-" + name, command, environment) == 0
+            def hashes():
+                return {binary: hashlib.sha256(Path(binary).read_bytes()).hexdigest()
+                        for _, _, binary in entries}
+            baseline = hashes()
+            (OUT / (variant + "-binary-hashes.json")).write_text(json.dumps(baseline, indent=2))
+            results[variant] = []
+            for iteration in range(3 if variant == "original" else 30):
+                label = variant + "-shutdown-" + str(iteration + 1)
+                result = run(label, [str(ROOT / entries[-1][2])], environment, timeout=120)
+                results[variant].append(result)
+                (OUT / "results.json").write_text(json.dumps(results, indent=2))
+                assert hashes() == baseline, "An instrumented binary changed between runs"
+                if variant == "original" and result:
+                    log = (OUT / (label + ".log")).read_text()
+                    assert "heap-use-after-free" in log, "The original must expose the lifetime fault"
+                    assert "threadProc" in log, "The failure must involve the real thread wrapper"
+                    break
+                if variant == "preallocated":
+                    assert result == 0, "Preallocated worker storage must pass every real case"
+            if variant == "original":
+                assert any(results[variant]), "The original-source negative control did not reproduce"
+        print("Original worker storage fails; preallocated storage passes all 30 real fixtures.",
+              flush=True)
+    finally:
+        DAEMON.write_text(original)
 
 
 if __name__ == "__main__":
