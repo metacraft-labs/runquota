@@ -801,3 +801,46 @@ lock is published with matching local/remote blob
 `a7ece987315c3cb18c02ce0395f6743cbb44fe12`. Complete native run
 `36809230285` and Reprobuild run `36809232981` are active. Helper PR 12
 is merged as `59a2bac`, whose tree equals the validated `43b1835` source.
+
+## Focused startup controls pass; current x64 observation waits fail
+
+Focused tooling `e4c3b73`, run `36806359507`, passes all eight expected
+outcomes on ARM as well as x64. Original pre-entry delay and repaired
+post-handshake delay each fail the exact three-second exit assertion;
+repaired pre-entry delay and ordinary execution pass in both modes. No
+outer timeout occurs. ARM evidence is `/tmp/runquota-startup-case-e4-arm`.
+
+Full x64 job `110189923675` in run `36805849869` at `15e4deb` passes
+compilation but fails two observation programs. The unwritable-store case
+sees one dropped row where it expects two. The aggregate-publication suite
+passes its automatic-publication case, but its separate zero-syscall case
+misses the ten-second setup publication wait. Other cases in both programs
+pass. Evidence: `/tmp/runquota-15e-x64-repro.log` and the report under
+`/tmp/runquota-15e-x64-evidence/.repro/build/repro/`. This does not measure
+the crash-helper handshake because the measurement lane remains blocked.
+
+### Proposed fixture synchronization
+
+OS-1 makes recording asynchronous; OS-2 requires accurate loss accounting
+and OS-4 requires clients to keep completing when storage fails. The real
+stats query calls `flushObservationWriter`, which waits until every earlier
+queued row has settled. The unwritable-store fixture already uses that
+barrier for its third failed write, but its first two writes rely only on a
+five-second polling window. Use the same real query barrier before reading
+the first pair's counters, retaining the read-only store, all loss and
+write-failure assertions, and the subsequent successful client operation.
+This deliberately moves the counter-read boundary to settled writes; it is
+not a claim that the old five-second enqueue-to-settle bound is preserved.
+
+For the separate zero-syscall measurement, query and verify the recorded
+aggregate during setup before waiting for its shared-memory publication.
+The suite's first case still checks automatic publication without that
+setup query. Keep all mapping, value, syscall-control and publication-wait
+assertions. The added setup waits remain inside the existing 600-second
+program bound. Product recording and publication code remain unchanged.
+
+Compare original and synchronized fixtures using real SQLite. Add a real
+tool wrapper that delays failed execution writes while forwarding identical
+SQL and preserving real outputs/status, to reproduce the counter timing
+failure and verify the settled-write check. Run the complete fixtures and
+Windows source checks before selecting the candidate, then ordinary CI.
