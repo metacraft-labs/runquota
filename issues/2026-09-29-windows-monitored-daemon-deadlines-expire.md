@@ -988,3 +988,53 @@ negative control to preserve every store and client answer. Its setup needs a
 real known resident value; a slot hit with unknown knowledge is insufficient,
 as this fixture's existing comment also records. No scheduling or timeout
 change is selected from the still-pending SQLite progress comparison.
+
+### Complete synchronized-fixture candidate and next admission experiment
+
+RunQuota `2d3897c`, run `36810843817`, passes four complete platform jobs.
+ARM passes compilation and finishes at 06:01 UTC with 189 successful actions,
+six failures and eight blocked measurement actions out of 203. M5, export and
+merge time out. Retention scheduling misses five cases' waits. The unchanged
+automatic-publication case fails, while the synchronized zero-syscall setup
+passes. The concurrent-client fixture reports 31 finished clients instead of
+32 despite all client exit checks passing; sessions, leases, queued and lost
+counts are zero. Captured client output is discarded by that fixture, so this
+report does not identify why one completion is absent. Evidence is
+`/tmp/runquota-2d-arm-repro.log` and `/tmp/runquota-2d-arm-evidence`.
+
+Cache fixture `a2676aac7d6d7ff1bfb57313dc78a0acb9d9e0d3` passes both
+local cases, Windows source checks and repository lint. The original fixture
+passes normally. Under a real 20-second execution-insert delay it fails only
+its resident assertion, while the revised fixture passes with the same SQL,
+results, binary inputs and delay. The delayed original/revised runs take
+20.99/21.31 seconds; the revised full suite takes 1.34 seconds. An earlier
+13-second delay was an insufficient negative control: the original passed.
+Phase timestamps show setup returned in 0.02 seconds and the original polling
+loop took 13.1 seconds. Keep the loop's actual contract explicit: 400 retries
+with 25-millisecond sleeps, rather than an exact ten-second wall-clock bound.
+Evidence is `/tmp/runquota-cache-residency-fix/build/cache-residency-control`,
+including the original insufficient control and the separate 20-second results.
+Its source lock is published with matching blob
+`41b45f1171c222af90418857d002ad7c1d6a286f`.
+
+Candidate `d6ee4588f71604376a4cc41ef281d6c479395efc` adds only a workflow
+limit above that fixture repair: two simultaneous Reprobuild test programs on
+the Windows ARM emulator, with the existing default on other hosts. The build
+step, every test's internal concurrency, all assertions and all watchdogs stay
+unchanged. This is a resource-allocation experiment, not an attributed fix;
+older pre-batching serial results also failed. The plan is published in
+`metacraft-specs@81f067a`, `infrastructure/gosti-io-mon-runquota-releases.md`.
+Workflow checks and lint pass. Source lock blob
+`049a0992f8de4e92683d07b95b037a437bd143a8` matches the remote record.
+Complete CI `36823480335` and Reprobuild CI `36823482913` are active.
+Verify the observed test-program concurrency as well as the final outcomes.
+
+Windows cache comparison tooling `ffbaa21`, run `36823603500`, is active on
+both hosts against the isolated `a2676aa` fixture change. It uses a real
+60-second insert delay to provide margin beyond the original polling loop,
+and requires the original to fail only its residency assertion. Revised
+full coverage and original/revised delayed cases run in native and monitored
+modes. The diagnostic verifies native Windows Python process IDs before using
+its process-tree timeout cleanup. Python syntax, workflow and Windows proxy
+source checks pass. This guard is not an attribution of the unrelated SQLite
+progress upload failures.
