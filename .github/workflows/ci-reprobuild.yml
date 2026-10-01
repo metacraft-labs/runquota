@@ -136,7 +136,7 @@ jobs:
           # Distinguish emulated x64 from native ARM children and preserve exit bits.
           repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
           # Preserve buffered root output without waiting for descendant pipe EOF.
-          repro-stackable-hooks-pin: d36cab880711c2f50f57079623a1ce89ba4a83dc
+          repro-stackable-hooks-pin: 43b1835128331fef09ecf64a614dbf46880dbe9f
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: Refresh authentication before repro build
