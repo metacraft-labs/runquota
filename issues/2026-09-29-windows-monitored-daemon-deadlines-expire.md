@@ -635,3 +635,31 @@ Tooling `b5e3811` resolves Bash to its absolute path before launching it,
 requires GNU Bash in its version output, and retains the selected identity.
 Run `36801996275` repeats the same four native/monitored process controls
 on both Windows hosts. No fixture expectation or product source changed.
+
+### x64 process controls and interrupted complete validation
+
+At tooling `b5e3811`, Windows x64 job `110178151125` passes all eight
+native/monitored outcomes for RunQuota `15e4deb`: delayed original entry
+fails only the intended exit assertion, delayed repaired entry passes all
+eight cases, delayed work after release still fails that assertion, and the
+unmodified repaired fixture passes all eight cases. No outer timeout occurs;
+the input hashes remain unchanged. The selected GNU Bash resolves under the
+activated Reprobuild tool store. Evidence: `/tmp/runquota-startup-b5e-x64`.
+ARM controls remain active. The earlier `7d1ef0c` ARM job also selects the
+WSL launcher and fails before fixture execution; its error requests a WSL
+update. That launcher error is distinct from the x64 missing-distribution
+message and is covered by the same absolute-path correction.
+
+Full candidate run `36800247249` receives cancellation at 01:58 UTC on
+October 1, before validation completes. Both Linux jobs have passed monitored
+build/test but lose the native test cross-check; Windows x64 has passed its
+monitored build, and macOS has completed setup and entered its monitored
+build. These partial results are not a complete gate. The available API
+does not identify the cancellation requester; there is no newer replacement
+run and manual-dispatch concurrency is unique per run. No assertion failure
+is inferred from cancellation. The reason has been requested from the user.
+
+Predecessor `9f88e77` independently passes complete macOS monitored and native
+cross-checks in job `110159381875`, run `36795962975`. Its existing x64
+helper failure remains the measured reason for selecting the handshake
+candidate, whose full validation is still required.
