@@ -1132,9 +1132,11 @@ Candidate `2d07c5d` changes only that scratch-root setup script and issue
 records above `d6ee458`. All application sources, fixtures, recipes and CI
 inputs are identical. All ten ordinary jobs pass in run `36846644651`.
 The complete focused ACL verification at tooling `61f68e8`, run `36852276089`,
-passes on x64: the original real explicit foreign grant survives, the repair
-removes it, the unchanged guard rejects its reinsertion, and all 86 scanner
-cases and twelve static-helper libraries pass. ARM verification is pending.
+passes on both Windows hosts: the original real explicit foreign grant
+survives, the repair removes it, the unchanged guard rejects its reinsertion,
+and all 86 scanner cases and twelve static-helper libraries pass. Independent
+checks of downloaded source hashes, DACLs and logs confirm all four outcomes
+per host in `/tmp/runquota-acl-61f-x64` and `/tmp/runquota-acl-61f-arm`.
 The owning issue is
 `2026-10-01-static-helper-gate-retains-explicit-windows-access-grants.md`.
 

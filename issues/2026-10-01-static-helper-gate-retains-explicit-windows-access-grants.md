@@ -46,3 +46,35 @@ privacy refusal. This does not turn the failed workflow into a passing one.
 
 Refreshed `dev@2c50aaf` and searched open and archived issues for this SID,
 static-helper ACLs and the gate-work-root refusal. No existing issue covers it.
+
+## Verified repair (2026-10-01)
+
+Candidate `2d07c5de63a24c4869ceddda78c14bbf38b76271` passes all four
+expected outcomes on Windows x64 and the ARM host in
+[run 36852276089](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36852276089),
+using diagnostic tooling `61f68e8ce2a8adef8ba9053d33346343edd78b8f`.
+Independent .NET ACL reads show the explicit Authenticated Users grant remains
+under the original sequence and disappears under the repair; the resulting
+protected DACL grants only the owning account access. Adding that real grant
+back makes the unchanged gate refuse it with the original privacy diagnostic.
+The complete repaired gate then passes all 86 scanner regressions and builds
+all 12 manifest-listed libraries with ARC and no refs in their closures.
+No control times out. The full gates take 81.73 seconds on x64 and 166.50
+seconds on ARM; these are individual runs, not a performance comparison.
+
+Downloaded evidence is `/tmp/runquota-acl-61f-x64` and
+`/tmp/runquota-acl-61f-arm`. Independent verification compares the actual source,
+guard and patch bytes with Git, checks every pinned dependency, reads each
+DACL and checks the negative-refusal and complete-gate logs. Results SHA256:
+
+- x64: `1b19bbcafe692c47e129fc8956980fcc1aab22589ce76ca044d3f31a3d2a971d`
+- ARM: `5dd8970be405a1c9d59eab7a30dc399fd24ec8e2b6f36e6b3ffea1fefb365cec`
+
+Earlier tooling `3a9f164` fails on both hosts while loading `Get-Acl`;
+`cb7a2f6` fixes the reader and confirms the original grant survives on both,
+then hits a CRLF-sensitive fragment extraction assertion. `61f68e8` preserves
+committed line endings during checkout and verifies their exact hashes.
+These are diagnostic corrections; the product remains at `2d07c5d`.
+Ordinary CI `36846644651` passes all ten jobs. Application sources and fixtures
+are identical to qualified `d6ee458`; that earlier overall workflow remains
+failed at its separate ACL gate and is not relabelled as successful.
