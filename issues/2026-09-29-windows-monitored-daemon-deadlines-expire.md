@@ -910,3 +910,33 @@ fixture times, including the monitor wrapper, not individual query latencies.
 Complete native CI `36810841209` now passes all ten jobs at `2d3897c`.
 Full Reprobuild CI `36810843817` remains active. Parent `b4a9c53` passes
 both Linux jobs and Windows x64 completely; macOS and ARM remain active.
+
+### Completed parent ARM run and unavailable SQLite probe evidence
+
+RunQuota `15e4deb`, full Reprobuild run `36805849869`, completes its ARM
+job at 04:57 UTC on 2026-10-01 with 191 successful actions, four failures and
+eight blocked measurement actions out of 203. All compilation passes.
+The M5 process benchmark, observation export and observation merge programs
+reach exit 124 after partial passing assertions. Retention scheduling exits
+1: the idle sweep, bounded busy-host deferral and failed-pass recovery cases
+miss their existing waits. The other programs that failed in earlier ARM
+runs do not recur here; that absence alone does not establish their repair.
+Evidence is `/tmp/runquota-15e-arm-repro.log` and
+`/tmp/runquota-15e-arm-evidence/.repro/build/repro/build-failure-report.json`.
+This parent still uses hooks `d36cab8`, before the independently verified
+propagation-lock initialization repair.
+
+SQLite progress tooling `4a2a9e7`, run `36808704707`, ends cancelled at
+04:58 UTC. Its check annotation explicitly reports exceeding the 110-minute
+job limit. The comparison step had failed at 03:45 UTC, but artifact upload
+never completed. GitHub exposes no artifact; the completed run's log download
+is an empty ZIP (22 bytes), and the individual job log returns HTTP 404.
+Consequently neither worker progress nor the comparison's original failure
+phase can be attributed from this run. The local controlled-delay result
+remains valid; it does not substitute for missing Windows evidence.
+
+At `2d3897c`, complete Reprobuild run `36810843817` now passes both Linux
+hosts and Windows x64. macOS is in its native cross-check and ARM is still
+compiling. Parent `b4a9c53` has passed ARM compilation and started monitored
+tests with hooks `43b1835`. No new scheduling or deadline change is selected
+while those candidates are being validated.
