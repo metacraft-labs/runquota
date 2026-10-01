@@ -529,3 +529,35 @@ macOS and Windows remain active. Separate candidate `7fd57f4` changes only
 the Windows hook pin to `d36cab8`, after that helper passes all 104 paired
 original/prepared Windows corpus cases. Its complete CI is `36792986046`
 and `36792989240`. No test deadline or assertion changes.
+
+## Complete ARM-host result before retention and hook changes
+
+Full Reprobuild run `36786740859` at RunQuota `c6ddde6` finishes with
+Linux x64, Linux ARM64, macOS and Windows x64 passing. Its Windows ARM
+x64-emulation job `110129883904` compiles all 103 programs, then reports
+187 successful actions, eight failures and eight blocked actions:
+
+- Inherited-descriptor isolation never starts: MSYS cannot launch
+  `/usr/bin/timeout` and reports `Device or resource busy` (status 126).
+- The process benchmark contract cannot remove `runquota_m5_process_bench.exe`
+  after its existing cleanup retries; the outer action times out. This is
+  distinct from the observation-database cleanup failure at `f93855c`.
+- The socket-write fixture misses its dropped-row count. It already polls
+  both write failures and dropped rows; adding that predicate again would
+  not fix this observation.
+- Aggregate publication and scheduled retention miss their existing waits.
+- Store export and merge return 124; store query is killed with status 137
+  after two passing cases.
+
+This candidate includes merge-query batching only. It predates retention
+batching at `f93855c`, prepared hook pages at `7fd57f4`, and bounded inner
+benchmark cleanup at `9f88e77`. Those later complete runs must decide which
+failures persist. The benchmark image-lock failure is not established as
+fixed by retrying removal of its separate daemon directory. Keep every
+assertion, deadline and runtime gate. No hook phase trace accompanies this
+report, so it does not identify the compiler-startup stall as its cause.
+
+Evidence: `/tmp/runquota-c6-arm-repro.log` and the downloaded
+`repro/build-failure-report.json` under `.repro/build/` in
+`/tmp/runquota-c6-arm-evidence`. Refreshed dev `2c50aaf` and agents
+`da47483` before extending this existing record.
