@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | open; attribution pending |
+| Status | worker-storage use-after-free confirmed; full repair qualification pending |
 | Recorded | 2026-10-01 |
 | Observed in | RunQuota `d48e196bb6817d2d543c3ef8ff85d21acee0c892` |
 | Area | daemon SIGTERM teardown under Linux x64 Reprobuild |
@@ -111,3 +111,27 @@ Backtraces and summaries: `/tmp/runquota-3aba-full-graph-evidence`.
 Fetched `agents` and `dev` at `d48e196` and `0389129`. Searched current and
 archived issues for SIGSEGV, exit 139, and SIGTERM crashes; no matching record
 exists. Local log: `/tmp/runquota-d48-linux-x64-repro-promotion.log`.
+
+## Original-source sanitizer control
+
+[Diagnostic `7d98a68`](https://github.com/metacraft-labs/runquota/actions/runs/36932354074)
+builds the real daemon and unchanged shutdown fixture with Nim 2.2.4, GCC
+15.2, AddressSanitizer and `-d:useMalloc`. The allocator switch exposes each
+Nim sequence allocation to the sanitizer; this is a separate diagnostic
+configuration. Real C positive and heap-use-after-free negative controls pass.
+
+The original daemon fails on the first fixture execution. AddressSanitizer
+identifies `threadProcWrapper` reading the freed `Thread` object, with the
+free stack pointing to `seq.add` in `serve` at line 4088. This establishes the
+worker-storage lifetime defect. Preallocating all worker slots before any
+`createThread` call passes all 30 fixture executions (60 shutdown cases).
+The source SHA256 for that variant is
+`7d19f06cc39b3fff051e23b68dbcad212bc227b08f39ac3b2cd965414d7af38c`,
+identical to the production repair staged on `fe11a68`. The worker count,
+join order, test assertions, deadlines and monitoring policy are unchanged.
+
+Both real macOS shutdown cases also pass at `fe11a68` plus this repair with
+the ordinary allocator. Full local suites and the ordinary monitored Linux
+graph remain the qualification gates before promotion. Evidence:
+`/tmp/runquota-7d98-asan-controls` and
+`/tmp/runquota-preallocated-workers-local.log`.

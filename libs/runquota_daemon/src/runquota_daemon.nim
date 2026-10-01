@@ -4083,10 +4083,12 @@ proc serve*(config: DaemonConfig): int =
   # before any worker exists, because the shutdown this arms is the one that
   # joins them.
   installShutdownHandler(config.endpoint.path)
-  var threads: seq[Thread[void]] = @[]
-  for _ in 0 ..< connectionWorkerCount():
-    threads.add(default(Thread[void]))
-    createThread(threads[^1], connectionWorker)
+  # Nim's thread wrapper borrows the Thread object's address through its exit
+  # cleanup. Allocate every slot before starting workers so sequence growth
+  # cannot move a live worker's storage.
+  var threads = newSeq[Thread[void]](connectionWorkerCount())
+  for i in 0 ..< threads.len:
+    createThread(threads[i], connectionWorker)
   # SERVICE_RUNNING IS REPORTED HERE AND NOWHERE EARLIER. The endpoint is
   # bound, the rendezvous directory has been verified, and a worker pool
   # exists to serve what the loop below accepts -- so this is the first
