@@ -1,0 +1,73 @@
+name: Daemon regression diagnostic
+
+on:
+  push:
+    branches: [diagnose-daemon-regressions-2026-10-01]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Daemon controls (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Locate Windows Python before bootstrap changes PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"DIAGNOSTIC_PYTHON=$((Get-Command python).Source)" >> $env:GITHUB_ENV'
+      - name: Mint installation token for source bootstrap
+        id: ci_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+      - name: Setup the pinned source bootstrap
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@41d0680bd78ca59ad110a261a20bcaa93a38fffd
+        with:
+          env-flavor: reprobuild
+          repro-from-source: true
+          repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
+          repro-posix-io-mon-pin: 3df08c24ee91900b950ed20a3827923d213f2a9c
+          repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
+          repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
+          repro-stackable-hooks-pin: 43b1835128331fef09ecf64a614dbf46880dbe9f
+          gh-token: ${{ steps.ci_token.outputs.token }}
+      - name: Refresh build authentication
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+      - name: Repeat Linux shutdown with local core backtraces
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb
+          export DIAGNOSTIC_CORE_DIR="$RUNNER_TEMP/runquota-diagnostic-cores"
+          mkdir -p "$DIAGNOSTIC_CORE_DIR"
+          printf '%s/core.%%e.%%p\n' "$DIAGNOSTIC_CORE_DIR" | sudo tee /proc/sys/kernel/core_pattern >/dev/null
+          ulimit -c unlimited
+          dev-exec "$REPROBUILD_BOOTSTRAP_PYTHON" .github/scripts/diagnose_daemon_regressions.py
+      - name: Repeat Windows readiness after compiling only its prerequisites
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: dev-exec $env:DIAGNOSTIC_PYTHON .github/scripts/diagnose_daemon_regressions.py
+      - name: Retain focused evidence without core memory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-regressions-${{ matrix.os }}
+          path: build/diagnostics/daemon-regressions/
+          if-no-files-found: warn
+          retention-days: 7
