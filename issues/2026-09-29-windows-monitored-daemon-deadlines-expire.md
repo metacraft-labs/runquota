@@ -115,3 +115,1002 @@ keeps every test and adds the startup checkpoints. Paired focused comparison
 uses the same instrumentation and one environment. Both use tooling `9ef9750`.
 The superseded `cea927f` and `3020d7e` diagnostics were cancelled explicitly;
 ordinary release gates and the independent ARM compiler trace continue.
+
+## Full-graph diagnostic correction
+
+Full graph `36723729088` at tooling `9ef9750` finishes with 179 successful
+actions, 14 failed programs and eight blocked programs. Its startup tracing
+writes five extra lines to every daemon's stdout. Other real fixtures use the
+three public startup lines as a readiness barrier, so they consume diagnostic
+lines instead and proceed before store verification. For example,
+`t_endpoint_serves_before_store_verification` prints the three diagnostic lines
+where it expects listening, capture and hardware-profile messages. The target
+crash-recovery program is blocked and never executes. This run does not
+reproduce or explain its original startup failure.
+
+Tooling `92c3b6d` enables those lines only in children of the instrumented
+crash-recovery fixture, using a process-local environment flag. The fixture
+already collects its own daemon output without parsing it as a barrier.
+Unrelated fixtures retain the ordinary startup protocol. Windows source checks
+pass for both instrumented sources. Against RunQuota `48bb701` plus this
+instrumentation, a real macOS store-verification test passes with all three
+ordinary startup lines, and all eight instrumented lifecycle cases pass.
+Evidence: `/tmp/runquota-readiness-scoped-control.log`.
+
+Replacement full graph
+[36731094289](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36731094289)
+uses tooling `92c3b6d` and the same exact RunQuota `7036462`, deadlines and
+assertions. The focused `9ef9750` comparison remains useful because it launches
+only the fixture that collects raw output, and is allowed to finish. The
+failed full-graph artifact is retained in `/tmp/runquota-readiness-9ef-full-evidence`.
+Refreshed dev `0bce530` and agents `fed6830` before recording this correction.
+
+## Completed focused comparison and helper observation
+
+Focused run `36723733885` at tooling `9ef9750` finishes all eight paired
+repetitions against RunQuota `7036462`. The monitored graph and every
+monitored repetition pass. Native repetitions 1, 3, 5, 7 and 8 pass; repetitions
+2, 4 and 6 fail helper exit/status assertions before any lease is granted.
+Granted-abnormal helpers return zero instead of 31 twice, starting-abnormal
+returns zero instead of 32 once, and running-abnormal returns zero instead of
+33 once. All daemons reach readiness, so this does not reproduce the original
+missing daemon pipe. These results show a helper failure also without an outer
+monitor. At Reprobuild `c14b1e6`, `runActivatedCommand` starts the activated
+command directly; only the paired monitored mode invokes `internal io monitor`.
+The unchanged binary hashes are retained in `results.json`.
+
+The helper output was not retained in that comparison. Tooling `71d7fe7` adds
+flushed helper-entry, connection, registration, lease and child-spawn phases,
+and records elapsed waits and bounded available output. The original 3000 ms
+wait and all assertions remain. Windows source checks pass, and real macOS
+startup-protocol and all eight lifecycle cases pass against `33add18` plus
+this diagnostic. Focused replacement `36734357209` runs the same `7036462`
+candidate; corrected full graph `36731094289` continues independently.
+Refreshed dev `2c50aaf` and agents `44bc56c` before recording this evidence.
+
+## CRLF diagnostic repair
+
+Run `36734357209` at tooling `71d7fe7` stops before compiling or executing the
+fixture: its anchored helper-phase regex does not match CRLF checkout lines.
+This is a diagnostic defect, not a new RunQuota failure. Tooling `30d78bd`
+normalizes disposable source and here-string anchors together and preserves
+original bytes for cleanup. A real CRLF conversion of all four edited files
+at RunQuota `33add18` passes Windows source checks, the native macOS public
+startup-protocol control, and all eight instrumented lifecycle cases. Cleanup
+is checked against the original CRLF bytes. Replacement focused run
+`36736205178` uses the same RunQuota `7036462` and unchanged fixture bounds.
+The independently corrected full graph `36731094289` continues.
+
+## Corrected full graph passes
+
+Complete run `36731094289` at tooling `92c3b6d` passes at RunQuota `7036462`:
+all 201 actions succeed and every one of the 99 test programs launches with
+`cdNotCacheable`. The instrumented crash-recovery fixture passes all eight
+cases; its daemon readiness measurements range from 132 to 173 ms. The
+ordinary startup protocol is preserved for every other fixture. This is a
+passing complete graph, not a closure of the separately reproduced intermittent
+helper failures. Focused helper-phase run `36736205178` remains active.
+Evidence: `/tmp/runquota-readiness-92-full-evidence`.
+
+## Helper phases pass; diagnostic console output times out
+
+Run `36736205178` at tooling `30d78bd` preserves a passing focused graph and
+all 16 successful native/monitored repetitions at RunQuota `7036462`. Each
+repetition's retained log has all eight passing lifecycle cases: 128 cases
+in total, with identical fixture and daemon hashes throughout. The 64 observed
+helper exit waits range from 15 to 1106 ms, below their unchanged 3000 ms
+bound. All helpers reach their expected exit codes. This run does not reproduce
+the earlier intermittent helper failure.
+
+The Actions step nevertheless expires at 60 minutes while emitting the
+captured console text. The complete files and final `results.json` are
+already present, while the job log is still printing the first monitored
+repetition. Treat the workflow as failed, retaining the narrower completed
+test evidence. Tooling `7729607` bounds console tails to 12 lines per capture
+and removes duplicate tail printing; complete files remain artifacts and
+command exit status is preserved. Real file/output controls cover successful
+and failing commands, spaces in paths and invalid tail limits. PowerShell
+syntax passes. Replacement `36745684530` keeps all pairs and all existing
+fixture, action and workflow time limits.
+
+Daemon readiness polling is 80 attempts with 50 ms sleeps, not a strict
+four-second wall-clock deadline: an IPC connection call may itself block.
+This run records 53–7603 ms from spawn return to readiness, with no exhausted
+poll loop. No timeout or product behavior is changed based on those durations.
+Evidence: `/tmp/runquota-readiness-30d-evidence` and
+`/tmp/runquota-readiness-30d-job.log`. Refreshed dev `2c50aaf` and agents
+`ef060dd` before extending this record.
+
+## Native helper expires before its first startup marker
+
+Bounded-output run `36745684530` at tooling `7729607` completes the focused
+monitored graph and all eight paired repetitions at RunQuota `7036462`.
+Every monitored repetition passes. Native repetitions 1–4 and 6–8 pass;
+native repetition 5 fails its normal supervisor-exit case. Across the retained
+logs, 127 of 128 lifecycle cases pass. Fixture and daemon hashes remain
+identical throughout each comparison.
+
+The failed helper has PID 1656, returns zero after 3105 ms against its unchanged
+3000 ms wait, and emits no helper-entry marker or later phase. The daemon
+reports zero granted leases. Nim's Windows timeout termination uses exit zero,
+which the expected normal exit alone cannot distinguish; the existing lease
+count assertion catches this failure. Its daemon was already ready after
+7642 ms of readiness polling. Every daemon in the comparison becomes ready;
+this is not the original missing-pipe failure.
+
+This occurrence is native, without the outer monitor. It establishes that
+this helper made no recorded progress before timeout termination; it does
+not yet distinguish Windows image/CRT startup from imported Nim module
+initialization or other scheduling delay. Capture process/thread startup
+state before the timeout kills a future failing helper. Preserve the actual
+lifecycle assertions and wait bound; do not attribute it to the ARM-host hook
+transaction based on a shared timeout symptom.
+
+Evidence: `/tmp/runquota-readiness-772-evidence/build/windows-readiness`,
+especially `native-5.log` and `results.json`. Daemon SHA-256 is
+`2650BB5E7659D33463678AB30B8CF0BA0EB24AEFBBC26F7EF4FD814D7FD5B515`;
+fixture SHA-256 is
+`CCCD5E8D61E0E33A61D97B6A185A8E85B11F9B4542BAACA19CF223F4E7D018E4`.
+Refreshed dev `2c50aaf` and agents `339ab1e` before extending this record.
+
+Tooling `8fd4eff` adds the next failure observer in `36753042655`. It waits
+on the real Windows process with the same 3000 ms bound; only after expiry
+it records process CPU time and up to eight thread contexts, with balanced
+suspend/resume calls and bounded unwind addresses. It then terminates with
+Nim's original exit zero and explicitly marks the expired wait as a failure.
+No raw stack contents, environment values or arguments are retained. A real
+fast child must preserve exit 17; a real sleeping child must time out and
+yield an actual thread context before the paired fixture comparison runs.
+
+PowerShell transformation and full Windows x64 C compilation/link pass for
+the instrumented fixture at RunQuota `33add18`; the actual comparison retains
+`7036462`. The observer's standalone C control also compiles/links for Windows
+x64. Runtime controls and repeated comparisons remain pending in the new run.
+This changes only disposable diagnostics, not the release source.
+
+## Helper context and missing daemon readiness both recur
+
+At exact RunQuota `7036462`, tooling `8fd4eff` in
+[36753042655](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36753042655)
+passes the real observer controls and focused graph, then completes all eight
+native/monitored pairs at unchanged hashes. Of 128 lifecycle cases, 125 pass.
+The three failures are distinct observations:
+
+- Native repetition 3's running-lease helper exceeds the original 3000 ms
+  wait before its first flushed helper marker. At expiry its process has
+  15.625 ms of kernel CPU time and zero reported user CPU time. The main thread
+  is at `ntdll+0x163294`; eight unwind addresses are in ntdll and KernelBase.
+  No function-symbol identity or application-level cause is established.
+  The observer records the timeout before termination, and the existing
+  lease/status assertions fail as well.
+- Native repetition 5's daemon never prints its application-entry marker or
+  publishes its pipe before the unchanged readiness loop expires.
+- Monitored repetition 1 reproduces the same missing daemon output/pipe in
+  its final forced-supervisor-kill case. `startProcess` itself takes 3999 ms;
+  cleanup begins at 9074 ms measured from before that spawn.
+
+The other 126 daemon startups report readiness. This reproduces the original
+missing-pipe symptom without an outer monitor as well as with it. A stalled
+helper also appears in a native run; neither observation supports attributing
+all startup failures to monitor injection. The system instruction addresses
+alone do not establish a Winsock, loader or security-software cause.
+
+The real fast-child control returns 17. The real sleeping-child control
+expires at 3000 ms, records two thread contexts and is reaped with the expected
+zero timeout termination status. The diagnostic retains every original test
+assertion and deadline. Daemon hash:
+`7A7AAFE74FAB9176CA4984B83AF46061C90DEC7C229A1CD7E8220D3FA897AF38`;
+fixture hash: `BF0C865F8479550EBC456FEF79207E647EA33E31F726E221AA62345B270F1BFE`.
+
+Evidence: `/tmp/runquota-readiness-8fd-evidence`. Refreshed dev `2c50aaf` and
+agents `641d103`. Current release candidate `33add18` separately passes all
+ten native jobs and complete Windows x64 and macOS Reprobuild jobs; this
+focused recurrence remains an open intermittent issue, not a failed gate at
+that candidate.
+
+## Full execution after all 100 monitored compilations succeed
+
+Run `36753037680` at tooling `8fd4eff` completes on 2026-09-30 at
+20:18 UTC against RunQuota `8cf662c`, hooks `8f4d806` and disposable all-range
+hook-page preparation. All 100 monitored compile actions pass. Its test graph
+has 93 successful actions, 85 up-to-date actions, 12 failed executions and
+eight blocked executions:
+
+- Exit 124: host-state trust, process/exec contract, extension write path,
+  query interface, standalone backup, observation export and observation merge.
+- Exit 137: observation socket write path, after a daemon stream-read error;
+  the shell reports the timeout wrapper was killed.
+- Exit 1: observation flush contract, multi-session fairness, standalone
+  daemonless degradation and retention schedule.
+
+Fairness fails to open a daemon pipe. Standalone degradation includes access
+denied while removing a child executable. Flush-count and retention-cadence
+assertions also fail. Partial successful test output precedes the timeouts;
+it does not establish that the programs completed. No phase-130 hook trace
+accompanies these failures. They cannot be assigned the compiler stall's cause
+from a shared timeout symptom.
+
+These 12 programs are unchanged between `8cf662c` and candidate `a173baf`.
+The latter does select the separately validated root-exit capture repair in
+its CI bootstrap. Its ordinary checks and the current-source prepared graph
+`36763970172` at `f5a3d99` remain pending; this older result does not establish
+their outcome. No test assertion or production deadline is waived.
+
+Evidence: `/tmp/windows-arm-prepared-all-8fd-evidence` and bounded action
+summary `/tmp/windows-arm-prepared-all-8fd-summary.json`. The diagnostic shim
+hash is `BBB2E1EE4B77C96F6D527DBBEB3763BCA33996A3CA44DE515B31F4309507D21E`.
+Refreshed dev `2c50aaf` and agents `057a60f` before extending this record.
+
+## Next diagnostic: observe a live test tree without changing its wait
+
+Use the current release sources and validated capture repair for a focused
+export/merge/retention comparison. Keep the real monitor, test binaries,
+assertions and GNU timeout's 600-second bound. Periodically read CPU times and
+the diagnostic shim's exported initialization phase in that invocation's own
+process tree. The observer must neither suspend threads nor terminate targets.
+A real child exporting a known phase must prove the reader works and that the
+child remains alive afterward. These observations can distinguish incomplete
+shim initialization from later execution; they do not identify a Windows
+wait's cause or replace the full ordinary CI gate.
+
+Implemented as disposable tooling `8817d55` in run `36774529116`, using
+RunQuota `33add18`, hooks `def2464` and original hook protection. Windows x64
+C compilation/link with warnings as errors, Python/PowerShell syntax and
+workflow validation pass at that tooling commit. The real Windows controls
+and native/monitored repetitions remain pending. The known-phase child must
+remain alive after observation; a separate child exporting a different phase
+must fail the same phase assertion. The existing full current-source graph and
+ordinary release CI remain running independently.
+
+## Completed current-source observations
+
+Full graph `36763970172` at tooling `f5a3d99`, RunQuota `33add18` and
+hooks `def2464` completes with all 103 build actions successful. Its test
+graph reports 93 successful, 88 up-to-date, 14 failed and eight blocked
+actions. Nine failures return 124, two return 137 and three return 1.
+The failures include SQLite concurrent spawn, daemon startup/communication,
+publication, retention and export/merge. All-range page preparation therefore
+does not establish a complete repair. No phase-130 trace accompanies these
+runtime failures. Evidence: `/tmp/windows-arm-prepared-f5-evidence`.
+
+Focused comparison `36774529116` at tooling `8817d55` preserves binary hashes
+and the original protection behavior. All three native programs pass:
+retention in 22.2 seconds, export in 52.2 and merge in 61.2. Monitored retention
+passes in 220.5 seconds and export in 553.6; merge returns 124 after 636.8
+seconds including monitor completion. The retained streams contain 360, 878
+and 1026 process-spawn records respectively. Merge prints six successful
+assertions before timeout, so this run does not support a post-suite exit
+deadlock. The process-tree samples include initialized shims but omit the
+actual test PID recorded in the merged stream: a snapshot of live parent
+links is insufficient across the MSYS process transitions. Do not attribute
+the test's wait to those idle ancestors. Both real phase-reader controls pass,
+including rejection of phase 322 with status 13. Evidence:
+`/tmp/runquota-runtime-881-evidence`.
+
+### Next controlled comparison
+
+The source bootstrap at candidate `a173baf` and these diagnostic rebuilds use
+debug monitor shims. Compare the same fixed application/test binaries with
+debug and release-mode shims built from identical source pins and diagnostic
+stores. Keep native execution, all assertions, capture and the original
+600-second timeout. Record both shim hashes and complete results even if the
+debug arm fails. This tests the existing `IO_MON_BUILD_MODE` build option;
+it does not select a production change or waive a gate.
+
+Extend the read-only observer to select the exact test executable path, created
+after the invocation root, as an additional observation root. Label it as an
+image match rather than asserting an unobserved parent relationship. Preserve
+creation-time checks, known/wrong-phase controls and the ban on suspending
+observed threads. Ordinary candidate `a173baf` remains in its failed-job retry;
+four Reprobuild hosts and all ten native jobs already pass at that SHA.
+
+## Startup cost and bounded merge-query batching
+
+Small real-assembler comparison `36784367520` at tooling `90d1c40` passes
+all 80 launches on each Windows host, including child-specific COFF output,
+process-start, file-read and file-write assertions. On the ARM host, median
+direct launch times are 492 ms with the debug shim and 487 ms with the release
+shim; propagated launches take 928 and 906 ms. Native launches take 71 ms.
+This does not support treating release-mode compilation as the startup fix.
+Evidence: `/tmp/windows-shim-mode-90d-arm` and
+`/tmp/windows-shim-mode-90d-x64`. The full fixed-RunQuota comparison remains
+active separately at tooling `2bed024`.
+
+At RunQuota `a173baf`, each merge launches SQLite separately for each of five
+spine-table existence checks, each source/destination column listing, and
+each of seven before/after row counts. Batch those read-only operations into
+one table-list query, one requested-column query per database and one count
+query per snapshot. Keep metadata scoped to the requested tables; an unrelated
+virtual table must not become a new prerequisite. Preserve column order,
+extension discovery and opacity, every host/owner refusal, the existing single
+write transaction, report counts and canonical merge identity (OS-5/6/7 of
+the observation-store spec). Do not cache metadata across merges or modify
+source databases, test fixtures, assertions or deadlines.
+
+Validate against the existing real SQLite merge, owner, migration and export
+tests, comparing original and batched binaries with the same input and tool.
+Count real SQLite invocations through a delegating executable wrapper; the
+wrapper must execute the real SQLite binary and preserve its stdin, stdout,
+stderr and status. This is measurement, not a replacement SQL implementation.
+The complete ordinary release matrix is still required before selecting the
+new candidate. This batching addresses excessive launch count; it is not
+claimed as a repair for the independent hook-protection compiler stall.
+
+## Repeated full runtime observation
+
+Diagnostic `36778919434` at tooling `d35cfcc`, using RunQuota `33add18`,
+hooks `def2464` and io-mon `5e71adf`, completes native retention/export/merge
+in 20.1/48.2/55.2 seconds. Monitored export and merge pass in 495.9 and
+623.9 seconds including monitor cleanup. Monitored retention fails in
+194.6 seconds: `waitFor(scFinished, 1)` remains zero in the bounded busy-host
+deferral case. Every other retention assertion passes. The unchanged merge
+can therefore complete under monitoring, but it is close to its execution
+bound and is not reliably green across runs.
+
+Evidence: `/tmp/runquota-runtime-d35-evidence`, including result JSON,
+per-test logs, exact binary hashes and source pins. This observer still has
+the known live-parent-tree gap; do not attribute its ancestor phase readings
+to an absent test process. The later `2bed024` comparison addresses that
+observation gap and remains a separate run.
+
+## Bounded retention-query batching
+
+RunQuota `c6ddde6` changes only merge reads. Its seven unchanged merge cases
+pass locally with 762 real SQLite launches versus 1,114 at `a173baf`, using
+the same Apple SQLite 3.51.0 executable through a delegating wrapper. Its
+complete 28-binary observation-store subset passes with Nix SQLite 3.51.2
+and Nim 2.2.4. Full ordinary CI and the paired Windows comparison at tooling
+`8159a30` remain pending; no release candidate is selected from this alone.
+
+The separate scheduled-retention failure at `33add18` is a ten-second wait
+for `scFinished`. At `c6ddde6`, the first sweep opens the store, queries the
+registry, checks each extension table separately, counts executions,
+extension rows and carried rows separately, commits the existing deletion
+transaction, then counts hosts and profiles separately. Each query launches
+a new SQLite process. The passing small startup comparison above measures
+about 0.5 seconds per monitored launch on the ARM host; this motivates
+reducing launches, but does not establish the duration of any failed sweep.
+
+On a separate branch, batch the registry's existing-table lookup into one
+read, all doomed-row counts into one snapshot, and the final host/profile
+counts into one read. Preserve registered extension order, invalid-identifier
+rejection, the absent-extension-table behavior, opaque extension columns,
+host-qualified deletion predicates and the existing single write transaction.
+An unreadable count must fail explicitly before deletion. Preserve all
+sweeper cadence, deferral, locking, degradation and reporting behavior, and
+every test assertion and deadline. This implements the observation-store
+spec's Retention and OS-5/6 requirements with fewer child processes.
+
+Measure the unmodified retention-schedule suite first, then run the existing
+real SQLite extension, retention, retention-schedule and crash/atomicity gates
+against the change. Run Windows controls before selecting it for the release.
+Do not infer a fix for compiler hook-protection stalls from these results.
+
+### Completed local and Windows x64 checks
+
+The retention change is `f93855c`, directly above merge change `c6ddde6`.
+At `f93855c`, all 34 observation-related binaries pass locally with Nim 2.2.4
+and Nix SQLite 3.51.2, including real extension rollback, retention, scheduled
+retention, crash/isolation and merge tests. Repository lint passes. Tests and
+deadlines are unchanged. Full CI and paired Windows retention controls are
+still required before selection.
+
+The merge comparison at tooling `8159a30` completes on Windows x64 with all
+12 original/batched, native/monitored cases passing. In that one paired run,
+the monitored merge suite takes 110.7 seconds at `a173baf` and 81.3 seconds
+at `c6ddde6`; export takes 91.6/80.0 seconds and users 62.8/48.9 seconds.
+The native merge times are 28.7/27.7 seconds. Both variants use the same
+compiler, SQLite and original debug monitor on the same worker. This is one
+run, not a latency distribution. Evidence: `/tmp/runquota-merge-batch-815-x64`.
+The ARM-host comparison in that run is still active.
+
+## Both Windows merge comparisons pass
+
+Tooling `8159a30`, run `36786810296`, now passes all 12 cases on both
+Windows hosts. On the ARM host, monitored merge takes 565.1 seconds at
+`a173baf` and 416.4 at `c6ddde6`; export takes 444.8/408.4 and users
+294.6/231.0 seconds. Native merge takes 55.7/43.1 seconds. This is one
+ordered paired run, not a latency distribution; the independent local count
+still establishes the reduced SQLite-launch count. Evidence:
+`/tmp/runquota-merge-batch-815-arm` and `/tmp/runquota-merge-batch-815-x64`.
+
+Native CI `36788909146` at retention candidate `f93855c` passes all ten
+jobs. The x64 retention comparison `36788891396` at `cfff6c3` passes all
+12 cases; store-retention takes 67.7/68.2 seconds under monitoring, so that
+run does not establish a speedup. Its ARM comparison also passes all 12
+cases: monitored store-retention takes 280.5 seconds at `c6ddde6` and
+243.7 at `f93855c`; schedule takes 195.1/170.4 and extension tests
+180.8/164.3. All use the same compiler, SQLite and original debug monitor
+on the same worker. This is one ordered comparison, not a latency
+distribution. Evidence: `/tmp/runquota-retention-cfff-arm`.
+
+Full Reprobuild CI `36788912758` at `f93855c` passes both Linux jobs;
+macOS and Windows remain active. Separate candidate `7fd57f4` changes only
+the Windows hook pin to `d36cab8`, after that helper passes all 104 paired
+original/prepared Windows corpus cases. Its complete CI is `36792986046`
+and `36792989240`. No test deadline or assertion changes.
+
+## Complete ARM-host result before retention and hook changes
+
+Full Reprobuild run `36786740859` at RunQuota `c6ddde6` finishes with
+Linux x64, Linux ARM64, macOS and Windows x64 passing. Its Windows ARM
+x64-emulation job `110129883904` compiles all 103 programs, then reports
+187 successful actions, eight failures and eight blocked actions:
+
+- Inherited-descriptor isolation never starts: MSYS cannot launch
+  `/usr/bin/timeout` and reports `Device or resource busy` (status 126).
+- The process benchmark contract cannot remove `runquota_m5_process_bench.exe`
+  after its existing cleanup retries; the outer action times out. This is
+  distinct from the observation-database cleanup failure at `f93855c`.
+- The socket-write fixture misses its dropped-row count. It already polls
+  both write failures and dropped rows; adding that predicate again would
+  not fix this observation.
+- Aggregate publication and scheduled retention miss their existing waits.
+- Store export and merge return 124; store query is killed with status 137
+  after two passing cases.
+
+This candidate includes merge-query batching only. It predates retention
+batching at `f93855c`, prepared hook pages at `7fd57f4`, and bounded inner
+benchmark cleanup at `9f88e77`. Those later complete runs must decide which
+failures persist. The benchmark image-lock failure is not established as
+fixed by retrying removal of its separate daemon directory. Keep every
+assertion, deadline and runtime gate. No hook phase trace accompanies this
+report, so it does not identify the compiler-startup stall as its cause.
+
+Evidence: `/tmp/runquota-c6-arm-repro.log` and the downloaded
+`repro/build-failure-report.json` under `.repro/build/` in
+`/tmp/runquota-c6-arm-evidence`. Refreshed dev `2c50aaf` and agents
+`da47483` before extending this existing record.
+
+## Current x64 recurrence and explicit helper-start boundary
+
+At candidate `9f88e77`, Windows x64 Reprobuild job `110159381835` in
+run `36795962975` compiles every program and reaches 195 successful actions,
+one failure and seven blocked measurement programs. The starting-abnormal
+helper's `waitForExit(3000)` returns zero; total grants and lost leases both
+remain zero. The other seven lifecycle cases pass. This matches the earlier
+traced helper-start failures, but this ordinary run has no entry-phase trace.
+Evidence: `/tmp/runquota-9f-x64-repro.log` and the failure report under
+`/tmp/runquota-9f-x64-evidence/.repro/build/repro/`.
+
+The fixture currently begins its three-second lease-operation/exit wait as
+soon as `startProcess` returns, before establishing that the helper has
+entered its own code. Earlier controls above directly observe expiration
+before helper entry even without monitoring. The protocol spec's
+[Supervisor-Lost Orphan Policy](../../reprobuild-specs/RunQuota-Protocol-And-Client-Libraries.md#supervisor-lost-orphan-policy)
+requires recovery from an actual granted/starting/running lease; it does not
+define a three-second OS-loader deadline.
+
+Repair the fixture boundary explicitly. A real child reports application
+entry through a scratch-file handshake, then waits for the parent to release
+it. Reuse the fixture's existing five-second readiness bound. The parent
+starts the unchanged three-second lease-operation/exit wait after releasing
+that gate. Keep every real daemon, lease transition, expected exit and
+reclamation assertion. Apply the same startup handshake to all helper modes;
+forced-kill cases retain their additional lease-state readiness condition.
+Clean up a child if setup fails. This deliberately separates setup time from
+lease-operation time; it does not claim the old total spawn-to-exit window
+is unchanged. No product timeout or runtime behavior changes.
+
+Validate with real processes and no replaced APIs: a delay before the
+helper-entry signal must reproduce the old failure and pass with the new
+boundary; the same delay after the parent's release must still fail the
+three-second exit assertion. Run the unchanged normal suite and both Windows
+native/monitored controls, then the complete candidate matrix.
+Refreshed dev `2c50aaf` and agents `53a6ca1`; the existing record and its
+archived history own this recurrence.
+
+### Handshake candidate and local controls
+
+Candidate `15e4deb` implements the entry/release handshake. Against its exact
+fixture source, the real local macOS controls produce all four expected
+results: original plus a 3.5-second pre-entry delay fails only the
+starting-abnormal case; the repaired fixture with that delay passes all eight
+cases; a 3.5-second delay after release still fails only the same three-second
+exit assertion; and the unmodified repaired fixture passes all eight cases.
+Windows source checking and repository lint pass. The controls were measured
+on the working tree above `9f88e77`, whose only source change became
+`15e4deb`. Evidence: `build/startup-handshake-local/results.json` under
+`/tmp/runquota-helper-startup-fix`; every variant has a retained binary hash.
+
+The exact candidate's source lock is published with verified remote blob
+`23634667c31393db5d456c3c49832d5da8704f09`. Complete native
+`36800244338` and Reprobuild `36800247249` runs are active. Shared tooling
+`7d1ef0c`, run `36800325319`, repeats all four real controls natively and
+under the production monitor on both Windows hosts. A Windows result and the
+complete ordinary matrix are still required before release selection.
+
+### Windows control launcher correction
+
+Native run `36800244338` passes all ten jobs at `15e4deb`. Its full
+Reprobuild matrix remains active. Windows x64 control job `110172972885`
+at tooling `7d1ef0c` fails before compiling or executing a fixture:
+Python's bare `bash` selects the Windows System32 WSL launcher, which
+reports that no WSL distribution is installed. Bootstrap had provisioned
+Git Bash. This is a diagnostic launcher failure, not a candidate assertion
+failure. Evidence: `/tmp/runquota-startup-7d1-x64/apps.build.log` and
+`/tmp/runquota-startup-7d1-x64-job.log`.
+
+Tooling `b5e3811` resolves Bash to its absolute path before launching it,
+requires GNU Bash in its version output, and retains the selected identity.
+Run `36801996275` repeats the same four native/monitored process controls
+on both Windows hosts. No fixture expectation or product source changed.
+
+### x64 process controls and interrupted complete validation
+
+At tooling `b5e3811`, Windows x64 job `110178151125` passes all eight
+native/monitored outcomes for RunQuota `15e4deb`: delayed original entry
+fails only the intended exit assertion, delayed repaired entry passes all
+eight cases, delayed work after release still fails that assertion, and the
+unmodified repaired fixture passes all eight cases. No outer timeout occurs;
+the input hashes remain unchanged. The selected GNU Bash resolves under the
+activated Reprobuild tool store. Evidence: `/tmp/runquota-startup-b5e-x64`.
+ARM controls remain active. The earlier `7d1ef0c` ARM job also selects the
+WSL launcher and fails before fixture execution; its error requests a WSL
+update. That launcher error is distinct from the x64 missing-distribution
+message and is covered by the same absolute-path correction.
+
+Full candidate run `36800247249` receives cancellation at 01:58 UTC on
+October 1, before validation completes. Both Linux jobs have passed monitored
+build/test but lose the native test cross-check; Windows x64 has passed its
+monitored build, and macOS has completed setup and entered its monitored
+build. These partial results are not a complete gate. The available API
+does not identify the cancellation requester; there is no newer replacement
+run and manual-dispatch concurrency is unique per run. No assertion failure
+is inferred from cancellation. The reason has been requested from the user.
+
+Predecessor `9f88e77` independently passes complete macOS monitored and native
+cross-checks in job `110159381875`, run `36795962975`. Its existing x64
+helper failure remains the measured reason for selecting the handshake
+candidate, whose full validation is still required.
+
+### ARM control result and next observation
+
+At tooling `b5e3811`, ARM job `110178150891` reaches all eight comparison
+outcomes for `15e4deb`. All four native outcomes match expectations. Under
+monitoring, repaired delayed entry and the unchanged repaired fixture each
+pass all eight lifecycle cases; delayed work after release still fails only
+the required three-second exit assertion. The original delayed-entry variant
+instead fails its fifth daemon's readiness check before launching the helper:
+`CreateFileW` reports Windows error 2 for the named pipe. Its other seven
+cases pass. Thus seven of eight comparison outcomes match, and every
+repaired outcome passes; the original monitored negative control fails for
+the wrong reason. Evidence: `/tmp/runquota-startup-b5e-arm`.
+
+Do not label that comparison wholly passing or attribute its daemon failure
+to the helper handshake. Supplement it with the same four variants selecting
+only the starting-lease case through Nim unittest's test filter. Retain the
+same real daemon and exact readiness/exit bounds. If daemon readiness fails,
+record its PID, running state and available exit status before ordinary
+cleanup. Preserve the existing full-suite controls and full ordinary gates.
+This narrows the intended measurement without discarding the unrelated
+startup failure above.
+
+The complete matrix at unchanged `15e4deb` restarts as run `36805849869`
+after the earlier interruption. Native CI remains fully passing. No source
+change or assertion relaxation is selected from the baseline daemon result.
+
+Focused tooling `e4c3b73`, run `36806359507`, implements that single-case
+comparison and records its test filter explicitly. The instrumented sources
+pass all four expected real local controls with one lifecycle case each;
+the delayed-work variant still fails the exact three-second assertion.
+Windows source checking, Python syntax and workflow checks pass. Local
+evidence is under `build/startup-handshake-focused-local` in
+`/tmp/runquota-helper-startup-fix`; the Windows source-check log is
+`/tmp/runquota-startup-case-windows-check.log`. Complete ordinary CI still
+runs every test at unchanged product `15e4deb`.
+
+## Complete prepared-hook ARM runtime result
+
+Full run `36792989240` at `7fd57f4` completes with 186 successful actions,
+nine failed executions and eight blocked measurements on ARM. Compilation
+passes completely. The failed executions are:
+
+- SQLite concurrent spawn: two threads do not complete 100 calls within
+  60 seconds. The message attributes this to inherited pipes, but the report
+  contains no progress counts or pipe ownership proving that diagnosis.
+- Concurrent short-lived clients: final state is quiet, with 30 completed
+  leases where the fixture expects 32. Its five-second `waitForExit` checks
+  do not identify which children may have timed out.
+- Multi-session fairness: the fifth daemon misses pipe readiness; the first
+  four cases pass.
+- Forking lease completion: the leased-call elapsed time is 5.418 seconds
+  against a five-second assertion. Its earlier direct completion case passes.
+- Process benchmark contract and standalone daemonless degradation: exit 124
+  after partial successful assertions.
+- Retention schedule: five cases miss their completion/counter waits.
+- Observation export and merge: exit 124 after three and four passing cases,
+  respectively.
+
+This source already includes merge/retention query batching and prepared
+hook pages. It predates the benchmark cleanup and helper-handshake changes.
+Those two changes do not establish repairs for the other eight test files.
+Evidence: `/tmp/runquota-7fd-arm-repro.log` and the failure report under
+`/tmp/runquota-7fd-arm-evidence/.repro/build/repro/`.
+
+The earlier current-source merge comparison at `c6ddde6` passed all twelve
+native/monitored cases on ARM with three independent programs admitted at
+once. Its monitored batched merge took 416.4 seconds, versus 43.1 seconds
+natively. The full graph admits more independent tests; this is a possible
+resource-interference explanation, not proof that serialization fixes the
+current failures. The older serial comparison at `33add18` still failed.
+
+Next, instrument the current SQLite stress fixture with real per-thread
+completion records, retaining both threads, all 100 calls, its 60-second
+deadline and survivor checks. Compare the unchanged and observed fixture
+alone, natively and monitored, then admit eight copies of the observed
+fixture before repeating its single-copy measurement. Keep real SQLite,
+separate databases and fixed binary/shim hashes. Counts and timestamps must
+distinguish slow progress from an actual stall before selecting a resource
+or fixture change. Full ordinary validation at `15e4deb` continues separately.
+
+## SQLite progress control and later complete ARM result
+
+Tooling `4a2a9e7`, run `36808704707`, implements the progress comparison
+above against RunQuota `15e4deb`. Both original and observed real SQLite
+fixtures pass locally. The observed fixture records 50 completed calls per
+worker. A corrected real-tool wrapper delays each SQLite invocation by 1.4
+seconds without changing its SQL: the original 60-second watchdog fails,
+with both workers still progressing and each recording 41 completions.
+This proves that the observer distinguishes continued progress from no
+progress when the watchdog expires. An earlier wrapper used a missing Bash
+interpreter and did not apply its delay; that attempt is not a control.
+Local evidence is `build/sqlite-progress-local/results.json` and its marker
+files in `/tmp/runquota-helper-startup-fix`. Windows source checking and
+Python/workflow syntax checks pass. Windows runtime results remain pending.
+
+Full ARM run `36795962975` at `9f88e77` now completes. Every compilation
+passes, but eight runtime programs fail and the eight measurement programs
+remain blocked. Multi-session fairness again misses its fifth daemon's pipe
+readiness. Forking lease completion takes 6.422 seconds against its original
+five-second assertion. The socket write-path case observes zero failure and
+dropped counters after making its store unwritable. Four retention schedule
+cases miss completion waits. Process benchmark, standalone degradation,
+export and merge reach exit 124 after partial passing output. The SQLite
+concurrent-spawn and short-lived-client failures from `7fd57f4` do not
+recur in this run; that alone establishes no repair.
+
+Evidence is `/tmp/runquota-9f-arm-repro.log` and the failure report under
+`/tmp/runquota-9f-arm-evidence/.repro/build/repro/`. The benchmark cleanup
+change does not address these runtime waits. Current `15e4deb` ordinary CI
+and the focused startup comparison remain active separately.
+
+## Select the independently validated injection-lock initialization
+
+Helper `43b1835` passes all seven native and all five monitored/native
+platform jobs. Corrected paired tooling `5336c54`, run `36802560317`,
+now completes on both Windows hosts. Its original ARM implementation hangs
+in native repetition one and monitored repetition four. The initialized
+implementation passes all twelve native and twelve monitored repetitions,
+with complete assertion output and four real output/status controls. Both
+variants pass all x64 repetitions. Helper PR 12 contains exactly this fix
+and its validated prerequisites.
+
+Select `43b1835` as RunQuota's Windows CI bootstrap helper pin, above the
+current `d36cab8`, to remove the independently demonstrated first-call lock
+race. Preserve RunQuota `15e4deb` source, every ordinary test and deadline,
+and the separate POSIX bootstrap pin. This selection does not attribute the
+RunQuota SQLite or daemon waits to that race: RunQuota's captured SQLite
+calls already serialize process creation. Run complete ordinary CI at the
+new pin before selecting it for the release. Keep the current `15e4deb`
+run and SQLite progress control as independent observations.
+
+Candidate `b4a9c53` contains only that Windows CI helper-pin change above
+`15e4deb`. Workflow checks and repository lint pass. Its isolated source
+lock is published with matching local/remote blob
+`a7ece987315c3cb18c02ce0395f6743cbb44fe12`. Complete native run
+`36809230285` and Reprobuild run `36809232981` are active. Helper PR 12
+is merged as `59a2bac`, whose tree equals the validated `43b1835` source.
+
+## Focused startup controls pass; current x64 observation waits fail
+
+Focused tooling `e4c3b73`, run `36806359507`, passes all eight expected
+outcomes on ARM as well as x64. Original pre-entry delay and repaired
+post-handshake delay each fail the exact three-second exit assertion;
+repaired pre-entry delay and ordinary execution pass in both modes. No
+outer timeout occurs. ARM evidence is `/tmp/runquota-startup-case-e4-arm`.
+
+Full x64 job `110189923675` in run `36805849869` at `15e4deb` passes
+compilation but fails two observation programs. The unwritable-store case
+sees one dropped row where it expects two. The aggregate-publication suite
+passes its automatic-publication case, but its separate zero-syscall case
+misses the ten-second setup publication wait. Other cases in both programs
+pass. Evidence: `/tmp/runquota-15e-x64-repro.log` and the report under
+`/tmp/runquota-15e-x64-evidence/.repro/build/repro/`. This does not measure
+the crash-helper handshake because the measurement lane remains blocked.
+
+### Proposed fixture synchronization
+
+OS-1 makes recording asynchronous; OS-2 requires accurate loss accounting
+and OS-4 requires clients to keep completing when storage fails. The real
+stats query calls `flushObservationWriter`, which waits until every earlier
+queued row has settled. The unwritable-store fixture already uses that
+barrier for its third failed write, but its first two writes rely only on a
+five-second polling window. Use the same real query barrier before reading
+the first pair's counters, retaining the read-only store, all loss and
+write-failure assertions, and the subsequent successful client operation.
+This deliberately moves the counter-read boundary to settled writes; it is
+not a claim that the old five-second enqueue-to-settle bound is preserved.
+
+For the separate zero-syscall measurement, query and verify the recorded
+aggregate during setup before waiting for its shared-memory publication.
+The suite's first case still checks automatic publication without that
+setup query. Keep all mapping, value, syscall-control and publication-wait
+assertions. The added setup waits remain inside the existing 600-second
+program bound. Product recording and publication code remain unchanged.
+
+Compare original and synchronized fixtures using real SQLite. Add a real
+tool wrapper that delays failed execution writes while forwarding identical
+SQL and preserving real outputs/status, to reproduce the counter timing
+failure and verify the settled-write check. Run the complete fixtures and
+Windows source checks before selecting the candidate, then ordinary CI.
+
+### Synchronized fixture candidate and real delay controls
+
+Candidate `2d3897c` changes only the two fixtures above `b4a9c53`.
+The unwritable-store case queries the real stats barrier, then asserts both
+counters directly. The zero-syscall case verifies the recorded aggregate in
+setup; the separate automatic-publication case is unchanged. No product
+runtime code changes. Complete local socket-write and publication suites
+pass all ten and four cases. Both fixtures and the real SQLite proxy pass
+Windows Nim source checking; repository lint passes.
+
+The real proxy delays INSERT statements into a read-only database by 6.5 seconds,
+then forwards the same SQL to Nix SQLite 3.51.2 and preserves its actual
+output/status. The unchanged fixture passes without delay, fails its loss
+counter assertion with delay, and the synchronized fixture passes with the
+same delay. The proxy records four delayed calls for the original case and
+five for the synchronized case. Full unchanged-delay-free fixture coverage
+then passes. Local evidence is
+`/tmp/runquota-observation-barrier-fix/build/observation-barrier-control`;
+`results.json` retains all five expected outcomes and each actual SQL input
+that was delayed. No API result or database result is mocked.
+
+The isolated source lock is published with matching blob
+`d9efbbf9bfe370ffc7f7b3156f3fe8fc6fceb0eb`. Complete native CI
+`36810841209` and Reprobuild CI `36810843817` are active. Windows paired
+tooling `7d4d24a` runs the same real-delay comparison in native and monitored
+modes on both Windows hosts, together with full socket-write coverage and
+both original/synchronized publication suites. Its Python/workflow checks
+pass. Results remain pending; the earlier candidates continue independently.
+
+### Windows x64 observation-barrier comparison
+
+Tooling `7d4d24a`, run `36810881206`, passes all twelve expected x64
+outcomes against candidate `2d3897c`. In each native/monitored mode, the
+original counter case passes without delay, fails its intended loss-counter
+assertion with real delayed writes, and the synchronized case passes with
+the same delay. The complete synchronized socket suite passes all ten
+cases; both original and synchronized publication suites pass all four.
+No outer timeout occurs and the recorded binary/shim/SQLite hashes remain
+unchanged. Evidence is `/tmp/runquota-observation-barriers-7d4-x64`.
+
+The monitored delayed original/fixed cases take 25.2 and 36.4 seconds,
+respectively. The fixed fixture waits for the actual writes to settle;
+this is not a performance-speedup claim. Monitored full socket coverage
+takes 36.6 seconds. ARM comparison and complete candidate CI remain active.
+Parent `b4a9c53` now passes all ten native CI jobs and its complete monitored
+x64 test step; the native x64 cross-check remains active.
+
+### Windows ARM comparison and complete native candidate CI
+
+Tooling `7d4d24a`, run `36810881206`, also passes all twelve expected ARM
+outcomes at RunQuota `2d3897c`. Both native and monitored delayed-original
+cases fail the intended counter assertion, while both synchronized delayed
+cases pass. Full synchronized socket coverage passes all ten cases in each
+mode; original and synchronized publication suites each pass all four cases
+in each mode. No outer timeout occurs and input hashes remain fixed.
+Evidence is `/tmp/runquota-observation-barriers-7d4-arm`.
+
+On that host, the monitored delayed original/fixed cases take 54.0/72.7
+seconds. Full synchronized socket coverage takes 223.7 seconds; original and
+synchronized publication coverage takes 102.5/101.4 seconds. These are whole
+fixture times, including the monitor wrapper, not individual query latencies.
+
+Complete native CI `36810841209` now passes all ten jobs at `2d3897c`.
+Full Reprobuild CI `36810843817` remains active. Parent `b4a9c53` passes
+both Linux jobs and Windows x64 completely; macOS and ARM remain active.
+
+### Completed parent ARM run and unavailable SQLite probe evidence
+
+RunQuota `15e4deb`, full Reprobuild run `36805849869`, completes its ARM
+job at 04:57 UTC on 2026-10-01 with 191 successful actions, four failures and
+eight blocked measurement actions out of 203. All compilation passes.
+The M5 process benchmark, observation export and observation merge programs
+reach exit 124 after partial passing assertions. Retention scheduling exits
+1: the idle sweep, bounded busy-host deferral and failed-pass recovery cases
+miss their existing waits. The other programs that failed in earlier ARM
+runs do not recur here; that absence alone does not establish their repair.
+Evidence is `/tmp/runquota-15e-arm-repro.log` and
+`/tmp/runquota-15e-arm-evidence/.repro/build/repro/build-failure-report.json`.
+This parent still uses hooks `d36cab8`, before the independently verified
+propagation-lock initialization repair.
+
+SQLite progress tooling `4a2a9e7`, run `36808704707`, ends cancelled at
+04:58 UTC. Its check annotation explicitly reports exceeding the 110-minute
+job limit. The comparison step had failed at 03:45 UTC, but artifact upload
+never completed. GitHub exposes no artifact; the completed run's log download
+is an empty ZIP (22 bytes), and the individual job log returns HTTP 404.
+Consequently neither worker progress nor the comparison's original failure
+phase can be attributed from this run. The local controlled-delay result
+remains valid; it does not substitute for missing Windows evidence.
+
+At `2d3897c`, complete Reprobuild run `36810843817` now passes both Linux
+hosts and Windows x64. macOS is in its native cross-check and ARM is still
+compiling. Parent `b4a9c53` has passed ARM compilation and started monitored
+tests with hooks `43b1835`. No new scheduling or deadline change is selected
+while those candidates are being validated.
+
+### SQLite progress comparison with the validated hook dependency
+
+Tooling `ae529a59c250b477ae9d6e7b3ba4f9cf4d280e7e`, run `36817926720`,
+repeats the real SQLite progress comparison at RunQuota `2d3897c` with hooks
+`43b1835`. The observation-store library, concurrent SQLite fixture and child
+watchdog are byte-identical to `15e4deb`; the selected hook initialization is
+the dependency change relevant to this comparison. Preserve the original two
+workers, 100 calls, 60-second watchdog, single/parallel admission phases and
+per-worker completion markers. The diagnostic now uploads small result,
+source and progress files before the full binary/trace artifact, with separate
+bounded upload steps. Python syntax and workflow checks pass at `ae529a5`.
+The new Windows result remains pending; the empty previous archive supplies
+no evidence of Windows progress or its failure phase.
+
+### Initialized-hook parent still has ARM runtime failures
+
+RunQuota `b4a9c53`, full Reprobuild run `36809232981`, completes ARM at
+05:43 UTC on 2026-10-01 with 188 successful actions, seven failures and eight
+blocked measurement actions out of 203. All compilation passes. Five
+programs exit 124: M5 process benchmark, socket write path, daemonless
+degradation, observation export and observation merge. The socket case also
+records zero write-failure/drop counters before its final case fails.
+Retention scheduling misses the age-bound, busy-host ceiling and failed-pass
+recovery waits. The cache-control fixture fails its initial `resident` wait,
+then reports the correct 512 MiB value from the table and from the emptied
+state's socket fallback. Evidence is `/tmp/runquota-b4-arm-repro.log` and
+`/tmp/runquota-b4-arm-evidence/.repro/build/repro/build-failure-report.json`.
+The initialized hook fixes its demonstrated race but does not eliminate these
+full-matrix failures.
+
+The cache-control setup queues an observation and starts its ten-second
+publication wait before its first store query. That query is already a real
+writer flush barrier, but currently runs after the wait. Prepare a fixture
+change above `2d3897c`: collect the existing store-gate answers before the
+publication wait and require a known published estimate before calling the
+entry resident. Keep every store/client/fallback comparison, the ten-second
+publication wait and the 600-second program bound. This changes the setup
+boundary, not the product's publication behavior; the separate automatic
+publication case stays unchanged. Validate with original/fixed real delayed
+SQLite inserts, normal full cache-control coverage and Windows source checks.
+
+Expectation: `reprobuild-specs@e9ba917`,
+`RunQuota-Observation-Store.milestones.org` M13b requires the emptied-table
+negative control to preserve every store and client answer. Its setup needs a
+real known resident value; a slot hit with unknown knowledge is insufficient,
+as this fixture's existing comment also records. No scheduling or timeout
+change is selected from the still-pending SQLite progress comparison.
+
+### Complete synchronized-fixture candidate and next admission experiment
+
+RunQuota `2d3897c`, run `36810843817`, passes four complete platform jobs.
+ARM passes compilation and finishes at 06:01 UTC with 189 successful actions,
+six failures and eight blocked measurement actions out of 203. M5, export and
+merge time out. Retention scheduling misses five cases' waits. The unchanged
+automatic-publication case fails, while the synchronized zero-syscall setup
+passes. The concurrent-client fixture reports 31 finished clients instead of
+32 despite all client exit checks passing; sessions, leases, queued and lost
+counts are zero. Captured client output is discarded by that fixture, so this
+report does not identify why one completion is absent. Evidence is
+`/tmp/runquota-2d-arm-repro.log` and `/tmp/runquota-2d-arm-evidence`.
+
+Cache fixture `a2676aac7d6d7ff1bfb57313dc78a0acb9d9e0d3` passes both
+local cases, Windows source checks and repository lint. The original fixture
+passes normally. Under a real 20-second execution-insert delay it fails only
+its resident assertion, while the revised fixture passes with the same SQL,
+results, binary inputs and delay. The delayed original/revised runs take
+20.99/21.31 seconds; the revised full suite takes 1.34 seconds. An earlier
+13-second delay was an insufficient negative control: the original passed.
+Phase timestamps show setup returned in 0.02 seconds and the original polling
+loop took 13.1 seconds. Keep the loop's actual contract explicit: 400 retries
+with 25-millisecond sleeps, rather than an exact ten-second wall-clock bound.
+Evidence is `/tmp/runquota-cache-residency-fix/build/cache-residency-control`,
+including the original insufficient control and the separate 20-second results.
+Its source lock is published with matching blob
+`41b45f1171c222af90418857d002ad7c1d6a286f`.
+
+Candidate `d6ee4588f71604376a4cc41ef281d6c479395efc` adds only a workflow
+limit above that fixture repair: two simultaneous Reprobuild test programs on
+the Windows ARM emulator, with the existing default on other hosts. The build
+step, every test's internal concurrency, all assertions and all watchdogs stay
+unchanged. This is a resource-allocation experiment, not an attributed fix;
+older pre-batching serial results also failed. The plan is published in
+`metacraft-specs@81f067a`, `infrastructure/gosti-io-mon-runquota-releases.md`.
+Workflow checks and lint pass. Source lock blob
+`049a0992f8de4e92683d07b95b037a437bd143a8` matches the remote record.
+Complete CI `36823480335` and Reprobuild CI `36823482913` are active.
+Verify the observed test-program concurrency as well as the final outcomes.
+
+Windows cache comparison tooling `ffbaa21`, run `36823603500`, is active on
+both hosts against the isolated `a2676aa` fixture change. It uses a real
+60-second insert delay to provide margin beyond the original polling loop,
+and requires the original to fail only its residency assertion. Revised
+full coverage and original/revised delayed cases run in native and monitored
+modes. The diagnostic verifies native Windows Python process IDs before using
+its process-tree timeout cleanup. Python syntax, workflow and Windows proxy
+source checks pass. This guard is not an attribution of the unrelated SQLite
+progress upload failures.
+
+### Retaining the concurrent clients' connection evidence
+
+At `d6ee458`, `runDebugAcquire` catches an initial connection exception and
+runs the command standalone. A successful child exit therefore does not prove
+that a lease was acquired. `connectEndpoint` makes five `CreateFileW` attempts
+on Windows and discards each `WaitNamedPipeW` result. This is a source-level
+hypothesis for the earlier 31-of-32 count, not a reproduced cause. The exact
+retry budget is not specified. The original fixture discards captured output;
+without a connection diagnostic, that run cannot distinguish the fallback.
+
+Microsoft's [WaitNamedPipeW contract](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-waitnamedpipew)
+states that a successful wait does not reserve the instance: another client can
+open it before the subsequent `CreateFile` call. The spec's relevant behavior
+is `RunQuota-Observation-Store.md`, "Standalone mode": missing-daemon execution
+may succeed while dropping a short-lived client's observations. It does not
+establish that the observed daemon was actually missing or unresponsive.
+
+The diagnostic plan at `metacraft-specs@cc947d4` preserves the complete fixture,
+adds captured client output and prints the real initial connection exception
+before taking the same fallback path. It compares an unchanged original with
+two instrumented samples per native/monitored mode on both Windows hosts. A
+missing-daemon control must expose the diagnostic and preserve child success.
+No product retry change is selected. RunQuota `dev@2c50aaf` and `agents@7a16aaf`
+were fetched before this investigation; the open issue already owns the count
+failure, and the resolved-issue pickaxe finds no `WaitNamedPipe` record.
+
+### Cache controls complete; progress diagnostic has no retrievable evidence
+
+Tooling `ffbaa21`, run `36823603500`, completes all eight expected outcomes on
+each Windows host against cache fixture `a2676aa`. Downloaded native and
+monitored logs independently confirm that the original 60-second-delay case
+fails only `resident`, the revised case passes, and both full fixtures pass
+their two cases. ARM monitored original/revised delayed samples take
+112.28/112.95 seconds; the full samples take 88.82/91.44 seconds. This validates
+setup ordering, not a performance improvement. Evidence is
+`/tmp/runquota-cache-ffbaa-x64` and `/tmp/runquota-cache-ffbaa-arm`.
+
+Concurrent-client tooling `17e9d40`, run `36825853485`, passes all eight checks
+on Windows x64 against `d6ee458`. All six 32-client samples pass; the four
+instrumented samples retain every client's output without connection failures.
+The missing-daemon control reports actual Windows error 2 only in the
+instrumented CLI, while both variants preserve child success. Thus this host
+does not reproduce the missing lease. ARM remains active. Local controls and
+Windows source checks pass. An initial local `--path` overlay compiled the
+original module; the missing-daemon control caught it before publication.
+Compiling the copied main beside its diagnostic module fixes that harness error.
+
+SQLite progress run `36817926720` at tooling `ae529a5` is cancelled by its
+110-minute job limit after the comparison and both uploads fail. GitHub's
+annotation names that limit. Its job-log endpoint returns 404, its artifact
+list is empty, and its completed-run log archive contains zero entries (22
+bytes; SHA256 `8739c76e681f900923b900c9df0ef75cf421d39cabb54650c4b9ad19b6a76d85`).
+This is a second evidence-collection failure, not a worker-progress finding.
+Archive: `/tmp/runquota-sqlite-progress-ae529-arm-logs.zip`. The underlying
+comparison failure remains unattributed. No unchanged retry is selected.
+
+### Concurrent-client controls complete on both Windows hosts
+
+Tooling `17e9d40`, run `36825853485`, also passes all eight expected outcomes
+on the ARM host at RunQuota `d6ee458`. All six concurrent-client samples count
+32 completed leases. The four instrumented samples retain 32 client outputs
+each with no initial connection failure. The missing-daemon control reports
+actual Windows error 2 only in the instrumented CLI, and both variants return
+child success. ARM evidence is `/tmp/runquota-concurrent-17e-arm`, with results
+SHA256 `a658ec8af53180026614c24a9591740a3a2c789849e0c6a1a97a0cf47ccfcb6e`.
+"Native" in these result files means unmonitored execution: both hosts use
+x64 binaries, with emulation on ARM. These controls do not reproduce or
+attribute the missing lease. No product connection retry change is selected.
+
+Candidate `d6ee458` also passes all ten CI jobs and the complete package dry
+run `36826918496`. Independent downloads verify 15 checksums and eight native
+binary architectures across all four release targets. The full Reprobuild
+matrix `36823482913` passes both Linux jobs and remains active on macOS and
+both Windows hosts as of 07:20 UTC. Its final ARM test concurrency and runtime
+outcomes still decide whether the resource-allocation experiment qualifies.

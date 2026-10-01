@@ -59,3 +59,130 @@ state and matched native/monitored controls. No deadlines or assertions are
 relaxed. Evidence is in `/tmp/runquota-703-windows-arm-evidence` and the full
 job log `/tmp/runquota-703-windows-arm.log`. Refreshed dev `0bce530` and agents
 `04a74d2` before extending this issue.
+
+## Test scheduling comparison
+
+The environment failure has a separate verified fixture repair at `48bb701`.
+The seven remaining failed programs are compared, unchanged, in
+[36726271653](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36726271653)
+at tooling `ce0d17e`. One monitored build supplies the same binaries for
+parallel, serial and parallel execution on one ARM host. The admission caps
+are eight, one and eight; the report's launch/completion trace can establish
+the actual overlap. Every execution is uncached and must really launch. The
+fixture deadlines, assertions, monitoring and internal concurrency (including
+all 32 concurrent clients) remain intact. Hashes must remain equal across all
+three runs. This is a diagnostic of competing fixture work, not a selected
+CI scheduling repair. Complete ordinary validation remains required.
+
+## First comparison outcome and fixed-image correction
+
+At tooling `ce0d17e`, run `36726271653` executes every selected program in
+parallel-first mode. Concurrent clients, process benchmark and stats-table
+control pass. Store degradation again counts one dropped row; retention
+schedule misses its sweep bounds; export and merge stop at 600 seconds after
+their first three cases pass. Before execution, the graph evaluation legitimately
+rebuilds stats-table control and export on cache misses. The hash guard then
+stops the experiment before serial mode. There is no serial-versus-parallel
+result, and these failures do not establish a common contention cause.
+
+Tooling `b60cba4` builds the same RunQuota `48bb701` programs once, enters the
+activated environment once, and launches fixed executable images under the
+production monitor. It never invokes a compiler during comparison. Replacement
+`36735013860` records each program's start, finish, exit code and binary hashes
+for admission caps eight, one and eight. Original internal concurrency,
+assertions, closed stdin and the 600-second timeout/ten-second kill grace remain.
+Every program executes in every mode, regardless of earlier failures. The
+complete ordinary Reprobuild workflow remains the release gate.
+
+Evidence: `/tmp/runquota-arm-contention-ce-evidence`. Refreshed dev `2c50aaf`
+and agents `e67ce70` before extending the existing record.
+
+## Ordinary environment-repair candidate
+
+At RunQuota `48bb701`, [job 109933446531](https://github.com/metacraft-labs/runquota/actions/runs/36729033751/job/109933446531)
+fails compilation of `t_hardware_run_tool_streams`: GCC reports that it cannot
+start its `cc1.exe` child (`CreateProcess: No such file or directory`). Tests
+and native cross-checks are consequently skipped. This is the compiler-launch
+symptom reproduced in the separately instrumented hook-transaction investigation;
+this ordinary run carries no trace proving the same underlying cause. Its
+Windows x64 counterpart passes the complete monitored suite, native cross-check
+and all 12 static helper checks. Current candidate `33add18` remains in CI.
+
+Raw ARM log: `/tmp/runquota-48bb-windows-arm-complete.log`; failure artifact:
+`/tmp/runquota-48bb-arm-evidence`. Refreshed dev `2c50aaf` and agents `4ae8008`
+before recording these results. Neither failure nor the passing x64 result
+replaces native ARM64 release-payload validation.
+
+The current RunQuota `33add18` repeats compiler-child launch failures in
+[job 109944771773](https://github.com/metacraft-labs/runquota/actions/runs/36732257074/job/109944771773):
+101 actions succeed, while the daemon and `t_observation_store_retention`
+compilations cannot start `cc1.exe`. Its Windows x64 job passes monitored
+build/test, all 100 native test programs and all 12 static helper checks.
+The ARM report again contains no hook checkpoints. Evidence is retained at
+`/tmp/runquota-33add-arm-evidence`; the shared hook investigation remains active.
+
+## Complete compilation reaches six execution failures at the same candidate
+
+PR 35 [job 109955361175](https://github.com/metacraft-labs/runquota/actions/runs/36735298536/job/109955361175)
+at `33add18` passes compilation, then reports 189 successful actions, six
+failed programs and eight blocked measurement programs. Four executions reach
+the unchanged 600-second bound: process benchmark contract, standalone
+daemonless degradation, observation-store export and observation-store merge.
+Stats-table publication misses its ten-second wait although a later socket
+query returns the expected estimate. The retention-schedule unit program
+misses its existing completion waits in five cases. These ordinary logs do
+not locate the blocked child or distinguish monitor startup from competing
+work. Preserve that distinction; no deadline increase is justified.
+
+The fixed-image serial/parallel comparison `36735013860` at `b60cba4` remains
+active. Separately, the full compiler trace with one prepared protection range
+at `5383510` moves its two observed stalls to `Ws2_32!connect`, still before
+writable protection; the hook issue owns that evidence. The replacement full
+graph `36753037680` at tooling `8fd4eff` prepares every queued install range
+while preserving suspension around writes and every test. No production hook
+repair is selected yet.
+
+Evidence: `/tmp/runquota-33add-pr35-arm-evidence` and
+`/tmp/runquota-33add-pr35-arm-complete.log`. Refreshed dev `2c50aaf` and agents
+`975ea1d` before adding this ordinary-CI result, preserving the concurrent
+sibling-manifest update.
+
+## Fixed binaries still fail with serial admission
+
+At exact RunQuota `48bb701`, tooling `b60cba4` completes all 21 executions in
+[36735013860](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/36735013860):
+seven identical binaries run with admission caps eight, one and eight. The
+recorded hashes remain unchanged. Nine executions pass, two fail assertions,
+and ten return timeout status 124. The comparison finishes at 17:29:07 UTC;
+the outer command does not return before the workflow reaches its 155-minute
+step deadline. The retained files do not locate that final wait. The complete
+per-program results and logs survive in the uploaded artifact.
+
+| Program | Parallel first | Serial | Parallel second |
+| --- | --- | --- | --- |
+| Concurrent clients | pass | pass | pass |
+| Process benchmark | pass | pass | timeout |
+| Socket write path | assertion failure | pass | timeout |
+| Stats-table cache control | pass | pass | pass |
+| Retention schedule | assertion failure | timeout | timeout |
+| Store export | timeout | timeout | timeout |
+| Store merge | timeout | timeout | timeout |
+
+Serial export prints every successful case but still returns 124. Retention
+and merge also remain incomplete when run alone. This rules out serial
+admission as a sufficient repair. The outer wrapper includes launch and
+monitor finalization: its elapsed times are not individual SQLite-call or
+test-body timings. Later modes are also not fresh machines: runner cleanup
+finally terminates three surviving SQLite processes. No common runtime cause
+is established by this comparison.
+
+Validated depfile decoding with the reader at io-mon `983a113` finds 878
+process-start records in serial export versus 436 in its first parallel run;
+serial retention records 248. These counts show substantial process activity,
+but the format contains no timestamps and does not identify where time was
+spent. Preserve original deadlines and capture child state before selecting a
+store, monitor or fixture change.
+
+Evidence: `/tmp/runquota-arm-contention-b60-evidence` and
+`/tmp/runquota-arm-contention-b60-job.log`. Refreshed dev `2c50aaf` and agents
+`494ef31` before extending this existing issue.
