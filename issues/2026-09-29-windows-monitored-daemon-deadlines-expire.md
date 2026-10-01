@@ -619,3 +619,19 @@ The exact candidate's source lock is published with verified remote blob
 `7d1ef0c`, run `36800325319`, repeats all four real controls natively and
 under the production monitor on both Windows hosts. A Windows result and the
 complete ordinary matrix are still required before release selection.
+
+### Windows control launcher correction
+
+Native run `36800244338` passes all ten jobs at `15e4deb`. Its full
+Reprobuild matrix remains active. Windows x64 control job `110172972885`
+at tooling `7d1ef0c` fails before compiling or executing a fixture:
+Python's bare `bash` selects the Windows System32 WSL launcher, which
+reports that no WSL distribution is installed. Bootstrap had provisioned
+Git Bash. This is a diagnostic launcher failure, not a candidate assertion
+failure. Evidence: `/tmp/runquota-startup-7d1-x64/apps.build.log` and
+`/tmp/runquota-startup-7d1-x64-job.log`.
+
+Tooling `b5e3811` resolves Bash to its absolute path before launching it,
+requires GNU Bash in its version output, and retains the selected identity.
+Run `36801996275` repeats the same four native/monitored process controls
+on both Windows hosts. No fixture expectation or product source changed.
