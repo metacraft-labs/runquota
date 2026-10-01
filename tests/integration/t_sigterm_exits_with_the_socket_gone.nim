@@ -158,29 +158,30 @@ type Ending = object
   parked: string
     ## Non-empty only when the budget was overrun.
 
-proc termAndWait(daemon: Process; budgetMillis: int): Ending =
-  ## SIGTERM, then a bounded wait for the process to go.
-  ##
-  ## THE WAIT IS OURS RATHER THAN `waitForExit`'s because the interesting
-  ## run is the one that overruns, and that is the run in which the daemon
-  ## has to be INSPECTED before it is killed. `waitForExit(timeout)` kills
-  ## on its own deadline and hands back 137 with nothing said about where
-  ## the process was; this does the same escalation and records the wchan
-  ## first. The escalation itself is not optional: an unbounded wait here
-  ## would turn a failing case into a wedged binary.
-  doAssert kill(Pid(daemon.processID), SIGTERM) == 0,
-    "could not send SIGTERM to the daemon"
-  let started = epochTime()
-  var waited = 0
-  while waited < budgetMillis and daemon.running:
-    sleep(10)
-    waited += 10
-  if daemon.running:
-    result.parked = parkedAt(daemon.processID)
-    doAssert kill(Pid(daemon.processID), SIGKILL) == 0,
-      "could not SIGKILL a daemon that outlasted its shutdown budget"
-  result.exitCode = daemon.waitForExit()
-  result.elapsedMillis = (epochTime() - started) * 1000.0
+when defined(posix):
+  proc termAndWait(daemon: Process; budgetMillis: int): Ending =
+    ## SIGTERM, then a bounded wait for the process to go.
+    ##
+    ## THE WAIT IS OURS RATHER THAN `waitForExit`'s because the interesting
+    ## run is the one that overruns, and that is the run in which the daemon
+    ## has to be INSPECTED before it is killed. `waitForExit(timeout)` kills
+    ## on its own deadline and hands back 137 with nothing said about where
+    ## the process was; this does the same escalation and records the wchan
+    ## first. The escalation itself is not optional: an unbounded wait here
+    ## would turn a failing case into a wedged binary.
+    doAssert kill(Pid(daemon.processID), SIGTERM) == 0,
+      "could not send SIGTERM to the daemon"
+    let started = epochTime()
+    var waited = 0
+    while waited < budgetMillis and daemon.running:
+      sleep(10)
+      waited += 10
+    if daemon.running:
+      result.parked = parkedAt(daemon.processID)
+      doAssert kill(Pid(daemon.processID), SIGKILL) == 0,
+        "could not SIGKILL a daemon that outlasted its shutdown budget"
+    result.exitCode = daemon.waitForExit()
+    result.elapsedMillis = (epochTime() - started) * 1000.0
 
 proc report(label: string; ending: Ending) =
   echo "  ", label, ": exit=", ending.exitCode, " after ",
