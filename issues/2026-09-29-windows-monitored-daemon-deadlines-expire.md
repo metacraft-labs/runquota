@@ -1038,3 +1038,29 @@ modes. The diagnostic verifies native Windows Python process IDs before using
 its process-tree timeout cleanup. Python syntax, workflow and Windows proxy
 source checks pass. This guard is not an attribution of the unrelated SQLite
 progress upload failures.
+
+### Retaining the concurrent clients' connection evidence
+
+At `d6ee458`, `runDebugAcquire` catches an initial connection exception and
+runs the command standalone. A successful child exit therefore does not prove
+that a lease was acquired. `connectEndpoint` makes five `CreateFileW` attempts
+on Windows and discards each `WaitNamedPipeW` result. This is a source-level
+hypothesis for the earlier 31-of-32 count, not a reproduced cause. The exact
+retry budget is not specified. The original fixture discards captured output;
+without a connection diagnostic, that run cannot distinguish the fallback.
+
+Microsoft's [WaitNamedPipeW contract](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-waitnamedpipew)
+states that a successful wait does not reserve the instance: another client can
+open it before the subsequent `CreateFile` call. The spec's relevant behavior
+is `RunQuota-Observation-Store.md`, "Standalone mode": missing-daemon execution
+may succeed while dropping a short-lived client's observations. It does not
+establish that the observed daemon was actually missing or unresponsive.
+
+The diagnostic plan at `metacraft-specs@cc947d4` preserves the complete fixture,
+adds captured client output and prints the real initial connection exception
+before taking the same fallback path. It compares an unchanged original with
+two instrumented samples per native/monitored mode on both Windows hosts. A
+missing-daemon control must expose the diagnostic and preserve child success.
+No product retry change is selected. RunQuota `dev@2c50aaf` and `agents@7a16aaf`
+were fetched before this investigation; the open issue already owns the count
+failure, and the resolved-issue pickaxe finds no `WaitNamedPipe` record.
