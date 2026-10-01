@@ -940,3 +940,17 @@ hosts and Windows x64. macOS is in its native cross-check and ARM is still
 compiling. Parent `b4a9c53` has passed ARM compilation and started monitored
 tests with hooks `43b1835`. No new scheduling or deadline change is selected
 while those candidates are being validated.
+
+### SQLite progress comparison with the validated hook dependency
+
+Tooling `ae529a59c250b477ae9d6e7b3ba4f9cf4d280e7e`, run `36817926720`,
+repeats the real SQLite progress comparison at RunQuota `2d3897c` with hooks
+`43b1835`. The observation-store library, concurrent SQLite fixture and child
+watchdog are byte-identical to `15e4deb`; the selected hook initialization is
+the dependency change relevant to this comparison. Preserve the original two
+workers, 100 calls, 60-second watchdog, single/parallel admission phases and
+per-worker completion markers. The diagnostic now uploads small result,
+source and progress files before the full binary/trace artifact, with separate
+bounded upload steps. Python syntax and workflow checks pass at `ae529a5`.
+The new Windows result remains pending; the empty previous archive supplies
+no evidence of Windows progress or its failure phase.
