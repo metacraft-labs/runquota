@@ -34,3 +34,15 @@ issues. The previous Linux issue concerns absent sysfs block devices; the
 Windows provisioning issue lists this symptom but has no media-type diagnosis.
 The observation library README also incorrectly says Windows detection does
 not exist; update it to describe the implemented native API and unknown fields.
+
+## Final application qualification (2026-10-01)
+
+The real host-profile fixture passes on both Windows hosts, preserving the documented unknown-media case and the remaining identity assertions.
+
+These results are measured at `d6ee4588f71604376a4cc41ef281d6c479395efc`
+in [run 36823482913](https://github.com/metacraft-labs/runquota/actions/runs/36823482913).
+All application test programs pass on the five development hosts. The ARM
+workflow still fails its subsequent, separate static-helper ACL gate; that
+issue remains open and is not attributed to this repaired defect.
+Ordinary [CI at `2d07c5d`](https://github.com/metacraft-labs/runquota/actions/runs/36846644651)
+passes all ten jobs with unchanged application sources and fixtures.

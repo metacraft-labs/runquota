@@ -42,3 +42,15 @@ each copied directory is removable from the moment it is created. The gate
 already pins GNU coreutils. Retain the EXIT cleanup and every scanner assertion.
 Repair permissions only on the identified retained scratch tree, then rerun the
 failed native job. The new copy must still pass the full static-helper gate.
+
+## Final application qualification (2026-10-01)
+
+The corrected mutable compiler fixture and complete POSIX static-helper gates pass.
+
+These results are measured at `d6ee4588f71604376a4cc41ef281d6c479395efc`
+in [run 36823482913](https://github.com/metacraft-labs/runquota/actions/runs/36823482913).
+All application test programs pass on the five development hosts. The ARM
+workflow still fails its subsequent, separate static-helper ACL gate; that
+issue remains open and is not attributed to this repaired defect.
+Ordinary [CI at `2d07c5d`](https://github.com/metacraft-labs/runquota/actions/runs/36846644651)
+passes all ten jobs with unchanged application sources and fixtures.

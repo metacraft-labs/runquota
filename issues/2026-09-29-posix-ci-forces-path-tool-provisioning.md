@@ -34,3 +34,15 @@ failure. The complete graph passed locally at `40e7ed4` with explicit Nix
 provisioning and the repaired monitor shim.
 Refreshed dev `f4f0f93`; searched open and deleted issues for ZIP extractors
 and PATH provisioning. No existing issue covers this CI override.
+
+## Final application qualification (2026-10-01)
+
+The complete Linux and macOS Reprobuild graphs pass with explicit Nix provisioning.
+
+These results are measured at `d6ee4588f71604376a4cc41ef281d6c479395efc`
+in [run 36823482913](https://github.com/metacraft-labs/runquota/actions/runs/36823482913).
+All application test programs pass on the five development hosts. The ARM
+workflow still fails its subsequent, separate static-helper ACL gate; that
+issue remains open and is not attributed to this repaired defect.
+Ordinary [CI at `2d07c5d`](https://github.com/metacraft-labs/runquota/actions/runs/36846644651)
+passes all ten jobs with unchanged application sources and fixtures.

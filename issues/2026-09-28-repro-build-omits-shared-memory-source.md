@@ -18,3 +18,15 @@ RunQuota has neither a committed `repro.lock` nor a carried workspace lock for
 a revision. Pin it to the clean, published and locally validated
 `02f442ac12ce2587d9c053c527041097af38609f` for this release, matching the explicit
 immutable producer pin, and retain full consumer validation.
+
+## Final application qualification (2026-10-01)
+
+Both application builds complete with the declared shared-memory source dependency.
+
+These results are measured at `d6ee4588f71604376a4cc41ef281d6c479395efc`
+in [run 36823482913](https://github.com/metacraft-labs/runquota/actions/runs/36823482913).
+All application test programs pass on the five development hosts. The ARM
+workflow still fails its subsequent, separate static-helper ACL gate; that
+issue remains open and is not attributed to this repaired defect.
+Ordinary [CI at `2d07c5d`](https://github.com/metacraft-labs/runquota/actions/runs/36846644651)
+passes all ten jobs with unchanged application sources and fixtures.

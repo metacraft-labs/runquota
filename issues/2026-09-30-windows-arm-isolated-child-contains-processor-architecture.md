@@ -103,3 +103,15 @@ fails the original assertion and passes the repair. Restoring real inheritance
 makes the repaired fixture fail on both hosts. All six processes finish.
 Evidence is retained in `/tmp/runquota-environment-583-arm-evidence` and
 `/tmp/runquota-environment-583-x64-evidence`. Complete CI remains active.
+
+## Final application qualification (2026-10-01)
+
+The exact child-environment fixture passes on both Windows hosts with the explicit architecture declaration. The earlier direct-OS and inherited-environment negative controls remain valid.
+
+These results are measured at `d6ee4588f71604376a4cc41ef281d6c479395efc`
+in [run 36823482913](https://github.com/metacraft-labs/runquota/actions/runs/36823482913).
+All application test programs pass on the five development hosts. The ARM
+workflow still fails its subsequent, separate static-helper ACL gate; that
+issue remains open and is not attributed to this repaired defect.
+Ordinary [CI at `2d07c5d`](https://github.com/metacraft-labs/runquota/actions/runs/36846644651)
+passes all ten jobs with unchanged application sources and fixtures.

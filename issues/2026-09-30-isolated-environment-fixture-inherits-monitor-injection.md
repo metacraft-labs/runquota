@@ -55,3 +55,15 @@ report `launched: true`, `cacheDecision: cdNotCacheable`, and
 `dependencyPolicyKind: dgRecognizedFormat`. All compilation stays monitored;
 the exact child-environment assertion and 600-second execution bound are
 unchanged. The complete candidate matrix remains required.
+
+## Final application qualification (2026-10-01)
+
+The exact environment fixture passes with the selected uncached monitor-free execution. Compilation and other tests retain their existing monitoring.
+
+These results are measured at `d6ee4588f71604376a4cc41ef281d6c479395efc`
+in [run 36823482913](https://github.com/metacraft-labs/runquota/actions/runs/36823482913).
+All application test programs pass on the five development hosts. The ARM
+workflow still fails its subsequent, separate static-helper ACL gate; that
+issue remains open and is not attributed to this repaired defect.
+Ordinary [CI at `2d07c5d`](https://github.com/metacraft-labs/runquota/actions/runs/36846644651)
+passes all ten jobs with unchanged application sources and fixtures.

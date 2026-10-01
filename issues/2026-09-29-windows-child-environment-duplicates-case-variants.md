@@ -51,3 +51,15 @@ Shared-actions PR 38 adds an explicit bootstrap dependency input and passes
 all seven contract CI jobs at `d966f7a`. This candidate selects `292e578`
 for the separately built Reprobuild launcher as well. Full Windows graph
 validation remains required before attributing the missing SQLite to it.
+
+## Final application qualification (2026-10-01)
+
+The actual Windows child-environment regression passes. The earlier missing-SQLite failure remains unattributed; closing this source defect does not assign that cause.
+
+These results are measured at `d6ee4588f71604376a4cc41ef281d6c479395efc`
+in [run 36823482913](https://github.com/metacraft-labs/runquota/actions/runs/36823482913).
+All application test programs pass on the five development hosts. The ARM
+workflow still fails its subsequent, separate static-helper ACL gate; that
+issue remains open and is not attributed to this repaired defect.
+Ordinary [CI at `2d07c5d`](https://github.com/metacraft-labs/runquota/actions/runs/36846644651)
+passes all ten jobs with unchanged application sources and fixtures.

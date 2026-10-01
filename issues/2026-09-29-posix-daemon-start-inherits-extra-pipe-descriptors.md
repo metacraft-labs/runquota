@@ -25,3 +25,15 @@ cases pass. The endpoint-only control fails the EOF deadline; the original
 fixture fails before daemon startup. Logs: `/tmp/runquota-daemon-start-control.log`,
 `/tmp/runquota-daemon-start-fixed.log`, `/tmp/runquota-daemon-start-hygiene.log`.
 Native Linux CI remains required.
+
+## Final application qualification (2026-10-01)
+
+The real POSIX daemon-start stream-detachment checks pass on Linux and macOS.
+
+These results are measured at `d6ee4588f71604376a4cc41ef281d6c479395efc`
+in [run 36823482913](https://github.com/metacraft-labs/runquota/actions/runs/36823482913).
+All application test programs pass on the five development hosts. The ARM
+workflow still fails its subsequent, separate static-helper ACL gate; that
+issue remains open and is not attributed to this repaired defect.
+Ordinary [CI at `2d07c5d`](https://github.com/metacraft-labs/runquota/actions/runs/36846644651)
+passes all ten jobs with unchanged application sources and fixtures.

@@ -40,3 +40,15 @@ simulated. The original socket-only wait reproduces the CI failure:
 same delay, including kernel refusal, spoof refusal and persisted attribution.
 The existing 60-second startup bound and 100 persistence polls are unchanged.
 Native Linux validation and the complete ordinary suite remain required.
+
+## Final application qualification (2026-10-01)
+
+The Linux x64 log confirms all three cases actually run and pass: distinct uid 30001 versus runner uid 1001, member admission, and non-member kernel refusal. Evidence: /tmp/runquota-d6-linux-x64-repro.log.
+
+These results are measured at `d6ee4588f71604376a4cc41ef281d6c479395efc`
+in [run 36823482913](https://github.com/metacraft-labs/runquota/actions/runs/36823482913).
+All application test programs pass on the five development hosts. The ARM
+workflow still fails its subsequent, separate static-helper ACL gate; that
+issue remains open and is not attributed to this repaired defect.
+Ordinary [CI at `2d07c5d`](https://github.com/metacraft-labs/runquota/actions/runs/36846644651)
+passes all ten jobs with unchanged application sources and fixtures.

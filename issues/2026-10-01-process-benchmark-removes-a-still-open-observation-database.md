@@ -61,3 +61,15 @@ Windows execution and promotion.
 The real IPC quick benchmark also passes locally at `9f88e77`, covering the
 second daemon scratch-root teardown. Log:
 `/tmp/runquota-benchmark-cleanup-ipc.log`. No performance comparison is claimed.
+
+## Final application qualification (2026-10-01)
+
+The real M5 process benchmark contract passes on both Windows hosts with bounded cleanup. The original file owner remains inferred, not measured.
+
+These results are measured at `d6ee4588f71604376a4cc41ef281d6c479395efc`
+in [run 36823482913](https://github.com/metacraft-labs/runquota/actions/runs/36823482913).
+All application test programs pass on the five development hosts. The ARM
+workflow still fails its subsequent, separate static-helper ACL gate; that
+issue remains open and is not attributed to this repaired defect.
+Ordinary [CI at `2d07c5d`](https://github.com/metacraft-labs/runquota/actions/runs/36846644651)
+passes all ten jobs with unchanged application sources and fixtures.
