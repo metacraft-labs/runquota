@@ -74,9 +74,22 @@ A missing file is not an error, and the daemon never creates the file or its
 directory. The installers create the directory and seed a file whose keys are
 all commented out (see [provisioning](/getting_started/provisioning)).
 
-A daemon that reprobuild starts for you reads the same file. Reprobuild passes
-no memory flag unless `REPROBUILD_RUNQUOTA_MEMORY_BYTES` is set, and passes
-CPU and pool flags only for the keys the file leaves unset.
+A daemon that reprobuild starts for you reads the same file and **behaves
+exactly as the service would**: reprobuild passes it no CPU, memory or pool
+flag, so nothing it starts is pinned, and `runquota config set` reaches it.
+The one exception is `REPROBUILD_RUNQUOTA_MEMORY_BYTES`, an explicit
+per-invocation override that reprobuild passes as `--memory-bytes` and warns
+about every time: it pins the memory budget for that daemon's life. (Until
+2026-10-01 reprobuild also passed `--cpu-milli` = its own build parallelism
+× 1000 and `--pool` flags; see *Pools a build declares* below for where the
+pools went.)
+
+On Windows the daemon reprobuild starts binds the same host-wide pipe as the
+service and outlives the build, so `runquota config reload` from any shell
+reaches it. On an unprovisioned Linux or macOS host reprobuild starts a daemon
+private to one build, on a socket of its own (exported to the build as
+`RUNQUOTA_SOCKET`), and stops it when the build ends; a change to the file is
+in force from the next build.
 
 ### Changing it: `runquota config`
 
@@ -129,6 +142,37 @@ per reload (`runquotad: host configuration reloaded: ...`).
 `runquotad --host-config PATH` names another file to read at start and on
 every reload — for a test's private daemon, never for the host's.
 
+### Pools a build declares
+
+A client can tell the daemon which named pools its work uses and the capacity
+it expects each to have, on its own session (`DeclarePools`). Reprobuild does
+this for every build: the convention `compile` / `fetch` pools and every
+recipe `buildPool(name, capacity)`. That is how a daemon reprobuild did not
+start — the installed service, or one another build left running — learns
+those pools.
+
+A declaration is the **lowest** layer of a pool's cap:
+
+1. a `--pool NAME=UNITS` flag (pins it);
+2. the host file's `[pools]` entry;
+3. what the open sessions declared — the smallest capacity, when several
+   declare one pool.
+
+So `runquota config set pools.compile 4` overrides what builds declare, and
+`runquota config unset pools.compile` hands the pool back to them. A
+declaration leaves with its session; a pool nobody declares and nothing else
+sizes is gone, and a queued lease in it is denied as on a reload. `runquota
+config show` and `runquota topology --json` name each pool's source (`flag`,
+`host-file`, `declared`).
+
+The host file's keys are bare TOML keys, so a pool whose name contains `.` or
+`/` (`nim_pty.pty-serial`, `host/linker`) cannot be written there; such a pool
+takes its declared capacity, or a flag.
+
+A daemon older than the message (RQSP minor 0) is never sent it, because it
+would close the connection and every session on it; the client warns instead,
+and that daemon admits only the pools its file and flags size.
+
 ### Flags
 
 `runquotad --help` prints the full list. The ones that shape admission:
@@ -140,7 +184,7 @@ every reload — for a test's private daemon, never for the host's.
 | `--io-slots N` | `1` | Concurrent heavy-I/O slots. |
 | `--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]` | one implicit machine, `local` | A named capacity. Omitted I/O slots inherit `--io-slots`; an omitted share group defaults to the machine's own id. |
 | `--cpu-share-group ID=CPU_MILLI` | derived | A CPU cap shared across machines. |
-| `--pool NAME=UNITS` | none | An arbitrary named counter. |
+| `--pool NAME=UNITS` | none | An arbitrary named counter. Pins the value against a reload, and over what sessions declare. |
 | `--socket PATH` | the rendezvous socket | Where to listen. A path you name here is created on demand; the host-wide one never is. |
 | `--host-config PATH` | the host file above | The budget file read at start and on every reload. |
 

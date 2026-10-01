@@ -99,6 +99,37 @@ proc applyHostConfig*(config: var DaemonConfig; host: HostConfig) =
   for name, units in host.pools:
     config.namedPoolCaps[name] = units
 
+proc recomputePoolCaps*(config: var DaemonConfig) =
+  ## The pool caps from the bottom up: what open sessions declared
+  ## (`declaredPools`), then the host file's `[pools]` (`hostFilePools`), then
+  ## the `--pool` flags. Run by `resolveBudget` (start, reload) and whenever a
+  ## declaration is added or leaves with its session.
+  ##
+  ## A DECLARATION IS THE BOTTOM LAYER, NOT A FLAG. It is the client's account
+  ## of the shape of its own work -- reprobuild declares the pools its build
+  ## graph uses -- so the operator's file overrides it, a reload re-reads the
+  ## file over it, and `runquota config unset pools.NAME` takes the pool back
+  ## to what the sessions declared. A flag-like channel would have pinned the
+  ## pool for the daemon's whole life, which is exactly how a
+  ## `runquota config set pools.compile 4` used to do nothing to a daemon
+  ## reprobuild had started with `--pool compile=8`.
+  var pools = initTable[string, uint32]()
+  for name, units in config.declaredPools:
+    pools[name] = units
+  for name, units in config.hostFilePools:
+    pools[name] = units
+  for name, units in config.budgetFlags.pools:
+    pools[name] = units
+  config.namedPoolCaps = pools
+
+proc poolCapSource*(config: DaemonConfig; name: string): string =
+  ## Which layer the cap in force for `name` comes from, in the spelling the
+  ## `topology` subject and `PoolsDeclared` use. Empty when no layer names it.
+  if config.budgetFlags.pools.hasKey(name): "flag"
+  elif config.hostFilePools.hasKey(name): "host-file"
+  elif config.declaredPools.hasKey(name): "declared"
+  else: ""
+
 proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
   ## The budget from the bottom up: the built-in defaults, then `host`, then
   ## the flags in `config.budgetFlags`. Used at start and by every reload, so
@@ -107,9 +138,10 @@ proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
   ## which is what lets `runquota config unset` take a key back to its
   ## default under a running daemon.
   ##
-  ## Pools are the file's `[pools]` plus the `--pool` flags; a pool the file
-  ## no longer names is gone (its cap is 0, so new demands for it are
-  ## refused and leases already granted in it keep running).
+  ## Pools are the pools open sessions declared, then the file's `[pools]`,
+  ## then the `--pool` flags (`recomputePoolCaps`). A pool none of the three
+  ## names any more is gone (its cap is 0, so new demands for it are refused
+  ## and leases already granted in it keep running).
   if config.builtinMemoryBytes.value == 0:
     config.builtinMemoryBytes = config.memoryBytes
   if config.builtinCpuSlots.value == 0:
@@ -123,12 +155,10 @@ proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
     if flags.cpuSlots.isSome: flags.cpuSlots.get
     elif host.cpuMilli.isSome: milliCpu(host.cpuMilli.get)
     else: config.builtinCpuSlots
-  var pools = initTable[string, uint32]()
+  config.hostFilePools = initTable[string, uint32]()
   for name, units in host.pools:
-    pools[name] = units
-  for name, units in flags.pools:
-    pools[name] = units
-  config.namedPoolCaps = pools
+    config.hostFilePools[name] = units
+  config.recomputePoolCaps()
 
 proc machineCapacity*(id: string; cpuSlots: MilliCpu; memoryBytes: Bytes;
                       ioSlots: uint32; cpuShareGroup = ""): MachineCapacity =
@@ -1075,7 +1105,8 @@ proc topologyJson(daemon: RunQuotaDaemon): string =
     if i > 0:
       result.add(",")
     result.add("{\"name\":" & jsonEscape(name) & ",\"units\":" &
-      $daemon.config.namedPoolCaps[name] & "}")
+      $daemon.config.namedPoolCaps[name] & ",\"source\":" &
+      jsonEscape(daemon.config.poolCapSource(name)) & "}")
   result.add("],\"host_config\":{" &
     "\"path\":" & jsonEscape(daemon.config.hostConfigPath) & "," &
     "\"source\":" & jsonEscape(daemon.config.hostConfigSource) & "," &
@@ -2464,6 +2495,79 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
       updated.queueDiagnostic = daemon.waitingDiagnostic(lease)
       daemon.leases[id] = updated
 
+proc rebudgetQueuedLeases(daemon: var RunQuotaDaemon;
+                          deniedBecause: string): seq[uint64] =
+  ## Put a changed budget in force for the queue, after `daemon.config` has
+  ## been replaced (a reload, a pool declaration arriving or leaving with its
+  ## session). Granted leases are not touched. A queued lease the new budget
+  ## can NEVER hold is denied -- delivered on its session's next `GrantNext`,
+  ## with the reason a fresh request of its size gets -- because waiting for
+  ## it could not end. Whatever now fits is promoted; the promoted ids are
+  ## returned.
+  var doomed: seq[uint64] = @[]
+  for id, lease in daemon.leases.pairs:
+    if lease.state == leaseStateQueued:
+      var reason = ""
+      if not daemon.possible(lease.resources, reason):
+        doomed.add(id)
+  for id in doomed:
+    let lease = daemon.leases[id]
+    var reason = ""
+    discard daemon.possible(lease.resources, reason)
+    daemon.pendingDenials.mgetOrPut(lease.sessionId.value, @[]).add(
+      lease.leaseDecision(leaseDecisionDenied, diagnostic(diagDenied, reason,
+        deniedBecause)))
+    daemon.removeLeaseFromTable(id)
+  daemon.tryPromoteQueued()
+
+proc refreshDeclaredPools(daemon: var RunQuotaDaemon): seq[uint64] =
+  ## Recompute the declared layer from the sessions still open -- each pool at
+  ## the SMALLEST capacity any of them declared -- and put the result in force.
+  ##
+  ## WHY THE SMALLEST. Two open sessions that declare the same pool with
+  ## different capacities share one host-wide cap, and only the smaller one
+  ## honours both: a recipe that declares `serial = 1` is saying "never two at
+  ## once", and the larger figure would break that for everyone. An operator
+  ## who wants another number writes it in the host file, which wins.
+  var declared = initTable[string, uint32]()
+  for _, pools in daemon.sessionPools:
+    for name, units in pools:
+      if not declared.hasKey(name) or units < declared[name]:
+        declared[name] = units
+  daemon.config.declaredPools = declared
+  daemon.config.recomputePoolCaps()
+  daemon.rebudgetQueuedLeases(
+    "the session that declared this pool closed while this lease was " &
+    "queued, and no open session, host file entry or runquotad flag sizes " &
+    "the pool any more")
+
+proc declarePools*(daemon: var RunQuotaDaemon; sessionId: SessionId;
+                   pools: openArray[NamedPoolCapWire]): PoolsDeclaredMessage =
+  ## `DeclarePools`: merge `pools` into what `sessionId` declared, recompute
+  ## the caps, and answer with the cap in force for each and where it comes
+  ## from (reprobuild-specs/RunQuota-Host-Configuration.md, "Pools a build
+  ## declares"). The caller has checked the session and the values.
+  var mine = daemon.sessionPools.getOrDefault(sessionId.value,
+    initTable[string, uint32]())
+  for pool in pools:
+    mine[pool.name] = pool.units
+  daemon.sessionPools[sessionId.value] = mine
+  let promoted = daemon.refreshDeclaredPools()
+  for pool in pools:
+    result.pools.add(DeclaredPoolWire(
+      name: pool.name,
+      declared: mine[pool.name],
+      inForce: daemon.config.namedPoolCaps.getOrDefault(pool.name, 0'u32),
+      source: daemon.config.poolCapSource(pool.name)))
+  result.promotedLeases = uint32(promoted.len)
+
+proc forgetSessionPools(daemon: var RunQuotaDaemon; sessionId: SessionId) =
+  ## A session's declaration leaves with it, whether it closed or its
+  ## connection dropped.
+  if daemon.sessionPools.hasKey(sessionId.value):
+    daemon.sessionPools.del(sessionId.value)
+    discard daemon.refreshDeclaredPools()
+
 proc reloadHostConfig*(daemon: var RunQuotaDaemon): HostConfigReloadedMessage =
   ## Re-read the host budget file and put it in force, under a running
   ## daemon (`reprobuild-specs/RunQuota-Host-Configuration.md`, "Changing
@@ -2519,23 +2623,9 @@ proc reloadHostConfig*(daemon: var RunQuotaDaemon): HostConfigReloadedMessage =
   daemon.config = next
   inc daemon.hostConfigReloads
 
-  var doomed: seq[uint64] = @[]
-  for id, lease in daemon.leases.pairs:
-    if lease.state == leaseStateQueued:
-      var reason = ""
-      if not daemon.possible(lease.resources, reason):
-        doomed.add(id)
-  for id in doomed:
-    let lease = daemon.leases[id]
-    var reason = ""
-    discard daemon.possible(lease.resources, reason)
-    daemon.pendingDenials.mgetOrPut(lease.sessionId.value, @[]).add(
-      lease.leaseDecision(leaseDecisionDenied, diagnostic(diagDenied, reason,
-        "the host budget was reloaded while this lease was queued, and the " &
-        "budget in force can never hold it")))
-    daemon.removeLeaseFromTable(id)
-
-  let promoted = daemon.tryPromoteQueued()
+  let promoted = daemon.rebudgetQueuedLeases(
+    "the host budget was reloaded while this lease was queued, and the " &
+    "budget in force can never hold it")
   let usage = daemon.machineUsage.getOrDefault(DefaultMachineId,
     MachineUsage())
   var pools: seq[NamedPoolCapWire] = @[]
@@ -2636,6 +2726,7 @@ proc cleanupLostSession(daemon: var RunQuotaDaemon; sessionId: SessionId) =
   daemon.reapSessionSelfReports(sessionId)
   daemon.pendingDenials.del(sessionId.value)
   daemon.sessions.del(sessionId.value)
+  daemon.forgetSessionPools(sessionId)
   discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
 
 proc cleanupConnection(daemon: var RunQuotaDaemon; context: ConnectionContext) =
@@ -2688,6 +2779,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     daemon.reapSessionSelfReports(msg.sessionId)
     daemon.pendingDenials.del(msg.sessionId.value)
     daemon.sessions.del(msg.sessionId.value)
+    daemon.forgetSessionPools(msg.sessionId)
     connection.sendResponse(
       rqSessionClosed,
       frame.header.requestId,
@@ -3053,6 +3145,33 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
         discard
       connection.sendError(frame.header.requestId, diagnostic(
           diagInvalidArgument, message))
+  of rqDeclarePools:
+    # ONLY FOR A SESSION THIS CONNECTION REGISTERED. A declaration is part of
+    # the session's account of its own work and leaves with it, so it is
+    # accepted on the connection that owns the session and nowhere else.
+    var msg: DeclarePoolsMessage
+    if not decodeDeclarePools(frame.payload, msg):
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "invalid DeclarePools payload"))
+      return
+    var owned = false
+    for id in context.sessionIds:
+      if id.value == msg.sessionId.value:
+        owned = true
+    if not owned or not daemon.sessions.hasKey(msg.sessionId.value):
+      connection.sendError(frame.header.requestId, diagnostic(
+          diagInvalidArgument, "unknown session id"))
+      return
+    for pool in msg.pools:
+      if pool.name.len == 0 or pool.units == 0:
+        connection.sendError(frame.header.requestId, diagnostic(
+            diagInvalidArgument, "a declared pool needs a name and a " &
+            "capacity of at least 1",
+            "pool " & (if pool.name.len > 0: pool.name else: "<empty>") &
+            " = " & $pool.units))
+        return
+    connection.sendResponse(rqPoolsDeclared, frame.header.requestId,
+        encodePoolsDeclared(daemon.declarePools(msg.sessionId, msg.pools)))
   of rqStatsQuery:
     # THE READ PATH, OVER THE SOCKET. Request/response with a variable-size
     # result, which is why it is here and not on the observation ring: the

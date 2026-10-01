@@ -18,6 +18,7 @@ import std/[os, osproc, streams, strutils, unittest]
 from runquota_ipc import endpointDirectoryPermissions, endpointForPath
 import runquota_client
 import runquota_core
+from runquota_protocol import NamedPoolCapWire
 import daemon_binary
 import daemon_endpoint
 from runquota_core/child_process import runCapturedProcess
@@ -237,6 +238,66 @@ suite "runquota config and a running daemon":
     check "memory_bytes = 4294967296 (4 GiB)" in answer.output
     check "pinned by runquotad flags" in answer.output
     check "machine.memory_bytes" in answer.output
+
+  test "a pool a session declares: admitted, under the file, gone with it":
+    # A daemon started with NO budget flags -- what reprobuild's auto-spawn
+    # and the installed service both start now -- and a client that declares
+    # the pools its work uses (reprobuild-specs/RunQuota-Host-Configuration.md,
+    # "Pools a build declares").
+    let root = scratchRoot("declared")
+    defer: removeScratchRoot(root)
+    let socket = rendezvousDir(root) / "d.sock"
+    let state = hostStateDir(root)
+    let file = root / "runquotad.toml"
+    putEnv("RUNQUOTA_SOCKET", socket)
+    writeFile(file, "schema = \"runquota.host-config.v1\"\n")
+    var daemon = startDaemon(socket, file, state)
+    defer: daemon.stop()
+    var client = connect(endpointForPath(socket))
+    defer: client.close()
+    check client.supportsPoolDeclarations()
+    var session = client.registerSession("build", "1")
+
+    proc pooled(id: uint64; pool: string): OfferedLease =
+      var req = request("pooled-" & $id, 1)
+      req.resources = req.resources.withNamedPool(pool, 1'u32)
+      let decisions = session.offerCandidates([toCandidate(id, req)])
+      doAssert decisions.len == 1
+      decisions[0]
+
+    # Undeclared, the pool does not exist on this daemon: refused outright.
+    let refused = pooled(1, "compile")
+    check not refused.lease.active and not refused.queued
+    check refused.diagnostic.message ==
+      "lease request exceeds named-pool budget: compile"
+
+    let answer = session.declarePools([
+      NamedPoolCapWire(name: "compile", units: 2'u32)])
+    check answer.pools.len == 1
+    check answer.pools[0].inForce == 2'u32
+    check answer.pools[0].source == "declared"
+    var first = pooled(2, "compile")
+    check first.lease.active
+    let shown = runCli("config", "show", "--file", file)
+    check "pools.compile = 2 (declared by open sessions" in shown.output
+
+    # The operator's file wins over the declaration, by reload ...
+    let set = runCli("config", "set", "pools.compile", "5", "--file", file)
+    check set.code == 0
+    check "pools compile=5" in set.output
+    check "pinned" notin set.output
+    check "pools.compile = 5 (host file)" in
+      runCli("config", "show", "--file", file).output
+    # ... and `unset` hands the pool back to the declaration, not to nothing.
+    let unset = runCli("config", "unset", "pools.compile", "--file", file)
+    check unset.code == 0
+    check "pools compile=2" in unset.output
+
+    # The declaration leaves with its session.
+    first.lease.release()
+    session.closeSession()
+    check "pools.compile" notin runCli("config", "show", "--file",
+      file).output
 
   test "a file the daemon does not read is reported as not in force":
     let root = scratchRoot("elsewhere")

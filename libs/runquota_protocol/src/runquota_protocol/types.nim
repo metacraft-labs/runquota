@@ -44,6 +44,15 @@ type
       ## administrators can write, so any client that may connect may ask --
       ## the answer can only be the budget the operator wrote down.
     rqHostConfigReloaded = 34
+    rqDeclarePools = 35
+      ## A session states the named pools its own work uses and the capacity
+      ## it expects each to have. The daemon admits against a declared pool
+      ## only where neither the host file nor a `runquotad` flag sizes it, and
+      ## only while a session that declared it is open. Sent only to a daemon
+      ## whose `HelloOk` reports protocol minor >= `PoolDeclarationsMinor`:
+      ## an older one closes the connection on a kind it does not know, and
+      ## the session with it.
+    rqPoolsDeclared = 36
 
   MessageKind* = RqspMessageKind
 
@@ -313,6 +322,30 @@ type
   NamedPoolCapWire* = object
     name*: string
     units*: uint32
+
+  DeclarePoolsMessage* = object
+    ## `rqDeclarePools`. `pools` is merged into what the session declared
+    ## before: a name declared again takes the new capacity.
+    sessionId*: SessionId
+    pools*: seq[NamedPoolCapWire]
+
+  DeclaredPoolWire* = object
+    name*: string
+    declared*: uint32
+      ## What this session declared.
+    inForce*: uint32
+      ## The cap the daemon admits against now.
+    source*: string
+      ## Where `inForce` comes from: `"flag"` (a `runquotad --pool` flag),
+      ## `"host-file"` (the host file's `[pools]`), or `"declared"` (the
+      ## smallest capacity any open session declared for it).
+
+  PoolsDeclaredMessage* = object
+    ## The answer to `rqDeclarePools`: one entry per pool the request named,
+    ## in the request's order.
+    pools*: seq[DeclaredPoolWire]
+    promotedLeases*: uint32
+      ## Queued leases granted because the declaration made room for them.
 
   HostConfigReloadedMessage* = object
     ## The budget in force after a `ReloadHostConfig`. A file that does not

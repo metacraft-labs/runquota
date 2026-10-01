@@ -66,6 +66,11 @@ with `--cpu-milli`, `--memory-bytes` and `--io-slots`, and can be subdivided:
 - `--pool NAME=UNITS` declares an arbitrary named counter — a licence seat, a
   GPU, a test fixture that only exists once.
 
+The host file (`runquotad.toml`) states the same budget without flags, and a
+flag overrides it. A named pool can also be declared by the clients that use
+it, under the file; see
+[Pools a build declares](/usage_guide/daemon#pools-a-build-declares).
+
 `runquota topology --json` prints the configured shape.
 
 ## Admission control
