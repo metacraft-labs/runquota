@@ -1,8 +1,33 @@
 # Windows monitored daemon readiness and retention miss fixture deadlines
 
-Status: open for the remaining attribution gaps. Originally observed at RunQuota
-`177e2af` with io-mon `5421a9b`. The application suites now pass at `d6ee458`;
-that workflow fails its separate final static-helper ACL gate, recorded below.
+Status: open. Originally observed at RunQuota `177e2af` with io-mon `5421a9b`.
+Application suites pass at `d6ee458`, whose workflow fails its later ACL gate.
+The endpoint-startup deadline fails again on Windows x64 at released `0389129`.
+
+## Reproduced after publication at 0389129 (2026-10-01)
+
+At `03891296dccc0f30d063c72e1552f41103286ca0`, Windows x64 job
+[110352061724](https://github.com/metacraft-labs/runquota/actions/runs/36857078024/job/110352061724)
+fails `repro test` at 12:33 UTC. The reported failed action is
+`runquota.test_execute.t_endpoint_serves_before_store_verification`.
+Its Hello response arrives 6360 ms after spawn, and `lock.millisHeld()` is
+6380 ms against the unchanged 3500 ms `LockHeldCeilingMillis` assertion at
+`tests/integration/t_endpoint_serves_before_store_verification.nim:231`.
+The log records only the `after-verification` session. This repeats the
+earlier lock-window failure described below; it does not establish whether
+the cause is process startup, monitoring, scheduling or the daemon itself.
+
+At the 13:38 UTC observation, Linux x64, Linux ARM64 and macOS pass in the
+same full Reprobuild run, while Windows ARM64 remains active. Ordinary CI
+[36857078090](https://github.com/metacraft-labs/runquota/actions/runs/36857078090)
+at the same source passes all ten jobs. Preserve both results: passing native
+CI and package checks do not erase this monitored failure.
+
+Downloaded job evidence is `/tmp/runquota-038-windows-x64-repro.log`, obtained
+through the completed-job logs API while the overall workflow remains active.
+Before recording, fetched dev at `0389129` and searched current issues and
+their Git history; this issue already owns the same test and 3500 ms ceiling.
+Keep the original deadline and obtain paired evidence before choosing a fix.
 
 ## Observed
 
