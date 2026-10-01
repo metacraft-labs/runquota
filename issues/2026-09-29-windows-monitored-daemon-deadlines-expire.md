@@ -561,3 +561,41 @@ Evidence: `/tmp/runquota-c6-arm-repro.log` and the downloaded
 `repro/build-failure-report.json` under `.repro/build/` in
 `/tmp/runquota-c6-arm-evidence`. Refreshed dev `2c50aaf` and agents
 `da47483` before extending this existing record.
+
+## Current x64 recurrence and explicit helper-start boundary
+
+At candidate `9f88e77`, Windows x64 Reprobuild job `110159381835` in
+run `36795962975` compiles every program and reaches 195 successful actions,
+one failure and seven blocked measurement programs. The starting-abnormal
+helper's `waitForExit(3000)` returns zero; total grants and lost leases both
+remain zero. The other seven lifecycle cases pass. This matches the earlier
+traced helper-start failures, but this ordinary run has no entry-phase trace.
+Evidence: `/tmp/runquota-9f-x64-repro.log` and the failure report under
+`/tmp/runquota-9f-x64-evidence/.repro/build/repro/`.
+
+The fixture currently begins its three-second lease-operation/exit wait as
+soon as `startProcess` returns, before establishing that the helper has
+entered its own code. Earlier controls above directly observe expiration
+before helper entry even without monitoring. The protocol spec's
+[Supervisor-Lost Orphan Policy](../../reprobuild-specs/RunQuota-Protocol-And-Client-Libraries.md#supervisor-lost-orphan-policy)
+requires recovery from an actual granted/starting/running lease; it does not
+define a three-second OS-loader deadline.
+
+Repair the fixture boundary explicitly. A real child reports application
+entry through a scratch-file handshake, then waits for the parent to release
+it. Reuse the fixture's existing five-second readiness bound. The parent
+starts the unchanged three-second lease-operation/exit wait after releasing
+that gate. Keep every real daemon, lease transition, expected exit and
+reclamation assertion. Apply the same startup handshake to all helper modes;
+forced-kill cases retain their additional lease-state readiness condition.
+Clean up a child if setup fails. This deliberately separates setup time from
+lease-operation time; it does not claim the old total spawn-to-exit window
+is unchanged. No product timeout or runtime behavior changes.
+
+Validate with real processes and no replaced APIs: a delay before the
+helper-entry signal must reproduce the old failure and pass with the new
+boundary; the same delay after the parent's release must still fail the
+three-second exit assertion. Run the unchanged normal suite and both Windows
+native/monitored controls, then the complete candidate matrix.
+Refreshed dev `2c50aaf` and agents `53a6ca1`; the existing record and its
+archived history own this recurrence.
