@@ -599,3 +599,23 @@ three-second exit assertion. Run the unchanged normal suite and both Windows
 native/monitored controls, then the complete candidate matrix.
 Refreshed dev `2c50aaf` and agents `53a6ca1`; the existing record and its
 archived history own this recurrence.
+
+### Handshake candidate and local controls
+
+Candidate `15e4deb` implements the entry/release handshake. Against its exact
+fixture source, the real local macOS controls produce all four expected
+results: original plus a 3.5-second pre-entry delay fails only the
+starting-abnormal case; the repaired fixture with that delay passes all eight
+cases; a 3.5-second delay after release still fails only the same three-second
+exit assertion; and the unmodified repaired fixture passes all eight cases.
+Windows source checking and repository lint pass. The controls were measured
+on the working tree above `9f88e77`, whose only source change became
+`15e4deb`. Evidence: `build/startup-handshake-local/results.json` under
+`/tmp/runquota-helper-startup-fix`; every variant has a retained binary hash.
+
+The exact candidate's source lock is published with verified remote blob
+`23634667c31393db5d456c3c49832d5da8704f09`. Complete native
+`36800244338` and Reprobuild `36800247249` runs are active. Shared tooling
+`7d1ef0c`, run `36800325319`, repeats all four real controls natively and
+under the production monitor on both Windows hosts. A Windows result and the
+complete ordinary matrix are still required before release selection.
