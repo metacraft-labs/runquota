@@ -37,6 +37,8 @@ def graph(label, target=None):
     print(label + ": exit=" + str(result.returncode), flush=True)
     if result.returncode:
         raise SystemExit(result.returncode)
+    daemon_cores = list(EVIDENCE.glob(label + "-core.runquotad.*.backtrace.log"))
+    assert not daemon_cores, "A daemon crashed despite passing fixture assertions: " + str(daemon_cores)
     executions = [a for a in summary["actions"]
                   if a["id"].startswith("runquota.test_execute.")]
     if target:
