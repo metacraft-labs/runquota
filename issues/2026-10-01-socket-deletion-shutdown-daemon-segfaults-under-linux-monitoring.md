@@ -64,6 +64,48 @@ The original crash remains unattributed. Repeat the complete Linux graph with
 core capture to retain the concurrent suite conditions of the original job.
 Evidence: `/tmp/runquota-94b-linux-daemon-controls`.
 
+## Full-suite reproduction and thread storage
+
+[Diagnostic `3aba051`](https://github.com/metacraft-labs/runquota/actions/runs/36925496086)
+has the same `libs/`, `apps/` and `tests/` tree as candidate `102734d`.
+It disables test-result caching while retaining the original graph dependencies
+and monitoring policies. The first complete graph executes all 103 tests and
+passes. The repeat reproduces the socket-only crash, exit 139 after 30.5 ms,
+while the scratch-tree case passes. The daemon and fixture hashes match the
+earlier 60-execution control above.
+
+The retained core backtrace identifies the crashing worker's exit path:
+
+```text
+free
+deallocThreadStorage
+threadProcWrapper
+start_thread
+```
+
+The main thread is joining workers in `serve`; the capture opener is still
+opening SQLite. A second daemon core from the first graph has the same stack,
+although that graph's assertions passed. The stats-table test also produces
+expected SIGSEGV cores by writing through a read-only mapping; those are
+separate, intentional negative controls.
+
+At `102734d`, `serve` appends a `Thread[void]` to a sequence and starts it on
+each loop iteration. Later appends can relocate already-started thread objects.
+The inspected Nim 2.2.4 runtime passes `addr(t)` to `pthread_create` and uses
+that pointer both when entering and when marking the thread stopped. This is
+a concrete lifetime violation consistent with the captured crashes. Allocate
+the complete worker sequence before starting any worker, then verify the
+repair with the real shutdown fixtures and failing original-source controls.
+
+Native sanitizer diagnostic `ead2e32` passed 30 executions with Nim's normal
+allocator; its GCC 15.2 build differs from the monitored GCC 13 build. Check
+the lifetime hypothesis with an instrumented allocation path as well as the
+unchanged ordinary graph. Do not waive the original assertions or monitoring.
+
+Fetched `agents` at `102734d` and `dev` at `0389129`; searched archived
+thread-storage and worker-reallocation issues before extending this record.
+Backtraces and summaries: `/tmp/runquota-3aba-full-graph-evidence`.
+
 ## Search
 
 Fetched `agents` and `dev` at `d48e196` and `0389129`. Searched current and
