@@ -101,3 +101,19 @@ The exact RunQuota source lock is published, remote blob
 CI is `36792986046` / `36792989240`. PR 35 remains at `a173baf`; this
 experimental input is not selected for a release until the full results pass.
 The ordinary `f93855c` run is retained as the unchanged-protection baseline.
+
+That baseline completes on 2026-10-01 at 00:43 UTC with 101 of 103 builds
+passing. `t_e2e_runquota_client_exit_releases_lease` cannot launch `cc1.exe`;
+`t_observation_retention_scheduled` cannot launch `as.exe`. Both report
+`CreateProcess: No such file or directory`; there is no hook phase trace.
+No test stage runs on the ARM host. Its Windows x64 monitored suite passes,
+but the native benchmark cleanup race is recorded separately.
+Evidence: `/tmp/runquota-f938-arm-repro.log` and
+`/tmp/runquota-f938-arm-evidence/repro/build-failure-report.json`.
+
+Prepared candidate `7fd57f4` passes all ten native jobs and the complete
+Linux ARM64 Reprobuild gate; other Reprobuild jobs remain active. Follow-up
+`9f88e77` changes only benchmark cleanup and its isolated-source fixture.
+It retains the same prepared hook input and runs complete native
+`36795959804` / Reprobuild `36795962975` CI. No compiler timeout or
+runtime assertion is relaxed.
