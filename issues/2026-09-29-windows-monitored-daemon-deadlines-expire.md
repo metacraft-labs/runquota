@@ -699,3 +699,47 @@ evidence is under `build/startup-handshake-focused-local` in
 `/tmp/runquota-helper-startup-fix`; the Windows source-check log is
 `/tmp/runquota-startup-case-windows-check.log`. Complete ordinary CI still
 runs every test at unchanged product `15e4deb`.
+
+## Complete prepared-hook ARM runtime result
+
+Full run `36792989240` at `7fd57f4` completes with 186 successful actions,
+nine failed executions and eight blocked measurements on ARM. Compilation
+passes completely. The failed executions are:
+
+- SQLite concurrent spawn: two threads do not complete 100 calls within
+  60 seconds. The message attributes this to inherited pipes, but the report
+  contains no progress counts or pipe ownership proving that diagnosis.
+- Concurrent short-lived clients: final state is quiet, with 30 completed
+  leases where the fixture expects 32. Its five-second `waitForExit` checks
+  do not identify which children may have timed out.
+- Multi-session fairness: the fifth daemon misses pipe readiness; the first
+  four cases pass.
+- Forking lease completion: the leased-call elapsed time is 5.418 seconds
+  against a five-second assertion. Its earlier direct completion case passes.
+- Process benchmark contract and standalone daemonless degradation: exit 124
+  after partial successful assertions.
+- Retention schedule: five cases miss their completion/counter waits.
+- Observation export and merge: exit 124 after three and four passing cases,
+  respectively.
+
+This source already includes merge/retention query batching and prepared
+hook pages. It predates the benchmark cleanup and helper-handshake changes.
+Those two changes do not establish repairs for the other eight test files.
+Evidence: `/tmp/runquota-7fd-arm-repro.log` and the failure report under
+`/tmp/runquota-7fd-arm-evidence/.repro/build/repro/`.
+
+The earlier current-source merge comparison at `c6ddde6` passed all twelve
+native/monitored cases on ARM with three independent programs admitted at
+once. Its monitored batched merge took 416.4 seconds, versus 43.1 seconds
+natively. The full graph admits more independent tests; this is a possible
+resource-interference explanation, not proof that serialization fixes the
+current failures. The older serial comparison at `33add18` still failed.
+
+Next, instrument the current SQLite stress fixture with real per-thread
+completion records, retaining both threads, all 100 calls, its 60-second
+deadline and survivor checks. Compare the unchanged and observed fixture
+alone, natively and monitored, then admit eight copies of the observed
+fixture before repeating its single-copy measurement. Keep real SQLite,
+separate databases and fixed binary/shim hashes. Counts and timestamps must
+distinguish slow progress from an actual stall before selecting a resource
+or fixture change. Full ordinary validation at `15e4deb` continues separately.
