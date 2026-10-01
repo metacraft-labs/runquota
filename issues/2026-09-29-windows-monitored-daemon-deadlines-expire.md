@@ -743,3 +743,34 @@ fixture before repeating its single-copy measurement. Keep real SQLite,
 separate databases and fixed binary/shim hashes. Counts and timestamps must
 distinguish slow progress from an actual stall before selecting a resource
 or fixture change. Full ordinary validation at `15e4deb` continues separately.
+
+## SQLite progress control and later complete ARM result
+
+Tooling `4a2a9e7`, run `36808704707`, implements the progress comparison
+above against RunQuota `15e4deb`. Both original and observed real SQLite
+fixtures pass locally. The observed fixture records 50 completed calls per
+worker. A corrected real-tool wrapper delays each SQLite invocation by 1.4
+seconds without changing its SQL: the original 60-second watchdog fails,
+with both workers still progressing and each recording 41 completions.
+This proves that the observer distinguishes continued progress from no
+progress when the watchdog expires. An earlier wrapper used a missing Bash
+interpreter and did not apply its delay; that attempt is not a control.
+Local evidence is `build/sqlite-progress-local/results.json` and its marker
+files in `/tmp/runquota-helper-startup-fix`. Windows source checking and
+Python/workflow syntax checks pass. Windows runtime results remain pending.
+
+Full ARM run `36795962975` at `9f88e77` now completes. Every compilation
+passes, but eight runtime programs fail and the eight measurement programs
+remain blocked. Multi-session fairness again misses its fifth daemon's pipe
+readiness. Forking lease completion takes 6.422 seconds against its original
+five-second assertion. The socket write-path case observes zero failure and
+dropped counters after making its store unwritable. Four retention schedule
+cases miss completion waits. Process benchmark, standalone degradation,
+export and merge reach exit 124 after partial passing output. The SQLite
+concurrent-spawn and short-lived-client failures from `7fd57f4` do not
+recur in this run; that alone establishes no repair.
+
+Evidence is `/tmp/runquota-9f-arm-repro.log` and the failure report under
+`/tmp/runquota-9f-arm-evidence/.repro/build/repro/`. The benchmark cleanup
+change does not address these runtime waits. Current `15e4deb` ordinary CI
+and the focused startup comparison remain active separately.
