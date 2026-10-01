@@ -139,4 +139,3 @@ contract.
   is granted, `store_status` is `verifying`, the session taken in that
   window is absent from the store, and a session taken after the verdict is
   recorded.
-

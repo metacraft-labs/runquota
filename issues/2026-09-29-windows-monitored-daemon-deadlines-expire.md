@@ -1,6 +1,45 @@
 # Windows monitored daemon readiness and retention miss fixture deadlines
 
-Status: open. Observed at RunQuota `177e2af` with io-mon `5421a9b`.
+Status: open. Originally observed at RunQuota `177e2af` with io-mon `5421a9b`.
+Application suites pass at `d6ee458`, whose workflow fails its later ACL gate.
+Daemon readiness fails again on both Windows hosts at released `0389129`.
+
+## Reproduced after publication at 0389129 (2026-10-01)
+
+At `03891296dccc0f30d063c72e1552f41103286ca0`, Windows x64 job
+[110352061724](https://github.com/metacraft-labs/runquota/actions/runs/36857078024/job/110352061724)
+fails `repro test` at 12:33 UTC. The reported failed action is
+`runquota.test_execute.t_endpoint_serves_before_store_verification`.
+Its Hello response arrives 6360 ms after spawn, and `lock.millisHeld()` is
+6380 ms against the unchanged 3500 ms `LockHeldCeilingMillis` assertion at
+`tests/integration/t_endpoint_serves_before_store_verification.nim:231`.
+The log records only the `after-verification` session. This repeats the
+earlier lock-window failure described below; it does not establish whether
+the cause is process startup, monitoring, scheduling or the daemon itself.
+
+Windows ARM64 job
+[110352061655](https://github.com/metacraft-labs/runquota/actions/runs/36857078024/job/110352061655)
+also fails `repro test`, at 14:32 UTC. Seven crash-recovery cases pass, but
+`starting lease is lost, never finished, and released on supervisor exit`
+fails in `waitForDaemon`: `CreateFileW` reports Windows error 2 for the
+fixture's named pipe. The failure occurs before the helper handshake and
+the three-second lease assertion. The log does not establish why the daemon
+failed to become ready within the existing bound. Preserve that distinction
+from the older helper-execution timeout.
+
+The complete full Reprobuild run therefore fails both Windows hosts and
+passes Linux x64, Linux ARM64 and macOS. Ordinary CI
+[36857078090](https://github.com/metacraft-labs/runquota/actions/runs/36857078090)
+at the same source passes all ten jobs. Preserve both results: passing native
+CI and package checks do not erase this monitored failure.
+
+Downloaded job evidence is `/tmp/runquota-038-windows-x64-repro.log` and
+`/tmp/runquota-038-windows-arm64-repro.log`. Before recording, fetched dev
+at `0389129` and agents at `139a441`, and searched current issues and their
+Git history; this issue already owns both readiness failures. The dev fixes
+are now reconciled into agents at `5c0de8f`; that merge is not yet qualified
+by a full cross-platform run.
+Keep the original deadline and obtain paired evidence before choosing a fix.
 
 ## Observed
 
@@ -855,7 +894,7 @@ runtime code changes. Complete local socket-write and publication suites
 pass all ten and four cases. Both fixtures and the real SQLite proxy pass
 Windows Nim source checking; repository lint passes.
 
-The real proxy delays INSERTs into a read-only database by 6.5 seconds,
+The real proxy delays INSERT statements into a read-only database by 6.5 seconds,
 then forwards the same SQL to Nix SQLite 3.51.2 and preserves its actual
 output/status. The unchanged fixture passes without delay, fails its loss
 counter assertion with delay, and the synchronized fixture passes with the
@@ -1094,3 +1133,64 @@ bytes; SHA256 `8739c76e681f900923b900c9df0ef75cf421d39cabb54650c4b9ad19b6a76d85`
 This is a second evidence-collection failure, not a worker-progress finding.
 Archive: `/tmp/runquota-sqlite-progress-ae529-arm-logs.zip`. The underlying
 comparison failure remains unattributed. No unchanged retry is selected.
+
+### Concurrent-client controls complete on both Windows hosts
+
+Tooling `17e9d40`, run `36825853485`, also passes all eight expected outcomes
+on the ARM host at RunQuota `d6ee458`. All six concurrent-client samples count
+32 completed leases. The four instrumented samples retain 32 client outputs
+each with no initial connection failure. The missing-daemon control reports
+actual Windows error 2 only in the instrumented CLI, and both variants return
+child success. ARM evidence is `/tmp/runquota-concurrent-17e-arm`, with results
+SHA256 `a658ec8af53180026614c24a9591740a3a2c789849e0c6a1a97a0cf47ccfcb6e`.
+"Native" in these result files means unmonitored execution: both hosts use
+x64 binaries, with emulation on ARM. These controls do not reproduce or
+attribute the missing lease. No product connection retry change is selected.
+
+Candidate `d6ee458` also passes all ten CI jobs and the complete package dry
+run `36826918496`. Independent downloads verify 15 checksums and eight native
+binary architectures across all four release targets. The full Reprobuild
+matrix `36823482913` passes both Linux jobs and remains active on macOS and
+both Windows hosts as of 07:20 UTC. Its final ARM test concurrency and runtime
+outcomes still decide whether the resource-allocation experiment qualifies.
+
+### Completed application qualification and separate ACL repair
+
+At `d6ee4588f71604376a4cc41ef281d6c479395efc`, full Reprobuild run
+`36823482913` completes both Linux jobs, macOS and Windows x64 successfully.
+ARM passes compilation, all 203 monitored actions (101 executed, 102 reused),
+and all 100 conventional test programs. The observed monitored concurrency
+peak is two across 35,240 scheduler samples; Windows x64 retains peak eight.
+The ARM job then fails the separate static-helper work-root privacy check for
+an Authenticated Users grant. The workflow remains failed. Logs are
+`/tmp/runquota-d6-arm-repro.log` and `/tmp/runquota-d6-x64-repro.log`.
+
+Candidate `2d07c5d` changes only that scratch-root setup script and issue
+records above `d6ee458`. All application sources, fixtures, recipes and CI
+inputs are identical. All ten ordinary jobs pass in run `36846644651`.
+The complete focused ACL verification at tooling `61f68e8`, run `36852276089`,
+passes on both Windows hosts: the original real explicit foreign grant
+survives, the repair removes it, the unchanged guard rejects its reinsertion,
+and all 86 scanner cases and twelve static-helper libraries pass. Independent
+checks of downloaded source hashes, DACLs and logs confirm all four outcomes
+per host in `/tmp/runquota-acl-61f-x64` and `/tmp/runquota-acl-61f-arm`.
+The owning issue is
+`2026-10-01-static-helper-gate-retains-explicit-windows-access-grants.md`.
+
+The earlier missing concurrent-client lease was not reproduced by the completed
+controls, and the failed SQLite progress diagnostics still have no retrievable
+worker evidence. Those causes remain unattributed. The two-program admission
+limit is the measured successful resource allocation at this candidate, not
+proof that serialization alone repairs every earlier failure.
+
+### Integrated agents candidate: Windows x64 qualification
+
+At `d48e196`, [full Windows x64 job 110474890644](https://github.com/metacraft-labs/runquota/actions/runs/36893338411/job/110474890644)
+passes the 106-action build, all 209 test actions and the native cross-check.
+The completed log contains no hidden test-failure markers. Focused diagnostic
+`5e6cb15`, [job 110499005938](https://github.com/metacraft-labs/runquota/actions/runs/36900752734/job/110499005938),
+uses the same production sources and repeats endpoint-before-store readiness
+and client-exit lease release twice each in native and monitored modes. All
+eight executions pass with identical binary hashes and unchanged deadlines.
+Artifacts: `/tmp/runquota-5e6-windows-daemon-controls`. The current ARM host
+qualification is still running; these x64 outcomes do not establish its result.

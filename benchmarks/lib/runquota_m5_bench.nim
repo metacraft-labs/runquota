@@ -6,6 +6,7 @@ import runquota_core
 import runquota_exec
 import runquota_process
 import runquota_protocol
+import scratch_root
 
 const FixtureNull = "--fixture-null"
 const FixtureOutput = "--fixture-output"
@@ -224,7 +225,7 @@ proc runProcessSuite(quick: bool): seq[BenchMetric] =
   let socketDir = getTempDir() / ("runquota-m5-process-" & $getCurrentProcessId())
   let socketPath = socketDir / "runquotad.sock"
   if dirExists(socketDir):
-    removeDir(socketDir)
+    removeScratchRoot(socketDir)
   createDir(socketDir)
   # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
   # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
@@ -375,7 +376,7 @@ proc runProcessSuite(quick: bool): seq[BenchMetric] =
   finally:
     stopDaemon(daemon)
     if dirExists(socketDir):
-      removeDir(socketDir)
+      removeScratchRoot(socketDir)
 
 proc runIpcSuite(quick: bool): seq[BenchMetric] =
   let binary = getAppFilename()
@@ -383,7 +384,7 @@ proc runIpcSuite(quick: bool): seq[BenchMetric] =
   let socketDir = getTempDir() / ("runquota-m5-ipc-" & $getCurrentProcessId())
   let socketPath = socketDir / "runquotad.sock"
   if dirExists(socketDir):
-    removeDir(socketDir)
+    removeScratchRoot(socketDir)
   createDir(socketDir)
   # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
   # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
@@ -472,7 +473,7 @@ proc runIpcSuite(quick: bool): seq[BenchMetric] =
   finally:
     stopDaemon(daemon)
     if dirExists(socketDir):
-      removeDir(socketDir)
+      removeScratchRoot(socketDir)
 
 proc main() =
   var suite = "process"

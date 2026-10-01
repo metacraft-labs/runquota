@@ -1,0 +1,2 @@
+# The packaged host configuration must equal HostConfigTemplate byte for byte.
+/packaging/etc/runquotad.toml text eol=lf
