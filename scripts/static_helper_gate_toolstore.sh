@@ -189,21 +189,30 @@ resolve_prefix() {
   dir="${exe%/*}"
   # A prefix's executables sit at most three levels below its root
   # (`bin/`, `cmd/`, `mingw64/bin/`, `usr/bin/`).
+  #
+  # Stripping `/mingw64` leaves the EMPTY string, which is the MSYS root `/`.
+  # Git for Windows' own git is `/mingw64/bin/git`, inside the prefix that IS
+  # the MSYS root, so that case is the dev shell's git, not an edge: before it
+  # was spelled out, the receipt at `/` was found and then recorded as an
+  # empty prefix, and the dev shell's own git was refused as "not in a
+  # reprobuild tool-store prefix". `${prefix%/}` below keeps the receipt path
+  # from becoming `//...`, which MSYS reads as a UNC path.
   for _ in 1 2 3 4; do
     if [ -f "${dir}/.reprobuild-tarball-receipt.json" ]; then
-      prefix="${dir}"
+      prefix="${dir:-/}"
       break
     fi
+    [ -n "${dir}" ] || break
     dir="${dir%/*}"
   done
   [ -n "${prefix}" ] ||
     fail "${program} on PATH (${exe}) is not in a reprobuild tool-store prefix:" \
       "no .reprobuild-tarball-receipt.json above it"
-  method="$(receipt_field "${prefix}/.reprobuild-tarball-receipt.json" installMethod)" ||
+  method="$(receipt_field "${prefix%/}/.reprobuild-tarball-receipt.json" installMethod)" ||
     exit 1
   [ "${method}" = tarball ] ||
     fail "${program} on PATH comes from a ${method} prefix, not a tarball one: ${prefix}"
-  lock="$(receipt_field "${prefix}/.reprobuild-tarball-receipt.json" lockIdentity)" ||
+  lock="$(receipt_field "${prefix%/}/.reprobuild-tarball-receipt.json" lockIdentity)" ||
     exit 1
   [ "${lock}" = "${expected}" ] ||
     fail "${program} on PATH (${exe}) is ${lock}; the gate is pinned to" \
@@ -297,6 +306,11 @@ case "${me_sid}" in
 S-1-*) ;;
 *) fail "cannot read this account's SID from whoami: ${me_sid}" ;;
 esac
+# Removing inheritance leaves explicit grants untouched. Reset this empty
+# directory first, so the following removal also drops default access for
+# other accounts before any compiler or source bytes are staged here.
+"${system_icacls}" "$(cygpath -w "${work_root}")" //reset >/dev/null ||
+  fail "cannot reset ${work_root} permissions"
 "${system_icacls}" "$(cygpath -w "${work_root}")" //inheritance:r //grant:r \
   "*${me_sid}:(OI)(CI)F" >/dev/null ||
   fail "cannot make ${work_root} private to ${me_sid}"

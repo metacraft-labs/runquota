@@ -7,3 +7,10 @@
 # sqlite from the flake. Pinned to the mainline branch until the catalog is in
 # the workspace lock.
 reprobuild-packages=dev
+
+# RunQuota's published stats table requires this source-library interface.
+# Explicitly override the carried workspace pin until it includes the interface.
+nim-shm-lease!=665e128df7ed841af4c8ca5e07c172de5fdf7ee6
+# Transitive source dependency of shm_lease/obsring. RunQuota has no carried
+# workspace lock yet, so this release uses the exact validated source revision.
+nim-shm-queue=02f442ac12ce2587d9c053c527041097af38609f

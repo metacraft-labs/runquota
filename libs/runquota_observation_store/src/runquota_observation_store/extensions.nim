@@ -620,42 +620,63 @@ proc pruneExecutions*(store: ObservationStore; hostId: string;
     ") in (select " & keyHostColumn & ", " & keyExecutionColumn &
     " from executions where " & clause & ")"
 
-  let counted = store.runQuery(
-    "select count(*) from executions where " & clause & ";")
-  if counted.len == 1 and counted[0].len == 1:
+  # Discover registered tables together. Missing extension tables remain
+  # absent from the cascade, without a SQLite process per existence check.
+  inc store.registryReads
+  let registry = runSqlite(store.path,
+    "select " & selectText("r.extension_id") &
+    " from extension_registry r join sqlite_master m on m.type = 'table' " &
+    "and m.name = " & encodeText(extensionTablePrefix) &
+    " || r.extension_id order by r.extension_id;")
+  if not registry.ok:
+    result.detail = "retention registry could not be read: " & registry.error.strip()
+    return
+  var extensionIds: seq[string] = @[]
+  for row in splitRows(registry.output):
+    if row.len != 1:
+      result.detail = "retention registry could not be decoded"
+      return
     try:
-      result.executionsRemoved = parseBiggestInt(counted[0][0].strip())
+      let id = decodeText(row[0])
+      if isStorableIdentifier(id):
+        extensionIds.add(id)
     except ValueError:
-      discard
+      result.detail = "retention registry could not be decoded"
+      return
 
+  # All accounting reads share one snapshot and one child process. The
+  # deletion itself still uses the existing atomic write/degradation path.
+  var countStatements = @[
+    "select count(*) from executions where " & clause & ";",
+    "select count(*) from " & carriedExtensionTable & " where " & membership & ";"]
   var sql = "begin immediate;\n"
-  for entry in store.readExtensionRegistry():
-    if not isStorableIdentifier(entry.extensionId):
-      continue
-    let tableName = extensionTableName(entry.extensionId)
-    # A registry row whose table was never created is not an error here:
-    # there is nothing of that extension to cascade into. Skipping it is
-    # what keeps one absent table from failing the whole pass.
-    if not store.extensionTableExists(tableName):
-      continue
-    let doomedRows = store.runQuery("select count(*) from " & tableName &
+  for id in extensionIds:
+    let tableName = extensionTableName(id)
+    countStatements.add("select count(*) from " & tableName &
       " where " & membership & ";")
-    if doomedRows.len == 1 and doomedRows[0].len == 1:
-      try:
-        result.extensionRowsRemoved +=
-          parseBiggestInt(doomedRows[0][0].strip())
-      except ValueError:
-        discard
-    result.extensionsCascaded.add(entry.extensionId)
     sql.add(extensionCascadeWhere(tableName, hostId, doomed) & "\n")
 
-  let doomedCarried = store.runQuery("select count(*) from " &
-    carriedExtensionTable & " where " & membership & ";")
-  if doomedCarried.len == 1 and doomedCarried[0].len == 1:
+  # Separate SELECTs avoid a column/compound-query limit on extension count.
+  let counted = store.runQuery("begin;\n" & countStatements.join("\n") &
+    "\ncommit;")
+  if counted.len != countStatements.len:
+    result.detail = "retention row counts could not be read"
+    return
+  var counts: seq[int64] = @[]
+  for row in counted:
+    if row.len != 1:
+      result.detail = "retention row counts could not be read"
+      return
     try:
-      result.carriedRowsRemoved = parseBiggestInt(doomedCarried[0][0].strip())
+      counts.add(parseBiggestInt(row[0].strip()))
     except ValueError:
-      discard
+      result.detail = "retention row counts could not be decoded"
+      return
+  result.executionsRemoved = counts[0]
+  result.carriedRowsRemoved = counts[1]
+  for count in counts[2 .. ^1]:
+    result.extensionRowsRemoved += count
+  result.extensionsCascaded = extensionIds
   sql.add(carriedCascadeStatement(hostId, doomed) & "\n")
 
   sql.add("delete from executions where " & clause & ";\n")

@@ -29,9 +29,13 @@ import runquota_protocol
 proc groupList(): string =
   var buffer: array[0 .. 255, Gid]
   let count = getgroups(cint(buffer.len), addr buffer)
-  var parts: seq[string] = @[]
+  # Linux getgroups reports supplementary groups only. The effective primary
+  # group also grants filesystem access, even when a Nix builder has no extras.
+  var parts: seq[string] = @[$int64(getegid())]
   for i in 0 ..< max(0, int(count)):
-    parts.add($int64(buffer[i]))
+    let group = $int64(buffer[i])
+    if group notin parts:
+      parts.add(group)
   parts.join(",")
 
 proc rawConnect(path: string): tuple[fd: SocketHandle; code: cint] =
@@ -63,6 +67,15 @@ proc errnoName(code: cint): string =
 
 when isMainModule:
   let args = commandLineParams()
+  if args.len == 2 and args[0] == "--stat":
+    var info: Stat
+    if lstat(args[1].cstring, info) != 0 or not S_ISSOCK(info.st_mode):
+      echo "socket stat failed: errno=" & $errno
+      quit 1
+    echo "sock_mode=" & toOct(int(info.st_mode) and 0o777, 3)
+    echo "sock_uid=" & $int64(info.st_uid)
+    echo "sock_gid=" & $int64(info.st_gid)
+    quit 0
   if args.len < 1:
     echo "usage: rendezvous_probe SOCKET [DECLARED_UID]"
     quit 2

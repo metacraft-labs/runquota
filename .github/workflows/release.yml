@@ -1,0 +1,18 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [release/unified-0.1.0]
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    uses: metacraft-labs/metacraft-github-actions/.github/workflows/release-tools.yml@96ac63b99d8d6c3a06ca43a9214abbc00f4ac01e
+    with:
+      tooling-ref: 96ac63b99d8d6c3a06ca43a9214abbc00f4ac01e
+    secrets: inherit

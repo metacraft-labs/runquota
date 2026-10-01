@@ -17,12 +17,16 @@ import std/[os, osproc, sets, unittest]
 import runquota_host_windows {.all.}
 
 when defined(windows):
+  # A real child with a bounded lifetime, independent of shell/PATH setup.
+  # The parent observes its OS identity and terminates it after sampling.
+  if commandLineParams() == @["--live-child"]:
+    sleep(30_000)
+    quit(0)
+
   suite "process tree: recycled parent PIDs":
 
     test "a genuine child is younger than its parent and is kept":
-      let child = startProcess(findExe("cmd"),
-        args = ["/c", "ping", "-n", "6", "127.0.0.1", ">nul"],
-        options = {poUsePath})
+      let child = startProcess(getAppFilename(), args = ["--live-child"])
       defer:
         try: child.terminate() except CatchableError: discard
         child.close()
@@ -35,9 +39,7 @@ when defined(windows):
       check kid in tree
 
     test "the tree sample counts the live child":
-      let child = startProcess(findExe("cmd"),
-        args = ["/c", "ping", "-n", "6", "127.0.0.1", ">nul"],
-        options = {poUsePath})
+      let child = startProcess(getAppFilename(), args = ["--live-child"])
       defer:
         try: child.terminate() except CatchableError: discard
         child.close()

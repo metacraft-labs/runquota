@@ -15,6 +15,9 @@ name: CI (reprobuild)
 # host without any other repo-side change.
 
 on:
+  workflow_dispatch:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, dev, stable]
   pull_request:
@@ -29,8 +32,44 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  choose-windows:
+    # Shared public-repository routing, with the existing fleet fallback.
+    # Native tests require distinct owner/group SIDs for their publication arm;
+    # see issues/2026-09-29-windows-ci-bypasses-declared-tool-store.md.
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: windows-2025
+      fallback: '["self-hosted","windows","x64"]'
+
+  choose-windows-arm:
+    # Existing x64-emulation suite on a native ARM64 host; no backend port.
+    # Temporary migration owner: zah. Follow-up: metacraft-specs/issues/
+    # 2026-09-29-windows-arm64-release-runner-migration.md
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: windows-11-arm
+      fallback: '["self-hosted","windows","arm64"]'
+
+  choose-macos:
+    # Native macOS jobs retain their full gates while the fleet repair lands.
+    # Owner: zah. Follow-up: metacraft-specs/issues/
+    # 2026-09-28-shared-macos-host-has-no-headroom-for-runquota-measurements.md
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: macos-26
+      fallback: '["self-hosted","macos","arm64","nix-darwin"]'
+
+  choose-linux:
+    # The shared CI_RUNNER_MODE policy selects free hosted runners for public
+    # repos by default and preserves the org-controlled self-hosted fallback.
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@cd73eba732b9190499ec78e1e65b0dd784507440
+    with:
+      preferred: ubuntu-24.04
+      fallback: '["self-hosted","linux","x64"]'
+
   reprobuild:
-    name: ${{ matrix.os }}-${{ matrix.arch }} — repro build/test
+    needs: [choose-linux, choose-macos, choose-windows, choose-windows-arm]
+    name: ${{ matrix.os }}-${{ matrix.arch }} — repro build/test ${{ contains(matrix.runner, 'windows') && contains(matrix.runner, 'arm64') && '(x64 emulation)' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -43,14 +82,24 @@ jobs:
             runner: [self-hosted, linux, arm64]
           - os: macos
             arch: arm64
-            runner: [self-hosted, macos, arm64]
+            runner: [self-hosted, macos, arm64, nix-darwin]
           - os: windows
             arch: x64
             runner: [self-hosted, windows, x64]
           - os: windows
             arch: arm64
             runner: [self-hosted, windows, arm64]
-    runs-on: ${{ matrix.runner }}
+    # Source bootstrap exceeds the current Tart guest's writable storage.
+    # The native nix-darwin class retains every test; owner zah, follow-up:
+    # metacraft-specs/issues/2026-09-29-macos-tart-source-bootstrap-exhausts-guest-disk.md
+    # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
+    # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
+    runs-on: ${{ contains(matrix.runner, 'windows') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-windows.outputs.runs_on) || contains(matrix.runner, 'windows') && contains(matrix.runner, 'arm64') && fromJSON(needs.choose-windows-arm.outputs.runs_on) || contains(matrix.runner, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
+    env:
+      # Reprobuild and its monitor currently target x64 on Windows, including
+      # the existing emulated lane on ARM64 hosts. Native release payloads
+      # are built and exercised separately by the release workflow.
+      WINDOWS_DIY_ARCH_OVERRIDE: ${{ contains(matrix.runner, 'windows') && contains(matrix.runner, 'arm64') && 'x64' || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -75,27 +124,70 @@ jobs:
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@41d0680bd78ca59ad110a261a20bcaa93a38fffd
         with:
           env-flavor: reprobuild
+          # Exercise the published bootstrap repairs before a new CLI release.
+          # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
+          repro-from-source: true
+          repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
+          repro-posix-io-mon-pin: ${{ matrix.os == 'linux' && '3df08c24ee91900b950ed20a3827923d213f2a9c' || '' }}
+          repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
+          # Distinguish emulated x64 from native ARM children and preserve exit bits.
+          repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
+          # Preserve buffered root output without waiting for descendant pipe EOF.
+          repro-stackable-hooks-pin: 43b1835128331fef09ecf64a614dbf46880dbe9f
           gh-token: ${{ steps.ci_token.outputs.token }}
+
+      - name: Refresh authentication before repro build
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
 
       - name: repro build
         # Builds the conventional `build` collection declared in
         # `repro.nim`. Verifies the primary shipping artefact (the
         # recorder binary or extension) materialises through the
         # reprobuild engine identically to `just build`.
-        run: dev-exec repro build
+        run: dev-exec repro build --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
+
+      - name: Refresh authentication before repro test
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
 
       - name: repro test
         # Materialises the `test` collection.
-        run: dev-exec repro test
+        # Bound simultaneous test programs on the ARM host's x64 emulator.
+        # Each fixture keeps its own concurrency and deadlines. An empty
+        # value leaves Reprobuild's existing default on the other platforms.
+        env:
+          REPROBUILD_MAX_PARALLELISM: ${{ matrix.os == 'windows' && matrix.arch == 'arm64' && '2' || '' }}
+        run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
+
+      - name: Refresh authentication before just build (cross-check)
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
 
       - name: just build (cross-check)
         # Re-runs the legacy `just build` path inside the same env so
         # we catch silent divergences between `repro build` outputs
         # and what the dev shell + Justfile produce today.
         run: dev-exec just build
+
+      - name: Refresh authentication before just test (cross-check)
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@bcd29c631ff01fbd0e577c5f96e5f9d5211fed26
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
 
       - name: just test (cross-check)
         run: dev-exec just test
@@ -135,6 +227,7 @@ jobs:
         with:
           name: reprobuild-logs-${{ matrix.os }}-${{ matrix.arch }}
           path: |
+            build/diagnostics/
             .repro/build/*/build-failure-report.json
             .repro/build/*/build-engine-cache/actions/
           include-hidden-files: true

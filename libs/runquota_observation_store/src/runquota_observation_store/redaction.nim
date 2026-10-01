@@ -153,7 +153,7 @@
 ## to carry; a policy that redacted them would produce an artifact with
 ## nothing in it, and the test's controls fail for exactly that reason.
 
-import std/[options, os, strutils]
+import std/[options, os, strutils, tables]
 
 import ./canonical, ./extensions, ./schema, ./sha256, ./sqlite_cli
 
@@ -491,13 +491,28 @@ proc redactCopy(path: string; active: set[RedactionCategory];
     report.detail = detail
     return false
 
+  # EVERY TABLE'S COLUMNS IN ONE `sqlite3` RUN, not one run per table: a
+  # run is a process spawn, which is what this pass costs, and on a loaded
+  # host a spawn is hundreds of milliseconds (see `canonicalDump`). Names
+  # are hex on the way out, so the separator cannot occur inside one.
+  var columnsOf = initTable[string, seq[string]]()
+  for line in linesOf(path,
+      "select hex(m.name) || '" & canonicalFieldSeparator &
+        "' || hex(i.name) from sqlite_master m, pragma_table_info(m.name) i " &
+        "where m.type = 'table' and substr(m.name, 1, 7) <> 'sqlite_' " &
+        "order by m.name, i.cid;", detail):
+    let parts = line.split(canonicalFieldSeparator)
+    if parts.len != 2:
+      report.detail = "unreadable column listing"
+      return false
+    columnsOf.mgetOrPut(parseHexStr(parts[0]), @[]).add(parseHexStr(parts[1]))
+  if detail.len > 0:
+    report.detail = detail
+    return false
+
   var updates = ""
   for table in tables:
-    let columns = linesOf(path, "select name from pragma_table_info(" &
-      encodeText(table) & ") order by cid;", detail)
-    if detail.len > 0:
-      report.detail = detail
-      return false
+    let columns = columnsOf.getOrDefault(table)
     var expressions: seq[string] = @[]
     for column in columns:
       expressions.add(textCellExpression(column))

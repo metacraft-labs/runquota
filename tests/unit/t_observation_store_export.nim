@@ -63,7 +63,7 @@
 ## by the same library the daemon writes with; the carried rows arrive
 ## through the real ``merge``.
 
-import std/[options, os, strutils, times, unittest]
+import std/[exitprocs, options, os, strutils, times, unittest]
 
 import runquota_observation_store
 
@@ -186,7 +186,7 @@ proc vendorSource(path: string): ObservationStore =
     columns: @["vendor_path"],
     values: @[extText(secretCarriedPath)])) == ewWritten
 
-proc buildLocalStore(dir, path: string): ObservationStore =
+proc buildLocalStoreOnce(dir, path: string): ObservationStore =
   ## The store a developer's machine accumulates: full detail, nothing
   ## redacted, exactly as OS-3 and the "redact at export" rule require.
   result = openObservationStore(path)
@@ -250,6 +250,40 @@ proc buildLocalStore(dir, path: string): ObservationStore =
   let vendor = dir / "vendor.sqlite"
   discard vendorSource(vendor)
   doAssert result.mergeObservationStore(vendor).outcome == moMerged
+
+var localStoreTemplate = ""
+  ## The one store `buildLocalStoreOnce` wrote, for `buildLocalStore` to copy.
+
+proc buildLocalStore(dir, path: string): ObservationStore =
+  ## A fresh copy of the local store at ``path``, opened.
+  ##
+  ## BUILT ONCE PER RUN AND COPIED, because building it is the expensive
+  ## part of this file and every case builds the same bytes: the fixture is
+  ## deterministic -- fixed ids, fixed timestamps, fixed secrets -- so a
+  ## rebuild could only ever reproduce the copy. It costs about 85 `sqlite3`
+  ## spawns (a vendor store, a merge, one insert per row), and seven cases
+  ## built it, so the rebuilds were a third of everything this file spawned.
+  ## A spawn is about 30 ms on a quiet Windows host and 160 ms on average
+  ## with the CPUs held by one other process, and the file was killed at its
+  ## 600 s bound during a loaded full-suite run. Each case still gets its
+  ## own file in its own directory, so nothing one case does can reach
+  ## another.
+  if localStoreTemplate.len == 0:
+    let templateDir = scratchDir("template")
+    addExitProc(proc () = removeDir(templateDir))
+    let templatePath = templateDir / "local.sqlite"
+    discard buildLocalStoreOnce(templateDir, templatePath)
+    localStoreTemplate = templatePath
+  # A write-ahead log still beside the template would hold rows the main
+  # file does not, and a copy of the main file alone would silently lose
+  # them. Every connection that wrote the template has exited, which checks
+  # the log in and removes it; this says so rather than assuming it.
+  for suffix in ["-wal", "-shm"]:
+    doAssert not fileExists(localStoreTemplate & suffix),
+      "the template store still has a " & suffix & " file"
+  copyFile(localStoreTemplate, path)
+  result = openObservationStore(path)
+  doAssert result.captureEnabled, result.report
 
 proc plainStore(path: string): ObservationStore =
   ## A store with NOTHING to redact in the column-shaped categories: no

@@ -401,7 +401,10 @@ mkdir -p \
   "${hostile_compiler}" "${hostile_cache}" \
   "${hostile_home}" "${hostile_tmp}" "${hostile_xdg}"
 cp "${scanner_source}" "${hostile_scripts}/nim_ref_token_scanner.nim"
-cp -R "${nim_root}/compiler/." "${hostile_compiler}/"
+# This is the deliberately mutable compiler-shadow fixture. Do not inherit
+# read-only Nix directory modes: a cancelled job may never reach the EXIT
+# trap, and the next checkout must still be able to remove this scratch tree.
+cp -R --no-preserve=mode "${nim_root}/compiler/." "${hostile_compiler}/"
 awk '
   /^    result\.getIdent\(\$s, hashIgnoreStyle\(\$s\)\)\.id = ord\(s\)$/ {
     print "    if s != wRef:"

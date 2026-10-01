@@ -23,11 +23,20 @@ Under Nix, prefer the service: `services.runquotad.enable = true` on NixOS,
 or the `runquotad` nix-darwin module on macOS. On Windows it runs as an SCM
 service named `runquotad`.
 
-`runquota daemon start` is the convenience path: it checks whether a daemon is
-already answering, and only if not spawns a detached `runquotad` **with no
-arguments**, then polls for readiness. Idempotent; the budget it gets is the
-host file's (below), or the defaults when there is none. For flags,
-start the daemon yourself or use the service.
+`runquota daemon start [RUNQUOTAD_ARG...]` is the convenience path: it checks
+whether a daemon is already answering, and only if not spawns a detached
+`runquotad` with the flags you give it, then polls for readiness. Idempotent; the
+budget it gets is the host file's (below) unless a flag overrides it, or the
+defaults when there is none.
+
+The daemon it starts **does not keep the caller's terminal or pipes**. Its
+output goes to `--log-file`, by default the per-user
+`%LOCALAPPDATA%\runquota\runquotad.log` on Windows and
+`$XDG_STATE_HOME/runquota/runquotad.log` (else `~/.local/state/...`)
+elsewhere, and the verb prints that path. So `runquota daemon start | tail`, a
+`$(...)` or a CI step returns as soon as the daemon answers, instead of waiting
+for it to exit. `runquotad --log-file PATH` does the same for a daemon you
+start yourself.
 
 ## Configuring the budget
 

@@ -155,7 +155,10 @@ proc runSqlite*(path, sqlText: string): SqliteRun =
   let captured = runCapturedProcess(
     "sqlite3",
     args = ["-batch", "-noheader", "-bail", path],
-    input = sqlText & "\n",
+    # A reader may overlap the first schema/WAL initialization or a writer's
+    # commit. Match the observation store's bounded busy wait on this worker;
+    # admission still only enqueues. The dot command adds no row to stdout.
+    input = ".timeout 5000\n" & sqlText & "\n",
     options = {poUsePath})
   SqliteRun(
     ok: captured.failure.len == 0 and captured.ok,

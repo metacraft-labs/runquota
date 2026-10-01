@@ -731,8 +731,9 @@ when defined(windows):
   proc windowsChildEnv(spec: CommandSpec): StringTableRef =
     # Windows: start from the current process env (unless the caller asked
     # for exactly its own entries, `inheritEnv = false`), then layer overrides.
-    when compiles(newStringTable()):
-      result = newStringTable()
+    # Windows names are case-insensitive: an inherited Path and a PATH
+    # override must describe one value in the child's environment block.
+    result = newStringTable(modeCaseInsensitive)
     if spec.inheritEnv:
       for k, v in envPairs():
         result[k] = v

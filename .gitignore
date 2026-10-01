@@ -29,3 +29,7 @@ bench-results/
 # `repro workspace lock` refuses, so an untracked one stops the whole
 # workspace publishing locks, not just this repo.
 .claude/worktrees/
+
+# Release output and pinned shared tooling checkout.
+/dist/
+/.release-tools/

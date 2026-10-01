@@ -51,7 +51,7 @@
 ##
 ## No mocks. The real sampler thread, the real host readings, the real store.
 
-import std/[atomics, cpuinfo, math, os, strutils, tempfiles, unittest]
+import std/[atomics, cpuinfo, math, monotimes, os, strutils, tempfiles, times, unittest]
 
 import runquota_observation_store
 import runquota_observation_store/ids
@@ -83,7 +83,9 @@ const
   ## not exist at the instant it stamped.
   StepMillis = 2
 
-  RunMillis = 10000
+  MinRunMillis = 10000
+  MaxRunMillis = 60000
+  MinSteps = 101
   MaxSpinners = 64
 
   ## CONTENTION, and why it is needed rather than gratuitous.
@@ -114,11 +116,11 @@ const
   MinDistinctSelfValues = 5
 
   ## Slots reserved for the step log, comfortably above the most a run at one
-  ## step per `StepMillis` over `RunMillis` can produce (a step also costs a
+  ## step per `StepMillis` over `MaxRunMillis` can produce (a step also costs a
   ## `reportSelfExecution`, so the observed yield is a few hundred). See the
   ## note on `Stepper`: the point of a fixed size is that the MAIN thread
   ## allocates the payload.
-  StepCapacity = 4 * (RunMillis div StepMillis)
+  StepCapacity = 4 * (MaxRunMillis div StepMillis)
 
 type
   StepRecord = object
@@ -147,6 +149,7 @@ type
     stop: Atomic[bool]
     steps: seq[StepRecord]
     stepCount: int
+    publishedSteps: Atomic[int]
 
   Spinner = object
     stop: Atomic[bool]
@@ -179,6 +182,7 @@ proc stepProbe(state: ptr Stepper) {.thread.} =
       state.steps[state.stepCount] = StepRecord(
         beforeMillis: before, afterMillis: after, value: value)
       state.stepCount += 1
+      state.publishedSteps.store(state.stepCount)
       sleep(StepMillis)
 
 proc churnLock(state: ptr Churn) {.thread.} =
@@ -243,7 +247,7 @@ suite "ambient sample atomicity":
     for i in 0 ..< spinnerCount:
       createThread(spinnerThreads[i], burnCpu, addr spinners[i])
     # SIZED HERE, ON THIS THREAD, and before the stepper can touch it. The
-    # cadence is one step per `StepMillis` over `RunMillis`, so the run
+    # cadence is one step per `StepMillis` over `MaxRunMillis`, so the run
     # cannot produce more than this many; a stepper that somehow reached the
     # end simply stops recording, and `steps.len > 100` below still refuses a
     # run that recorded nothing.
@@ -252,9 +256,30 @@ suite "ambient sample atomicity":
       defer: discard timeEndPeriod(1)
     stepper.steps = newSeq[StepRecord](StepCapacity)
     stepper.stepCount = 0
+    stepper.publishedSteps.store(0)
     createThread(stepperThread, stepProbe, addr stepper)
 
-    sleep(RunMillis)
+    # The probe deliberately contends on the real sampler lock. Ten seconds
+    # is a minimum observation window, not a promise of 101 scheduled writes.
+    # Keep every coverage floor: enough step writes alone do not prove the
+    # sampler recorded enough rows or distinct values. Inspect persisted rows
+    # through the real store while extending a slow run to the same bounded
+    # monotonic deadline. Read step records only after the writer joins.
+    let started = getMonoTime()
+    while true:
+      let elapsed = (getMonoTime() - started).inMilliseconds
+      if elapsed >= MaxRunMillis:
+        break
+      if elapsed >= MinRunMillis and stepper.publishedSteps.load() >= MinSteps:
+        let observed = store.readAmbientSamples()
+        var sampledSelf: seq[float64] = @[]
+        for row in observed:
+          if row.selfCpuPct notin sampledSelf:
+            sampledSelf.add(row.selfCpuPct)
+        if observed.len >= MinCheckedRows and
+            sampledSelf.len >= MinDistinctSelfValues:
+          break
+      sleep(500)
     stopAmbientSampler()
 
     stepper.stop.store(true)
@@ -276,8 +301,9 @@ suite "ambient sample atomicity":
     let steps = stepper.steps
 
     # The driver has to have actually driven something.
-    check steps.len > 100
-    check steps[^1].value > steps[0].value
+    check steps.len >= MinSteps
+    if steps.len >= 2:
+      check steps[^1].value > steps[0].value
 
     var checkedRows = 0
     var straddling = 0

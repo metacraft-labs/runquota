@@ -20,10 +20,8 @@
 ##   forbids. Capacities belong here; utilisation does not. The one field
 ##   where the line is genuinely blurred is swap, handled below.
 ##
-## PLATFORM STATUS. macOS/arm64 and Windows 11/x64 are the platforms this
-## has been run on. The Linux branch is written from ``/proc`` and ``/sys``
-## semantics and has NEVER EXECUTED; treat a failure there as a first
-## observation, not a regression.
+## Platform evidence and outstanding gaps are recorded in the release
+## validation notes and issues; the detector is exercised on native hosts.
 
 import std/[os, strutils]
 
@@ -295,15 +293,8 @@ when defined(macosx):
 # ---------------------------------------------------------------------------
 
 elif defined(linux):
-  # NOT EXECUTED ANYWHERE YET. Everything in this branch is written from
-  # the documented contents of `/proc` and `/sys` and has never run on a
-  # Linux host: no field below has been compared against a real machine,
-  # and the campaign's rule is that a finding only counts on the OS it was
-  # reproduced on. Treat a wrong value here as a first observation, not a
-  # regression. What macOS does prove is the shape: detection feeds
-  # `profileHash`, `ensureHostProfile` reuses on an unchanged hash, and
-  # both are platform-independent.
   import std/posix
+  import ./linux_cpu_model
 
   proc readFileOrEmpty(path: string): string =
     try:
@@ -355,54 +346,15 @@ elif defined(linux):
     let physical = if pairs.len > 0: int64(pairs.len) else: logical
     (physical, logical)
 
-  proc cpuModelOf(cpuinfo: string): string =
-    for key in ["model name", "Model", "Hardware", "cpu model", "cpu"]:
-      let value = keyValue(cpuinfo, key, ":")
-      if value.len > 0:
-        return value
-    unknownField
+  import ./linux_storage
 
-  proc mountedFilesystem(path: string): tuple[fsType, device: string] =
-    ## The longest mount point in `/proc/self/mountinfo` that is a prefix
-    ## of `path`. Longest wins because mounts nest.
-    var probe = if path.len > 0: path else: "/"
+  proc mountedFilesystem(path: string): LinuxMount =
+    var probe = if path.len > 0: absolutePath(path) else: "/"
     while probe.len > 1 and not fileExists(probe) and not dirExists(probe):
       probe = probe.parentDir
-    result = (unknownField, "")
-    var bestLength = -1
-    for line in readFileOrEmpty("/proc/self/mountinfo").splitLines():
-      let halves = line.split(" - ", maxsplit = 1)
-      if halves.len != 2:
-        continue
-      let left = halves[0].split()
-      let right = halves[1].split()
-      if left.len < 5 or right.len < 2:
-        continue
-      let mountPoint = left[4]
-      if not (probe == mountPoint or probe.startsWith(
-          if mountPoint.endsWith("/"): mountPoint else: mountPoint & "/")):
-        continue
-      if mountPoint.len > bestLength:
-        bestLength = mountPoint.len
-        result = (right[0], right[1])
-
-  proc diskClassOf(fsType, device: string): DiskClass =
-    if networkFsType(fsType):
-      return dcNetwork
-    if not device.startsWith("/dev/"):
-      return dcUnknown
-    var name = device[5 .. ^1]
-    if name.startsWith("nvme"):
-      return dcNvme
-    # Strip a partition suffix: sda1 -> sda, mmcblk0p1 -> mmcblk0.
-    while name.len > 1 and name[^1] in {'0' .. '9'}:
-      name.setLen(name.len - 1)
-    let rotational =
-      readFileOrEmpty("/sys/block/" & name & "/queue/rotational").strip()
-    case rotational
-    of "1": dcHdd
-    of "0": dcSsd
-    else: dcUnknown
+    if fileExists(probe) or dirExists(probe):
+      probe = expandFilename(probe)
+    linuxMountForPath(readFileOrEmpty("/proc/self/mountinfo"), probe)
 
   proc virtualizationOf(): string =
     if fileExists("/.dockerenv") or
@@ -424,7 +376,8 @@ elif defined(linux):
     let cpuinfo = readFileOrEmpty("/proc/cpuinfo")
     let meminfo = readFileOrEmpty("/proc/meminfo")
     let counts = coreCounts(cpuinfo)
-    profile.cpuModel = cpuModelOf(cpuinfo)
+    let model = linuxCpuModel(cpuinfo)
+    profile.cpuModel = if model.len > 0: model else: unknownField
     profile.physicalCores = counts.physical
     profile.logicalCores = counts.logical
     profile.ramBytes = kilobytesField(meminfo, "MemTotal")
@@ -447,7 +400,9 @@ elif defined(linux):
     let mounted = mountedFilesystem(referencePath)
     profile.fsType =
       if mounted.fsType.len > 0: mounted.fsType else: unknownField
-    profile.diskClass = diskClassOf(mounted.fsType, mounted.device)
+    profile.diskClass =
+      if networkFsType(mounted.fsType): dcNetwork
+      else: linuxBlockDiskClass(mounted.deviceNumber)
 
 # ---------------------------------------------------------------------------
 # Windows

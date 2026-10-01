@@ -1,3 +1,6 @@
+## Real daemon and supervisor processes; no mocks. A startup handshake keeps
+## loader scheduling outside the lease-operation/exit deadline. The helper
+## performs every connection and lease transition after the parent releases it.
 import std/[envvars, json, os, osproc, strutils, unittest]
 
 when defined(posix):
@@ -11,6 +14,7 @@ import daemon_binary
 import scratch_root
 
 const HelperModeEnv = "RUNQUOTA_E2E_CRASH_MODE"
+const HelperStartupEnv = "RUNQUOTA_E2E_CRASH_STARTUP"
 
 var daemonCounter = 0
 
@@ -73,8 +77,18 @@ proc waitForStatus(activeSessions, activeLeases, supervisorLost,
       " last_error=" & lastError
   )
 
-proc spawnHelper(mode: string; args: openArray[string] = []): owned(Process) =
+proc waitForReady(path: string) =
+  for _ in 0 ..< 100:
+    if fileExists(path):
+      return
+    sleep(50)
+  raise newException(OSError, "helper did not report ready: " & path)
+
+proc spawnHelper(mode, startupRoot: string;
+                 args: openArray[string] = []): owned(Process) =
+  let readyPath = startupRoot / ("helper-" & mode & ".entered")
   putEnv(HelperModeEnv, mode)
+  putEnv(HelperStartupEnv, readyPath)
   try:
     result = startProcess(
       getAppFilename(),
@@ -83,20 +97,26 @@ proc spawnHelper(mode: string; args: openArray[string] = []): owned(Process) =
     )
   finally:
     delEnv(HelperModeEnv)
-
-proc waitForReady(path: string) =
-  for _ in 0 ..< 100:
-    if fileExists(path):
-      return
-    sleep(50)
-  raise newException(OSError, "helper did not report ready: " & path)
+    delEnv(HelperStartupEnv)
+  try:
+    waitForReady(readyPath)
+    writeFile(readyPath & ".go", "go")
+  except:
+    if result.running:
+      result.terminate()
+      discard result.waitForExit(3000)
+    result.close()
+    raise
 
 proc blockUntilKilled() =
   while true:
     sleep(1000)
 
 proc sleepCommand(): string =
-  result = findExe("sleep")
+  # Nix can provide sleep as a symlink to the multicall coreutils executable.
+  # Preserve argv[0]: invoking the resolved `coreutils 30` exits immediately,
+  # leaving no live child whose reservation the crash test can retain.
+  result = findExe("sleep", followSymlinks = false)
   if result.len == 0:
     result = "/bin/sleep"
 
@@ -180,6 +200,12 @@ proc terminatePidFile(pidPath: string) =
 
 let helperMode = getEnv(HelperModeEnv)
 if helperMode.len > 0:
+  let startupPath = getEnv(HelperStartupEnv)
+  delEnv(HelperStartupEnv)
+  if startupPath.len == 0:
+    quit 2
+  writeFile(startupPath, "entered")
+  waitForReady(startupPath & ".go")
   case helperMode
   of "granted-normal":
     quit runGrantedLeak(0)
@@ -258,7 +284,7 @@ suite "e2e_runquota_client_exit_releases_lease":
 
   test "normal supervisor exit releases granted-but-not-started lease":
     withDaemon:
-      var helper = spawnHelper("granted-normal")
+      var helper = spawnHelper("granted-normal", socketDir)
       check helper.waitForExit(3000) == 0
       helper.close()
 
@@ -267,7 +293,7 @@ suite "e2e_runquota_client_exit_releases_lease":
 
   test "abnormal supervisor exit also releases granted-but-not-started lease":
     withDaemon:
-      var helper = spawnHelper("granted-abnormal")
+      var helper = spawnHelper("granted-abnormal", socketDir)
       check helper.waitForExit(3000) == 31
       helper.close()
 
@@ -277,7 +303,7 @@ suite "e2e_runquota_client_exit_releases_lease":
   test "forced supervisor kill releases granted-but-not-started lease":
     withDaemon:
       let readyPath = socketDir / "granted.ready"
-      var helper = spawnHelper("granted-kill", [readyPath])
+      var helper = spawnHelper("granted-kill", socketDir, [readyPath])
       try:
         waitForReady(readyPath)
         forceKillSupervisor(helper)
@@ -300,7 +326,7 @@ suite "e2e_runquota_client_exit_releases_lease":
   # lost rather than finished, and released by the reaper.
   test "starting lease is lost, never finished, and released on supervisor exit":
     withDaemon:
-      var helper = spawnHelper("starting-abnormal")
+      var helper = spawnHelper("starting-abnormal", socketDir)
       check helper.waitForExit(3000) == 32
       helper.close()
 
@@ -311,7 +337,7 @@ suite "e2e_runquota_client_exit_releases_lease":
   test "forced supervisor kill loses a starting lease and releases it":
     withDaemon:
       let readyPath = socketDir / "starting.ready"
-      var helper = spawnHelper("starting-kill", [readyPath])
+      var helper = spawnHelper("starting-kill", socketDir, [readyPath])
       try:
         waitForReady(readyPath)
         forceKillSupervisor(helper)
@@ -329,7 +355,7 @@ suite "e2e_runquota_client_exit_releases_lease":
   test "running lease becomes supervisor-lost without LeaseFinished inference":
     withDaemon:
       let childPidPath = socketDir / "child.pid"
-      var helper = spawnHelper("running-abnormal", [childPidPath])
+      var helper = spawnHelper("running-abnormal", socketDir, [childPidPath])
       try:
         check helper.waitForExit(3000) == 33
         helper.close()
@@ -344,7 +370,7 @@ suite "e2e_runquota_client_exit_releases_lease":
     withDaemon:
       let readyPath = socketDir / "running.ready"
       let childPidPath = socketDir / "child-kill.pid"
-      var helper = spawnHelper("running-kill", [readyPath, childPidPath])
+      var helper = spawnHelper("running-kill", socketDir, [readyPath, childPidPath])
       try:
         waitForReady(readyPath)
         forceKillSupervisor(helper)

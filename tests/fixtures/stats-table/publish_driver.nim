@@ -21,7 +21,7 @@
 ##   hammer <path> <slots> <key> <durationMs> <readyFile>
 ##   hold <path> <slots> <key> <durationMs> <readyFile>
 ##   rebind <path> <keyA> <keyB> <durationMs> <readyFile>
-##   read-at <path> <key> <iterations> <baseOffsetBytes>
+##   read-at <path> <key> <iterations> <baseOffsetBytes> [avoidBaseHex]
 
 import std/[os, strutils, times]
 
@@ -95,7 +95,7 @@ proc runHold(path: string; slots: int; key: string; durationMs: int;
   echo "generations 8"
   echo "ready"
   flushFile(stdout)
-  writeFile(readyFile, "ready")
+  writeFile(readyFile, toHex(cast[uint](pub.unsafeMappedBase()), 16))
   let deadline = nowMillis() + float(durationMs)
   while nowMillis() < deadline:
     sleep(10)
@@ -188,7 +188,7 @@ proc chooseBase(path: string; baseOffset: int; want: var pointer): int =
     1
 
 proc runReadAt(path: string; key: string; iterations: int;
-               baseOffset: int): int =
+               baseOffset: int; avoidBase: uint = 0): int =
   ## Attach at a CHOSEN address, which is how `nim-shm-lease` makes the
   ## differing-base property provable instead of merely likely: two
   ## processes both mapping wherever the kernel likes would very often land
@@ -198,18 +198,27 @@ proc runReadAt(path: string; key: string; iterations: int;
     let chosen = chooseBase(path, baseOffset, want)
     if chosen != 0:
       return chosen
-    var table = openStatsTable(path, want)
-    if not table.available:
+    var first = openStatsTable(path, want)
+    defer: first.close()
+    var second: StatsTable
+    defer: second.close()
+    var table = addr first
+    if first.available and cast[uint](first.unsafeMappedBase()) == avoidBase:
+      # Keep the first view mapped: a second view in this process must have
+      # a different base, even when ASLR is disabled.
+      second = openStatsTable(path)
+      table = addr second
+    if not table[].available:
       echo "ERROR could not attach " & path
       return 1
-    echo "base " & toHex(cast[uint](table.unsafeMappedBase()), 16)
+    echo "base " & toHex(cast[uint](table[].unsafeMappedBase()), 16)
     var hits = 0
     var torn = 0
     var coherent = 0
     var lastMemory = 0'u64
     var estimate: PublishedEstimate
     for _ in 0 ..< iterations:
-      case table.lookupEstimate(key, estimate)
+      case table[].lookupEstimate(key, estimate)
       of stlHit:
         inc hits
         if estimate.memoryBytes == estimate.recentPeakBytes and
@@ -224,10 +233,9 @@ proc runReadAt(path: string; key: string; iterations: int;
     echo "hits " & $hits
     echo "coherent " & $coherent
     echo "torn " & $torn
-    echo "retries " & $table.retryCount
+    echo "retries " & $table[].retryCount
     echo "last " & $lastMemory
     flushFile(stdout)
-    table.close()
     0
   else:
     echo "ERROR not supported"
@@ -251,8 +259,9 @@ when isMainModule:
     if args.len != 6: quit 2
     quit runRebind(args[1], args[2], args[3], parseInt(args[4]), args[5])
   of "read-at":
-    if args.len != 5: quit 2
-    quit runReadAt(args[1], args[2], parseInt(args[3]), parseInt(args[4]))
+    if args.len notin [5, 6]: quit 2
+    quit runReadAt(args[1], args[2], parseInt(args[3]), parseInt(args[4]),
+      if args.len > 5: uint(parseHexInt(args[5])) else: 0'u)
   else:
     echo "unknown command " & args[0]
     quit 2

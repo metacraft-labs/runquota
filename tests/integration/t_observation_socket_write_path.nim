@@ -1170,18 +1170,12 @@ suite "observation_socket_write_path":
       discard client.completeOneExecution("degraded-two")
       check client.daemonStatus().totalFinished >= 3'u64
 
-      var degraded = client.observations()
-      for _ in 0 ..< 200:
-        # BOTH COUNTERS ARE WAITED ON, not just the first. The writer
-        # drains in batches, so `write_failures` can reach one while the
-        # second row is still queued -- and a loop that exited on the
-        # first counter and then asserted the second is a race that fails
-        # about once in a dozen runs on a loaded host. It was observed
-        # doing exactly that.
-        if degraded["write_failures"].getInt() >= 1 and
-            degraded["dropped"].getInt() >= 2: break
-        sleep(25)
-        degraded = client.observations()
+      # Completion queues rows without waiting for storage. Settle both
+      # earlier writes before inspecting their loss counters, using the same
+      # real stats-query barrier as the third failed write below. Keep the
+      # store read-only until all three writes have settled.
+      discard client.queryStats(statsSubjectExecutions)
+      let degraded = client.observations()
       # THE LOSS IS COUNTED, which is OS-2: a window that lost rows must be
       # distinguishable from one that had none.
       check degraded["write_failures"].getInt() >= 1
@@ -1189,6 +1183,16 @@ suite "observation_socket_write_path":
 
       # And admission is untouched.
       discard client.completeOneExecution("degraded-three")
+      # A stats query flushes all earlier observations before replying. Keep
+      # the store read-only across that barrier; lease completion only queues
+      # its row, so restoring permissions earlier lets the writer commit it.
+      discard client.queryStats(statsSubjectExecutions)
+      let settled = client.observations()
+      check settled["dropped"].getInt() >= 3
+      # The loss the barrier forced is asserted, not assumed: degraded-three's
+      # own write failed too.
+      check settled["write_failures"].getInt() >
+        degraded["write_failures"].getInt()
       client.close()
 
       setFilePermissions(state, {fpUserRead, fpUserWrite, fpUserExec})

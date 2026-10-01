@@ -26,6 +26,10 @@ type
       ## keys an action on the variables it reads) can do so. There is no
       ## other removal channel — layering can replace a variable, never
       ## unset one.
+      ##
+      ## The OS loader may normalize reserved platform variables: Windows x64
+      ## emulation sets `PROCESSOR_ARCHITECTURE=AMD64` even for an explicit
+      ## block. Declare the target architecture when composing such a block.
     stdoutLimit*: int
     stderrLimit*: int
     createProcessGroup*: bool
