@@ -2,7 +2,7 @@
 
 |             |                                                           |
 | ----------- | --------------------------------------------------------- |
-| Status      | open                                                      |
+| Status      | in progress on `agents-to-dev-2026-10-01`                  |
 | Recorded    | 2026-10-01                                                |
 | Observed in | RunQuota `c4bfffa0cb007db75fd111e2346f24cebaea8de3`           |
 | Area        | Git checkout attributes for `packaging/etc/runquotad.toml` |
@@ -38,6 +38,16 @@ Declare `text eol=lf` for this specific packaged template in `.gitattributes`.
 Verify a real checkout with `core.autocrlf=true`, retaining a control without
 the attribute that reproduces the mismatch. Do not normalize the comparison
 or convert the daemon's canonical template at runtime.
+
+## Local repair evidence
+
+At `57ce33c`, the existing packaging-contract program was compiled from a real
+`git -c core.autocrlf=true checkout-index --all` export. It reproduced the
+Windows exact-byte failure on macOS ARM64 with pinned Nim 2.2.4.
+Adding only `/packaging/etc/runquotad.toml text eol=lf` in `.gitattributes` and
+checking out that file again produced zero CRLF endings and exact source-blob
+bytes. The **same compiled test binary**, with every assertion unchanged,
+then passed all eight packaging checks. Windows CI confirmation remains pending.
 
 ## Search
 
