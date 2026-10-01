@@ -1064,3 +1064,33 @@ missing-daemon control must expose the diagnostic and preserve child success.
 No product retry change is selected. RunQuota `dev@2c50aaf` and `agents@7a16aaf`
 were fetched before this investigation; the open issue already owns the count
 failure, and the resolved-issue pickaxe finds no `WaitNamedPipe` record.
+
+### Cache controls complete; progress diagnostic has no retrievable evidence
+
+Tooling `ffbaa21`, run `36823603500`, completes all eight expected outcomes on
+each Windows host against cache fixture `a2676aa`. Downloaded native and
+monitored logs independently confirm that the original 60-second-delay case
+fails only `resident`, the revised case passes, and both full fixtures pass
+their two cases. ARM monitored original/revised delayed samples take
+112.28/112.95 seconds; the full samples take 88.82/91.44 seconds. This validates
+setup ordering, not a performance improvement. Evidence is
+`/tmp/runquota-cache-ffbaa-x64` and `/tmp/runquota-cache-ffbaa-arm`.
+
+Concurrent-client tooling `17e9d40`, run `36825853485`, passes all eight checks
+on Windows x64 against `d6ee458`. All six 32-client samples pass; the four
+instrumented samples retain every client's output without connection failures.
+The missing-daemon control reports actual Windows error 2 only in the
+instrumented CLI, while both variants preserve child success. Thus this host
+does not reproduce the missing lease. ARM remains active. Local controls and
+Windows source checks pass. An initial local `--path` overlay compiled the
+original module; the missing-daemon control caught it before publication.
+Compiling the copied main beside its diagnostic module fixes that harness error.
+
+SQLite progress run `36817926720` at tooling `ae529a5` is cancelled by its
+110-minute job limit after the comparison and both uploads fail. GitHub's
+annotation names that limit. Its job-log endpoint returns 404, its artifact
+list is empty, and its completed-run log archive contains zero entries (22
+bytes; SHA256 `8739c76e681f900923b900c9df0ef75cf421d39cabb54650c4b9ad19b6a76d85`).
+This is a second evidence-collection failure, not a worker-progress finding.
+Archive: `/tmp/runquota-sqlite-progress-ae529-arm-logs.zip`. The underlying
+comparison failure remains unattributed. No unchanged retry is selected.
