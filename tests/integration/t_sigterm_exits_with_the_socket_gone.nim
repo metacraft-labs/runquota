@@ -71,7 +71,7 @@
 import std/[os, osproc, strutils, times, unittest]
 
 when defined(posix):
-  import std/posix
+  import std/[monotimes, posix]
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
@@ -159,6 +159,21 @@ type Ending = object
     ## Non-empty only when the budget was overrun.
 
 when defined(posix):
+  proc removeStartingDaemonTree(root: string) =
+    # Hello is served while the observation store opens, so SQLite can create
+    # another file between recursive removal's directory walk and rmdir.
+    # Complete the real removal before asserting absence and sending SIGTERM;
+    # keep unexpected filesystem errors fatal and this setup phase bounded.
+    let deadline = getMonoTime() + initDuration(milliseconds = BindBudgetMillis)
+    while true:
+      try:
+        removeDir(root)
+        return
+      except OSError as error:
+        if error.errorCode != ENOTEMPTY or getMonoTime() >= deadline:
+          raise
+        sleep(10)
+
   proc termAndWait(daemon: Process; budgetMillis: int): Ending =
     ## SIGTERM, then a bounded wait for the process to go.
     ##
@@ -250,7 +265,7 @@ suite "sigterm_exits_with_the_socket_gone":
         # the published stats table beside it, the host identity file and
         # the observation database. This is what happens to an orphan when
         # the caller that started it removes its scratch directory.
-        removeDir(root)
+        removeStartingDaemonTree(root)
         require not fileExists(socketPath)
         require not dirExists(endpointDir)
         require not dirExists(state)
