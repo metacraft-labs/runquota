@@ -891,3 +891,22 @@ this is not a performance-speedup claim. Monitored full socket coverage
 takes 36.6 seconds. ARM comparison and complete candidate CI remain active.
 Parent `b4a9c53` now passes all ten native CI jobs and its complete monitored
 x64 test step; the native x64 cross-check remains active.
+
+### Windows ARM comparison and complete native candidate CI
+
+Tooling `7d4d24a`, run `36810881206`, also passes all twelve expected ARM
+outcomes at RunQuota `2d3897c`. Both native and monitored delayed-original
+cases fail the intended counter assertion, while both synchronized delayed
+cases pass. Full synchronized socket coverage passes all ten cases in each
+mode; original and synchronized publication suites each pass all four cases
+in each mode. No outer timeout occurs and input hashes remain fixed.
+Evidence is `/tmp/runquota-observation-barriers-7d4-arm`.
+
+On that host, the monitored delayed original/fixed cases take 54.0/72.7
+seconds. Full synchronized socket coverage takes 223.7 seconds; original and
+synchronized publication coverage takes 102.5/101.4 seconds. These are whole
+fixture times, including the monitor wrapper, not individual query latencies.
+
+Complete native CI `36810841209` now passes all ten jobs at `2d3897c`.
+Full Reprobuild CI `36810843817` remains active. Parent `b4a9c53` passes
+both Linux jobs and Windows x64 completely; macOS and ARM remain active.
