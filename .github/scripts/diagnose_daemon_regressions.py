@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path.cwd()
@@ -75,8 +76,8 @@ def monitored(label, target, expected):
     return result.returncode
 
 
-def native(label, name):
-    environment = dict(os.environ)
+def native(label, name, activated):
+    environment = dict(activated)
     for key in list(environment):
         if key == "LD_PRELOAD" or key.startswith("REPRO_MONITOR_"):
             del environment[key]
@@ -114,12 +115,22 @@ def main():
     try:
         RECIPE.write_text(selected)
         assert monitored("compile", ".#daemon-diagnostic-builds", []) == 0
+        # Activate only native controls. Repro graph commands keep the exact
+        # bootstrap environment used by CI instead of nesting repro exec.
+        with (EVIDENCE / "native-activation.log").open("w") as log:
+            activation = subprocess.run([
+                REPRO, "exec", "--", sys.executable, "-c",
+                "import json,os; print(json.dumps(dict(os.environ)))",
+            ], stdout=subprocess.PIPE, stderr=log, text=True, timeout=1200)
+        assert activation.returncode == 0, "Native environment activation failed"
+        # This may contain credentials. Keep it in memory; never write or print it.
+        activated = json.loads(activation.stdout)
         baseline = hashes()
         (EVIDENCE / "binary-hashes.json").write_text(json.dumps(baseline, indent=2))
         for iteration in range(2 if WINDOWS else 30):
             for name in NAMES:
                 prefix = str(iteration + 1) + "-" + name
-                direct = native(prefix + "-native", name)
+                direct = native(prefix + "-native", name, activated)
                 observed = monitored(prefix + "-monitored", ".#test-" + name,
                                      ["runquota.test_execute." + name])
                 assert hashes() == baseline, "Binary changed between control modes"
