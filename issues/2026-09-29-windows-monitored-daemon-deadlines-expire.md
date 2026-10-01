@@ -2,7 +2,7 @@
 
 Status: open. Originally observed at RunQuota `177e2af` with io-mon `5421a9b`.
 Application suites pass at `d6ee458`, whose workflow fails its later ACL gate.
-The endpoint-startup deadline fails again on Windows x64 at released `0389129`.
+Daemon readiness fails again on both Windows hosts at released `0389129`.
 
 ## Reproduced after publication at 0389129 (2026-10-01)
 
@@ -17,16 +17,28 @@ The log records only the `after-verification` session. This repeats the
 earlier lock-window failure described below; it does not establish whether
 the cause is process startup, monitoring, scheduling or the daemon itself.
 
-At the 13:38 UTC observation, Linux x64, Linux ARM64 and macOS pass in the
-same full Reprobuild run, while Windows ARM64 remains active. Ordinary CI
+Windows ARM64 job
+[110352061655](https://github.com/metacraft-labs/runquota/actions/runs/36857078024/job/110352061655)
+also fails `repro test`, at 14:32 UTC. Seven crash-recovery cases pass, but
+`starting lease is lost, never finished, and released on supervisor exit`
+fails in `waitForDaemon`: `CreateFileW` reports Windows error 2 for the
+fixture's named pipe. The failure occurs before the helper handshake and
+the three-second lease assertion. The log does not establish why the daemon
+failed to become ready within the existing bound. Preserve that distinction
+from the older helper-execution timeout.
+
+The complete full Reprobuild run therefore fails both Windows hosts and
+passes Linux x64, Linux ARM64 and macOS. Ordinary CI
 [36857078090](https://github.com/metacraft-labs/runquota/actions/runs/36857078090)
 at the same source passes all ten jobs. Preserve both results: passing native
 CI and package checks do not erase this monitored failure.
 
-Downloaded job evidence is `/tmp/runquota-038-windows-x64-repro.log`, obtained
-through the completed-job logs API while the overall workflow remains active.
-Before recording, fetched dev at `0389129` and searched current issues and
-their Git history; this issue already owns the same test and 3500 ms ceiling.
+Downloaded job evidence is `/tmp/runquota-038-windows-x64-repro.log` and
+`/tmp/runquota-038-windows-arm64-repro.log`. Before recording, fetched dev
+at `0389129` and agents at `139a441`, and searched current issues and their
+Git history; this issue already owns both readiness failures. The dev fixes
+are now reconciled into agents at `5c0de8f`; that merge is not yet qualified
+by a full cross-platform run.
 Keep the original deadline and obtain paired evidence before choosing a fix.
 
 ## Observed
