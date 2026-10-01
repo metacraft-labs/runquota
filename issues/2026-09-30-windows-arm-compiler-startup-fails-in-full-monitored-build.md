@@ -109,7 +109,7 @@ passing. `t_e2e_runquota_client_exit_releases_lease` cannot launch `cc1.exe`;
 No test stage runs on the ARM host. Its Windows x64 monitored suite passes,
 but the native benchmark cleanup race is recorded separately.
 Evidence: `/tmp/runquota-f938-arm-repro.log` and
-`/tmp/runquota-f938-arm-evidence/repro/build-failure-report.json`.
+`/tmp/runquota-f938-arm-evidence/.repro/build/repro/build-failure-report.json`.
 
 Prepared candidate `7fd57f4` passes all ten native jobs and the complete
 Linux ARM64 Reprobuild gate; other Reprobuild jobs remain active. Follow-up

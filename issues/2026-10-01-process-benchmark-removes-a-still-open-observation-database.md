@@ -57,3 +57,7 @@ Its immutable source lock is published with verified remote blob
 `07a11ba185c875496cff8d096dc2406ffb3e7310`. Full native run `36795959804`
 and Reprobuild run `36795962975` are active; the issue remains open pending
 Windows execution and promotion.
+
+The real IPC quick benchmark also passes locally at `9f88e77`, covering the
+second daemon scratch-root teardown. Log:
+`/tmp/runquota-benchmark-cleanup-ipc.log`. No performance comparison is claimed.
