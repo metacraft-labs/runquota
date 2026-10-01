@@ -15,6 +15,7 @@ from diagnose_daemon_regressions import (
 
 
 def graph(label, target=None):
+    print(label + ": starting", flush=True)
     with tempfile.TemporaryDirectory(prefix="runquota-full-diagnostic-") as temporary:
         report = Path(temporary) / "report.json"
         command = [REPRO, "build"]

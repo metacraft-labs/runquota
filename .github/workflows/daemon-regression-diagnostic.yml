@@ -50,12 +50,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gdb
+          mkdir -p build/diagnostics/daemon-regressions
+          echo 'Preparing local crash diagnostics'
+          if [[ ! -x /usr/bin/gdb ]]; then
+            /usr/bin/sudo -n /usr/bin/timeout 180 /usr/bin/apt-get update
+            /usr/bin/sudo -n /usr/bin/timeout 180 /usr/bin/apt-get install -y gdb
+          fi
+          /usr/bin/gdb --version | head -n 1
           export DIAGNOSTIC_CORE_DIR="$RUNNER_TEMP/runquota-diagnostic-cores"
           mkdir -p "$DIAGNOSTIC_CORE_DIR"
-          printf '%s/core.%%e.%%p\n' "$DIAGNOSTIC_CORE_DIR" | sudo tee /proc/sys/kernel/core_pattern >/dev/null
+          printf '%s/core.%%e.%%p\n' "$DIAGNOSTIC_CORE_DIR" | /usr/bin/sudo -n /usr/bin/timeout 10 /usr/bin/tee /proc/sys/kernel/core_pattern >/dev/null
           ulimit -c unlimited
+          echo 'Starting complete-graph diagnostic'
           /usr/bin/python3 .github/scripts/diagnose_full_graph_shutdown.py
       - name: Repeat Windows readiness after compiling only its prerequisites
         if: runner.os == 'Windows'
