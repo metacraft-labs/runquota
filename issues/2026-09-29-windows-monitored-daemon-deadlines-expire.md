@@ -663,3 +663,29 @@ Predecessor `9f88e77` independently passes complete macOS monitored and native
 cross-checks in job `110159381875`, run `36795962975`. Its existing x64
 helper failure remains the measured reason for selecting the handshake
 candidate, whose full validation is still required.
+
+### ARM control result and next observation
+
+At tooling `b5e3811`, ARM job `110178150891` reaches all eight comparison
+outcomes for `15e4deb`. All four native outcomes match expectations. Under
+monitoring, repaired delayed entry and the unchanged repaired fixture each
+pass all eight lifecycle cases; delayed work after release still fails only
+the required three-second exit assertion. The original delayed-entry variant
+instead fails its fifth daemon's readiness check before launching the helper:
+`CreateFileW` reports Windows error 2 for the named pipe. Its other seven
+cases pass. Thus seven of eight comparison outcomes match, and every
+repaired outcome passes; the original monitored negative control fails for
+the wrong reason. Evidence: `/tmp/runquota-startup-b5e-arm`.
+
+Do not label that comparison wholly passing or attribute its daemon failure
+to the helper handshake. Supplement it with the same four variants selecting
+only the starting-lease case through Nim unittest's test filter. Retain the
+same real daemon and exact readiness/exit bounds. If daemon readiness fails,
+record its PID, running state and available exit status before ordinary
+cleanup. Preserve the existing full-suite controls and full ordinary gates.
+This narrows the intended measurement without discarding the unrelated
+startup failure above.
+
+The complete matrix at unchanged `15e4deb` restarts as run `36805849869`
+after the earlier interruption. Native CI remains fully passing. No source
+change or assertion relaxation is selected from the baseline daemon result.
