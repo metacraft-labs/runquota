@@ -43,3 +43,17 @@ Log: `/tmp/runquota-f938-x64-repro.log`. Fetched dev `2c50aaf` and agents
 SQLite, scratch and shutdown. Earlier image-retention cleanup was resolved
 for integration fixtures but this standalone benchmark still uses direct
 removal. The unrelated Windows WSL-Bash benchmark issue is already recorded.
+
+## Candidate validation
+
+Candidate `9f88e77`, above prepared-hook candidate `7fd57f4`, uses the
+shared helper for both M5 daemon scratch roots and copies `tests/support`
+into the existing isolated benchmark tree. The complete local process
+contract passes with real clients, daemon and benchmark compilation. Windows
+amd64 type checking and repository lint also pass. Source files were unchanged
+between the local build and commit. Logs are
+`/tmp/runquota-benchmark-cleanup-{build,test-build,test,windows-check,lint}.log`.
+Its immutable source lock is published with verified remote blob
+`07a11ba185c875496cff8d096dc2406ffb3e7310`. Full native run `36795959804`
+and Reprobuild run `36795962975` are active; the issue remains open pending
+Windows execution and promotion.
