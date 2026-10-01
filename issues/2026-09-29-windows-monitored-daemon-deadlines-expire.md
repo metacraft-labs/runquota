@@ -1,6 +1,8 @@
 # Windows monitored daemon readiness and retention miss fixture deadlines
 
-Status: open. Observed at RunQuota `177e2af` with io-mon `5421a9b`.
+Status: open for the remaining attribution gaps. Originally observed at RunQuota
+`177e2af` with io-mon `5421a9b`. The application suites now pass at `d6ee458`;
+that workflow fails its separate final static-helper ACL gate, recorded below.
 
 ## Observed
 
@@ -855,7 +857,7 @@ runtime code changes. Complete local socket-write and publication suites
 pass all ten and four cases. Both fixtures and the real SQLite proxy pass
 Windows Nim source checking; repository lint passes.
 
-The real proxy delays INSERTs into a read-only database by 6.5 seconds,
+The real proxy delays INSERT statements into a read-only database by 6.5 seconds,
 then forwards the same SQL to Nix SQLite 3.51.2 and preserves its actual
 output/status. The unchanged fixture passes without delay, fails its loss
 counter assertion with delay, and the synchronized fixture passes with the
@@ -1114,3 +1116,32 @@ binary architectures across all four release targets. The full Reprobuild
 matrix `36823482913` passes both Linux jobs and remains active on macOS and
 both Windows hosts as of 07:20 UTC. Its final ARM test concurrency and runtime
 outcomes still decide whether the resource-allocation experiment qualifies.
+
+### Completed application qualification and separate ACL repair
+
+At `d6ee4588f71604376a4cc41ef281d6c479395efc`, full Reprobuild run
+`36823482913` completes both Linux jobs, macOS and Windows x64 successfully.
+ARM passes compilation, all 203 monitored actions (101 executed, 102 reused),
+and all 100 conventional test programs. The observed monitored concurrency
+peak is two across 35,240 scheduler samples; Windows x64 retains peak eight.
+The ARM job then fails the separate static-helper work-root privacy check for
+an Authenticated Users grant. The workflow remains failed. Logs are
+`/tmp/runquota-d6-arm-repro.log` and `/tmp/runquota-d6-x64-repro.log`.
+
+Candidate `2d07c5d` changes only that scratch-root setup script and issue
+records above `d6ee458`. All application sources, fixtures, recipes and CI
+inputs are identical. All ten ordinary jobs pass in run `36846644651`.
+The complete focused ACL verification at tooling `61f68e8`, run `36852276089`,
+passes on both Windows hosts: the original real explicit foreign grant
+survives, the repair removes it, the unchanged guard rejects its reinsertion,
+and all 86 scanner cases and twelve static-helper libraries pass. Independent
+checks of downloaded source hashes, DACLs and logs confirm all four outcomes
+per host in `/tmp/runquota-acl-61f-x64` and `/tmp/runquota-acl-61f-arm`.
+The owning issue is
+`2026-10-01-static-helper-gate-retains-explicit-windows-access-grants.md`.
+
+The earlier missing concurrent-client lease was not reproduced by the completed
+controls, and the failed SQLite progress diagnostics still have no retrievable
+worker evidence. Those causes remain unattributed. The two-program admission
+limit is the measured successful resource allocation at this candidate, not
+proof that serialization alone repairs every earlier failure.

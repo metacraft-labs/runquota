@@ -306,6 +306,11 @@ case "${me_sid}" in
 S-1-*) ;;
 *) fail "cannot read this account's SID from whoami: ${me_sid}" ;;
 esac
+# Removing inheritance leaves explicit grants untouched. Reset this empty
+# directory first, so the following removal also drops default access for
+# other accounts before any compiler or source bytes are staged here.
+"${system_icacls}" "$(cygpath -w "${work_root}")" //reset >/dev/null ||
+  fail "cannot reset ${work_root} permissions"
 "${system_icacls}" "$(cygpath -w "${work_root}")" //inheritance:r //grant:r \
   "*${me_sid}:(OI)(CI)F" >/dev/null ||
   fail "cannot make ${work_root} private to ${me_sid}"
