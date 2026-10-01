@@ -1182,3 +1182,15 @@ controls, and the failed SQLite progress diagnostics still have no retrievable
 worker evidence. Those causes remain unattributed. The two-program admission
 limit is the measured successful resource allocation at this candidate, not
 proof that serialization alone repairs every earlier failure.
+
+### Integrated agents candidate: Windows x64 qualification
+
+At `d48e196`, [full Windows x64 job 110474890644](https://github.com/metacraft-labs/runquota/actions/runs/36893338411/job/110474890644)
+passes the 106-action build, all 209 test actions and the native cross-check.
+The completed log contains no hidden test-failure markers. Focused diagnostic
+`5e6cb15`, [job 110499005938](https://github.com/metacraft-labs/runquota/actions/runs/36900752734/job/110499005938),
+uses the same production sources and repeats endpoint-before-store readiness
+and client-exit lease release twice each in native and monitored modes. All
+eight executions pass with identical binary hashes and unchanged deadlines.
+Artifacts: `/tmp/runquota-5e6-windows-daemon-controls`. The current ARM host
+qualification is still running; these x64 outcomes do not establish its result.
