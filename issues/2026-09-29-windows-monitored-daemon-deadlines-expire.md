@@ -1094,3 +1094,23 @@ bytes; SHA256 `8739c76e681f900923b900c9df0ef75cf421d39cabb54650c4b9ad19b6a76d85`
 This is a second evidence-collection failure, not a worker-progress finding.
 Archive: `/tmp/runquota-sqlite-progress-ae529-arm-logs.zip`. The underlying
 comparison failure remains unattributed. No unchanged retry is selected.
+
+### Concurrent-client controls complete on both Windows hosts
+
+Tooling `17e9d40`, run `36825853485`, also passes all eight expected outcomes
+on the ARM host at RunQuota `d6ee458`. All six concurrent-client samples count
+32 completed leases. The four instrumented samples retain 32 client outputs
+each with no initial connection failure. The missing-daemon control reports
+actual Windows error 2 only in the instrumented CLI, and both variants return
+child success. ARM evidence is `/tmp/runquota-concurrent-17e-arm`, with results
+SHA256 `a658ec8af53180026614c24a9591740a3a2c789849e0c6a1a97a0cf47ccfcb6e`.
+"Native" in these result files means unmonitored execution: both hosts use
+x64 binaries, with emulation on ARM. These controls do not reproduce or
+attribute the missing lease. No product connection retry change is selected.
+
+Candidate `d6ee458` also passes all ten CI jobs and the complete package dry
+run `36826918496`. Independent downloads verify 15 checksums and eight native
+binary architectures across all four release targets. The full Reprobuild
+matrix `36823482913` passes both Linux jobs and remains active on macOS and
+both Windows hosts as of 07:20 UTC. Its final ARM test concurrency and runtime
+outcomes still decide whether the resource-allocation experiment qualifies.
