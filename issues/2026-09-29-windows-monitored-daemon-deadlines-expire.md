@@ -774,3 +774,23 @@ Evidence is `/tmp/runquota-9f-arm-repro.log` and the failure report under
 `/tmp/runquota-9f-arm-evidence/.repro/build/repro/`. The benchmark cleanup
 change does not address these runtime waits. Current `15e4deb` ordinary CI
 and the focused startup comparison remain active separately.
+
+## Select the independently validated injection-lock initialization
+
+Helper `43b1835` passes all seven native and all five monitored/native
+platform jobs. Corrected paired tooling `5336c54`, run `36802560317`,
+now completes on both Windows hosts. Its original ARM implementation hangs
+in native repetition one and monitored repetition four. The initialized
+implementation passes all twelve native and twelve monitored repetitions,
+with complete assertion output and four real output/status controls. Both
+variants pass all x64 repetitions. Helper PR 12 contains exactly this fix
+and its validated prerequisites.
+
+Select `43b1835` as RunQuota's Windows CI bootstrap helper pin, above the
+current `d36cab8`, to remove the independently demonstrated first-call lock
+race. Preserve RunQuota `15e4deb` source, every ordinary test and deadline,
+and the separate POSIX bootstrap pin. This selection does not attribute the
+RunQuota SQLite or daemon waits to that race: RunQuota's captured SQLite
+calls already serialize process creation. Run complete ordinary CI at the
+new pin before selecting it for the release. Keep the current `15e4deb`
+run and SQLite progress control as independent observations.
