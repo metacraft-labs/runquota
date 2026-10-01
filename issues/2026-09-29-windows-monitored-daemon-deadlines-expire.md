@@ -954,3 +954,37 @@ source and progress files before the full binary/trace artifact, with separate
 bounded upload steps. Python syntax and workflow checks pass at `ae529a5`.
 The new Windows result remains pending; the empty previous archive supplies
 no evidence of Windows progress or its failure phase.
+
+### Initialized-hook parent still has ARM runtime failures
+
+RunQuota `b4a9c53`, full Reprobuild run `36809232981`, completes ARM at
+05:43 UTC on 2026-10-01 with 188 successful actions, seven failures and eight
+blocked measurement actions out of 203. All compilation passes. Five
+programs exit 124: M5 process benchmark, socket write path, daemonless
+degradation, observation export and observation merge. The socket case also
+records zero write-failure/drop counters before its final case fails.
+Retention scheduling misses the age-bound, busy-host ceiling and failed-pass
+recovery waits. The cache-control fixture fails its initial `resident` wait,
+then reports the correct 512 MiB value from the table and from the emptied
+state's socket fallback. Evidence is `/tmp/runquota-b4-arm-repro.log` and
+`/tmp/runquota-b4-arm-evidence/.repro/build/repro/build-failure-report.json`.
+The initialized hook fixes its demonstrated race but does not eliminate these
+full-matrix failures.
+
+The cache-control setup queues an observation and starts its ten-second
+publication wait before its first store query. That query is already a real
+writer flush barrier, but currently runs after the wait. Prepare a fixture
+change above `2d3897c`: collect the existing store-gate answers before the
+publication wait and require a known published estimate before calling the
+entry resident. Keep every store/client/fallback comparison, the ten-second
+publication wait and the 600-second program bound. This changes the setup
+boundary, not the product's publication behavior; the separate automatic
+publication case stays unchanged. Validate with original/fixed real delayed
+SQLite inserts, normal full cache-control coverage and Windows source checks.
+
+Expectation: `reprobuild-specs@e9ba917`,
+`RunQuota-Observation-Store.milestones.org` M13b requires the emptied-table
+negative control to preserve every store and client answer. Its setup needs a
+real known resident value; a slot hit with unknown knowledge is insufficient,
+as this fixture's existing comment also records. No scheduling or timeout
+change is selected from the still-pending SQLite progress comparison.
