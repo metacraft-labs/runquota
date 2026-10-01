@@ -873,3 +873,21 @@ tooling `7d4d24a` runs the same real-delay comparison in native and monitored
 modes on both Windows hosts, together with full socket-write coverage and
 both original/synchronized publication suites. Its Python/workflow checks
 pass. Results remain pending; the earlier candidates continue independently.
+
+### Windows x64 observation-barrier comparison
+
+Tooling `7d4d24a`, run `36810881206`, passes all twelve expected x64
+outcomes against candidate `2d3897c`. In each native/monitored mode, the
+original counter case passes without delay, fails its intended loss-counter
+assertion with real delayed writes, and the synchronized case passes with
+the same delay. The complete synchronized socket suite passes all ten
+cases; both original and synchronized publication suites pass all four.
+No outer timeout occurs and the recorded binary/shim/SQLite hashes remain
+unchanged. Evidence is `/tmp/runquota-observation-barriers-7d4-x64`.
+
+The monitored delayed original/fixed cases take 25.2 and 36.4 seconds,
+respectively. The fixed fixture waits for the actual writes to settle;
+this is not a performance-speedup claim. Monitored full socket coverage
+takes 36.6 seconds. ARM comparison and complete candidate CI remain active.
+Parent `b4a9c53` now passes all ten native CI jobs and its complete monitored
+x64 test step; the native x64 cross-check remains active.
