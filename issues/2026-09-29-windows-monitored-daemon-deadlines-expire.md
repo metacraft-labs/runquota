@@ -689,3 +689,13 @@ startup failure above.
 The complete matrix at unchanged `15e4deb` restarts as run `36805849869`
 after the earlier interruption. Native CI remains fully passing. No source
 change or assertion relaxation is selected from the baseline daemon result.
+
+Focused tooling `e4c3b73`, run `36806359507`, implements that single-case
+comparison and records its test filter explicitly. The instrumented sources
+pass all four expected real local controls with one lifecycle case each;
+the delayed-work variant still fails the exact three-second assertion.
+Windows source checking, Python syntax and workflow checks pass. Local
+evidence is under `build/startup-handshake-focused-local` in
+`/tmp/runquota-helper-startup-fix`; the Windows source-check log is
+`/tmp/runquota-startup-case-windows-check.log`. Complete ordinary CI still
+runs every test at unchanged product `15e4deb`.
