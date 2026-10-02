@@ -25,7 +25,7 @@ import repro_dsl_stdlib/packaging
 const
   RunQuotaPackageName* = "runquota"
 
-  RunQuotaPackageVersion* = "0.1.0"
+  RunQuotaPackageVersion* = "0.1.1"
     ## The version every package format carries.
     ##
     ## A THIRD copy of a string that already exists twice, and the

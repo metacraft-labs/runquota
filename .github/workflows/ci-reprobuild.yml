@@ -136,7 +136,7 @@ jobs:
           # Distinguish emulated x64 from native ARM children and preserve exit bits.
           repro-io-mon-pin: 5e71adf033b860c0fdbe13dda4320cf4a580f632
           # Preserve buffered root output without waiting for descendant pipe EOF.
-          repro-stackable-hooks-pin: def2464b2d282c7c1a982689a25953e1d4501f93
+          repro-stackable-hooks-pin: 43b1835128331fef09ecf64a614dbf46880dbe9f
           gh-token: ${{ steps.ci_token.outputs.token }}
 
       - name: Refresh authentication before repro build
@@ -162,6 +162,11 @@ jobs:
 
       - name: repro test
         # Materialises the `test` collection.
+        # Bound simultaneous test programs on the ARM host's x64 emulator.
+        # Each fixture keeps its own concurrency and deadlines. An empty
+        # value leaves Reprobuild's existing default on the other platforms.
+        env:
+          REPROBUILD_MAX_PARALLELISM: ${{ matrix.os == 'windows' && matrix.arch == 'arm64' && '2' || '' }}
         run: dev-exec repro test --tool-provisioning=${{ matrix.os == 'windows' && 'tarball' || 'nix' }}
 
       - name: Refresh authentication before just build (cross-check)

@@ -117,3 +117,51 @@ Linux ARM64 Reprobuild gate; other Reprobuild jobs remain active. Follow-up
 It retains the same prepared hook input and runs complete native
 `36795959804` / Reprobuild `36795962975` CI. No compiler timeout or
 runtime assertion is relaxed.
+
+## "No such file or directory" is GCC's text for any failed child launch
+
+The `cc1.exe`/`as.exe` messages do not mean the toolchain prefix is missing
+files. Checked on 2026-10-01 against the exact prefix the ARM job uses,
+`tool-store/prefixes/gcc/62fb8588d2deee7d-f119add4dcd61ecd`:
+
+- The pinned WinLibs archive (re-downloaded; SHA-256
+  `62fb8588d2deee7d662dbcbd386702adbf19643764c971c38aa4839472eee232`
+  verified) lists 11,750 files including
+  `mingw64\libexec\gcc\x86_64-w64-mingw32\16.1.0\cc1.exe` and
+  `mingw64\x86_64-w64-mingw32\bin\as.exe`. The gcc package declares only an
+  x86_64 Windows arm, so the ARM leg realizes this same archive; the prefix
+  id in its log equals the one realized on a Windows x64 host, which holds all
+  11,750 files plus the realization receipt (no prune paths are declared).
+- Run `36729033751`'s failure report counts 101 succeeded, 0 cache hits: the
+  other compiles ran this prefix's `cc1.exe` in the same job. In
+  `36788912758` one compile fails launching `as.exe`, which GCC starts only
+  after `cc1.exe` has run for that same translation unit.
+- GCC's driver (libiberty `pex_win32_exec_child`) reports every
+  `CreateProcess` failure as `ENOENT`. Measured with that prefix's
+  `gcc.exe`: `gcc -B<dir>/ -c t.c`, where `<dir>/cc1.exe` exists but is not
+  a PE image, prints
+  `cannot execute '<dir>/cc1.exe': CreateProcess: No such file or directory`.
+
+So these launches are failed `CreateProcess` calls of existing images. Inside
+a monitored `gcc.exe`, the shim's `snoopCreateProcessW` returns `FALSE` with
+`ERROR_TIMEOUT` (`failSpawnForTerminatedChild`) when it terminates a child
+whose injection could not finish. That is the 1460 Nim reports for `gcc.exe`
+itself, now shown through GCC's fixed `ENOENT` text. This is an inference: the
+ordinary reports carry no last-error value or phase trace.
+
+The newest completed ARM Reprobuild jobs select hooks `d36cab8` (`7fd57f4`,
+`9f88e77`, `15e4deb`) or its descendant `43b1835` (`b4a9c53`, `2d3897c`).
+All five complete compilation; their failures are test executions. The last
+eleven jobs before them used original protection or no explicit hook pin;
+eight of the eleven fail a compiler launch: six with this message, two
+with 1460 (`36765565687`, `36704362941`).
+Five clean builds are consistent with the prepared-page candidate, but they
+are not a controlled reproduction and do not close this issue.
+
+Commit `975ea1d`'s message says run `36729033751`'s ARM job "failed before the
+build, on the env-flavor check". The log shows the `case "reprobuild"` check
+passing and the job failing in `repro build`, as recorded above.
+
+Refreshed agents `58abb26` before extending this record. Hooks issue
+`2026-09-30-windows-arm-compiler-startup-stalls-in-hook-transaction.md`
+receives the same evidence.

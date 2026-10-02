@@ -465,7 +465,8 @@ suite "m5_process_exec_bench_contract":
     let root = getCurrentDir()
     let benchmarkRoot = createTempDir("runquota-m5-build-", "-fixture")
     defer: removeScratchRoot(benchmarkRoot)
-    for name in ["apps", "libs", "scripts", "benchmarks"]:
+    # The benchmark uses the shared bounded daemon-file cleanup helper.
+    for name in ["apps", "libs", "scripts", "benchmarks", "tests/support"]:
       copyDir(root / name, benchmarkRoot / name)
     copyFile(root / "config.nims", benchmarkRoot / "config.nims")
     # The benchmark invokes this script directly. Source copies need only

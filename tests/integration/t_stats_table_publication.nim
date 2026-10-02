@@ -283,6 +283,10 @@ suite "stats_table_publication":
       let tablePath = endpointDir / "stats-table"
       var client = connectDefault()
       completeOneExecution(client, PublishedKey, ObservedPeakBytes)
+      # This case measures reads from an existing aggregate. Settle and
+      # verify its recorded input before waiting for publication; the first
+      # case separately checks publication without a setup query.
+      check socketPeakFor(client, PublishedKey) == ObservedPeakBytes
       var published: PublishedEstimate
       check waitForPublished(tablePath, PublishedKey, 10_000, published)
 

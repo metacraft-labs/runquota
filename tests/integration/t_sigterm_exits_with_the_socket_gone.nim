@@ -71,7 +71,7 @@
 import std/[os, osproc, strutils, times, unittest]
 
 when defined(posix):
-  import std/posix
+  import std/[monotimes, posix]
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
@@ -158,29 +158,45 @@ type Ending = object
   parked: string
     ## Non-empty only when the budget was overrun.
 
-proc termAndWait(daemon: Process; budgetMillis: int): Ending =
-  ## SIGTERM, then a bounded wait for the process to go.
-  ##
-  ## THE WAIT IS OURS RATHER THAN `waitForExit`'s because the interesting
-  ## run is the one that overruns, and that is the run in which the daemon
-  ## has to be INSPECTED before it is killed. `waitForExit(timeout)` kills
-  ## on its own deadline and hands back 137 with nothing said about where
-  ## the process was; this does the same escalation and records the wchan
-  ## first. The escalation itself is not optional: an unbounded wait here
-  ## would turn a failing case into a wedged binary.
-  doAssert kill(Pid(daemon.processID), SIGTERM) == 0,
-    "could not send SIGTERM to the daemon"
-  let started = epochTime()
-  var waited = 0
-  while waited < budgetMillis and daemon.running:
-    sleep(10)
-    waited += 10
-  if daemon.running:
-    result.parked = parkedAt(daemon.processID)
-    doAssert kill(Pid(daemon.processID), SIGKILL) == 0,
-      "could not SIGKILL a daemon that outlasted its shutdown budget"
-  result.exitCode = daemon.waitForExit()
-  result.elapsedMillis = (epochTime() - started) * 1000.0
+when defined(posix):
+  proc removeStartingDaemonTree(root: string) =
+    # Hello is served while the observation store opens, so SQLite can create
+    # another file between recursive removal's directory walk and rmdir.
+    # Complete the real removal before asserting absence and sending SIGTERM;
+    # keep unexpected filesystem errors fatal and this setup phase bounded.
+    let deadline = getMonoTime() + initDuration(milliseconds = BindBudgetMillis)
+    while true:
+      try:
+        removeDir(root)
+        return
+      except OSError as error:
+        if error.errorCode != ENOTEMPTY or getMonoTime() >= deadline:
+          raise
+        sleep(10)
+
+  proc termAndWait(daemon: Process; budgetMillis: int): Ending =
+    ## SIGTERM, then a bounded wait for the process to go.
+    ##
+    ## THE WAIT IS OURS RATHER THAN `waitForExit`'s because the interesting
+    ## run is the one that overruns, and that is the run in which the daemon
+    ## has to be INSPECTED before it is killed. `waitForExit(timeout)` kills
+    ## on its own deadline and hands back 137 with nothing said about where
+    ## the process was; this does the same escalation and records the wchan
+    ## first. The escalation itself is not optional: an unbounded wait here
+    ## would turn a failing case into a wedged binary.
+    doAssert kill(Pid(daemon.processID), SIGTERM) == 0,
+      "could not send SIGTERM to the daemon"
+    let started = epochTime()
+    var waited = 0
+    while waited < budgetMillis and daemon.running:
+      sleep(10)
+      waited += 10
+    if daemon.running:
+      result.parked = parkedAt(daemon.processID)
+      doAssert kill(Pid(daemon.processID), SIGKILL) == 0,
+        "could not SIGKILL a daemon that outlasted its shutdown budget"
+    result.exitCode = daemon.waitForExit()
+    result.elapsedMillis = (epochTime() - started) * 1000.0
 
 proc report(label: string; ending: Ending) =
   echo "  ", label, ": exit=", ending.exitCode, " after ",
@@ -249,7 +265,7 @@ suite "sigterm_exits_with_the_socket_gone":
         # the published stats table beside it, the host identity file and
         # the observation database. This is what happens to an orphan when
         # the caller that started it removes its scratch directory.
-        removeDir(root)
+        removeStartingDaemonTree(root)
         require not fileExists(socketPath)
         require not dirExists(endpointDir)
         require not dirExists(state)
