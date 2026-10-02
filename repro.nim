@@ -148,16 +148,18 @@ package runquota:
     # once with ``repro exec -- prek install``). pre-commit itself stays the
     # flake shell's: it is a Python application with no release binary.
     "prek"
-    # No Windows realization exists for these two, and the reasons are
-    # recorded with each interface: nixfmt's executable depends on the
-    # Haskell ``unix`` package, which does not build on Windows, and nobody
-    # publishes a Windows binary; repomix is an npm package whose
-    # ``node_modules`` closure no realization shape can install yet.
-    # ``just format`` and ``just repomix`` say so on Windows rather than
-    # skipping silently.
+    # ``repomix`` everywhere: on Windows, where nobody publishes a binary, it
+    # is upstream's npm package with its pinned dependency closure
+    # (reprobuild-packages ``packages/interfaces/repomix``), run under the
+    # ``node`` this list declares; repomix needs node 22 or newer.
+    "repomix"
+    "node >=22"
+    # ``nixfmt`` has no Windows realization yet: nobody publishes a Windows
+    # binary, and building it from source needs reprobuild to fall through
+    # from tarball provisioning to a source recipe, which has not landed.
+    # ``just format`` says so on Windows rather than skipping silently.
     when not defined(windows):
       "nixfmt"
-      "repomix"
 
   # ``repro shell`` / ``repro exec -- <cmd>``: the tools in ``uses:`` above,
   # provisioned per ``defaultToolProvisioning``. The source-library producer

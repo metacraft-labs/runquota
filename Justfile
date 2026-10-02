@@ -112,24 +112,14 @@ bench-socket-baseline *args:
     mkdir -p bench-results test-logs
     bash scripts/run-m1-benchmark.sh {{args}} 2> >(tee test-logs/bench-socket-baseline.log >&2)
 
-# repomix has no Windows realization (reprobuild-packages:
-# packages/interfaces/repomix records why), so on Windows this recipe says so
-# instead of failing with "command not found".
+# repomix comes from the dev shell on every platform (reprobuild-packages:
+# packages/interfaces/repomix), so a missing one says where to get it instead
+# of failing with "command not found".
 repomix *args:
     #!/usr/bin/env bash
     set -euo pipefail
     if ! command -v repomix >/dev/null 2>&1; then
-      case "$(uname -s)" in
-      MINGW* | MSYS* | CYGWIN*)
-        echo "repomix: not available on Windows. Upstream publishes only an npm" >&2
-        echo "  package that needs its node_modules closure, which no realization" >&2
-        echo "  can install yet (reprobuild-packages: packages/interfaces/repomix)." >&2
-        echo "  Run 'just repomix' from a Linux or macOS dev shell." >&2
-        ;;
-      *)
-        echo "repomix: not on PATH; run this from the dev shell (nix develop, or repro shell)." >&2
-        ;;
-      esac
+      echo "repomix: not on PATH; run this from the dev shell (nix develop, or repro shell)." >&2
       exit 1
     fi
     mkdir -p {{REPOMIX_OUT_DIR}}
