@@ -71,7 +71,7 @@ require_contains flake.nix "packages.default"
 require_contains flake.nix "checks ="
 require_contains flake.nix "static-helpers"
 require_contains flake.nix "git-hooks.lib"
-require_contains flake.nix "shellHook = pre-commit-check.shellHook"
+require_contains flake.nix "shellHook = ownRepoOnly pre-commit-check.shellHook"
 
 # ONE PRE-COMMIT HOOK, WRITTEN DOWN TWICE. git-hooks.nix generates the
 # Linux/macOS hook config from flake.nix; prek.toml carries the same hook for
