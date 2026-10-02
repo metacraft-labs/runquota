@@ -102,8 +102,32 @@ mkdir "C:\ProgramData\runquota" && icacls "C:\ProgramData\runquota" /reset && ic
 **A bare `mkdir` is not enough on Windows.** `C:\ProgramData` lets every user
 create files in every directory made under it, so the daemon refuses such a
 directory -- naming the ACE that lets other users write -- and keeps serving
-leases with capture off. `/inheritance:r` is what removes that ACE. The MSI
-does not create this directory.
+leases with capture off. `/inheritance:r` is what removes that ACE.
+
+**The MSI creates this directory for you** (since 2026-09-30), with the same
+access: a protected DACL granting SYSTEM and Administrators full control and
+every user read and traverse
+(`D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)`), owned by the
+installer's account. It is left in place on uninstall, with everything in it.
+The command above is for a host that got RunQuota some other way. A
+non-elevated Scoop install cannot create it and does not try.
+
+## The host budget file
+
+The daemon's budget lives in one file per host (see
+[Running the daemon](/usage_guide/daemon#the-host-file)):
+
+| OS | File | Created by |
+|---|---|---|
+| Windows | `C:\ProgramData\runquota\runquotad.toml` | the MSI, once (never overwritten, never removed) |
+| Linux | `/etc/runquota/runquotad.toml` | the deb/rpm/Arch package, as a conffile; `/etc/runquota` is root-owned `0755` |
+| macOS, NixOS | `/etc/runquota/runquotad.toml` | the Nix module, from `services.runquotad.hostConfig` |
+
+The seeded file sets nothing — every key is commented out — so installing it
+changes no budget; the daemon's default is 75% of physical memory. Change it
+with `runquota config set` (elevated on Windows, root elsewhere), which never
+creates the directory: a host without it is unprovisioned, and the verb says
+so.
 
 **`/run` is cleared on boot** (and so is `/var/run` on macOS), so the
 rendezvous directory has to be re-created on every boot. That is what the
@@ -144,11 +168,29 @@ The NixOS module runs the daemon as user and group `runquota` with
 `StateDirectory=runquota` (mode `0755`), `RuntimeDirectory=runquota` (mode
 `0750`, preserved across restarts), `UMask=0007` and `Restart=on-failure`, and
 adds `tmpfiles` rules so the directories survive a reboot. Options are
-`package`, `user`, `group`, `observationDb` and `extraArgs`.
+`package`, `user`, `group`, `observationDb`, `extraArgs` and `hostConfig`.
+
+`hostConfig` is the host budget, declared:
+
+```nix
+services.runquotad.hostConfig = {
+  memoryBytes = 103079215104;   # 96 GiB
+  cpuMilli = 16000;
+  pools = { compile = 8; };
+};
+```
+
+It is rendered to `/etc/runquota/runquotad.toml` as a link into the store, and
+a change is applied by **reloading** the daemon (`ExecReload` runs `runquota
+config reload`), never by restarting it. Because the file is a store link,
+`runquota config set` refuses to edit it and tells you to change the module.
+Left `null`, no file is written and `/etc/runquota` is still created (root,
+`0755`) for `runquota config set`.
 
 The nix-darwin module installs a `launchd` daemon labelled
 `org.metacraft-labs.runquotad` with `RunAtLoad` and `KeepAlive`, and an
-activation script that creates both directories. Note that it defaults to
+activation script that creates both directories and `/etc/runquota`, and asks
+a running daemon to reload when `hostConfig` is set. Note that it defaults to
 running as **`root`:`wheel`** rather than a dedicated account — nix-darwin has
 no system-user abstraction to hang one on.
 

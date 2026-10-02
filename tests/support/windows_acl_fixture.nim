@@ -116,6 +116,16 @@ when defined(windows):
       "[System.Security.AccessControl.AccessControlSections]::Access); " &
       "[System.IO.Directory]::SetAccessControl(" & psQuote(path) & ", $s)")
 
+  proc setDaclSddl*(path, sddl: string) =
+    ## Replaces ``path``'s DACL with ``sddl`` (``D:...``), the way Windows
+    ## Installer's ``MsiLockPermissionsEx`` does for a package's folder.
+    ## Only the DACL, for the reason ``setNullDacl`` gives.
+    discard powershell(
+      "$s = New-Object System.Security.AccessControl.DirectorySecurity; " &
+      "$s.SetSecurityDescriptorSddlForm(" & psQuote(sddl) & ", " &
+      "[System.Security.AccessControl.AccessControlSections]::Access); " &
+      "[System.IO.Directory]::SetAccessControl(" & psQuote(path) & ", $s)")
+
   proc restrictToOwnerAndSystem*(path: string) =
     ## The DACL "this daemon owns and nobody else can write": inheritance
     ## removed, full control for this user, SYSTEM and Administrators, and

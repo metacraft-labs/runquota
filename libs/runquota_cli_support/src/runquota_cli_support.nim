@@ -11,6 +11,7 @@ from runquota_ipc import defaultEndpoint, defaultStatsTablePath
 import runquota_protocol
 import runquota_stats_table
 import runquota_cli_support/stats
+import runquota_cli_support/config
 
 proc wantsVersion*(args: openArray[string]): bool =
   args.len == 1 and args[0] in ["--version", "-V"]
@@ -32,6 +33,7 @@ proc renderUsage*(programName: string): string =
     "    starts a detached runquotad (with those flags) unless one answers;\n" &
     "    its output goes to --log-file, by default the per-user runquotad.log\n" &
     "  " & programName & " daemon status\n" &
+    configUsage.replace("  runquota ", "  " & programName & " ") &
     "  " & programName & " stats-table [KEY]\n" &
     "  " & programName & " stats capture [--json]\n" &
     "  " & programName & " stats top [KEY] [--limit N] [--all-users] [--all-profiles] [--json]\n" &
@@ -718,6 +720,10 @@ proc runThinApp*(programName: string): int =
         return runStats(programName, args[1 .. ^1])
       of "acquire":
         return runDebugAcquire(args[1 .. ^1])
+      of "config":
+        # THE HOST BUDGET FILE: who writes it, and how a running daemon
+        # learns it changed (reprobuild-specs/RunQuota-Host-Configuration.md).
+        return runConfig(args[1 .. ^1])
       else:
         discard
     except CatchableError as error:

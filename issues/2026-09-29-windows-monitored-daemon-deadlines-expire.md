@@ -1,8 +1,45 @@
 # Windows monitored daemon readiness and retention miss fixture deadlines
 
-Status: open for the remaining attribution gaps. Originally observed at RunQuota
-`177e2af` with io-mon `5421a9b`. The application suites now pass at `d6ee458`;
-that workflow fails its separate final static-helper ACL gate, recorded below.
+Status: open. Originally observed at RunQuota `177e2af` with io-mon `5421a9b`.
+Application suites pass at `d6ee458`, whose workflow fails its later ACL gate.
+Daemon readiness fails again on both Windows hosts at released `0389129`.
+
+## Reproduced after publication at 0389129 (2026-10-01)
+
+At `03891296dccc0f30d063c72e1552f41103286ca0`, Windows x64 job
+[110352061724](https://github.com/metacraft-labs/runquota/actions/runs/36857078024/job/110352061724)
+fails `repro test` at 12:33 UTC. The reported failed action is
+`runquota.test_execute.t_endpoint_serves_before_store_verification`.
+Its Hello response arrives 6360 ms after spawn, and `lock.millisHeld()` is
+6380 ms against the unchanged 3500 ms `LockHeldCeilingMillis` assertion at
+`tests/integration/t_endpoint_serves_before_store_verification.nim:231`.
+The log records only the `after-verification` session. This repeats the
+earlier lock-window failure described below; it does not establish whether
+the cause is process startup, monitoring, scheduling or the daemon itself.
+
+Windows ARM64 job
+[110352061655](https://github.com/metacraft-labs/runquota/actions/runs/36857078024/job/110352061655)
+also fails `repro test`, at 14:32 UTC. Seven crash-recovery cases pass, but
+`starting lease is lost, never finished, and released on supervisor exit`
+fails in `waitForDaemon`: `CreateFileW` reports Windows error 2 for the
+fixture's named pipe. The failure occurs before the helper handshake and
+the three-second lease assertion. The log does not establish why the daemon
+failed to become ready within the existing bound. Preserve that distinction
+from the older helper-execution timeout.
+
+The complete full Reprobuild run therefore fails both Windows hosts and
+passes Linux x64, Linux ARM64 and macOS. Ordinary CI
+[36857078090](https://github.com/metacraft-labs/runquota/actions/runs/36857078090)
+at the same source passes all ten jobs. Preserve both results: passing native
+CI and package checks do not erase this monitored failure.
+
+Downloaded job evidence is `/tmp/runquota-038-windows-x64-repro.log` and
+`/tmp/runquota-038-windows-arm64-repro.log`. Before recording, fetched dev
+at `0389129` and agents at `139a441`, and searched current issues and their
+Git history; this issue already owns both readiness failures. The dev fixes
+are now reconciled into agents at `5c0de8f`; that merge is not yet qualified
+by a full cross-platform run.
+Keep the original deadline and obtain paired evidence before choosing a fix.
 
 ## Observed
 
@@ -1145,3 +1182,15 @@ controls, and the failed SQLite progress diagnostics still have no retrievable
 worker evidence. Those causes remain unattributed. The two-program admission
 limit is the measured successful resource allocation at this candidate, not
 proof that serialization alone repairs every earlier failure.
+
+### Integrated agents candidate: Windows x64 qualification
+
+At `d48e196`, [full Windows x64 job 110474890644](https://github.com/metacraft-labs/runquota/actions/runs/36893338411/job/110474890644)
+passes the 106-action build, all 209 test actions and the native cross-check.
+The completed log contains no hidden test-failure markers. Focused diagnostic
+`5e6cb15`, [job 110499005938](https://github.com/metacraft-labs/runquota/actions/runs/36900752734/job/110499005938),
+uses the same production sources and repeats endpoint-before-store readiness
+and client-exit lease release twice each in native and monitored modes. All
+eight executions pass with identical binary hashes and unchanged deadlines.
+Artifacts: `/tmp/runquota-5e6-windows-daemon-controls`. The current ARM host
+qualification is still running; these x64 outcomes do not establish its result.

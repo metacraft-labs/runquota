@@ -1,4 +1,4 @@
-import std/[algorithm, atomics, cpuinfo, locks, options, os, strutils,
+import std/[algorithm, atomics, cpuinfo, locks, options, os, sets, strutils,
   tables, times]
 
 when defined(posix):
@@ -12,6 +12,8 @@ import runquota_daemon/types as daemonTypes
 # every leg rather than only on the one that uses it.
 import runquota_daemon/windows_service
 import runquota_daemon/host_config
+import runquota_daemon/host_memory
+import runquota_daemon/reload_report
 import runquota_daemon/child_identity
 import runquota_codec
 import runquota_core
@@ -40,6 +42,7 @@ export daemonTypes
 # stdio redirection, because both have to happen before `serve` prints
 # its first line.
 export windows_service
+export reload_report
 
 const libraryName* = "runquota_daemon"
 
@@ -47,11 +50,23 @@ proc libraryInfo*(): daemonTypes.LibraryInfo =
   daemonTypes.LibraryInfo(name: libraryName)
 
 proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
+  ## The built-in budget is proportional to the host: one core per logical
+  ## processor, and `DefaultMemoryBudgetPercent` (75%) of physical memory --
+  ## the flat 16 GiB it replaced (`FallbackMemoryBudgetBytes`) survives only
+  ## for a host whose memory cannot be read. Decided 2026-09-30 in
+  ## `reprobuild-specs/RunQuota-Host-Configuration.md`: a constant is too
+  ## small for a workstation and too large for a laptop, and a host file
+  ## remains the way to say anything else.
+  let cpu = milliCpu(max(1, countProcessors()) * 1000)
+  let memory = bytes(defaultMemoryBudgetBytes(hostPhysicalMemoryBytes()))
   DaemonConfig(
     endpoint: endpoint,
     daemonId: uint64(getCurrentProcessId()),
-    cpuSlots: milliCpu(max(1, countProcessors()) * 1000),
-    memoryBytes: bytes(16'u64 * 1024'u64 * 1024'u64 * 1024'u64),
+    cpuSlots: cpu,
+    memoryBytes: memory,
+    hostConfigPath: host_config.hostConfigPath,
+    builtinMemoryBytes: memory,
+    builtinCpuSlots: cpu,
     ioSlots: 1'u32,
     machines: initTable[string, MachineCapacity](),
     cpuShareGroups: initTable[string, CpuShareGroup](),
@@ -83,6 +98,37 @@ proc applyHostConfig*(config: var DaemonConfig; host: HostConfig) =
     config.cpuSlots = milliCpu(host.cpuMilli.get)
   for name, units in host.pools:
     config.namedPoolCaps[name] = units
+
+proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
+  ## The budget from the bottom up: the built-in defaults, then `host`, then
+  ## the flags in `config.budgetFlags`. Used at start and by every reload, so
+  ## the two cannot disagree about precedence -- and a reload is computed
+  ## from the defaults rather than from whatever the previous file left,
+  ## which is what lets `runquota config unset` take a key back to its
+  ## default under a running daemon.
+  ##
+  ## Pools are the file's `[pools]` plus the `--pool` flags; a pool the file
+  ## no longer names is gone (its cap is 0, so new demands for it are
+  ## refused and leases already granted in it keep running).
+  if config.builtinMemoryBytes.value == 0:
+    config.builtinMemoryBytes = config.memoryBytes
+  if config.builtinCpuSlots.value == 0:
+    config.builtinCpuSlots = config.cpuSlots
+  let flags = config.budgetFlags
+  config.memoryBytes =
+    if flags.memoryBytes.isSome: flags.memoryBytes.get
+    elif host.memoryBytes.isSome: bytes(host.memoryBytes.get)
+    else: config.builtinMemoryBytes
+  config.cpuSlots =
+    if flags.cpuSlots.isSome: flags.cpuSlots.get
+    elif host.cpuMilli.isSome: milliCpu(host.cpuMilli.get)
+    else: config.builtinCpuSlots
+  var pools = initTable[string, uint32]()
+  for name, units in host.pools:
+    pools[name] = units
+  for name, units in flags.pools:
+    pools[name] = units
+  config.namedPoolCaps = pools
 
 proc machineCapacity*(id: string; cpuSlots: MilliCpu; memoryBytes: Bytes;
                       ioSlots: uint32; cpuShareGroup = ""): MachineCapacity =
@@ -970,6 +1016,23 @@ proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
     "}")
   result.add("]}")
 
+proc pinnedKeys*(flags: BudgetFlags): seq[string] =
+  ## The host-file keys a flag overrides for this launch, in the file's own
+  ## spelling (`HostConfigReloadedMessage.pinnedByFlags`).
+  if flags.machines:
+    result.add("machine")
+  else:
+    if flags.memoryBytes.isSome:
+      result.add("machine.memory_bytes")
+    if flags.cpuSlots.isSome:
+      result.add("machine.cpu_milli")
+  var names: seq[string] = @[]
+  for name in flags.pools.keys:
+    names.add(name)
+  names.sort()
+  for name in names:
+    result.add("pools." & name)
+
 proc topologyJson(daemon: RunQuotaDaemon): string =
   var machineIds: seq[string] = @[]
   for id in daemon.config.machines.keys:
@@ -1000,7 +1063,30 @@ proc topologyJson(daemon: RunQuotaDaemon): string =
       "\"id\":" & jsonEscape(group.id) & "," &
       "\"cpu_milli\":" & $group.cpuSlots.value &
     "}")
-  result.add("]}")
+  # WHERE THE BUDGET CAME FROM, beside the budget. A machine row alone does
+  # not say whether 94 GiB is the operator's file, a flag, or the 75% default,
+  # and that is the first question a refused lease raises.
+  var poolNames: seq[string] = @[]
+  for name in daemon.config.namedPoolCaps.keys:
+    poolNames.add(name)
+  poolNames.sort()
+  result.add("],\"pools\":[")
+  for i, name in poolNames:
+    if i > 0:
+      result.add(",")
+    result.add("{\"name\":" & jsonEscape(name) & ",\"units\":" &
+      $daemon.config.namedPoolCaps[name] & "}")
+  result.add("],\"host_config\":{" &
+    "\"path\":" & jsonEscape(daemon.config.hostConfigPath) & "," &
+    "\"source\":" & jsonEscape(daemon.config.hostConfigSource) & "," &
+    "\"reloads\":" & $daemon.hostConfigReloads & "," &
+    "\"reloads_refused\":" & $daemon.hostConfigReloadsRefused & "," &
+    "\"pinned_by_flags\":[")
+  for i, key in daemon.config.budgetFlags.pinnedKeys:
+    if i > 0:
+      result.add(",")
+    result.add(jsonEscape(key))
+  result.add("]}}")
 
 proc estimatesJson(daemon: RunQuotaDaemon): string =
   var keys: seq[string] = @[]
@@ -2378,6 +2464,118 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
       updated.queueDiagnostic = daemon.waitingDiagnostic(lease)
       daemon.leases[id] = updated
 
+proc reloadHostConfig*(daemon: var RunQuotaDaemon): HostConfigReloadedMessage =
+  ## Re-read the host budget file and put it in force, under a running
+  ## daemon (`reprobuild-specs/RunQuota-Host-Configuration.md`, "Changing
+  ## it under a running daemon").
+  ##
+  ## A FILE THAT DOES NOT PARSE CHANGES NOTHING: `readHostConfig` raises
+  ## `HostConfigError` before any field is touched, and the caller answers
+  ## with the file and line. The budget in force stays the last one that
+  ## parsed -- the same "a half-read budget is worse than none" rule that
+  ## stops the daemon at start, applied where stopping is not an option.
+  ##
+  ## WHAT A NEW BUDGET DOES TO LEASES, which is the whole of the decision:
+  ##
+  ## * GRANTED LEASES ARE NEVER REVOKED. A lease is a promise the client has
+  ##   already acted on -- its process is running -- and RunQuota neither
+  ##   spawns nor kills process trees. After a shrink the granted total can
+  ##   exceed the budget; `fitsNow` then admits nothing new until enough of
+  ##   them finish, exactly as if the host had been started at the smaller
+  ##   budget with that work already running.
+  ## * QUEUED LEASES ARE ADMITTED AGAINST THE NEW BUDGET. A grow promotes
+  ##   whatever now fits, here, before the reply; the clients see the grants
+  ##   on their next `GrantNext`.
+  ## * A QUEUED LEASE THE NEW BUDGET CAN NEVER HOLD IS DENIED, not left
+  ##   waiting: it is larger than the whole machine (or names a pool the file
+  ##   dropped), so waiting cannot end. It leaves the queue now -- a queued
+  ##   benchmark would otherwise keep gating every other lease -- and the
+  ##   denial is delivered on its session's next `GrantNext`, with the same
+  ##   reason `possible` gives a fresh request of that size.
+  ##
+  ## Flags still win: `budgetFlags` is re-applied over the file, and the
+  ## answer names what they pin so an operator who edited a pinned key is
+  ## told it had no effect.
+  let host = readHostConfig(daemon.config.hostConfigPath)
+  var next = daemon.config
+  next.resolveBudget(host)
+  if next.budgetFlags.machines:
+    # `--machine` pinned the topology; `config.cpuSlots`/`memoryBytes`
+    # describe its `local` machine (see `normalizeTopology`), not the file.
+    if next.machines.hasKey(DefaultMachineId):
+      let local = next.machines[DefaultMachineId]
+      next.cpuSlots = local.cpuSlots
+      next.memoryBytes = local.memoryBytes
+  elif next.machines.hasKey(DefaultMachineId):
+    var local = next.machines[DefaultMachineId]
+    local.cpuSlots = next.cpuSlots
+    local.memoryBytes = next.memoryBytes
+    next.machines[DefaultMachineId] = local
+    let group = local.cpuShareGroup
+    if group notin next.budgetFlags.cpuShareGroups and
+        next.cpuShareGroups.hasKey(group):
+      next.cpuShareGroups[group] = cpuShareGroup(group, next.cpuSlots)
+  next.hostConfigSource = host.sourcePath
+  daemon.config = next
+  inc daemon.hostConfigReloads
+
+  var doomed: seq[uint64] = @[]
+  for id, lease in daemon.leases.pairs:
+    if lease.state == leaseStateQueued:
+      var reason = ""
+      if not daemon.possible(lease.resources, reason):
+        doomed.add(id)
+  for id in doomed:
+    let lease = daemon.leases[id]
+    var reason = ""
+    discard daemon.possible(lease.resources, reason)
+    daemon.pendingDenials.mgetOrPut(lease.sessionId.value, @[]).add(
+      lease.leaseDecision(leaseDecisionDenied, diagnostic(diagDenied, reason,
+        "the host budget was reloaded while this lease was queued, and the " &
+        "budget in force can never hold it")))
+    daemon.removeLeaseFromTable(id)
+
+  let promoted = daemon.tryPromoteQueued()
+  let usage = daemon.machineUsage.getOrDefault(DefaultMachineId,
+    MachineUsage())
+  var pools: seq[NamedPoolCapWire] = @[]
+  var poolNames: seq[string] = @[]
+  for name in daemon.config.namedPoolCaps.keys:
+    poolNames.add(name)
+  poolNames.sort()
+  for name in poolNames:
+    pools.add(NamedPoolCapWire(name: name,
+      units: daemon.config.namedPoolCaps[name]))
+  HostConfigReloadedMessage(
+    configPath: daemon.config.hostConfigPath,
+    sourcePath: host.sourcePath,
+    memoryBytes: daemon.config.memoryBytes.value,
+    cpuMilli: daemon.config.cpuSlots.value,
+    pools: pools,
+    pinnedByFlags: daemon.config.budgetFlags.pinnedKeys,
+    promotedLeases: uint32(promoted.len),
+    memoryInUse: usage.memory,
+    cpuInUse: usage.cpu)
+
+proc grantNextDecisions*(daemon: var RunQuotaDaemon;
+                         sessionId: SessionId): seq[LeaseDecision] =
+  ## What a `GrantNext` from `sessionId` is answered with. Denials a reload
+  ## decided for this session's queued leases (`reloadHostConfig`) go out
+  ## first: they are final, and a client waiting on one of them has nothing
+  ## else to wait for. Then at most one grant not yet delivered.
+  discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
+  if daemon.pendingDenials.hasKey(sessionId.value):
+    result = daemon.pendingDenials[sessionId.value]
+    daemon.pendingDenials.del(sessionId.value)
+  for id, row in daemon.leases.pairs:
+    if row.sessionId.value == sessionId.value and
+        row.state == leaseStateGranted and not row.delivered:
+      var lease = row
+      lease.delivered = true
+      daemon.leases[id] = lease
+      result.add(lease.leaseDecision(leaseDecisionGranted))
+      break
+
 proc requireOwnedLease(daemon: RunQuotaDaemon; connection: var LocalConnection;
                        requestId: uint64; sessionId: SessionId;
                        id: LeaseId; lease: var LeaseRow): bool =
@@ -2436,6 +2634,7 @@ proc cleanupLostSession(daemon: var RunQuotaDaemon; sessionId: SessionId) =
   # visible in the data — the arithmetic stays self-consistent — which is
   # why it is reaped here rather than bounded by a timeout somewhere.
   daemon.reapSessionSelfReports(sessionId)
+  daemon.pendingDenials.del(sessionId.value)
   daemon.sessions.del(sessionId.value)
   discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
 
@@ -2487,6 +2686,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     # An orderly close is still a close: whatever the session reported and
     # did not end goes with it, by the same key the crash path uses.
     daemon.reapSessionSelfReports(msg.sessionId)
+    daemon.pendingDenials.del(msg.sessionId.value)
     daemon.sessions.del(msg.sessionId.value)
     connection.sendResponse(
       rqSessionClosed,
@@ -2635,16 +2835,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       connection.sendError(frame.header.requestId, diagnostic(
           diagInvalidArgument, "unknown session id"))
       return
-    discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
-    var decisions: seq[LeaseDecision] = @[]
-    for id, row in daemon.leases.pairs:
-      if row.sessionId.value == msg.sessionId.value and
-          row.state == leaseStateGranted and not row.delivered:
-        var lease = row
-        lease.delivered = true
-        daemon.leases[id] = lease
-        decisions.add(lease.leaseDecision(leaseDecisionGranted))
-        break
+    let decisions = daemon.grantNextDecisions(msg.sessionId)
     connection.sendResponse(
       rqLeaseDecisionBatch,
       frame.header.requestId,
@@ -2835,6 +3026,33 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
   of rqStatusRequest:
     connection.sendResponse(rqStatusResponse, frame.header.requestId,
         encodeStatus(daemon.status()))
+  of rqReloadHostConfig:
+    # NO AUTHORISATION BEYOND THE CONNECTION, on purpose: the request names
+    # no values. The daemon re-reads the one file it was started with, which
+    # only the host's administrators can write, so the worst a client can do
+    # is make the daemon enforce what the operator wrote down.
+    if frame.payload.len != 0:
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "ReloadHostConfig carries no payload"))
+      return
+    try:
+      let answer = daemon.reloadHostConfig()
+      try:
+        echo "runquotad: host configuration reloaded: " & reloadReport(answer)
+      except CatchableError:
+        discard
+      connection.sendResponse(rqHostConfigReloaded, frame.header.requestId,
+          encodeHostConfigReloaded(answer))
+    except HostConfigError as err:
+      inc daemon.hostConfigReloadsRefused
+      let message = "host configuration not reloaded, the budget in " &
+        "force is unchanged: " & err.msg
+      try:
+        echo "runquotad: " & message
+      except CatchableError:
+        discard
+      connection.sendError(frame.header.requestId, diagnostic(
+          diagInvalidArgument, message))
   of rqStatsQuery:
     # THE READ PATH, OVER THE SOCKET. Request/response with a variable-size
     # result, which is why it is here and not on the observation ring: the
@@ -3266,28 +3484,69 @@ proc connectionWorker() {.thread, gcsafe.} =
 # wakes when the handler writes to it, and opens one connection to this
 # daemon's own socket. `accept` returns it, the loop sees the flag, closes it
 # and breaks into the `finally` that was always there.
+#
+# AND A DIAL TRAVELS THROUGH THE FILESYSTEM, WHICH IS WHERE IT BROKE. An
+# AF_UNIX `connect` names the endpoint BY PATH, so the wake is only
+# deliverable while that path still resolves to this daemon's socket. Unlink
+# the socket -- which is what happens to every auto-started `runquotad`
+# whose caller's scratch directory is removed while the daemon outlives it --
+# and the dial fails with ENOENT, the waker exits having woken nobody, and
+# the accept loop stays parked in a socket that is otherwise in perfect
+# health. `kill -TERM` then runs the handler (so the signal is caught, not
+# blocked and not ignored) and never reaches the exit. Measured: of 22
+# leaked `runquotad` processes reaped on one host, the five that ignored
+# SIGTERM and needed SIGKILL were EXACTLY the five whose `--socket` path no
+# longer existed, and the main thread of a reproduction sits in
+# `__skb_wait_for_more_packets` -- `unix_accept` -- for as long as it is
+# left alone.
+#
+# SO THE WAKE NO LONGER GOES THROUGH THE ENDPOINT AT ALL. The handler writes
+# a second byte, into a SECOND pipe that nobody ever drains, and the accept
+# loop waits on `poll` over two descriptors -- the LISTENING SOCKET, whose
+# readability means "a connection is there to accept", and that pipe, whose
+# readability means "stop". Neither can be deleted from underneath the
+# process: one is the listener itself and the other never had a name. The
+# loop therefore calls `accept` only when a connection is already waiting,
+# and observes the flag whatever has happened to the rendezvous directory.
+# The dial is KEPT, because when the path does resolve it is the faster wake
+# of the two and it is what the Windows arm has instead of a pipe; it has
+# simply stopped being the only one.
 # ---------------------------------------------------------------------------
 
 when defined(posix):
   var
     shutdownRequested: Atomic[bool]
     shutdownPipe: array[0 .. 1, cint] = [cint(-1), cint(-1)]
+    acceptWakePipe: array[0 .. 1, cint] = [cint(-1), cint(-1)]
+      ## THE WAKE THAT DOES NOT GO THROUGH THE FILESYSTEM. Written by the
+      ## handler and READ BY NOBODY: the accept loop only ever `poll`s it,
+      ## so the byte stays in the pipe and every later wait returns at once.
+      ## That is what makes the wake immune to the one race a consumed token
+      ## would have -- a wake delivered before the loop reaches its wait
+      ## would otherwise be a wake lost, and this daemon's shutdown would
+      ## again depend on timing rather than on state.
     shutdownWakerThread: Thread[void]
     shutdownWakerRunning = false
     shutdownEndpointPath = ""
       ## Written once, before the waker exists, and read only by it.
 
   proc onShutdownSignal(sig: cint) {.noconv.} =
-    ## THE WHOLE OF WHAT RUNS IN SIGNAL CONTEXT.
+    ## THE WHOLE OF WHAT RUNS IN SIGNAL CONTEXT: one atomic store and two
+    ## non-blocking one-byte writes, all three async-signal-safe. The first
+    ## byte wakes the waker thread, which dials; the second wakes the accept
+    ## loop directly, and is the one that still arrives when the endpoint
+    ## path has been unlinked.
     shutdownRequested.store(true, moRelease)
+    var token = '\0'
     if shutdownPipe[1] >= 0:
-      var token = '\0'
       discard write(shutdownPipe[1], addr token, 1)
+    if acceptWakePipe[1] >= 0:
+      discard write(acceptWakePipe[1], addr token, 1)
 
   proc shutdownWasRequested(): bool =
     shutdownRequested.load(moAcquire)
 
-  proc ensureShutdownPipe(): bool =
+  proc ensureLongLivedPipe(fds: var array[0 .. 1, cint]): bool =
     ## THE PIPE IS CREATED ONCE AND NEVER CLOSED, and that is the whole of
     ## the fix for a write to a stale descriptor.
     ##
@@ -3304,8 +3563,7 @@ when defined(posix):
     ## Keeping the pair for the life of the process closes the window
     ## outright: the numbers are never free, so they can never be handed to
     ## anything else, and a late handler's byte lands in a pipe that the
-    ## next arming drains. Two descriptors, for a daemon that arms SIGTERM
-    ## once, is not a trade worth a race.
+    ## next arming drains.
     ##
     ## THE WRITE END IS NON-BLOCKING, so nothing in `onShutdownSignal` can
     ## block. A pipe holds 64 KiB and the handler writes one byte, so it
@@ -3315,17 +3573,33 @@ when defined(posix):
     ## failure mode it replaces costs nothing: a write refused for want of
     ## room means the pipe already HAS a byte in it, so the waker has
     ## already been woken and the wake this call was making is redundant.
-    if shutdownPipe[0] >= 0 and shutdownPipe[1] >= 0:
+    ##
+    ## SHARED BY BOTH WAKE PIPES, so the count in the paragraph above is now
+    ## four descriptors rather than two. The reasoning does not change with
+    ## the number: what is bought is that no handler can ever hold a
+    ## descriptor number that has been handed to something else, and four
+    ## numbers for a daemon that arms SIGTERM once is still not a trade
+    ## worth a race.
+    if fds[0] >= 0 and fds[1] >= 0:
       return true
-    if pipe(shutdownPipe) != 0:
-      shutdownPipe = [cint(-1), cint(-1)]
+    if pipe(fds) != 0:
+      fds = [cint(-1), cint(-1)]
       return false
-    let flags = fcntl(shutdownPipe[1], F_GETFL)
+    let flags = fcntl(fds[1], F_GETFL)
     if flags != -1:
-      discard fcntl(shutdownPipe[1], F_SETFL, flags or O_NONBLOCK)
+      discard fcntl(fds[1], F_SETFL, flags or O_NONBLOCK)
     true
 
-  proc drainShutdownPipe() =
+  proc ensureShutdownPipe(): bool =
+    ## The waker's pipe: one reader, which consumes what it takes.
+    ensureLongLivedPipe(shutdownPipe)
+
+  proc ensureAcceptWakePipe(): bool =
+    ## The accept loop's pipe: no reader at all, only `poll`. Same lifetime
+    ## rule and same non-blocking write end, for the same reasons.
+    ensureLongLivedPipe(acceptWakePipe)
+
+  proc drainPipe(readEnd: cint) =
     ## A WAKE TOKEN OUTLIVES THE ARMING THAT PRODUCED IT, and with a pipe
     ## that is never closed it would outlive it INTO THE NEXT ONE.
     ##
@@ -3343,17 +3617,28 @@ when defined(posix):
     ## reader while it runs. Draining at the disarm as well would tidy the
     ## ordinary leftover a little sooner and cover nothing this does not --
     ## a byte from a handler stranded past the disarm arrives after it.
-    if shutdownPipe[0] < 0:
+    if readEnd < 0:
       return
-    let flags = fcntl(shutdownPipe[0], F_GETFL)
+    let flags = fcntl(readEnd, F_GETFL)
     if flags == -1:
       return
-    if fcntl(shutdownPipe[0], F_SETFL, flags or O_NONBLOCK) == -1:
+    if fcntl(readEnd, F_SETFL, flags or O_NONBLOCK) == -1:
       return
     var scratch: array[64, char]
-    while read(shutdownPipe[0], addr scratch[0], scratch.len) > 0:
+    while read(readEnd, addr scratch[0], scratch.len) > 0:
       discard
-    discard fcntl(shutdownPipe[0], F_SETFL, flags)
+    discard fcntl(readEnd, F_SETFL, flags)
+
+  proc drainShutdownPipe() =
+    drainPipe(shutdownPipe[0])
+
+  proc drainAcceptWakePipe() =
+    ## AND THIS ONE MATTERS MORE THAN THE WAKER'S, because nothing else ever
+    ## empties it. A byte left by a previous arming would make the next
+    ## accept loop's very first wait return immediately and the daemon shut
+    ## itself down before serving anything -- so the arming empties it, at
+    ## the one moment there is provably no waiter to race with.
+    drainPipe(acceptWakePipe[0])
 
   proc dialOwnEndpoint(path: string) =
     ## One connection to our own socket, opened and dropped. It carries no
@@ -3410,6 +3695,57 @@ when defined(posix):
           break
       dialOwnEndpoint(shutdownEndpointPath)
 
+  proc waitForAcceptOrShutdown(acceptHandle: int) =
+    ## PARK UNTIL THERE IS A CONNECTION TO ACCEPT, OR UNTIL WE ARE STOPPING.
+    ## Returns with no answer of its own: the caller re-reads the flag and
+    ## calls `accept`, and both of those are the authority they always were.
+    ##
+    ## THIS IS THE GATE IN FRONT OF `accept`, and it exists because `accept`
+    ## itself cannot be woken by anything that does not arrive over the
+    ## endpoint. Waiting on the LISTENING DESCRIPTOR instead of on the
+    ## endpoint's NAME is the whole of the difference: unlinking the socket
+    ## file takes the name away and leaves the descriptor exactly as it was,
+    ## so a `poll` on it is still answerable when a `connect` to the path is
+    ## not.
+    ##
+    ## `POLLIN` ON A LISTENING AF_UNIX SOCKET MEANS "A COMPLETED CONNECTION
+    ## IS QUEUED", and a queued connection is not withdrawn by a peer that
+    ## goes away -- it is still handed out by `accept`, which then reads EOF.
+    ## So the `accept` that follows a readable listener does not block, and
+    ## the loop is not made to depend on that: a wait that somehow returned
+    ## early only puts the caller back where it was before this gate
+    ## existed.
+    ##
+    ## NO TIMEOUT, ON PURPOSE. A bounded wait would also fix the hang, and
+    ## would leave the daemon ticking for the rest of its life for a flag
+    ## that changes once. Both descriptors here are edges: the pipe is
+    ## readable from the instant the handler writes into it and stays
+    ## readable, because nobody drains it.
+    ##
+    ## EINTR IS A RETRY AND NOT A RESULT. Every other error returns, which
+    ## hands the caller back to `accept` and to the consecutive-failure
+    ## accounting that has always decided whether a listener is really dead.
+    if acceptHandle < 0:
+      # NOTHING TO WAIT ON, so the caller blocks in `accept` as it did
+      # before this existed -- the Windows named-pipe shape, and a listener
+      # with no socket. Never a spin: `accept` is still what follows.
+      return
+    var descriptors: array[0 .. 1, TPollfd]
+    descriptors[0].fd = cint(acceptHandle)
+    descriptors[0].events = POLLIN
+    descriptors[0].revents = 0
+    var counted = 1
+    if acceptWakePipe[0] >= 0:
+      descriptors[1].fd = acceptWakePipe[0]
+      descriptors[1].events = POLLIN
+      descriptors[1].revents = 0
+      counted = 2
+    while true:
+      if poll(addr descriptors[0], Tnfds(counted), -1.cint) >= 0:
+        return
+      if errno != EINTR:
+        return
+
   proc installShutdownHandler(endpointPath: string) =
     ## Arms SIGTERM. Called after the endpoint is bound, because the waker
     ## has to have something to dial.
@@ -3420,8 +3756,16 @@ when defined(posix):
       # flag nobody could act on would turn an immediate stop into a hang,
       # which is strictly worse than the default disposition it replaced.
       return
-    # NOTHING LEFT OVER FROM THE LAST ARMING; see `drainShutdownPipe`.
+    # THE SAME RULE FOR THE ACCEPT LOOP'S PIPE, and it is the one that
+    # carries the stop when the endpoint path has been unlinked. Without it
+    # the only wake left is the dial, which is exactly the arrangement that
+    # hung -- so a handler is not armed on half a mechanism either.
+    if not ensureAcceptWakePipe():
+      return
+    # NOTHING LEFT OVER FROM THE LAST ARMING; see `drainShutdownPipe` and
+    # `drainAcceptWakePipe`.
     drainShutdownPipe()
+    drainAcceptWakePipe()
     createThread(shutdownWakerThread, shutdownWakerMain)
     shutdownWakerRunning = true
     signal(SIGTERM, onShutdownSignal)
@@ -3511,6 +3855,17 @@ else:
           dialOwnEndpoint(shutdownEndpointPath)
           return
         sleep(50)
+
+  proc waitForAcceptOrShutdown(acceptHandle: int) =
+    ## NOTHING TO WAIT ON HERE, and that is a property of the transport
+    ## rather than an omission. A named-pipe listener has no descriptor
+    ## whose readability means "a client is waiting": `ConnectNamedPipe` IS
+    ## the wait, and the stop watcher wakes it by opening the pipe -- which
+    ## needs the pipe NAME and not a file on disk, so the hazard the POSIX
+    ## gate exists for (an unlinked socket) has no Windows form.
+    ## `acceptWaitHandle` answers -1 for every named-pipe listener, so this
+    ## is reached with nothing to do.
+    discard acceptHandle
 
   proc installShutdownHandler(endpointPath: string) =
     ## Arms the SCM stop watch. Called after the endpoint is bound, because
@@ -3728,10 +4083,12 @@ proc serve*(config: DaemonConfig): int =
   # before any worker exists, because the shutdown this arms is the one that
   # joins them.
   installShutdownHandler(config.endpoint.path)
-  var threads: seq[Thread[void]] = @[]
-  for _ in 0 ..< connectionWorkerCount():
-    threads.add(default(Thread[void]))
-    createThread(threads[^1], connectionWorker)
+  # Nim's thread wrapper borrows the Thread object's address through its exit
+  # cleanup. Allocate every slot before starting workers so sequence growth
+  # cannot move a live worker's storage.
+  var threads = newSeq[Thread[void]](connectionWorkerCount())
+  for i in 0 ..< threads.len:
+    createThread(threads[i], connectionWorker)
   # SERVICE_RUNNING IS REPORTED HERE AND NOWHERE EARLIER. The endpoint is
   # bound, the rendezvous directory has been verified, and a worker pool
   # exists to serve what the loop below accepts -- so this is the first
@@ -3771,12 +4128,25 @@ proc serve*(config: DaemonConfig): int =
     # interleaved with successful accepts, a dead listener fails every time.
     const MaxConsecutiveAcceptFailures = 64
     var consecutiveFailures = 0
+    # ASKED ONCE. The listener is bound for the life of this loop, so its
+    # descriptor does not change; re-deriving it per iteration would only
+    # add a variant-field read to the hot path.
+    let acceptHandle = listener.acceptWaitHandle
     while true:
+      # THE WAIT THAT MAKES THE FLAG OBSERVABLE. `accept` cannot be woken by
+      # anything that does not arrive over the endpoint, so the loop waits
+      # on the LISTENING DESCRIPTOR and on the shutdown wake pipe first, and
+      # calls `accept` only once a connection is really queued. This is what
+      # a SIGTERM reaches when the socket file has been unlinked -- the
+      # dialled wake cannot be delivered then, and before this gate existed
+      # the daemon stayed parked in `accept` until SIGKILL. See the section
+      # headed "SIGTERM, and the orderly shutdown it now reaches".
+      waitForAcceptOrShutdown(acceptHandle)
       # SIGTERM LEAVES BY THE SAME DOOR AS A DEAD LISTENER: it breaks the
       # loop, and everything below `finally` then happens exactly as it does
       # for every other way of ending. The flag is checked three times
-      # because there are three places the signal can land relative to a
-      # blocking `accept`.
+      # because there are three places the signal can land relative to the
+      # wait above and the `accept` below.
       if shutdownWasRequested():
         break
       var accepted: AcceptedConnection

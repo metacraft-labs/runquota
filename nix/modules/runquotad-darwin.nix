@@ -21,6 +21,7 @@
 let
   cfg = config.services.runquotad;
   hostState = import ../host-state.nix;
+  hostConfigLib = import ../host-config.nix { inherit lib; };
   stateDir = hostState.directories.darwin;
   endpointDir = hostState.endpointDirectories.darwin;
 in
@@ -86,6 +87,24 @@ in
       default = [ ];
       description = "Additional arguments passed to `runquotad`.";
     };
+
+    hostConfig = lib.mkOption {
+      type = lib.types.nullOr hostConfigLib.optionType;
+      default = null;
+      example = lib.literalExpression ''
+        { memoryBytes = 25769803776; pools = { compile = 4; }; }
+      '';
+      description = ''
+        The host budget, written declaratively to `${hostConfigLib.path}`.
+        Every key is optional; an absent one keeps the daemon's built-in
+        default (75% of physical memory, one core per logical processor).
+        Activation asks the running daemon to reload it
+        (`runquota config reload`) rather than restarting it.
+
+        `null` (the default) writes no file and leaves `/etc/runquota` for
+        `runquota config set` to write into, as root.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -115,7 +134,24 @@ in
       printf 'provisioning RunQuota rendezvous directory %s\n' '${endpointDir}'
       /usr/bin/install -d -m ${hostState.endpointDirectoryMode} \
         -o '${cfg.user}' -g '${cfg.group}' '${endpointDir}'
+      # The host budget file's directory: root-owned 0755, like the rest of
+      # /etc. `runquota config set` writes into it and never creates it.
+      printf 'provisioning RunQuota host configuration directory %s\n' /etc/runquota
+      /usr/bin/install -d -m 0755 -o root -g wheel /etc/runquota
+    ''
+    + lib.optionalString (cfg.hostConfig != null) ''
+      # A changed budget is a RELOAD, never a restart: the running daemon
+      # keeps every session and lease. No daemon answering is not an error.
+      RUNQUOTA_SOCKET='${endpointDir}/${hostState.endpointSocketName}' \
+        '${cfg.package}/bin/runquota' config reload || true
     '';
+
+    # A LINK INTO THE STORE, on purpose: `runquota config set` refuses a
+    # symbolic link, so an operator is told to change the module rather than
+    # having an edit undone by the next activation.
+    environment.etc = lib.mkIf (cfg.hostConfig != null) {
+      ${hostConfigLib.etcName}.text = hostConfigLib.render cfg.hostConfig;
+    };
 
     launchd.daemons.runquotad = {
       script = lib.escapeShellArgs (

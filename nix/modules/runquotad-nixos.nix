@@ -17,6 +17,7 @@
 let
   cfg = config.services.runquotad;
   hostState = import ../host-state.nix;
+  hostConfigLib = import ../host-config.nix { inherit lib; };
   stateDir = hostState.directories.linux;
   # `StateDirectory=` names a path RELATIVE to /var/lib, so the two have to
   # agree. Deriving it rather than writing "runquota" twice keeps a change
@@ -80,6 +81,30 @@ in
       default = [ ];
       description = "Additional arguments passed to `runquotad`.";
     };
+
+    hostConfig = lib.mkOption {
+      type = lib.types.nullOr (hostConfigLib.optionType);
+      default = null;
+      example = lib.literalExpression ''
+        {
+          memoryBytes = 103079215104; # 96 GiB
+          cpuMilli = 16000;
+          pools = { compile = 8; fetch = 2; };
+        }
+      '';
+      description = ''
+        The host budget, written declaratively to
+        `${hostConfigLib.path}` (a link into the store). Every
+        key is optional; an absent one keeps the daemon's built-in
+        default: 75% of physical memory and one core per logical
+        processor. A change is applied by RELOADING the running daemon
+        (`runquota config reload`), not by restarting it, so switching
+        configurations does not drop every build session on the host.
+
+        `null` (the default) writes no file and leaves the directory for
+        `runquota config set` to write into, as root.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -113,7 +138,19 @@ in
     systemd.tmpfiles.rules = [
       "d ${stateDir} ${hostState.mode} ${cfg.user} ${cfg.group} -"
       "d ${endpointDir} ${hostState.endpointDirectoryMode} ${cfg.user} ${cfg.group} -"
+      # THE HOST BUDGET FILE'S DIRECTORY: root-owned 0755, like the rest of
+      # /etc. The daemon reads the file and never writes it; root writes it,
+      # through `hostConfig` below or `runquota config set`, which never
+      # creates the directory itself.
+      "d /etc/runquota 0755 root root -"
     ];
+
+    environment.etc = lib.mkIf (cfg.hostConfig != null) {
+      # A LINK INTO THE STORE, on purpose (no `mode`): `runquota config set`
+      # refuses a symbolic link, so an operator is told to change the module
+      # rather than having an edit silently undone by the next activation.
+      ${hostConfigLib.etcName}.text = hostConfigLib.render cfg.hostConfig;
+    };
 
     systemd.services.runquotad = {
       description = "RunQuota host-wide lease authority";
@@ -143,7 +180,14 @@ in
           ++ cfg.extraArgs
         );
         Restart = "on-failure";
+        # A new budget is a RELOAD: the daemon re-reads its file and keeps
+        # every session and lease (granted leases are never revoked; see
+        # "Changing it under a running daemon" in the host-configuration
+        # spec). A restart would drop every build on the host.
+        ExecReload = "${cfg.package}/bin/runquota config reload";
       };
+      environment.RUNQUOTA_SOCKET = "${endpointDir}/${hostState.endpointSocketName}";
+      reloadTriggers = lib.optional (cfg.hostConfig != null) (hostConfigLib.render cfg.hostConfig);
     };
   };
 }

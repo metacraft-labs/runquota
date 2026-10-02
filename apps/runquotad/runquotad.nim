@@ -1,5 +1,5 @@
 import std/os
-import std/[options, strutils, tables]
+import std/[options, sets, strutils, tables]
 
 import runquota_core
 import runquota_daemon
@@ -21,6 +21,7 @@ proc parseCpuShareGroupSpec(config: var DaemonConfig; spec: string): bool =
     return false
   config.cpuShareGroups[parts[0]] = cpuShareGroup(parts[0], milliCpu(parseUInt(
       parts[1])))
+  config.budgetFlags.cpuShareGroups.incl(parts[0])
   true
 
 proc parseMachineSpec(config: var DaemonConfig; spec: string): bool =
@@ -47,6 +48,7 @@ proc parseMachineSpec(config: var DaemonConfig; spec: string): bool =
     ioSlots,
     group
   )
+  config.budgetFlags.machines = true
   true
 
 const
@@ -134,17 +136,7 @@ when isMainModule:
     quit 0
 
   var config = defaultDaemonConfig(defaultEndpoint())
-  # The host's budget, between the built-in defaults and the flags below, so
-  # that a flag still overrides it for one launch
-  # (reprobuild-specs/RunQuota-Host-Configuration.md). A malformed file stops
-  # the daemon: a budget that is silently half-read looks configured and is
-  # not. A missing file is the ordinary case and changes nothing.
-  try:
-    config.applyHostConfig(readHostConfig())
-  except HostConfigError as err:
-    echo "runquotad: " & err.msg
-    quit 2
-  let usage = "usage: runquotad [--socket PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--log-file PATH]"
+  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--log-file PATH]"
   var i = 0
   while i < args.len:
     case args[i]
@@ -158,15 +150,27 @@ when isMainModule:
       # deterministically onto a named pipe so the matching client agrees.
       config.endpoint = endpointForPath(args[i + 1])
       i += 2
+    of "--host-config":
+      # The host budget file, read at start and on every reload. The default
+      # is the literal `hostConfigPath`; this names another for a test that
+      # must not read -- or reload -- the host's real one.
+      if i + 1 >= args.len:
+        echo usage
+        quit 2
+      config.hostConfigPath = args[i + 1]
+      i += 2
     of "--cpu-milli":
       if i + 1 >= args.len:
         quit 2
-      config.cpuSlots = milliCpu(parseUInt(args[i + 1]))
+      # Recorded as a FLAG rather than written into the budget: the host
+      # file is laid under it below, and a reload re-applies it over the
+      # file (`BudgetFlags`).
+      config.budgetFlags.cpuSlots = some(milliCpu(parseUInt(args[i + 1])))
       i += 2
     of "--memory-bytes":
       if i + 1 >= args.len:
         quit 2
-      config.memoryBytes = bytes(parseUInt(args[i + 1]))
+      config.budgetFlags.memoryBytes = some(bytes(parseUInt(args[i + 1])))
       i += 2
     of "--io-slots":
       if i + 1 >= args.len:
@@ -189,7 +193,7 @@ when isMainModule:
       let parts = args[i + 1].split("=", 1)
       if parts.len != 2:
         quit 2
-      config.namedPoolCaps[parts[0]] = uint32(parseUInt(parts[1]))
+      config.budgetFlags.pools[parts[0]] = uint32(parseUInt(parts[1]))
       i += 2
     of "--memory-pressure-source":
       if i + 1 >= args.len:
@@ -308,6 +312,20 @@ when isMainModule:
     else:
       echo "unknown runquotad argument: " & args[i]
       quit 2
+
+  # The host's budget, between the built-in defaults and the flags, so that
+  # a flag still overrides it for one launch
+  # (reprobuild-specs/RunQuota-Host-Configuration.md). Read after the flags
+  # because one of them (`--host-config`) says where it is. A malformed file
+  # stops the daemon: a budget that is silently half-read looks configured and
+  # is not. A missing file is the ordinary case and changes nothing.
+  try:
+    let host = readHostConfig(config.hostConfigPath)
+    config.resolveBudget(host)
+    config.hostConfigSource = host.sourcePath
+  except HostConfigError as err:
+    echo "runquotad: " & err.msg
+    quit 2
 
   # `serve` reports SERVICE_RUNNING once it is bound and serving, and
   # watches for the SCM's stop; this is the other end of that handshake.

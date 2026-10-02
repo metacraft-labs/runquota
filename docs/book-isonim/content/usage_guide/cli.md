@@ -14,6 +14,11 @@ usage:
   runquota observations --json
   runquota explain SESSION_ID
   runquota daemon start|status
+  runquota config path
+  runquota config show [--file PATH]
+  runquota config set KEY VALUE [--file PATH] [--no-reload]
+  runquota config unset KEY [--file PATH] [--no-reload]
+  runquota config reload
   runquota stats-table [KEY]
   runquota stats capture [--json]
   runquota stats top [KEY] [--limit N] [--all-users] [--all-profiles] [--json]
@@ -44,6 +49,25 @@ The `stats` verbs have a page of their own:
 > `observations`. Without it you fall through to the usage text and a zero exit
 > — which is easy to mistake for "there is nothing to report". These four have
 > no text renderer; the JSON *is* the answer.
+
+## `runquota config`
+
+Reads and changes the host budget file, `runquotad.toml`, and asks the running
+daemon to reload it. `KEY` is `machine.memory_bytes` (the value may carry a
+unit: `96GiB`, `512MiB`, `64GB`), `machine.cpu_milli` or `pools.NAME`.
+
+| Command | What it does | Exit |
+|---|---|---|
+| `config path` | Prints the file's path. | 0 |
+| `config show` | The file's keys, the built-in default for each unset one on this host, and the budget the running daemon enforces, where it came from and which keys its flags pin. | 0; 1 if the file does not parse |
+| `config set KEY VALUE` | Checks the edit with the daemon's reader, writes the file atomically, reloads the daemon. | 0; 1 if refused or the reload failed |
+| `config unset KEY` | The same, removing the key. | as `set` |
+| `config reload` | Asks the daemon to re-read its file. | 0; 1 if the file does not parse |
+
+With no daemon answering, `set` and `unset` still write the file and say the
+next daemon to start will read it. Unrecognised arguments exit **2**. See
+[Running the daemon](/usage_guide/daemon#reloading-under-a-running-daemon) for
+what a reload does to leases.
 
 ## `runquota stats-table [KEY]`
 

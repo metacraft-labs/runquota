@@ -1569,3 +1569,49 @@ proc inspectionStatusJson*(status: DaemonStatusMessage): string =
     "\"total_granted\":" & $status.totalGranted & "," &
     "\"total_finished\":" & $status.totalFinished &
   "}"
+
+proc encodeHostConfigReloaded*(msg: HostConfigReloadedMessage): string =
+  var w = writer()
+  w.writeString(msg.configPath)
+  w.writeString(msg.sourcePath)
+  w.writeU64(msg.memoryBytes)
+  w.writeU32(msg.cpuMilli)
+  w.writeU32(uint32(msg.pools.len))
+  for pool in msg.pools:
+    w.writeString(pool.name)
+    w.writeU32(pool.units)
+  w.writeU32(uint32(msg.pinnedByFlags.len))
+  for key in msg.pinnedByFlags:
+    w.writeString(key)
+  w.writeU32(msg.promotedLeases)
+  w.writeU64(msg.memoryInUse)
+  w.writeU32(msg.cpuInUse)
+  w.data
+
+proc decodeHostConfigReloaded*(payload: string;
+    msg: var HostConfigReloadedMessage): bool =
+  var r = reader(payload)
+  var decoded: HostConfigReloadedMessage
+  if not r.readString(decoded.configPath): return false
+  if not r.readString(decoded.sourcePath): return false
+  if not r.readU64(decoded.memoryBytes): return false
+  if not r.readU32(decoded.cpuMilli): return false
+  var poolCount: uint32
+  if not r.readU32(poolCount): return false
+  for _ in 0'u32 ..< poolCount:
+    var pool: NamedPoolCapWire
+    if not r.readString(pool.name): return false
+    if not r.readU32(pool.units): return false
+    decoded.pools.add(pool)
+  var pinnedCount: uint32
+  if not r.readU32(pinnedCount): return false
+  for _ in 0'u32 ..< pinnedCount:
+    var key: string
+    if not r.readString(key): return false
+    decoded.pinnedByFlags.add(key)
+  if not r.readU32(decoded.promotedLeases): return false
+  if not r.readU64(decoded.memoryInUse): return false
+  if not r.readU32(decoded.cpuInUse): return false
+  if r.remaining != 0: return false
+  msg = decoded
+  true

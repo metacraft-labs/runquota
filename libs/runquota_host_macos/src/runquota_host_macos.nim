@@ -66,3 +66,21 @@ proc sampleMacosMemoryPressure*(required = false): HostMemoryPressureSample =
 
 proc sampleMacosProcessTreeTelemetry*(rootProcessId: uint64): HostProcessTreeTelemetrySample =
   sampleMacosProcessTreeTelemetryNative(rootProcessId)
+
+when defined(macosx):
+  proc sysctlbyname(name: cstring; oldp: pointer; oldlenp: ptr csize_t;
+                    newp: pointer; newlen: csize_t): cint
+    {.importc: "sysctlbyname", header: "<sys/sysctl.h>".}
+
+  proc totalMemory*(): uint64 =
+    ## Physical memory, from `hw.memsize`; 0 when it cannot be read. The same
+    ## name and contract as `runquota_host_linux.totalMemory` and
+    ## `runquota_host_windows.totalMemory`, so a caller picks the backend by
+    ## platform and nothing else.
+    var value: uint64 = 0
+    var size = csize_t(sizeof(value))
+    if sysctlbyname("hw.memsize", addr value, addr size, nil, 0) != 0:
+      return 0'u64
+    value
+else:
+  proc totalMemory*(): uint64 = 0'u64

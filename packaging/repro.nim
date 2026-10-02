@@ -94,6 +94,16 @@ proc runQuotaComponents(targetOs: TargetOs): seq[DistComponent] =
     executableComponent(PrebuiltBin & "/runquotad" & sfx)
   ]
   result.add(component(crDataFile, PrebuiltShare & "/LICENSE"))
+  # THE HOST BUDGET FILE, seeded where the daemon reads it. On POSIX it is
+  # a conffile at `/etc/runquota/runquotad.toml` (`crConfigFile` escapes
+  # the prefix to `/etc`), so dpkg and rpm create `/etc/runquota` root-owned
+  # 0755 and keep an operator's edit across upgrades. On Windows the MSI
+  # seeds it into `C:\ProgramData\runquota` instead, through the
+  # distribution's host directory (`runQuotaHostDirectories`): a component
+  # under the prefix would land in Program Files, where nothing reads it.
+  if targetOs != toWindows:
+    result.add(component(crConfigFile, HostConfigTemplatePath,
+      subdir = "runquota", installName = HostConfigFileName))
 
 package `runquota-packages`:
   config:

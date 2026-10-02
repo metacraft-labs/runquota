@@ -440,9 +440,13 @@ The flake ships the install step:
 - `nixosModules.runquotad` — a systemd unit plus `StateDirectory=runquota`,
   `RuntimeDirectory=runquota` and two `systemd.tmpfiles` rules, so
   `/var/lib/runquota` and `/run/runquota` both exist with the right owner,
-  group and mode from activation onwards.
+  group and mode from activation onwards. A third rule creates
+  `/etc/runquota` (`root`, `0755`); `services.runquotad.hostConfig` renders
+  the host budget file into it as a store link, and a changed budget reloads
+  the unit (`ExecReload`, `runquota config reload`) instead of restarting it.
 - `darwinModules.runquotad` — a launchd daemon plus an activation script that
-  `install -d`s `/var/db/runquota` and `/var/run/runquota`.
+  `install -d`s `/var/db/runquota`, `/var/run/runquota` and `/etc/runquota`,
+  renders `hostConfig` the same way, and asks a running daemon to reload.
 
 Both modules are **evaluated** by `checks.module-eval` in `flake.nix`, which
 puts each through its real module system — nix-darwin is reached transitively
@@ -476,13 +480,36 @@ sudo mkdir -p /run/runquota && sudo chown "$(id -u)":runquota /run/runquota && s
 
 On Windows there is only the state directory -- the endpoint is a named pipe,
 which lives in the kernel object namespace and needs no directory. **The MSI
-does not create it**: reprobuild's packaging layer places every Windows
-component under the install prefix and its MSI producer emits no
-`CreateFolder`, so the package cannot express `C:\ProgramData\runquota` (a gap
-recorded in `codetracer-specs/runbooks/packaging/runquota.md`). Create it once,
-from an elevated `cmd.exe`, as the account `runquotad` will run as -- or, for
-the shipped service, which runs as SYSTEM, from any elevated `cmd.exe`: the
-first two grants already cover SYSTEM, and the third then only adds you:
+creates it** (2026-09-30): reprobuild's packaging layer gained a
+`HostDirectory` (`repro_dsl_stdlib/packaging`), which the MSI producer renders
+as a `CreateFolder` under `CommonAppDataFolder` with a `PermissionEx Sddl`
+(`MsiLockPermissionsEx`, Windows Installer 5.0), and
+`packaging/runquota_dist.nim` declares `C:\ProgramData\runquota` with
+`WindowsStateDirSddl`:
+
+```text
+D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)
+```
+
+-- protected (nothing inherited from `C:\ProgramData`), full control for
+SYSTEM and Administrators, read and traverse for every user: the same access
+the command below gives, minus the operator's own account, which the service
+(SYSTEM) does not need. The directory is owned by the installer's account
+(SYSTEM or Administrators), which the check accepts, and it is `Permanent`:
+an uninstall leaves it and its contents. `tests/unit/t_host_state_directory_rules`
+applies that SDDL to a real directory and asserts the daemon's check accepts
+it. The MSI also seeds the host budget file there, once; see "The host budget
+file" below. The authoring is unit-tested in reprobuild's
+`t_packaging_msi_authoring`. A sample package using it was built with the
+pinned WiX 3.14, and its `MsiLockPermissionsEx`, `CreateFolder` and
+`Component` rows were read back (Permanent; NeverOverwrite on the seed).
+RunQuota's own MSI has not yet been built or installed with it.
+
+On a host that got RunQuota some other way -- a hand-built binary, Scoop, which
+installs unelevated and cannot create it -- create it once, from an elevated
+`cmd.exe`, as the account `runquotad` will run as -- or, for the shipped
+service, which runs as SYSTEM, from any elevated `cmd.exe`: the first two
+grants already cover SYSTEM, and the third then only adds you:
 
 ```bat
 mkdir "C:\ProgramData\runquota" && icacls "C:\ProgramData\runquota" /reset && icacls "C:\ProgramData\runquota" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "%USERDOMAIN%\%USERNAME%:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"
@@ -510,6 +537,27 @@ filled in, so an operator who hits it does not have to come back here.
 `--host-identity-file PATH` overrides the location for a test or an unusual
 host. It does not change the rule: the directory containing `PATH` must exist
 before the daemon starts.
+
+### The host budget file
+
+The daemon's budget is read from `runquotad.toml`
+(`reprobuild-specs/RunQuota-Host-Configuration.md`). On Windows it lives in the
+state directory above; on POSIX it is configuration, not state, and lives in
+`/etc`:
+
+| Platform | File | Directory owner, mode | Provisioned by |
+|----------|------|-----------------------|----------------|
+| Windows | `C:\ProgramData\runquota\runquotad.toml` | the state directory's DACL, inherited | the MSI: seeded once, `NeverOverwrite`, `Permanent` |
+| Linux | `/etc/runquota/runquotad.toml` | `root`, `0755`; file `0644` | the deb/rpm/Arch package, as a conffile / `%config(noreplace)`; the NixOS module (`hostConfig`, or an empty directory) |
+| macOS | `/etc/runquota/runquotad.toml` | `root:wheel`, `0755` | the nix-darwin module |
+
+The seeded file is `packaging/etc/runquotad.toml`, byte for byte the daemon's
+`HostConfigTemplate`, with every key commented out: installing it changes no
+budget. The daemon reads the file and never writes or creates it. `runquota
+config set` writes it -- atomically, validated by the daemon's reader, never
+creating the directory -- and needs the rights its directory grants: an
+elevated prompt on Windows, root elsewhere. The daemon's account only reads it,
+and a budget is not a secret, so the file is world-readable.
 
 ## Capture is on without any flag
 

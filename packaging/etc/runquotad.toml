@@ -1,0 +1,17 @@
+# RunQuota host budget. One file per host: every workspace and every user on
+# this machine shares the one runquotad that reads it.
+#
+# Every key is optional; an absent key keeps the built-in default. A runquotad
+# flag (--memory-bytes, --cpu-milli, --pool) overrides the file for that launch.
+# Change it with `runquota config set KEY VALUE` (or `unset KEY`), which checks
+# the result with the daemon's own reader, writes it atomically and asks the
+# running daemon to reload it. After editing by hand, run `runquota config
+# reload`. See reprobuild-specs/RunQuota-Host-Configuration.md.
+schema = "runquota.host-config.v1"
+
+[machine]
+# memory_bytes = 103_079_215_104   # default: 75% of physical memory
+# cpu_milli    = 16000             # default: logical processors x 1000
+
+[pools]
+# compile = 8
