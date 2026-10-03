@@ -132,3 +132,30 @@ Observation Store §ambient_samples supports budgeting waits against monotonic
 deadlines. Investigate this separately from SQLite publication; do not identify
 it as the CI cause without evidence, change the test window, lower the minimum
 count, invent readings or manufacture timestamps to fill missed intervals.
+
+## Reproduced macOS background timer coalescing and repair design
+
+At `f094336` on this Mac, launching the existing contention binary with
+`/usr/sbin/taskpolicy -b` reproduces both count failures: six ticks in 1.323
+and 1.365 seconds. Actual host reads take only 0.248 and 0.353 milliseconds
+across those windows. A native timer probe under the same policy takes 4.879
+seconds for twenty 50-ms `nanosleep` calls, versus 1.005 seconds for twenty
+50-ms `EVFILT_TIMER` waits with `NOTE_CRITICAL`. This establishes a local
+background timer-coalescing problem; the CI runner's process policy is not yet
+measured, so the original CI cause remains provisional.
+
+Repair within the fixed-cadence contract and authorized LOCAL-4 follow-up:
+
+- On macOS use one periodic kqueue timer per sampler, with the requested
+  interval and `NOTE_CRITICAL`. This limits timer coalescing without raising
+  the sampler's CPU scheduling priority. Keep the existing waits on other OSes.
+- Close the timer at thread exit and prevent its descriptor from crossing exec.
+  An unavailable timer falls back to the current sleep and reports the fallback
+  count; it must not spin, fabricate ticks or stop reading host counters silently.
+- One delivered timer event triggers one actual read, even when the kernel
+  reports multiple elapsed periods. Keep real timestamps and all stale/loss
+  handling, lease gates, SQLite queue limits and test assertions unchanged.
+- Add a real child running under macOS background policy. Verify actual sampler
+  ticks while SQLite holds its lock, plus descriptor cleanup and failure-path
+  behavior where practical. The original coalesced sleep must fail the control.
+  Run native debug, optimized and Reprobuild suites before promotion.
