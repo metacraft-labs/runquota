@@ -5,9 +5,25 @@
 ## the transaction. We require an in-flight publication, continued actual
 ## host reads, bounded overflow, complete shutdown draining, and counted
 ## foreign-key rejection. No mocks or synthetic host readings are used.
+## On macOS a real child repeats these controls under background process
+## policy, which coalesces ordinary sleeps and previously starved the sampler.
 
-import std/[monotimes, os, osproc, streams, strutils, tempfiles, times, unittest]
+import std/[monotimes, os, osproc, streams, strtabs, strutils, tempfiles, times, unittest]
 import runquota_observation_store
+
+when defined(macosx):
+  import std/posix
+  import runquota_observation_store/ambient_cadence
+  let
+    prioDarwinProcess {.importc: "PRIO_DARWIN_PROCESS",
+      header: "<sys/resource.h>", nodecl.}: cint
+    prioDarwinBackground {.importc: "PRIO_DARWIN_BG",
+      header: "<sys/resource.h>", nodecl.}: cint
+  proc setPriority(which, who, priority: cint): cint
+    {.importc: "setpriority", header: "<sys/resource.h>".}
+  let backgroundChild = getEnv("RUNQUOTA_TEST_BACKGROUND_CADENCE") == "1"
+  if backgroundChild:
+    doAssert setPriority(prioDarwinProcess, 0, prioDarwinBackground) == 0
 
 proc waitFor(predicate: proc(): bool {.closure.}; millis = 3500): bool =
   let start = getMonoTime()
@@ -66,11 +82,15 @@ suite "ambient writer contention":
       # synchronous flush records zero ticks during the locked transaction.
       let ticksWhileBlocked = ambientSamplerTicks() - before
       let timingAfter = ambientSamplerTiming()
+      let windowMillis = (getMonoTime() - windowStarted).inMilliseconds
       echo "  capacity=", capacity, " ticksDuringBlockedFlush=", ticksWhileBlocked,
-        " windowMillis=", (getMonoTime() - windowStarted).inMilliseconds,
+        " windowMillis=", windowMillis,
         " hostReadNanos=", timingAfter.hostReadNanos - timingBefore.hostReadNanos,
-        " maxHostReadNanos=", timingAfter.maxHostReadNanos
+        " maxHostReadNanos=", timingAfter.maxHostReadNanos,
+        " timerFallbacks=", timingAfter.timerFallbacks
       check ticksWhileBlocked >= 10
+      check ticksWhileBlocked <= windowMillis div 50 + 2
+      check timingAfter.timerFallbacks == 0
       check ambientSamplerTiming().flushes == 0
       if capacity == 1:
         require waitFor(proc(): bool = ambientSamplesDropped() > 0, 2300)
@@ -107,3 +127,44 @@ suite "ambient writer contention":
     check ambientSamplesTaken() == ambientSamplesDropped()
     check store.readAmbientSamples().len == 0
     check ambientSamplerTiming().flushesStarted == ambientSamplerTiming().flushes
+
+when defined(macosx):
+  if not backgroundChild:
+    suite "macOS ambient timer lifecycle":
+      test "background scheduling preserves real samples during SQLite contention":
+        var childEnv = newStringTable(modeCaseSensitive)
+        for key, value in envPairs():
+          childEnv[key] = value
+        childEnv["RUNQUOTA_TEST_BACKGROUND_CADENCE"] = "1"
+        let child = startProcess(getAppFilename(),
+          env = childEnv, options = {poStdErrToStdOut})
+        defer: child.close()
+        let code = child.waitForExit(15000)
+        if code == -1:
+          child.kill()
+          discard child.waitForExit()
+        let output = child.outputStream.readAll()
+        echo output
+        check code == 0
+        check output.count("[OK]") == 3
+
+      test "closed timer falls back to sleep and repeated close releases descriptors":
+        proc descriptorCount(): int =
+          let dir = opendir("/dev/fd")
+          doAssert dir != nil
+          defer: discard closedir(dir)
+          while true:
+            let entry = readdir(dir)
+            if entry == nil: break
+            if $cast[cstring](addr entry.d_name[0]) notin [".", ".."]:
+              inc result
+        let before = descriptorCount()
+        var timer = openAmbientCadence(50)
+        require descriptorCount() == before + 1
+        require waitAmbientCadence(timer)
+        closeAmbientCadence(timer)
+        closeAmbientCadence(timer)
+        check descriptorCount() == before
+        let started = getMonoTime()
+        check not waitAmbientCadence(timer)
+        check (getMonoTime() - started).inMilliseconds >= 50

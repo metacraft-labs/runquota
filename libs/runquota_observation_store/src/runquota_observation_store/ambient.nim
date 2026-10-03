@@ -44,7 +44,7 @@
 
 import std/[locks, math, monotimes, os, strutils, times]
 
-import ./ids, ./store, ./types
+import ./ambient_cadence, ./ids, ./store, ./types
 import runquota_core/process_owned
 
 const
@@ -64,6 +64,8 @@ type
     ## these are not used to change cadence, timestamps or sample selection.
     hostReads*, hostReadNanos*, maxHostReadNanos*: int64
     flushesStarted*, flushes*, flushNanos*, maxFlushNanos*: int64
+    timerFallbacks*: int64
+      ## macOS timer failures that used an ordinary sleep instead.
 
   HostLoadReading* = object
     ## Host-wide totals, and nothing else.
@@ -1067,21 +1069,30 @@ proc samplerWriterMain() {.thread.} =
 proc samplerMain() {.thread.} =
   var previous = HostLoadReading(available: false)
   var sinceFlush = 0
+  var interval = 0
+  {.cast(gcsafe).}:
+    acquire(samplerLock)
+    interval = samplerCadenceMillis
+    release(samplerLock)
+  var timer = openAmbientCadence(interval)
+  defer: closeAmbientCadence(timer)
   while true:
-    var cadence = 0
     var flushEvery = 0
     var shouldStop = false
     {.cast(gcsafe).}:
       acquire(samplerLock)
       try:
-        cadence = samplerCadenceMillis
         flushEvery = samplerFlushSamples
         shouldStop = samplerStop
       finally:
         release(samplerLock)
     if shouldStop:
       break
-    sleep(cadence)
+    if not waitAmbientCadence(timer):
+      {.cast(gcsafe).}:
+        acquire(samplerLock)
+        inc samplerTiming.timerFallbacks
+        release(samplerLock)
     takeAmbientSample(previous)
     sinceFlush += 1
     if sinceFlush >= flushEvery:

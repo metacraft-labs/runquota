@@ -159,3 +159,25 @@ Repair within the fixed-cadence contract and authorized LOCAL-4 follow-up:
   ticks while SQLite holds its lock, plus descriptor cleanup and failure-path
   behavior where practical. The original coalesced sleep must fail the control.
   Run native debug, optimized and Reprobuild suites before promotion.
+
+## Local qualification of macOS cadence repair
+
+At `c11043a0e07a4407ba86eacf9a1b20b13f669e7d` plus the timer repair,
+`just lint`, `just test` and `just test-release` pass on macOS ARM64. Both
+native modes run all 104 programs: 524 distinct passing cases plus three
+repeated real-background-policy controls (527 passing result lines), with the
+same existing Windows-only case skip. Both static-helper gates pass.
+
+The repaired contention cases take 24 ticks in a normal 1.21-second window
+and 27 ticks in a background-policy 1.40-second window. Restoring ordinary
+sleep causes the actual background child to report six ticks and fail both
+original minimum-count assertions; the parent also requires all three child
+cases to execute and succeed. The mutation was restored. Timer descriptor
+cleanup and an actual closed-timer sleep fallback are covered. A new upper
+count bound rejects a timer running faster than its configured cadence.
+Windows C generation succeeds; Windows native qualification remains pending.
+
+The separate Reprobuild macOS job at `0d4c8cd8` also fails the unmodified
+contention minimum: capacity 128 records nine ticks, capacity one ten. Log
+`111202120133` in run `37122709601` contains that evidence. The new periodic
+timer still needs native CI qualification at its committed source.
