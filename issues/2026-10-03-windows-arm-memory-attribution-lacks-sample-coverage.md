@@ -20,7 +20,7 @@ this test program pass. No root cause is established from this log alone.
 
 ## Expected and investigation
 
-[Observation Store / ambient_samples](../../reprobuild-specs/RunQuota-Observation-Store.md#ambient_samples)
+[Observation Store / ambient_samples](../../reprobuild-specs/spec/RunQuota-Observation-Store.md#ambient_samples)
 requires sampled host usage and its attribution. This real-load fixture must
 first collect enough observations of both allocation states for its estimator.
 The existing count and majority requirements remain enforced.
@@ -44,3 +44,21 @@ mainline. Searched open records and deleted issue history for `fullRows.len`,
 `paired.len * 2`, memory-cycle coverage and the observed sample counts.
 No existing issue records this Windows ARM64 failure. The local retained
 CI log is `/tmp/runquota-011-windows-arm-failure.log`.
+
+## Portable diagnostics prepared on macOS
+
+The sampler now exposes monotonic counts, total time and maximum time for its
+actual host-counter reads and database flushes. The existing memory control
+prints that snapshot, sampler outcome counts, all nine allocation-window bounds
+and every persisted sample timestamp. New checks connect the timing counters to
+real sampling and publication. Allocation size, all observation/settling waits,
+sample selection, minimum counts, majority and ratio assertions are unchanged.
+
+At `11cc0aa702ebf6435a15fbe5949b20e4b1b724d3` plus this diagnostics patch, the
+focused macOS ARM64 memory test passes with 195 sampler reads, 160 persisted
+samples, 22 empty-window and 26 full-window rows, and nine valid pairs. Maximum
+host read is 65,709 ns; maximum flush is 33,792,958 ns. This qualifies the
+diagnostics on macOS, not the Windows sampler or the cause of its missing rows.
+
+The next Windows ARM64 run must use these diagnostics with the original gates.
+This issue remains open until that run establishes the required coverage.
