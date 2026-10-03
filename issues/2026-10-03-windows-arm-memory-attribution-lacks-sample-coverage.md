@@ -109,3 +109,26 @@ C generation succeeds; native Windows runtime qualification remains required.
 The new timing test joins the existing serialized measurement group in the
 Reprobuild graph so concurrent load generators cannot invalidate its control.
 No existing sampling window, cadence, sample-count or ratio requirement changes.
+
+## macOS contention control needs timing attribution
+
+At `0d4c8cd810c9aeb0d217c63d7c515c31eabb5ece`, native macOS job
+[111201933293](https://github.com/metacraft-labs/runquota/actions/runs/37122709511/job/111201933293)
+runs all 104 programs and fails the new capacity-one contention case: nine
+sampler ticks in its 1.2-second window, below the unchanged minimum of ten.
+Capacity 128 records thirteen ticks and passes. Publication remains blocked.
+The existing memory-attribution cases pass. Linux x64 and ARM64 native suites
+pass at the same source.
+
+The contention control now prints the actual monotonic window length, host-read
+time during that window and maximum host-read time. At `0d4c8cd8` plus this
+instrumentation, five local macOS runs pass all three cases, recording 20–21
+ticks per contention window. Host reads occupy about 1–2 milliseconds in each
+window. This does not establish why the CI runner sampled more slowly.
+
+The sampler currently sleeps a full cadence after each iteration, so host-read,
+formatting and scheduler delays accumulate. The fixed-cadence requirement in
+Observation Store §ambient_samples supports budgeting waits against monotonic
+deadlines. Investigate this separately from SQLite publication; do not identify
+it as the CI cause without evidence, change the test window, lower the minimum
+count, invent readings or manufacture timestamps to fill missed intervals.

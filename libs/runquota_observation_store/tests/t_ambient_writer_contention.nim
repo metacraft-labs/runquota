@@ -59,11 +59,17 @@ suite "ambient writer contention":
       require waitFor(proc(): bool = ambientSamplerTiming().flushesStarted > 0)
       require ambientSamplerTiming().flushes == 0
       let before = ambientSamplerTicks()
+      let timingBefore = ambientSamplerTiming()
+      let windowStarted = getMonoTime()
       sleep(1200)
       # At 50 ms this allows ordinary scheduler jitter, while the original
       # synchronous flush records zero ticks during the locked transaction.
       let ticksWhileBlocked = ambientSamplerTicks() - before
-      echo "  capacity=", capacity, " ticksDuringBlockedFlush=", ticksWhileBlocked
+      let timingAfter = ambientSamplerTiming()
+      echo "  capacity=", capacity, " ticksDuringBlockedFlush=", ticksWhileBlocked,
+        " windowMillis=", (getMonoTime() - windowStarted).inMilliseconds,
+        " hostReadNanos=", timingAfter.hostReadNanos - timingBefore.hostReadNanos,
+        " maxHostReadNanos=", timingAfter.maxHostReadNanos
       check ticksWhileBlocked >= 10
       check ambientSamplerTiming().flushes == 0
       if capacity == 1:
