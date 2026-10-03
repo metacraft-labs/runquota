@@ -37,15 +37,15 @@
 ## ambient growth by build activity. ``setAmbientLiveLeaseCount`` is how
 ## the lease authority publishes it.
 ##
-## PLATFORM STATUS. macOS/arm64 is the only platform this has been run on.
-## The Linux branch is written from ``/proc`` semantics and HAS NEVER
-## EXECUTED. Every other platform reports unavailable, and an unavailable
-## reading writes no row at all: a row of zeros would be indistinguishable
-## from a measured idle machine.
+## Host counter readers are implemented for macOS, Linux and Windows.
+## An unavailable reading writes no row: zeros would be indistinguishable
+## from a measured idle machine. Database publication runs on a separate
+## worker so a slow SQLite operation cannot suspend those readings.
 
-import std/[locks, math, os, strutils]
+import std/[locks, math, monotimes, os, strutils, times]
 
-import ./ids, ./store, ./types
+import ./ambient_cadence, ./ids, ./store, ./types
+import runquota_core/process_owned
 
 const
   ioQueueDepthUnmeasured* = -1.0
@@ -58,6 +58,15 @@ const
     ## cost on the hot path the specification forbids.
 
 type
+  AmbientSamplerTiming* = object
+    ## Diagnostic totals for the actual sampler's blocking work. Monotonic
+    ## durations distinguish slow host reads from slow store publication;
+    ## these are not used to change cadence, timestamps or sample selection.
+    hostReads*, hostReadNanos*, maxHostReadNanos*: int64
+    flushesStarted*, flushes*, flushNanos*, maxFlushNanos*: int64
+    timerFallbacks*: int64
+      ## macOS timer failures that used an ordinary sleep instead.
+
   HostLoadReading* = object
     ## Host-wide totals, and nothing else.
     ##
@@ -535,19 +544,21 @@ const
 var
   samplerLock: Lock
   samplerThread: Thread[void]
+  samplerWriterThread: Thread[void]
+  samplerWriterWake: Cond
+  samplerFlushRequested = false
+  samplerWriterStop = false
   samplerPath = ""
   samplerHostId = ""
   samplerCadenceMillis = defaultAmbientCadenceMillis
   samplerFlushSamples = defaultAmbientFlushSamples
   samplerCapacity = 0
-  samplerQueue: seq[AmbientSampleRow] = @[]
-    ## Grown and emptied ONLY on the sampler thread -- `takeAmbientSample`
-    ## appends and `flushAmbientQueue` drains, and both run there. That is
-    ## what keeps it an ordinary `seq` while the live report set below cannot
-    ## be one: `startAmbientSampler` resets it from another thread, and the
-    ## reset is safe only because `samplerMain` ends with a flush that leaves
-    ## the payload empty. See the note above `reportSlots`.
+  samplerQueue: OwnedStrings
+    ## Process-owned SQL bytes cross the sampler/writer thread boundary.
+    ## Neither thread frees payload allocated in the other's ORC region;
+    ## the writer can safely drain after the sampler has been joined.
   samplerTicks = 0'i64
+  samplerTiming: AmbientSamplerTiming
   samplerTaken = 0'i64
   samplerWritten = 0'i64
   samplerDropped = 0'i64
@@ -573,6 +584,7 @@ var
 # ``reportSelfExecution`` -- and several workers can arrive together. Module
 # initialisation runs inside ``NimMain``, before any thread exists.
 initLock(samplerLock)
+initCond(samplerWriterWake)
 
 # ---------------------------------------------------------------------------
 # The live self-report set, and why it is not a `seq`
@@ -868,21 +880,26 @@ proc clearSelfReportedExecutions*() =
 
 proc flushAmbientQueue() {.gcsafe.} =
   {.cast(gcsafe).}:
-    var rows: seq[AmbientSampleRow] = @[]
+    var rows: seq[string] = @[]
     var path = ""
     acquire(samplerLock)
     try:
       path = samplerPath
       if samplerQueue.len > 0:
-        rows = samplerQueue
-        samplerQueue = @[]
+        rows = samplerQueue.takeAll()
+        inc samplerTiming.flushesStarted
     finally:
       release(samplerLock)
     if path.len == 0 or rows.len == 0:
       return
-    let outcome = appendAmbientSamplesAt(path, rows)
+    let flushStarted = getMonoTime()
+    let outcome = appendStatementsAt(path, rows)
+    let flushNanos = (getMonoTime() - flushStarted).inNanoseconds
     acquire(samplerLock)
     try:
+      inc samplerTiming.flushes
+      samplerTiming.flushNanos += flushNanos
+      samplerTiming.maxFlushNanos = max(samplerTiming.maxFlushNanos, flushNanos)
       if outcome.ok:
         samplerWritten += int64(rows.len)
       else:
@@ -908,15 +925,21 @@ proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
     #
     # A row's `sampled_at_unix_millis` therefore now denotes the instant at
     # which BOTH the kernel counters and the live self-reports were read.
-    # `readHostLoad` is syscalls only (mach counters on macOS, `/proc` on
-    # Linux); it spawns nothing and takes no lock of its own, so holding
-    # `samplerLock` across it costs a few microseconds and cannot deadlock.
+    # `readHostLoad` spawns nothing (mach counters on macOS, `/proc` on
+    # Linux, system counters and serialized PDH collection on Windows).
+    # Its elapsed time is measured separately from store publication below;
+    # the Windows read need not have the cost of the macOS/Linux path.
     var current: HostLoadReading
     var reports: seq[SelfReport]
     acquire(samplerLock)
     try:
       samplerTicks += 1
+      let readStarted = getMonoTime()
       current = readHostLoad()
+      let readNanos = (getMonoTime() - readStarted).inNanoseconds
+      inc samplerTiming.hostReads
+      samplerTiming.hostReadNanos += readNanos
+      samplerTiming.maxHostReadNanos = max(samplerTiming.maxHostReadNanos, readNanos)
       reports = snapshotSelfReports()
     finally:
       release(samplerLock)
@@ -1014,7 +1037,8 @@ proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
         if samplerQueue.len >= samplerCapacity:
           samplerDropped += 1
         else:
-          samplerQueue.add(row)
+          if not samplerQueue.add(ambientInsertStatement(row)):
+            samplerDropped += 1
     finally:
       release(samplerLock)
     if collided:
@@ -1024,30 +1048,62 @@ proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
       return
     previous = current
 
+proc samplerWriterMain() {.thread.} =
+  # SQLite can wait for another writer or a slow process launch. Only this
+  # worker waits for it; the sampler continues taking real host readings.
+  while true:
+    var stopping = false
+    {.cast(gcsafe).}:
+      acquire(samplerLock)
+      try:
+        while not samplerFlushRequested and not samplerWriterStop:
+          wait(samplerWriterWake, samplerLock)
+        stopping = samplerWriterStop
+        samplerFlushRequested = false
+      finally:
+        release(samplerLock)
+    flushAmbientQueue()
+    if stopping:
+      break
+
 proc samplerMain() {.thread.} =
   var previous = HostLoadReading(available: false)
   var sinceFlush = 0
+  var interval = 0
+  {.cast(gcsafe).}:
+    acquire(samplerLock)
+    interval = samplerCadenceMillis
+    release(samplerLock)
+  var timer = openAmbientCadence(interval)
+  defer: closeAmbientCadence(timer)
   while true:
-    var cadence = 0
     var flushEvery = 0
     var shouldStop = false
     {.cast(gcsafe).}:
       acquire(samplerLock)
       try:
-        cadence = samplerCadenceMillis
         flushEvery = samplerFlushSamples
         shouldStop = samplerStop
       finally:
         release(samplerLock)
     if shouldStop:
       break
-    sleep(cadence)
+    if not waitAmbientCadence(timer):
+      {.cast(gcsafe).}:
+        acquire(samplerLock)
+        inc samplerTiming.timerFallbacks
+        release(samplerLock)
     takeAmbientSample(previous)
     sinceFlush += 1
     if sinceFlush >= flushEvery:
       sinceFlush = 0
-      flushAmbientQueue()
-  flushAmbientQueue()
+      {.cast(gcsafe).}:
+        acquire(samplerLock)
+        try:
+          samplerFlushRequested = true
+          signal(samplerWriterWake)
+        finally:
+          release(samplerLock)
 
 proc startAmbientSampler*(path, hostId: string;
                           cadenceMillis = defaultAmbientCadenceMillis;
@@ -1065,9 +1121,12 @@ proc startAmbientSampler*(path, hostId: string;
     samplerCadenceMillis = max(1, cadenceMillis)
     samplerFlushSamples = max(1, flushSamples)
     samplerCapacity = max(1, capacity)
-    samplerQueue = @[]
+    samplerQueue.clear()
+    samplerFlushRequested = false
+    samplerWriterStop = false
     clearSelfReportSlots()
     samplerTicks = 0
+    samplerTiming = AmbientSamplerTiming()
     samplerTaken = 0
     samplerWritten = 0
     samplerDropped = 0
@@ -1090,7 +1149,24 @@ proc startAmbientSampler*(path, hostId: string;
     samplerActive = true
   finally:
     release(samplerLock)
-  createThread(samplerThread, samplerMain)
+  var writerStarted = false
+  try:
+    createThread(samplerWriterThread, samplerWriterMain)
+    writerStarted = true
+    createThread(samplerThread, samplerMain)
+  except CatchableError:
+    acquire(samplerLock)
+    samplerWriterStop = true
+    signal(samplerWriterWake)
+    release(samplerLock)
+    if writerStarted:
+      joinThread(samplerWriterThread)
+    acquire(samplerLock)
+    samplerActive = false
+    samplerPath = ""
+    samplerHostId = ""
+    release(samplerLock)
+    raise
 
 proc ambientSamplerActive*(): bool =
   acquire(samplerLock)
@@ -1105,6 +1181,15 @@ proc ambientSamplerTicks*(): int64 =
   acquire(samplerLock)
   try:
     samplerTicks
+  finally:
+    release(samplerLock)
+
+proc ambientSamplerTiming*(): AmbientSamplerTiming =
+  ## A consistent POD snapshot, valid after stop as well as while running.
+  ## Reset on the next start alongside the existing tick/failure counters.
+  acquire(samplerLock)
+  try:
+    samplerTiming
   finally:
     release(samplerLock)
 
@@ -1184,7 +1269,7 @@ proc ambientReadingsUnavailable*(): int64 =
     release(samplerLock)
 
 proc stopAmbientSampler*() =
-  ## Flushes what is queued and joins the sampler thread.
+  ## Join the sampler, then settle its final batch before joining the writer.
   var running = false
   acquire(samplerLock)
   try:
@@ -1195,6 +1280,13 @@ proc stopAmbientSampler*() =
   if not running:
     return
   joinThread(samplerThread)
+  acquire(samplerLock)
+  try:
+    samplerWriterStop = true
+    signal(samplerWriterWake)
+  finally:
+    release(samplerLock)
+  joinThread(samplerWriterThread)
   acquire(samplerLock)
   try:
     samplerActive = false

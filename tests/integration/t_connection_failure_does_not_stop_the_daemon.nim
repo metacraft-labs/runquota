@@ -36,6 +36,7 @@ import std/[envvars, json, os, osproc, streams, strtabs, strutils, unittest]
 
 when defined(windows):
   import std/[oserrors, winlean]
+  import windows_handle_snapshot
 else:
   import std/[nativesockets, posix]
 
@@ -97,6 +98,10 @@ when defined(windows):
     {.stdcall, dynlib: "kernel32.dll", importc: "CreateFileW".}
   proc getProcessHandleCount(process: Handle; count: ptr int32): WINBOOL
     {.stdcall, dynlib: "kernel32.dll", importc: "GetProcessHandleCount".}
+
+  proc createEventW(attributes: pointer; manualReset, initialState: WINBOOL;
+                    name: WideCString): Handle
+    {.stdcall, dynlib: "kernel32.dll", importc: "CreateEventW".}
 
   proc connectThenCloseWithoutHello(socketPath: string) =
     ## The same abuse over the transport Windows serves: open the daemon's
@@ -225,6 +230,19 @@ proc waitForSteadyState(socketPath: string) =
 
 suite "connection_failure_does_not_stop_the_daemon":
 
+  when defined(windows):
+    test "handle diagnostics see a real event and its closure":
+      let root = scratchRoot("handle-snapshot")
+      defer: removeScratchRoot(root)
+      let name = "rq-handle-control-" & $getCurrentProcessId()
+      let event = createEventW(nil, 1, 0, newWideCString(name))
+      require event != 0
+      let before = captureWindowsHandles(getCurrentProcessId(), root / "open.txt")
+      check name in before
+      require closeHandle(event) != 0
+      let after = captureWindowsHandles(getCurrentProcessId(), root / "closed.txt")
+      check name notin after
+
   test "a peer that connects and vanishes cannot take the daemon with it":
     const AbortedConnections = 50
 
@@ -239,6 +257,10 @@ suite "connection_failure_does_not_stop_the_daemon":
     let pid = daemon.process.processID
     waitForSteadyState(socketPath)
     let descriptorsBefore = openDescriptorCount(pid)
+    when defined(windows):
+      let handlesBefore =
+        try: captureWindowsHandles(pid, root / "handles-before.txt")
+        except CatchableError as error: error.msg
 
     for _ in 0 ..< AbortedConnections:
       connectThenCloseWithoutHello(socketPath)
@@ -272,6 +294,13 @@ suite "connection_failure_does_not_stop_the_daemon":
       # A generous bound: the assertion is about 50 descriptors never being
       # released, not about the daemon holding a fixed number. The live
       # client above legitimately holds one.
+      when defined(windows):
+        if descriptorsAfter - descriptorsBefore >= AbortedConnections div 2:
+          let handlesAfter =
+            try: captureWindowsHandles(pid, root / "handles-after.txt")
+            except CatchableError as error: error.msg
+          checkpoint("Windows handles before aborted connections:\n" & handlesBefore)
+          checkpoint("Windows handles after aborted connections:\n" & handlesAfter)
       check descriptorsAfter - descriptorsBefore < AbortedConnections div 2
 
   test "a peer refused at Hello is counted too, and the daemon keeps serving":

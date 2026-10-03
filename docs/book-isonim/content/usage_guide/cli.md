@@ -59,7 +59,7 @@ unit: `96GiB`, `512MiB`, `64GB`), `machine.cpu_milli` or `pools.NAME`.
 | Command | What it does | Exit |
 |---|---|---|
 | `config path` | Prints the file's path. | 0 |
-| `config show` | The file's keys, the built-in default for each unset one on this host, and the budget the running daemon enforces, where it came from and which keys its flags pin. | 0; 1 if the file does not parse |
+| `config show` | The file's keys, the built-in default for each unset one on this host, and the budget the running daemon enforces, where it came from, which keys its flags pin, and for each pool whether a flag, the file or the open sessions' declarations size it. | 0; 1 if the file does not parse |
 | `config set KEY VALUE` | Checks the edit with the daemon's reader, writes the file atomically, reloads the daemon. | 0; 1 if refused or the reload failed |
 | `config unset KEY` | The same, removing the key. | as `set` |
 | `config reload` | Asks the daemon to re-read its file. | 0; 1 if the file does not parse |

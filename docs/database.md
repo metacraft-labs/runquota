@@ -503,7 +503,10 @@ file" below. The authoring is unit-tested in reprobuild's
 `t_packaging_msi_authoring`. A sample package using it was built with the
 pinned WiX 3.14, and its `MsiLockPermissionsEx`, `CreateFolder` and
 `Component` rows were read back (Permanent; NeverOverwrite on the seed).
-RunQuota's own MSI has not yet been built or installed with it.
+RunQuota's own x64 and ARM64 MSI packages were built and qualified in release
+rehearsal `37142894685` at `3138d5a`: actual tables, ICE validation,
+administrative extraction and exact template bytes pass. This does not yet
+qualify a complete service installation on an operator's machine.
 
 On a host that got RunQuota some other way -- a hand-built binary, Scoop, which
 installs unelevated and cannot create it -- create it once, from an elevated

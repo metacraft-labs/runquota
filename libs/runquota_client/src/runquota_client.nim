@@ -721,6 +721,50 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
     raise newException(RunQuotaClientError, lease.session[].client[].lastDiagnostic.message)
   lease.state = leaseClientFinished
 
+proc supportsPoolDeclarations*(client: RunQuotaClient): bool =
+  ## Whether the daemon this client is connected to understands
+  ## `DeclarePools`: its `HelloOk` reported protocol minor
+  ## `PoolDeclarationsMinor` or later.
+  client.capabilities.protocolMinor >= PoolDeclarationsMinor
+
+proc declarePools*(session: var RunQuotaSession;
+                   pools: openArray[NamedPoolCapWire]): PoolsDeclaredMessage =
+  ## State the named pools this session's work uses and the capacity each is
+  ## expected to have (`DeclarePools`). The daemon admits against a declared
+  ## capacity only for a pool neither its host file nor a `runquotad` flag
+  ## sizes, and only while a session that declared it is open; the answer
+  ## says, per pool, the cap in force and where it comes from.
+  ##
+  ## NOTHING IS SENT TO A DAEMON THAT PREDATES THE MESSAGE. Such a daemon
+  ## closes the connection on an unknown message kind, and every session on
+  ## the connection with it, so the daemon's minor is checked first and the
+  ## call raises `RunQuotaClientError` (`diagUnsupportedVersion`) with the
+  ## connection intact.
+  if not session.client[].supportsPoolDeclarations():
+    session.client[].lastDiagnostic = diagnostic(diagUnsupportedVersion,
+      "the running runquotad (protocol minor " &
+      $session.client[].capabilities.protocolMinor & ") predates pool " &
+      "declarations, so it admits only the pools its host file or --pool " &
+      "flags size")
+    raise newException(RunQuotaClientError,
+      session.client[].lastDiagnostic.message)
+  var msg = DeclarePoolsMessage(sessionId: session.id)
+  for pool in pools:
+    msg.pools.add(pool)
+  let requestId = session.client[].requestFrame(rqDeclarePools,
+    encodeDeclarePools(msg))
+  let frame = session.client[].readResponse(requestId, handshakeTimeoutMs())
+  if frame.header.messageKind != rqPoolsDeclared:
+    session.client[].lastDiagnostic = diagnostic(diagProtocol,
+      "daemon did not answer DeclarePools")
+    raise newException(RunQuotaClientError,
+      session.client[].lastDiagnostic.message)
+  if not decodePoolsDeclared(frame.payload, result):
+    session.client[].lastDiagnostic = diagnostic(diagProtocol,
+      "invalid PoolsDeclared payload")
+    raise newException(RunQuotaClientError,
+      session.client[].lastDiagnostic.message)
+
 proc reloadHostConfig*(client: var RunQuotaClient): HostConfigReloadedMessage =
   ## Ask the daemon to re-read its host budget file and put it in force
   ## (`ReloadHostConfig`). Raises `RunQuotaClientError` with the daemon's

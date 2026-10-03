@@ -135,7 +135,16 @@ proc showDaemon(): int =
         echo "  cpu_milli    = " & $machine["cpu_milli"].getBiggestInt
     if topology.hasKey("pools"):
       for pool in topology["pools"]:
-        echo "  pools." & pool["name"].getStr & " = " & $pool["units"].getInt
+        # Where the cap comes from: a flag, the file, or -- for a pool
+        # neither names -- the smallest capacity an open session declared.
+        let source = pool{"source"}.getStr
+        echo "  pools." & pool["name"].getStr & " = " &
+          $pool["units"].getInt & (case source
+            of "flag": " (pinned by a runquotad flag)"
+            of "host-file": " (host file)"
+            of "declared": " (declared by open sessions; the host file " &
+              "overrides it)"
+            else: "")
     if topology.hasKey("host_config"):
       let hostConfig = topology["host_config"]
       let source = hostConfig["source"].getStr
@@ -158,8 +167,15 @@ proc reloadDaemon(writtenPath: string): int =
   ## Ask the running daemon to re-read its file. 0 when it did, or when no
   ## daemon runs (the next one reads the file at start); 1 when it refused.
   if not daemonReachable(defaultEndpoint()):
+    # A daemon on a PRIVATE endpoint is not this one: reprobuild starts one
+    # per build on an unprovisioned Linux or macOS host, and it is reached
+    # only with that build's RUNQUOTA_SOCKET. Said here, where the operator
+    # would otherwise conclude no daemon runs at all.
     echo "no runquotad answers at " & defaultEndpoint().path &
-      "; the next one to start reads " & writtenPath
+      "; the next one to start reads " &
+      (if writtenPath.len > 0: writtenPath else: "its host file") &
+      " (a daemon on a private endpoint, such as one reprobuild started " &
+      "for a single build, is reached with RUNQUOTA_SOCKET set to its socket)"
     return 0
   try:
     var client = connectDefault()

@@ -7,7 +7,7 @@ export protocolTypes
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 2'u16
-const RqspProtocolMinor* = 0'u16
+const RqspProtocolMinor* = 1'u16
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -29,6 +29,19 @@ const RqspProtocolMinor* = 0'u16
   ##
   ## THE MINOR RESETS TO 0 with the major, as it must: minor 4 of major 2
   ## would name a version that never existed.
+  ##
+  ## MINOR 1 ANNOUNCES ONE ADDITIVE REQUEST, `DeclarePools` (2026-10-01), and
+  ## that is a use of the minor a client really does act on. Nothing about an
+  ## existing message changed. But a daemon that does not know a message kind
+  ## does not answer "unsupported": it fails to decode the frame header and
+  ## closes the connection, taking every session on it along. A client that
+  ## wants to declare pools therefore reads the daemon's minor from `HelloOk`
+  ## (`capabilities.protocolMinor`) first, and sends `DeclarePools` only at
+  ## `PoolDeclarationsMinor` or above. The majors still decide whether two
+  ## peers speak at all; the minor only says which optional requests the
+  ## daemon will understand.
+const PoolDeclarationsMinor* = 1'u16
+  ## The first daemon minor that understands `DeclarePools`.
 const RqspHeaderLen* = 24'u16
 const MaxCommandStatsIdBytes* = 64
 const FrameFlagRequest* = 0x0001'u16
@@ -1587,6 +1600,60 @@ proc encodeHostConfigReloaded*(msg: HostConfigReloadedMessage): string =
   w.writeU64(msg.memoryInUse)
   w.writeU32(msg.cpuInUse)
   w.data
+
+proc encodeDeclarePools*(msg: DeclarePoolsMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU32(uint32(msg.pools.len))
+  for pool in msg.pools:
+    w.writeString(pool.name)
+    w.writeU32(pool.units)
+  w.data
+
+proc decodeDeclarePools*(payload: string; msg: var DeclarePoolsMessage): bool =
+  var r = reader(payload)
+  var decoded: DeclarePoolsMessage
+  var id: uint64
+  if not r.readU64(id): return false
+  decoded.sessionId = sessionId(id)
+  var count: uint32
+  if not r.readU32(count): return false
+  for _ in 0'u32 ..< count:
+    var pool: NamedPoolCapWire
+    if not r.readString(pool.name): return false
+    if not r.readU32(pool.units): return false
+    decoded.pools.add(pool)
+  if r.remaining != 0: return false
+  msg = decoded
+  true
+
+proc encodePoolsDeclared*(msg: PoolsDeclaredMessage): string =
+  var w = writer()
+  w.writeU32(uint32(msg.pools.len))
+  for pool in msg.pools:
+    w.writeString(pool.name)
+    w.writeU32(pool.declared)
+    w.writeU32(pool.inForce)
+    w.writeString(pool.source)
+  w.writeU32(msg.promotedLeases)
+  w.data
+
+proc decodePoolsDeclared*(payload: string; msg: var PoolsDeclaredMessage): bool =
+  var r = reader(payload)
+  var decoded: PoolsDeclaredMessage
+  var count: uint32
+  if not r.readU32(count): return false
+  for _ in 0'u32 ..< count:
+    var pool: DeclaredPoolWire
+    if not r.readString(pool.name): return false
+    if not r.readU32(pool.declared): return false
+    if not r.readU32(pool.inForce): return false
+    if not r.readString(pool.source): return false
+    decoded.pools.add(pool)
+  if not r.readU32(decoded.promotedLeases): return false
+  if r.remaining != 0: return false
+  msg = decoded
+  true
 
 proc decodeHostConfigReloaded*(payload: string;
     msg: var HostConfigReloadedMessage): bool =

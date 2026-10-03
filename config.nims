@@ -85,6 +85,12 @@ if reprobuildSrc.len > 0:
   addReprobuildPkgPath("STINT_SRC", [
     reprobuildSrc / "libs" / "stint" / "src",
   ], "stint.nim")
+  # reprobuild's action index (`repro_local_store/action_index`) imports the
+  # grow-only shared-memory set; reprobuild resolves it the same way
+  # (`$SHM_GSET_SRC`, then the `nim-shm-gset` sibling).
+  addReprobuildPkgPath("SHM_GSET_SRC", [
+    reprobuildSrc / ".." / "nim-shm-gset" / "src",
+  ], "shm_gset.nim")
 
 # `nim-shm-lease` — THE FIRST DEPENDENCY RUNQUOTA HAS ON THE SHARED-MEMORY
 # LIBRARY, introduced by M13b's published aggregate table.

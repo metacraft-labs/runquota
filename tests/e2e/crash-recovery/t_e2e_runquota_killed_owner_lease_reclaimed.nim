@@ -119,6 +119,17 @@ proc note(log: CaseLog; message: string) =
   f.writeLine(formatFloat(epochTime() - log.started, ffDecimal, 3) & "s " &
     message)
 
+template currentCaseFailed(): bool =
+  ## Whether the running `test` case has failed so far. `unittest` injects
+  ## `testStatusIMPL` as the case's status VALUE; the CodeTracer Nim fork that
+  ## builds this file inside reprobuild injects a POINTER to it, and a bare
+  ## `testStatusIMPL == TestStatus.FAILED` does not compile there. Dereference
+  ## only when that compiles, so both compilers read the same status.
+  when compiles(testStatusIMPL[] == TestStatus.FAILED):
+    testStatusIMPL[] == TestStatus.FAILED
+  else:
+    testStatusIMPL == TestStatus.FAILED
+
 proc reportOnFailure(log: CaseLog; failed: bool) =
   if failed:
     echo "    case log: " & log.path & " (" & $getFileSize(log.path) &
@@ -405,7 +416,7 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
           holder.killAbruptly()
         holder.close()
       daemon.stop(log)
-      log.reportOnFailure(testStatusIMPL == TestStatus.FAILED)
+      log.reportOnFailure(currentCaseFailed())
 
   test "a killed `runquota acquire` releases its reservation to a waiting client":
     # THE HOST SCENARIO END TO END, through the shipped CLI and the shipped
@@ -465,4 +476,4 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
           cli.killAbruptly()
         cli.close()
       daemon.stop(log)
-      log.reportOnFailure(testStatusIMPL == TestStatus.FAILED)
+      log.reportOnFailure(currentCaseFailed())

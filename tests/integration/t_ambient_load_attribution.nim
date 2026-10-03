@@ -785,6 +785,38 @@ suite "ambient_load_attribution":
 
     let emptyRows = inWindows(rows, emptyWindows)
     let fullRows = inWindows(rows, fullWindows)
+    # Keep the evidence even on a successful run. Counts alone cannot tell
+    # whether a missed window came from host-counter reads, store publication
+    # or timestamp selection. This observes the real sampler and changes no
+    # allocation, duration, cadence, estimator or acceptance threshold.
+    let timing = ambientSamplerTiming()
+    echo "  m11 mem sampler: cadenceMs=", cadenceMillis,
+      " ticks=", ambientSamplerTicks(), " taken=", ambientSamplesTaken(),
+      " written=", ambientSamplesWritten(), " stale=", ambientReadingsStale(),
+      " discontinuous=", ambientReadingsDiscontinuous(),
+      " unavailable=", ambientReadingsUnavailable(),
+      " collided=", ambientSamplesCollided(), " dropped=", ambientSamplesDropped(),
+      " failures=", ambientSampleFailures(), " withoutLease=", ambientTicksWithoutLease()
+    echo "  m11 mem timing: hostReads=", timing.hostReads,
+      " hostReadTotalNs=", timing.hostReadNanos,
+      " hostReadMaxNs=", timing.maxHostReadNanos,
+      " flushes=", timing.flushes, " flushTotalNs=", timing.flushNanos,
+      " flushMaxNs=", timing.maxFlushNanos
+    check timing.hostReads == ambientSamplerTicks()
+    check timing.hostReadNanos >= timing.maxHostReadNanos
+    check timing.maxHostReadNanos > 0
+    check timing.flushes > 0
+    check timing.flushNanos >= timing.maxFlushNanos
+    check timing.maxFlushNanos > 0
+    for i in 0 ..< memoryCycles:
+      echo "  m11 mem window: cycle=", i,
+        " emptyMs=", emptyWindows[i].fromMillis, "..", emptyWindows[i].toMillis,
+        " fullMs=", fullWindows[i].fromMillis, "..", fullWindows[i].toMillis,
+        " rows=", inWindows(rows, [emptyWindows[i]]).len, "/",
+        inWindows(rows, [fullWindows[i]]).len
+    for row in rows:
+      echo "  m11 mem sample: atMs=", row.sampledAtUnixMillis,
+        " foreignRssBytes=", row.foreignRssBytes
     check emptyRows.len >= 9
     check fullRows.len >= 9
 

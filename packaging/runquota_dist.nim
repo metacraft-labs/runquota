@@ -25,7 +25,7 @@ import repro_dsl_stdlib/packaging
 const
   RunQuotaPackageName* = "runquota"
 
-  RunQuotaPackageVersion* = "0.1.0"
+  RunQuotaPackageVersion* = "0.1.1"
     ## The version every package format carries.
     ##
     ## A THIRD copy of a string that already exists twice, and the
@@ -115,6 +115,13 @@ const
     ## `%config(noreplace)` at `/etc/runquota/runquotad.toml`. After the
     ## first install it is the operator's file, written with `runquota
     ## config set`.
+
+proc runQuotaConfigurationComponents*(targetOs: TargetOs): seq[DistComponent] =
+  ## POSIX packages seed the host budget through their conffile mechanism.
+  ## Windows seeds it through the host directory below, outside Program Files.
+  if targetOs != toWindows:
+    result.add(component(crConfigFile, HostConfigTemplatePath,
+      subdir = "runquota", installName = HostConfigFileName))
 
 func runQuotaHostDirectories*(targetOs: TargetOs): seq[HostDirectory] =
   ## What the installer provisions outside the prefix. Windows only: the
