@@ -41,6 +41,17 @@ Linux ARM64 is deferred from version 0.1.0 by the release scope decision of
 2026-09-29. Add its native artifacts and repository verification in a later
 release. Existing Linux ARM64 development tests remain enabled.
 
+## Host configuration qualification
+
+Release rehearsal [37142894685](https://github.com/metacraft-labs/runquota/actions/runs/37142894685)
+passes at `3138d5ac430e79d812df7603023356e570319d53` on all four declared
+targets. Both Windows MSI packages pass actual table checks, ICE validation,
+administrative extraction and canonical template/payload comparison. Linux
+packages install in Debian 11, Ubuntu 24.04 and AlmaLinux 9; each preserves a
+real operator edit when reinstalled. Arch archive contents and backup metadata
+also pass their package gate. These results qualify CI artifacts, not a
+published release or a full Windows service installation.
+
 ## Release sequence
 
 1. Agree the version, update its declared source(s), and land the reviewed
