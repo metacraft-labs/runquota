@@ -130,7 +130,7 @@ jobs:
           # Exercise the published bootstrap repairs before a new CLI release.
           # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
           repro-from-source: true
-          repro-build-pin: c14b1e618d7c4b64476d89792e80b8e8f10b8a52
+          repro-build-pin: 1f85ace0037d0a70e966fe8eee645d766522b1ab
           repro-posix-io-mon-pin: ${{ matrix.os == 'linux' && '3df08c24ee91900b950ed20a3827923d213f2a9c' || '' }}
           repro-runquota-pin: 292e578d57eb85d6037f9e2d3a03f0bcb0489dbb
           # Distinguish emulated x64 from native ARM children and preserve exit bits.

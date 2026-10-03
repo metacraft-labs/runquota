@@ -258,6 +258,7 @@ package runquota:
       "t_observation_retention_scheduled",
       "t_observation_store_retention_crash",
       "t_ambient_sample_atomicity",
+      "t_ambient_writer_contention",
       "t_host_load_reading_invariants",
       "t_completion_report_does_not_wait_on_the_store",
       "t_ambient_load_attribution",

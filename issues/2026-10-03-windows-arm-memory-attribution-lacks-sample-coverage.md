@@ -62,3 +62,122 @@ diagnostics on macOS, not the Windows sampler or the cause of its missing rows.
 
 The next Windows ARM64 run must use these diagnostics with the original gates.
 This issue remains open until that run establishes the required coverage.
+
+## Windows x64 timing evidence and repair design
+
+At `1915b28670f1df1722def660817ba2d8a2bcc4a8`, native Windows x64 Reprobuild
+job [111186935291](https://github.com/metacraft-labs/runquota/actions/runs/37117429003/job/111186935291)
+fails the unchanged released-state requirement: two rows instead of at least
+three in the 2.5-second observation window. The memory control in that same
+process passes, but measures 140 host reads taking 0.391 seconds total (maximum
+14.2 ms), and 35 flushes taking 9.879 seconds total (maximum 1.202 seconds).
+`samplerMain` calls `flushAmbientQueue` synchronously after every flush interval,
+so those database calls suspend sampling. This establishes a scheduling defect;
+it does not yet prove that it explains the earlier ARM64 result.
+
+Repair design, within the authorized LOCAL-4 follow-up:
+
+- Keep the actual host-counter reads and attribution on the sampler thread.
+  Give database publication its own worker, signaled at the existing flush
+  cadence. Database contention must not stop host observations.
+- Use a bounded queue of process-owned statement bytes so a drained batch never
+  refers to the sampler thread's ORC allocator after that thread exits. Preserve
+  timestamps, ordering, the existing capacity, and all dropped/failed counters.
+- Stop and join the sampler first, then signal the writer to drain the final
+  batch and join it before resetting any shared state. Failed database writes
+  remain counted losses; no invented samples or retry timestamps.
+- Qualify with a real SQLite write transaction held by another process: sampling
+  must continue while publication is blocked, then all accepted rows must settle
+  before stop returns. Exercise bounded overflow and failed publication too.
+  Retain all existing load windows and minimum coverage assertions.
+
+## Local qualification of the writer repair
+
+At `6aef188f0dc30b73c34b2ddffcdd869b06c79a2d` plus the separate-writer
+patch, `just lint`, `just test` and `just test-release` succeed on macOS ARM64.
+Each test mode compiles and runs all 104 programs, with 522 passing cases and
+zero failed, timed-out or skipped programs. The existing platform-specific case
+skip remains. Both static-helper checks pass in the same combined command.
+
+The three new real-SQLite controls pass with queue capacities 128 and one,
+including overflow accounting, shutdown draining and foreign-key rejection.
+Putting the database flush back on the sampling thread makes both contention
+controls fail with zero ticks during the blocked write; the small-capacity
+control also rejects the missing overflow. The mutation was restored. Windows
+C generation succeeds; native Windows runtime qualification remains required.
+
+The new timing test joins the existing serialized measurement group in the
+Reprobuild graph so concurrent load generators cannot invalidate its control.
+No existing sampling window, cadence, sample-count or ratio requirement changes.
+
+## macOS contention control needs timing attribution
+
+At `0d4c8cd810c9aeb0d217c63d7c515c31eabb5ece`, native macOS job
+[111201933293](https://github.com/metacraft-labs/runquota/actions/runs/37122709511/job/111201933293)
+runs all 104 programs and fails the new capacity-one contention case: nine
+sampler ticks in its 1.2-second window, below the unchanged minimum of ten.
+Capacity 128 records thirteen ticks and passes. Publication remains blocked.
+The existing memory-attribution cases pass. Linux x64 and ARM64 native suites
+pass at the same source.
+
+The contention control now prints the actual monotonic window length, host-read
+time during that window and maximum host-read time. At `0d4c8cd8` plus this
+instrumentation, five local macOS runs pass all three cases, recording 20–21
+ticks per contention window. Host reads occupy about 1–2 milliseconds in each
+window. This does not establish why the CI runner sampled more slowly.
+
+The sampler currently sleeps a full cadence after each iteration, so host-read,
+formatting and scheduler delays accumulate. The fixed-cadence requirement in
+Observation Store §ambient_samples supports budgeting waits against monotonic
+deadlines. Investigate this separately from SQLite publication; do not identify
+it as the CI cause without evidence, change the test window, lower the minimum
+count, invent readings or manufacture timestamps to fill missed intervals.
+
+## Reproduced macOS background timer coalescing and repair design
+
+At `f094336` on this Mac, launching the existing contention binary with
+`/usr/sbin/taskpolicy -b` reproduces both count failures: six ticks in 1.323
+and 1.365 seconds. Actual host reads take only 0.248 and 0.353 milliseconds
+across those windows. A native timer probe under the same policy takes 4.879
+seconds for twenty 50-ms `nanosleep` calls, versus 1.005 seconds for twenty
+50-ms `EVFILT_TIMER` waits with `NOTE_CRITICAL`. This establishes a local
+background timer-coalescing problem; the CI runner's process policy is not yet
+measured, so the original CI cause remains provisional.
+
+Repair within the fixed-cadence contract and authorized LOCAL-4 follow-up:
+
+- On macOS use one periodic kqueue timer per sampler, with the requested
+  interval and `NOTE_CRITICAL`. This limits timer coalescing without raising
+  the sampler's CPU scheduling priority. Keep the existing waits on other OSes.
+- Close the timer at thread exit and prevent its descriptor from crossing exec.
+  An unavailable timer falls back to the current sleep and reports the fallback
+  count; it must not spin, fabricate ticks or stop reading host counters silently.
+- One delivered timer event triggers one actual read, even when the kernel
+  reports multiple elapsed periods. Keep real timestamps and all stale/loss
+  handling, lease gates, SQLite queue limits and test assertions unchanged.
+- Add a real child running under macOS background policy. Verify actual sampler
+  ticks while SQLite holds its lock, plus descriptor cleanup and failure-path
+  behavior where practical. The original coalesced sleep must fail the control.
+  Run native debug, optimized and Reprobuild suites before promotion.
+
+## Local qualification of macOS cadence repair
+
+At `c11043a0e07a4407ba86eacf9a1b20b13f669e7d` plus the timer repair,
+`just lint`, `just test` and `just test-release` pass on macOS ARM64. Both
+native modes run all 104 programs: 524 distinct passing cases plus three
+repeated real-background-policy controls (527 passing result lines), with the
+same existing Windows-only case skip. Both static-helper gates pass.
+
+The repaired contention cases take 24 ticks in a normal 1.21-second window
+and 27 ticks in a background-policy 1.40-second window. Restoring ordinary
+sleep causes the actual background child to report six ticks and fail both
+original minimum-count assertions; the parent also requires all three child
+cases to execute and succeed. The mutation was restored. Timer descriptor
+cleanup and an actual closed-timer sleep fallback are covered. A new upper
+count bound rejects a timer running faster than its configured cadence.
+Windows C generation succeeds; Windows native qualification remains pending.
+
+The separate Reprobuild macOS job at `0d4c8cd8` also fails the unmodified
+contention minimum: capacity 128 records nine ticks, capacity one ten. Log
+`111202120133` in run `37122709601` contains that evidence. The new periodic
+timer still needs native CI qualification at its committed source.
