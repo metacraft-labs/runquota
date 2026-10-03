@@ -43,7 +43,7 @@
 ## reading writes no row at all: a row of zeros would be indistinguishable
 ## from a measured idle machine.
 
-import std/[locks, math, os, strutils]
+import std/[locks, math, monotimes, os, strutils, times]
 
 import ./ids, ./store, ./types
 
@@ -58,6 +58,13 @@ const
     ## cost on the hot path the specification forbids.
 
 type
+  AmbientSamplerTiming* = object
+    ## Diagnostic totals for the actual sampler's blocking work. Monotonic
+    ## durations distinguish slow host reads from slow store publication;
+    ## these are not used to change cadence, timestamps or sample selection.
+    hostReads*, hostReadNanos*, maxHostReadNanos*: int64
+    flushes*, flushNanos*, maxFlushNanos*: int64
+
   HostLoadReading* = object
     ## Host-wide totals, and nothing else.
     ##
@@ -548,6 +555,7 @@ var
     ## reset is safe only because `samplerMain` ends with a flush that leaves
     ## the payload empty. See the note above `reportSlots`.
   samplerTicks = 0'i64
+  samplerTiming: AmbientSamplerTiming
   samplerTaken = 0'i64
   samplerWritten = 0'i64
   samplerDropped = 0'i64
@@ -880,9 +888,14 @@ proc flushAmbientQueue() {.gcsafe.} =
       release(samplerLock)
     if path.len == 0 or rows.len == 0:
       return
+    let flushStarted = getMonoTime()
     let outcome = appendAmbientSamplesAt(path, rows)
+    let flushNanos = (getMonoTime() - flushStarted).inNanoseconds
     acquire(samplerLock)
     try:
+      inc samplerTiming.flushes
+      samplerTiming.flushNanos += flushNanos
+      samplerTiming.maxFlushNanos = max(samplerTiming.maxFlushNanos, flushNanos)
       if outcome.ok:
         samplerWritten += int64(rows.len)
       else:
@@ -908,15 +921,21 @@ proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
     #
     # A row's `sampled_at_unix_millis` therefore now denotes the instant at
     # which BOTH the kernel counters and the live self-reports were read.
-    # `readHostLoad` is syscalls only (mach counters on macOS, `/proc` on
-    # Linux); it spawns nothing and takes no lock of its own, so holding
-    # `samplerLock` across it costs a few microseconds and cannot deadlock.
+    # `readHostLoad` spawns nothing (mach counters on macOS, `/proc` on
+    # Linux, system counters and serialized PDH collection on Windows).
+    # Its elapsed time is measured separately from store publication below;
+    # the Windows read need not have the cost of the macOS/Linux path.
     var current: HostLoadReading
     var reports: seq[SelfReport]
     acquire(samplerLock)
     try:
       samplerTicks += 1
+      let readStarted = getMonoTime()
       current = readHostLoad()
+      let readNanos = (getMonoTime() - readStarted).inNanoseconds
+      inc samplerTiming.hostReads
+      samplerTiming.hostReadNanos += readNanos
+      samplerTiming.maxHostReadNanos = max(samplerTiming.maxHostReadNanos, readNanos)
       reports = snapshotSelfReports()
     finally:
       release(samplerLock)
@@ -1068,6 +1087,7 @@ proc startAmbientSampler*(path, hostId: string;
     samplerQueue = @[]
     clearSelfReportSlots()
     samplerTicks = 0
+    samplerTiming = AmbientSamplerTiming()
     samplerTaken = 0
     samplerWritten = 0
     samplerDropped = 0
@@ -1105,6 +1125,15 @@ proc ambientSamplerTicks*(): int64 =
   acquire(samplerLock)
   try:
     samplerTicks
+  finally:
+    release(samplerLock)
+
+proc ambientSamplerTiming*(): AmbientSamplerTiming =
+  ## A consistent POD snapshot, valid after stop as well as while running.
+  ## Reset on the next start alongside the existing tick/failure counters.
+  acquire(samplerLock)
+  try:
+    samplerTiming
   finally:
     release(samplerLock)
 
