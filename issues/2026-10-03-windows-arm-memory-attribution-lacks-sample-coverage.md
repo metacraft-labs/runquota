@@ -62,3 +62,31 @@ diagnostics on macOS, not the Windows sampler or the cause of its missing rows.
 
 The next Windows ARM64 run must use these diagnostics with the original gates.
 This issue remains open until that run establishes the required coverage.
+
+## Windows x64 timing evidence and repair design
+
+At `1915b28670f1df1722def660817ba2d8a2bcc4a8`, native Windows x64 Reprobuild
+job [111186935291](https://github.com/metacraft-labs/runquota/actions/runs/37117429003/job/111186935291)
+fails the unchanged released-state requirement: two rows instead of at least
+three in the 2.5-second observation window. The memory control in that same
+process passes, but measures 140 host reads taking 0.391 seconds total (maximum
+14.2 ms), and 35 flushes taking 9.879 seconds total (maximum 1.202 seconds).
+`samplerMain` calls `flushAmbientQueue` synchronously after every flush interval,
+so those database calls suspend sampling. This establishes a scheduling defect;
+it does not yet prove that it explains the earlier ARM64 result.
+
+Repair design, within the authorized LOCAL-4 follow-up:
+
+- Keep the actual host-counter reads and attribution on the sampler thread.
+  Give database publication its own worker, signaled at the existing flush
+  cadence. Database contention must not stop host observations.
+- Use a bounded queue of process-owned statement bytes so a drained batch never
+  refers to the sampler thread's ORC allocator after that thread exits. Preserve
+  timestamps, ordering, the existing capacity, and all dropped/failed counters.
+- Stop and join the sampler first, then signal the writer to drain the final
+  batch and join it before resetting any shared state. Failed database writes
+  remain counted losses; no invented samples or retry timestamps.
+- Qualify with a real SQLite write transaction held by another process: sampling
+  must continue while publication is blocked, then all accepted rows must settle
+  before stop returns. Exercise bounded overflow and failed publication too.
+  Retain all existing load windows and minimum coverage assertions.
