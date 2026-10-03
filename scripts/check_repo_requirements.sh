@@ -71,7 +71,7 @@ require_contains flake.nix "packages.default"
 require_contains flake.nix "checks ="
 require_contains flake.nix "static-helpers"
 require_contains flake.nix "git-hooks.lib"
-require_contains flake.nix "shellHook = pre-commit-check.shellHook"
+require_contains flake.nix "shellHook = ownRepoOnly pre-commit-check.shellHook"
 
 # ONE PRE-COMMIT HOOK, WRITTEN DOWN TWICE. git-hooks.nix generates the
 # Linux/macOS hook config from flake.nix; prek.toml carries the same hook for
@@ -174,8 +174,9 @@ fi
 require_contains .github/workflows/release.yml "workflow_dispatch:"
 require_contains .github/workflows/release.yml "tags:"
 require_contains .github/release.json "linux-x86_64"
-# Linux ARM64 is explicitly deferred for the initial release.
-if ! grep -Eq '^[[:space:]]*version[[:space:]]*=[[:space:]]*"0\.1\.0"' runquota.nimble; then
+# Linux ARM64 remains explicitly deferred for 0.1.0 and 0.1.1 (shared release
+# specification, 2026-10-02). Every other version requires both architectures.
+if ! grep -Eq '^[[:space:]]*version[[:space:]]*=[[:space:]]*"0\.1\.[01]"' runquota.nimble; then
   require_contains .github/release.json "linux-aarch64"
 fi
 require_contains .github/release.json "darwin-aarch64"

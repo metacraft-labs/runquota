@@ -12,10 +12,12 @@ RunQuota implements the Metacraft repository requirements locally through:
   `just lint`.
 - `repro.nim`'s `uses:` for the reprobuild dev shell's tools, including the
   flake shell's lint and formatting tools (`shellcheck`, `shfmt`, `typos`,
-  `prek`; `nixfmt` and `repomix` on Linux and macOS only). `just format`
-  reports that it left `flake.nix` unformatted on Windows, and `just repomix`
-  refuses there by name: neither tool has a Windows realization, for reasons
-  recorded with each interface in reprobuild-packages.
+  `prek`, `repomix`; `nixfmt` on Linux and macOS only). On Windows, where
+  nobody publishes a repomix binary, `repomix` is upstream's npm package with
+  its pinned dependency closure, run by the declared `node`. `just format`
+  reports that it left `flake.nix` unformatted on Windows: nixfmt has no
+  Windows realization yet, for reasons recorded with its interface in
+  reprobuild-packages.
 - `.envrc` using the repository flake.
 - `Justfile` targets for build, test, lint, format, version bumping,
   benchmarking, repomix snapshots, and static helper checks.
