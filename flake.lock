@@ -1977,17 +1977,17 @@
     "release-packaging-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1790548385,
-        "narHash": "sha256-VOEO/EMWn3Y/MA6f4uhnsva009C6N5EZ5y37z6YMdn8=",
+        "lastModified": 1790790501,
+        "narHash": "sha256-pB6zyfBWFK4mzINecy9aqxUb5GWLQTVdc9qvY8e34mg=",
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "a04cf4d2191086a22151f03d974fa0cd46e3533a",
+        "rev": "fb9f2e764b98acdd2d0a0c3ab622f3287bc78b0a",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "a04cf4d2191086a22151f03d974fa0cd46e3533a",
+        "rev": "fb9f2e764b98acdd2d0a0c3ab622f3287bc78b0a",
         "type": "github"
       }
     },

@@ -217,8 +217,11 @@ suite "packaging contract":
       "the MSI would seed a file the daemon does not read"
     # The POSIX conffile lands at /etc/runquota/<name>, which is where
     # `hostConfigPath` points off Windows.
-    doAssert "component(crConfigFile, HostConfigTemplatePath," in recipe and
-      "subdir = \"runquota\"" in recipe,
+    doAssert "component(crConfigFile, HostConfigTemplatePath," in distText and
+      "subdir = \"runquota\"" in distText and
+      "result.add(runQuotaConfigurationComponents(targetOs))" in recipe and
+      "dist.components.add(runQuotaConfigurationComponents(targetOs))" in
+        readSource("packaging/release_metadata.nim"),
       "the POSIX packages no longer ship /etc/runquota/runquotad.toml"
     let guid = quotedValueAfter(distText, "WindowsStateDirComponentGuid* =",
       "the host directory's component GUID")

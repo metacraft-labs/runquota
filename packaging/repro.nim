@@ -101,9 +101,7 @@ proc runQuotaComponents(targetOs: TargetOs): seq[DistComponent] =
   # seeds it into `C:\ProgramData\runquota` instead, through the
   # distribution's host directory (`runQuotaHostDirectories`): a component
   # under the prefix would land in Program Files, where nothing reads it.
-  if targetOs != toWindows:
-    result.add(component(crConfigFile, HostConfigTemplatePath,
-      subdir = "runquota", installName = HostConfigFileName))
+  result.add(runQuotaConfigurationComponents(targetOs))
 
 package `runquota-packages`:
   config:

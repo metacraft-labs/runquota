@@ -166,6 +166,39 @@ foreach ($shipped in @('runquota.exe', 'runquotad.exe', 'LICENSE')) {
     -What "the File table carries $shipped"
 }
 
+# The host budget belongs under CommonAppDataFolder, with the canonical DACL
+# and a seed that survives repair, upgrade and uninstall. Read the real MSI.
+$distribution = Get-Content -Raw "$PSScriptRoot/../packaging/runquota_dist.nim"
+$hostGuid = [regex]::Match($distribution, 'WindowsStateDirComponentGuid\*\s*=\s*"([^"]+)"').Groups[1].Value
+$hostSddl = [regex]::Match($distribution, 'WindowsStateDirSddl\*\s*=\s*"([^"]+)"').Groups[1].Value
+Assert-That -Condition ($hostGuid -ne '' -and $hostSddl -ne '') -What 'canonical host-directory identity and DACL are present'
+$hostComponent = Get-MsiRows -Sql "SELECT Component, Directory_, Attributes FROM Component WHERE ComponentId = '$hostGuid'" -Columns 3
+Assert-That -Condition ($hostComponent.Count -eq 1) -What 'exactly one canonical host-directory component'
+if ($hostComponent.Count -eq 1) {
+  Assert-That -Condition (([int]$hostComponent[0][2] -band 16) -ne 0) -What 'host directory is Permanent'
+  $directory = Get-MsiRows -Sql "SELECT Directory_Parent, DefaultDir FROM Directory WHERE Directory = '$($hostComponent[0][1])'" -Columns 2
+  Assert-That -Condition ($directory.Count -eq 1 -and $directory[0][0] -eq 'CommonAppDataFolder' -and ($directory[0][1] -split '\|')[-1] -eq 'runquota') -What 'host directory is CommonAppDataFolder/runquota'
+  $folder = Get-MsiRows -Sql "SELECT Directory_, Component_ FROM CreateFolder WHERE Component_ = '$($hostComponent[0][0])'" -Columns 2
+  Assert-That -Condition ($folder.Count -eq 1 -and $folder[0][0] -eq $hostComponent[0][1]) -What 'the installer creates the host directory'
+  $permissions = Get-MsiRows -Sql "SELECT LockObject, SDDLText FROM MsiLockPermissionsEx" -Columns 2
+  $matching = @($permissions | Where-Object { $_[0] -eq $hostComponent[0][1] -and $_[1] -eq $hostSddl })
+  Assert-That -Condition ($matching.Count -eq 1) -What 'host directory receives the exact protected DACL'
+}
+Assert-That -Condition ($files.ContainsKey('runquotad.toml')) -What 'host configuration seed is packaged'
+if ($files.ContainsKey('runquotad.toml')) {
+  $seed = Get-MsiRows -Sql "SELECT Component_, File FROM File WHERE File = '$($files['runquotad.toml'])'" -Columns 2
+  Assert-That -Condition ($seed.Count -eq 1) -What 'one configuration seed file'
+  if ($seed.Count -eq 1) {
+    $component = Get-MsiRows -Sql "SELECT Directory_, Attributes, KeyPath FROM Component WHERE Component = '$($seed[0][0])'" -Columns 3
+    Assert-That -Condition ($component.Count -eq 1) -What 'seed component exists'
+    if ($component.Count -eq 1) {
+      Assert-That -Condition ($hostComponent.Count -eq 1 -and $component[0][0] -eq $hostComponent[0][1]) -What 'seed is installed in the host directory'
+      Assert-That -Condition (([int]$component[0][1] -band 144) -eq 144) -What 'seed is Permanent and NeverOverwrite'
+      Assert-That -Condition ($component[0][2] -eq $seed[0][1]) -What 'seed file is its component key path'
+    }
+  }
+}
+
 # ---- THE SERVICE -----------------------------------------------------
 #
 # `Arguments` is column 5 of ServiceInstall and is what becomes the tail

@@ -21,6 +21,19 @@ dist.components = @[
   executableComponent(root / ("bin/runquota" & suffix)),
   executableComponent(root / ("bin/runquotad" & suffix)),
   component(crDataFile, root / "LICENSE")]
+dist.components.add(runQuotaConfigurationComponents(targetOs))
+let packagingRoot = currentSourcePath.parentDir
+var configurationFiles = newJArray()
+for entry in dist.components.mitems:
+  if entry.role == crConfigFile:
+    entry.buildPath = absolutePath(entry.buildPath, packagingRoot)
+    doAssert fileExists(entry.buildPath), "Missing configuration input: " & entry.buildPath
+    configurationFiles.add(%*{"source": entry.buildPath,
+      "destination": "/" & installRelPath(dist, entry)})
+for directory in dist.hostDirectories.mitems:
+  for seed in directory.seedFiles.mitems:
+    seed.buildPath = absolutePath(seed.buildPath, packagingRoot)
+    doAssert fileExists(seed.buildPath), "Missing host seed input: " & seed.buildPath
 var tree = StagedTree(dist: dist, root: root)
 for file in walkDirRec(root):
   let rel = relativePath(file, root).replace('\\', '/')
@@ -30,7 +43,8 @@ for file in walkDirRec(root):
 writeFile(output / "distribution.json", pretty(%*{
   "name": dist.name, "version": dist.version, "license": dist.metadata.license,
   "summary": dist.metadata.summary, "upgradeCode": dist.metadata.upgradeCode,
-  "serviceName": RunQuotaDaemonServiceName}) & "\n")
+  "serviceName": RunQuotaDaemonServiceName,
+  "configurationFiles": configurationFiles}) & "\n")
 case targetOs
 of toWindows:
   writeFile(output / "runquota.wxs", wxsText(dist, tree))

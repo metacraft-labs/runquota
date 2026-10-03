@@ -13,7 +13,12 @@ in Debian 11, Ubuntu 24.04 and AlmaLinux 9 containers without the Nix store.
 Every archive is extracted away from the source tree and checked for native
 architecture, runtime dependencies and functional behavior.
 
-The archive includes `runquota` and `runquotad`. The smoke check starts an isolated daemon and executes a real lease through the client. Linux also emits an Arch package; Windows emits MSI and Scoop authoring from the existing `packaging/runquota_dist.nim`. Service capacity remains an explicit operator configuration step.
+The archive includes `runquota` and `runquotad`. The smoke check starts an isolated daemon and executes a real lease through the client. Linux also emits an Arch package; Windows emits MSI and Scoop authoring from the existing `packaging/runquota_dist.nim`. The release pins the packaging
+source that implements its host-directory API. Linux package configuration is
+derived from the same components as the independent packaging recipe; MSI
+seed paths resolve from the canonical packaging directory. Real package checks
+verify the template bytes, destination and preservation of operator edits.
+Service capacity remains an explicit operator configuration step.
 
 Both Windows targets execute their own native ZIP payload checks. A separate
 Windows ARM64 job then validates both MSI packages: transferred hashes, full
@@ -26,8 +31,8 @@ Installer access in the validation job is a failure, never a skipped check.
 Each target emits JSON evidence naming the source commit, pinned dependency
 revisions, smoke result, signing state and artifact hashes. The assembly step
 checks the exact asset set and hashes after upload and generates `SHA256SUMS`.
-The user approved unsigned version 0.1.0 releases on 2026-09-28;
-`unsignedReleaseVersion` scopes this exception to that version. Signing evidence
+The user approved unsigned release payloads; the current release policy
+scopes `unsignedReleaseVersion` to version 0.1.1. Signing evidence
 remains false. Later versions must update the policy explicitly or use OS
 signatures and a verified Sigstore checksum-manifest signature. The shared Linux
 package publisher retains its existing package and repository signatures.
@@ -45,7 +50,7 @@ release. Existing Linux ARM64 development tests remain enabled.
    commit. Wait for the complete matrix, packaging checks and checksum manifest.
    Download the `verified-release` workflow artifact for review. A dispatch
    never publishes, including one dispatched at an existing tag.
-3. Check the signing scope. Version 0.1.0 has an explicit unsigned-release
+3. Check the signing scope. Version 0.1.1 has an explicit unsigned-release
    exception. A version change rejects that exception until the policy is
    updated; it cannot silently waive signing for future releases. Required
    ad-hoc Mach-O execution signatures do not imply Developer ID signing.

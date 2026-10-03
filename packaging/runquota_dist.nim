@@ -116,6 +116,13 @@ const
     ## first install it is the operator's file, written with `runquota
     ## config set`.
 
+proc runQuotaConfigurationComponents*(targetOs: TargetOs): seq[DistComponent] =
+  ## POSIX packages seed the host budget through their conffile mechanism.
+  ## Windows seeds it through the host directory below, outside Program Files.
+  if targetOs != toWindows:
+    result.add(component(crConfigFile, HostConfigTemplatePath,
+      subdir = "runquota", installName = HostConfigFileName))
+
 func runQuotaHostDirectories*(targetOs: TargetOs): seq[HostDirectory] =
   ## What the installer provisions outside the prefix. Windows only: the
   ## POSIX packages' `/etc/runquota` comes from the conffile itself (dpkg

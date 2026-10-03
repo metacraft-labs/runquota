@@ -57,6 +57,13 @@ foreach ($target in $targets) {
     } finally { $process.Dispose() }
     $client = @(Get-ChildItem $extract -Recurse -Filter runquota.exe)
     if ($client.Count -ne 1) { throw 'MSI does not extract exactly one client' }
+    $seed = @(Get-ChildItem $extract -Recurse -Filter runquotad.toml)
+    $canonicalSeed = Join-Path $PSScriptRoot '../../packaging/etc/runquotad.toml'
+    if ($seed.Count -ne 1 -or
+        (Get-FileHash $seed[0].FullName -Algorithm SHA256).Hash -ne
+        (Get-FileHash $canonicalSeed -Algorithm SHA256).Hash) {
+      throw "MSI host configuration differs from the canonical template: $id"
+    }
     $prefix = Split-Path (Split-Path $client[0].FullName -Parent) -Parent
     $zipRoot = Join-Path $work 'zip'
     Expand-Archive -LiteralPath (Join-Path $Dist "$stem.zip") -DestinationPath $zipRoot

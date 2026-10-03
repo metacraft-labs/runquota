@@ -10,7 +10,7 @@
     # Pure package renderers used by release_metadata.nim. Pin their sources
     # independently of the operator's installed repro executable.
     release-packaging-src = {
-      url = "github:metacraft-labs/reprobuild/a04cf4d2191086a22151f03d974fa0cd46e3533a";
+      url = "github:metacraft-labs/reprobuild/fb9f2e764b98acdd2d0a0c3ab622f3287bc78b0a";
       flake = false;
     };
     release-nimcrypto-src = {
