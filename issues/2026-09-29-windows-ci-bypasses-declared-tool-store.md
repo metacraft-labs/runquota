@@ -123,3 +123,26 @@ atomicity check or a missing executable in the unmonitored shell. Control
 compares each invocation through Reprobuild's internal monitor driver and
 retains finalized event streams. Both are diagnostics, not substitutes for
 ordinary CI.
+
+## Windows x64 connection handle count at `7ba894d`
+
+RunQuota agents and this checkout were refreshed to `7ba894d880bb665e499155892937452a9e2f5155`.
+[Reprobuild job 111214334152](https://github.com/metacraft-labs/runquota/actions/runs/37127013750/job/111214334152)
+builds successfully, then fails only the connection-abort program: 50 real
+aborted connections leave the measured daemon handle count 26 higher, against
+the unchanged `< 25` bound. The daemon remains alive, serves a real lease,
+and reports all 50 failures; the refused-Hello case passes. This differs from
+the earlier 50-handle finding and does not yet establish a permanent leak.
+
+The existing test's expectation is release of accepted OS handles as required
+by the persistent host-wide lease authority in `AGENTS.md` and the connection
+cleanup contract in `libs/runquota_daemon/src/runquota_daemon.nim`. The first
+ambient reading is already awaited before measurement. Do not widen the bound,
+add a success retry, or disable observation capture in the required gate.
+
+Planned diagnostic: retain the unchanged original assertion and record native
+Windows handle snapshots before and after the failed window, then during idle
+cleanup. A controlled run without stats distinguishes connection cleanup from
+background store/counter activity, but cannot substitute for the ordinary
+capture-enabled gate. Search of current and archived handle/descriptor issues
+found this existing record; extend it rather than filing a duplicate.
