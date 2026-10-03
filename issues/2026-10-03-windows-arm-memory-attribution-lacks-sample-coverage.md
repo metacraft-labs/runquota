@@ -90,3 +90,22 @@ Repair design, within the authorized LOCAL-4 follow-up:
   must continue while publication is blocked, then all accepted rows must settle
   before stop returns. Exercise bounded overflow and failed publication too.
   Retain all existing load windows and minimum coverage assertions.
+
+## Local qualification of the writer repair
+
+At `6aef188f0dc30b73c34b2ddffcdd869b06c79a2d` plus the separate-writer
+patch, `just lint`, `just test` and `just test-release` succeed on macOS ARM64.
+Each test mode compiles and runs all 104 programs, with 522 passing cases and
+zero failed, timed-out or skipped programs. The existing platform-specific case
+skip remains. Both static-helper checks pass in the same combined command.
+
+The three new real-SQLite controls pass with queue capacities 128 and one,
+including overflow accounting, shutdown draining and foreign-key rejection.
+Putting the database flush back on the sampling thread makes both contention
+controls fail with zero ticks during the blocked write; the small-capacity
+control also rejects the missing overflow. The mutation was restored. Windows
+C generation succeeds; native Windows runtime qualification remains required.
+
+The new timing test joins the existing serialized measurement group in the
+Reprobuild graph so concurrent load generators cannot invalidate its control.
+No existing sampling window, cadence, sample-count or ratio requirement changes.

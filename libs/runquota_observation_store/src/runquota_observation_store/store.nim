@@ -484,12 +484,15 @@ proc appendStatementsAt*(path: string;
   sql.add("commit;\n")
   runSqlite(path, sql)
 
+proc ambientInsertStatement*(row: AmbientSampleRow): string =
+  ## Compose on the sampling thread before copying bytes to the writer queue.
+  insertStatement("ambient_samples", ambientColumns, ambientValues(row))
+
 proc ambientBatchStatement*(rows: openArray[AmbientSampleRow]): string =
   ## One transaction for a drained run of ambient samples.
   result = "begin immediate;\n"
   for row in rows:
-    result.add(insertStatement("ambient_samples", ambientColumns,
-      ambientValues(row)) & "\n")
+    result.add(ambientInsertStatement(row) & "\n")
   result.add("commit;\n")
 
 proc appendAmbientSamplesAt*(path: string;
