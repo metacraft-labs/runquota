@@ -146,3 +146,19 @@ cleanup. A controlled run without stats distinguishes connection cleanup from
 background store/counter activity, but cannot substitute for the ordinary
 capture-enabled gate. Search of current and archived handle/descriptor issues
 found this existing record; extend it rather than filing a duplicate.
+
+### Full-suite handle diagnostics
+
+The isolated real-PSS probe at shared-actions `869e4695` did not reproduce the
+26-handle delta seen in full Repro CI at RunQuota `7ba894d8`: all six unchanged
+fixture runs passed, including three with ambient capture enabled. Keep the
+original `< 25` bound and all fifty aborted connections. Add read-only snapshots
+at the existing baseline and, on failure, after the existing final count; print
+handle values, types and available names without polling or delaying that final
+count. A real named-event presence/closure control must validate the snapshot.
+The full-suite failure still needs attribution; the isolated pass is insufficient.
+
+Before preparing this change, fetched and incorporated `agents` `4ec72e92`,
+which also contains the separately developed named-pool declarations. That newer
+source requires fresh full-suite qualification before promotion; the passing
+`7ba894d8` measurements do not establish its status.
