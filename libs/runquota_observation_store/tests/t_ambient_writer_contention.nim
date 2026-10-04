@@ -67,7 +67,10 @@ suite "ambient writer contention":
           discard locker.waitForExit()
         locker.close()
         stopAmbientSampler()
-      require waitFor(proc(): bool = fileExists(ready))
+      # .once opens the file before SQLite writes the following SELECT result.
+      # Readiness is the complete acknowledgment, within the same setup bound.
+      require waitFor(proc(): bool =
+        fileExists(ready) and readFile(ready).strip() == "locked")
       require readFile(ready).strip() == "locked"
       startAmbientSampler(path, hostId, cadenceMillis = 50,
         flushSamples = 1, capacity = capacity)

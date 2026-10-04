@@ -37,3 +37,17 @@ fixture must fail on empty contents; the repaired fixture must pass the same
 real contention controls. A wrong acknowledgment must still fail within the
 existing readiness bound. Repeat full debug, optimized and forced Repro suites
 with exact program/case parity before opening the promotion PR.
+
+## Local controls
+
+At `29adbce` plus the readiness repair, a real recursive SQLite query delays
+its one `locked` result after `.once` opens the file. The original fixture
+fails on the empty acknowledgment in 0.465 seconds. The repaired fixture with
+the identical SQL passes all eight cases, including the real background child,
+in 10.30 seconds. Returning `wrong` instead of `locked` still fails readiness:
+the whole program exits in 3.90 seconds, including database setup before the
+unchanged 3500 ms wait. Source variants, logs and results are retained under
+`/tmp/runquota-sqlite-ready-controls` on the development host.
+
+Only fixture synchronization changes. Full debug, optimized, Repro and platform
+qualification remain required; the preceding failed full report is retained.
