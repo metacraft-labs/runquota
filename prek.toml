@@ -13,7 +13,68 @@
 # Install the hook from a repro shell with `prek install`; `git commit` then
 # runs `just lint`, which needs the shell's `just`, `bash` and `nim`, so
 # commit from inside the shell.
+#
+# ----------------------------------------------------------------------------
+# WHY THE TWO COMMITTED-BINARY REFUSALS ARE HERE AND NOT IN A
+# `.pre-commit-config.yaml`
+# ----------------------------------------------------------------------------
+#
+# metacraft-dev-guidelines/policies/repo-requirements.md §4.3 requires
+# `check-added-large-files` and `ban-added-ct-recordings` in every repo, and §4.1
+# gives the portable form as a committed `.pre-commit-config.yaml`. In THIS repo
+# that form does not work, and it was measured rather than assumed: a committed
+# `.pre-commit-config.yaml` was added, `prek install` run, and an added `*.ct`
+# then COMMITTED CLEANLY, because prek reported
+#
+#     warning: Multiple configuration files found (`prek.toml`,
+#     `.pre-commit-config.yaml`); using `.../runquota/prek.toml`
+#
+# — exactly the precedence the header above states. A rule written in the file
+# prek does not read is a rule that never fires, which is the defect this whole
+# campaign keeps finding. So the rules go here, in the file prek actually reads.
+#
+# BOTH REFUSALS ACT ON FILES A COMMIT ADDS (`git diff --staged
+# --diff-filter=A`), never on files already tracked, so they cannot
+# retroactively fail anything here. `--enforce-all` is deliberately not passed
+# to the first and must not be added to "tighten" it.
+#
+# STILL OUTSTANDING, STATED RATHER THAN HIDDEN: the Linux/macOS *pre-commit*
+# path described above — the flake's generated `.pre-commit-config.yaml` — still
+# carries only `just lint`. Its route to these two is
+# `nixos-modules.modules.flake.git-hooks`, which needs the repo's
+# `nixos-modules` input (pinned at b4c1815dc) moved past the commit that made
+# the pair mandatory members of `mcl-standard-hooks`. That is a lock bump with
+# its own verification and is deliberately not folded into this change. prek is
+# what the repro dev shell installs on every platform, so this file is the one
+# in force today.
+#
+# ON NixOS, `uv` MUST BE ON PATH. The two hooks below come from `language:
+# python` hook repositories, and the `uv` prek downloads for itself is a
+# generic-linux dynamically linked binary NixOS cannot exec; the hooks then fail
+# to INSTALL and refuse every commit for a reason unrelated to its content. See
+# repo-requirements.md §4.x.
 
+# --- The committed-binaries tier of §4.3. -----------------------------------
+[[repos]]
+repo = "https://github.com/pre-commit/pre-commit-hooks"
+rev = "v6.0.0"
+
+[[repos.hooks]]
+# 1024 KB passed explicitly because UPSTREAM'S DEFAULT IS 500 KB; dropping the
+# argument silently halves the ceiling.
+id = "check-added-large-files"
+args = ["--maxkb=1024"]
+
+[[repos]]
+# Pinned to a sha, never to a branch: a hook set that changes under a repo
+# without a commit in that repo is a hook set nobody can bisect.
+repo = "https://github.com/metacraft-labs/devops-modules"
+rev = "6ba34072850f7348e1669a6daf8a0acb79669434"
+
+[[repos.hooks]]
+id = "ban-added-ct-recordings"
+
+# --- This repo's own hook. ---------------------------------------------------
 [[repos]]
 repo = "local"
 
