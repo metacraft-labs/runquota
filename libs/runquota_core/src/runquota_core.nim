@@ -9,7 +9,7 @@ when defined(posix):
   import runquota_core/fd_hygiene
   export fd_hygiene
 
-const RunQuotaVersion* = "0.1.2"
+const RunQuotaVersion* = "0.1.3"
 
 proc versionString*(): string =
   RunQuotaVersion

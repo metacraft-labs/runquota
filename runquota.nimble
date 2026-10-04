@@ -1,4 +1,4 @@
-version = "0.1.2"
+version = "0.1.3"
 author = "Metacraft Labs"
 description = "RunQuota local resource lease coordinator"
 license = "MIT"
