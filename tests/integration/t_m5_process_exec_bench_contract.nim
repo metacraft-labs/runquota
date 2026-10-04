@@ -172,6 +172,7 @@ suite "m5_process_exec_bench_contract":
       let completion = child.waitForCompletion(3000)
       child.close()
 
+      checkpoint "cwd/environment child completion: " & $completion
       check completion.exited
       check completion.exitCode == 0
       check completion.processId > 0

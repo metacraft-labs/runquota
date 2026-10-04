@@ -191,15 +191,26 @@ proc completeOneExecution(client: var RunQuotaClient; statsKey: string;
 proc waitForPublished(path, statsKey: string; timeoutMs: int;
                       estimate: var PublishedEstimate): bool =
   let deadline = epochTime() + float(timeoutMs) / 1000.0
+  var verdictCounts: array[StatsLookup, int]
+  var lastState: tuple[available, ownerAlive: bool; slotCount: int;
+    retryCount, tornCount, hitCount, missCount: uint64]
   while epochTime() < deadline:
     var table = openStatsTable(path)
+    var verdict = stlUnavailable
     if table.available:
-      let verdict = table.lookupEstimate(statsKey, estimate)
-      table.close()
-      if verdict == stlHit: return true
-    else:
-      table.close()
+      verdict = table.lookupEstimate(statsKey, estimate)
+    inc verdictCounts[verdict]
+    # Closing clears these fields. Retain the actual last reader state without
+    # adding lookups or requests to the publisher during the bounded wait.
+    lastState = (table.available, table.ownerAlive, table.slotCount,
+      table.retryCount, table.tornCount, table.hitCount, table.missCount)
+    table.close()
+    if verdict == stlHit: return true
     sleep(25)
+  checkpoint "published stats readiness: path=" & path & " key=" & statsKey &
+    " timeoutMs=" & $timeoutMs &
+    " verdictCounts(unavailable,absent,torn,hit)=" & $verdictCounts &
+    " lastReader=" & $lastState
   false
 
 proc socketPeakFor(client: var RunQuotaClient; statsKey: string): uint64 =
