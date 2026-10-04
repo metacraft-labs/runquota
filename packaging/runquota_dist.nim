@@ -25,7 +25,7 @@ import repro_dsl_stdlib/packaging
 const
   RunQuotaPackageName* = "runquota"
 
-  RunQuotaPackageVersion* = "0.1.1"
+  RunQuotaPackageVersion* = "0.1.2"
     ## The version every package format carries.
     ##
     ## A THIRD copy of a string that already exists twice, and the
@@ -34,7 +34,7 @@ const
     ## is what `--version` prints, and this one is read by `repro build`
     ## under a Nim invocation that has neither of the others on its
     ## path. `scripts/bump_version.sh` rewrites all three in one act and
-    ## `tests/unit/t_version_sources_agree` refuses a drift between
+    ## `tests/unit/t_packaging_contract` refuses a drift between
     ## them, which is what keeps three copies from being three answers.
 
   RunQuotaUpgradeCode* = "{15A44E77-C288-4B55-8FA6-6A90AA289295}"
