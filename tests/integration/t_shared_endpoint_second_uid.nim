@@ -41,6 +41,8 @@
 ## No mocks anywhere -- a real `runquotad`, real distinct uids, real
 ## groups, a real `connect(2)`, the shipped CLI taking a real lease, and
 ## `owner_uid` read back out of the SQLite file the daemon wrote.
+## Native builder tools are required immutable Nix-store inputs, not assumed
+## /usr/bin or /bin executables. Their real closure is carried by each derivation.
 ## Capture readiness is separate from socket readiness: sessions opened during
 ## store verification are intentionally not recorded (docs/database.md,
 ## "When the endpoint appears"). Wait for the capture-enabled startup line
@@ -69,7 +71,7 @@ when not defined(posix):
     test "a member connects and is served; a non-member is refused by the KERNEL":
       skip()
 else:
-  import std/[os, osproc, posix, strutils, tables, times, unittest]
+  import std/[os, osproc, posix, strutils, tables, times, unittest, sequtils]
 
   import daemon_binary
 
@@ -101,6 +103,38 @@ else:
     for i in 0 ..< max(0, int(count)):
       result.add(int64(buffer[i]))
 
+  const requiredFixtureTools = ["bash", "mkdir", "chmod", "mv", "cp", "rm",
+                                "sleep", "echo", "sqlite3"]
+
+  proc requireFixtureTool(name: string): string =
+    # Preserve named argv[0] dispatch for Nix coreutils multicall aliases.
+    result = findExe(name, followSymlinks = false)
+    if result.len == 0 or not result.startsWith("/nix/store/"):
+      raise newException(ValueError,
+        "second-UID fixture requires an immutable Nix-backed tool: " & name)
+
+  let fixtureTools = block:
+    var selected = initTable[string, string]()
+    for name in requiredFixtureTools:
+      selected[name] = requireFixtureTool(name)
+    selected
+
+  proc fixtureToolRoots(): seq[string] =
+    for name in requiredFixtureTools:
+      let path = fixtureTools[name]
+      let boundary = path.find('/', "/nix/store/".len)
+      if boundary < 0:
+        raise newException(ValueError, "invalid immutable fixture tool path: " & name)
+      let root = path[0 ..< boundary]
+      if root notin result: result.add(root)
+
+  proc fixturePath(): string =
+    var directories: seq[string] = @[]
+    for name in requiredFixtureTools:
+      let directory = parentDir(fixtureTools[name])
+      if directory notin directories: directories.add(directory)
+    directories.join(":")
+
   proc nixBuildExe(): string =
     # `followSymlinks = false` IS LOAD-BEARING. `nix-build` is a symlink to
     # the multicall `nix` binary, which dispatches on `argv[0]`; resolving
@@ -131,7 +165,9 @@ else:
       "derivation {\n" &
       "  name = \"rq-m13d-" & nonce & "\";\n" &
       "  system = builtins.currentSystem;\n" &
-      "  builder = \"/bin/sh\";\n" &
+      "  builder = builtins.storePath \"" & fixtureTools["bash"] & "\";\n" &
+      "  runtimeToolRoots = [ " & fixtureToolRoots().mapIt(
+        "(builtins.storePath \"" & it & "\")").join(" ") & " ];\n" &
       "  args = [ \"" & scriptPath & "\" ];\n" &
       "}\n")
 
@@ -284,7 +320,7 @@ else:
         # `getuid`/`getgroups` rather than from `id`.
         let report = parseReport(runAsSecondUid("ids", script(
           "set -e",
-          "export PATH=/usr/bin:/bin",
+          "export PATH=" & quoteShell(fixturePath()),
           probeBinary & " /tmp/rq-no-such-socket > \"$out\" 2>&1")))
         check report.hasKey("uid")
         if report.hasKey("uid"):
@@ -324,15 +360,14 @@ else:
         let auditFlag = rv / "audit"
         let ownerReport = rv / "execution-owners"
         let auditError = rv / "audit-error"
-        let sqlite = findExe("sqlite3")
+        let sqlite = fixtureTools["sqlite3"]
         require sqlite.len > 0
 
         # PATH is set explicitly: a Nix builder gets `PATH=/path-not-set`,
         # and the observation store shells out to `sqlite3`.
         var daemon = startAsSecondUid("daemon", script(
           "set -e",
-          "export PATH=" & quoteShell(parentDir(sqlite) &
-            ":/usr/bin:/bin:/usr/sbin:/sbin"),
+          "export PATH=" & quoteShell(fixturePath()),
           "export RUNQUOTA_ENDPOINT_GROUP=" & $memberGid,
           "mkdir -p " & rv & "/state",
           "chmod 0755 " & rv & "/state",
@@ -350,7 +385,7 @@ else:
           "j=0",
           "while [ $j -lt 600 ]; do",
           "  [ -S " & socketPath & " ] && break",
-          "  /bin/sleep 0.1",
+          "  " & quoteShell(fixtureTools["sleep"]) & " 0.1",
           "  j=$((j+1))",
           "done",
           probeBinary & " --stat " &
@@ -368,11 +403,11 @@ else:
           "  fi",
           "  [ -e " & stopFlag & " ] && break",
           "  kill -0 $pid 2>/dev/null || break",
-          "  /bin/sleep 0.2",
+          "  " & quoteShell(fixtureTools["sleep"]) & " 0.2",
           "  i=$((i+1))",
           "done",
           "kill $pid 2>/dev/null || true",
-          "/bin/sleep 0.5",
+          quoteShell(fixtureTools["sleep"]) & " 0.5",
           "kill -9 $pid 2>/dev/null || true",
           "cp " & rv & "/daemon.log \"$out\" 2>/dev/null || " &
             "echo no-daemon-log > \"$out\"",
@@ -446,7 +481,7 @@ else:
             # ---------------------------------------------------------------
             let clientText = runAsSecondUid("client", script(
               "set -e",
-              "export PATH=/usr/bin:/bin",
+              "export PATH=" & quoteShell(fixturePath()),
               "export RUNQUOTA_ENDPOINT_GROUP=" & $memberGid,
               "export RUNQUOTA_ENDPOINT_OWNER_UID=" & $daemonUid,
               "{",
@@ -457,7 +492,7 @@ else:
               "  echo '--- lease ---'",
               "  RUNQUOTA_SOCKET=" & socketPath & " " & toolDir &
                 "/runquota acquire --cpu 1000 --mem 64MB" &
-                " --label m13d-second-uid -- /bin/echo m13d-second-uid-ok",
+                " --label m13d-second-uid -- " & quoteShell(fixtureTools["echo"]) & " m13d-second-uid-ok",
               "} > \"$out\" 2>&1"))
 
             let honest = parseReport(section(clientText, "honest"))

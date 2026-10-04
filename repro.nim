@@ -106,6 +106,11 @@ package runquota:
     "sleep"
     "mkdir"
     when not defined(windows):
+      "chmod"
+      "cp"
+      "mv"
+      "rm"
+      "echo"
       "dirname"
       "uname"
       "ps"
@@ -323,6 +328,9 @@ package runquota:
         ["timeout", "sleep", "nim", backendCompiler, "sqlite3", "sh", "bash", "git", "mkdir"])
       when not defined(windows):
         appendRegisteredActionToolIdentityRefs(executed.id, ["dirname", "uname", "ps", "find", "nix"])
+      when not defined(windows):
+        if name == "t_shared_endpoint_second_uid":
+          appendRegisteredActionToolIdentityRefs(executed.id, ["chmod", "cp", "mv", "rm", "echo"])
       run("test-" & name, build = executed.id, owningPackage = "runquota")
       testRuns.add(executed)
     discard collect("test-builds", testBuilds)
