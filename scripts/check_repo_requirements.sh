@@ -174,9 +174,9 @@ fi
 require_contains .github/workflows/release.yml "workflow_dispatch:"
 require_contains .github/workflows/release.yml "tags:"
 require_contains .github/release.json "linux-x86_64"
-# Linux ARM64 remains explicitly deferred for 0.1.0 and 0.1.1 (shared release
-# specification, 2026-10-02). Every other version requires both architectures.
-if ! grep -Eq '^[[:space:]]*version[[:space:]]*=[[:space:]]*"0\.1\.[01]"' runquota.nimble; then
+# Linux ARM64 remains explicitly deferred for 0.1.0 through 0.1.2 (shared
+# release specification, 2026-10-04). Later versions require both architectures.
+if ! grep -Eq '^[[:space:]]*version[[:space:]]*=[[:space:]]*"0\.1\.[012]"' runquota.nimble; then
   require_contains .github/release.json "linux-aarch64"
 fi
 require_contains .github/release.json "darwin-aarch64"

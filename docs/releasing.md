@@ -32,7 +32,7 @@ Each target emits JSON evidence naming the source commit, pinned dependency
 revisions, smoke result, signing state and artifact hashes. The assembly step
 checks the exact asset set and hashes after upload and generates `SHA256SUMS`.
 The user approved unsigned release payloads; the current release policy
-scopes `unsignedReleaseVersion` to version 0.1.1. Signing evidence
+scopes `unsignedReleaseVersion` to version 0.1.2. Signing evidence
 remains false. Later versions must update the policy explicitly or use OS
 signatures and a verified Sigstore checksum-manifest signature. The shared Linux
 package publisher retains its existing package and repository signatures.
@@ -61,7 +61,7 @@ published release or a full Windows service installation.
    commit. Wait for the complete matrix, packaging checks and checksum manifest.
    Download the `verified-release` workflow artifact for review. A dispatch
    never publishes, including one dispatched at an existing tag.
-3. Check the signing scope. Version 0.1.1 has an explicit unsigned-release
+3. Check the signing scope. Version 0.1.2 has an explicit unsigned-release
    exception. A version change rejects that exception until the policy is
    updated; it cannot silently waive signing for future releases. Required
    ad-hoc Mach-O execution signatures do not imply Developer ID signing.
@@ -84,3 +84,17 @@ ARM runner as an outage; consult the fleet runbook before diagnosis.
 The broader org distribution draft also covers Homebrew, installers, additional
 package formats and nixpkgs publication. Those channels are outside this staged
 release scope and must not be claimed as shipped by this workflow.
+
+## Current stabilization candidate
+
+Version 0.1.2 includes the development-shell hook-preservation repair and pins
+the enclosing Linux CI monitor to `004b8fc3eb0a6c31f78622272ba323c221b79b28`.
+That monitor fixes abandoned Nim frames after vfork/exec and preserves host
+fault handlers. RunQuota `f369c34` passes six fresh monitored provider builds
+with it in [37165456283](https://github.com/metacraft-labs/metacraft-github-actions/actions/runs/37165456283).
+The earlier old-monitor run reproduced the GCC crash on its fifth build.
+
+The existing public 0.1.1 release remains immutable. The shared release
+specification explicitly carries the unsigned-payload, hosted-runner and
+Linux ARM64 deferral scopes to 0.1.2. Complete promotion CI, exact-source
+rehearsal and publication checks remain required; no test assertion is removed.
