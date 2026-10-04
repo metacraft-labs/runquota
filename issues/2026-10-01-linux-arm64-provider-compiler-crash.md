@@ -49,3 +49,19 @@ Fetched RunQuota `agents` and `dev` before recording; their tips were `020e695`
 and `0389129`. Searched current documentation and open/deleted issue history
 for segmentation faults, compiler crashes and libtiff. No matching record was
 found. Local log: `/tmp/runquota-020-linux-arm64-repro-promotion.log`.
+
+## Qualified monitor correction — 2026-10-04
+
+At RunQuota `f369c34`, the old enclosing Linux monitor reproduces the GCC
+crash on the fifth fresh provider in `37162127465`. Its retained backtrace
+enters io-mon's close hook and Nim stack tracing; direct compiler replay passes.
+io-mon's native controls at `19ea53c` prove that original settings abandon a
+Nim frame across vfork/exec, while its documented POSIX policy preserves the
+parent state and host fault handlers on x64 and ARM.
+
+Run `37165456283` uses io-mon `004b8fc3eb0a6c31f78622272ba323c221b79b28`
+with the same RunQuota source and remaining bootstrap pins. All six fresh
+monitored provider builds pass, including the exact first ordinary command.
+The candidate updates the Linux CI bootstrap pin to that qualified monitor;
+complete development CI remains required. Linux ARM64 payloads stay deferred,
+and no existing test, assertion or monitor is removed.
