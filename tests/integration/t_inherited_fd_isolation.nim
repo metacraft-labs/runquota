@@ -152,16 +152,44 @@ suite "inherited_fd_isolation":
         # `getdirentries64` call. A launcher holding only a handful of
         # descriptors would never reach that continuation, so a bug in it would
         # sit undetected until a busy daemon hit it in production.
+        # A daemon-hosted runner can inherit Darwin's 256-descriptor soft
+        # limit even when the invoking shell has more capacity. Establish the
+        # fixture's prerequisite without changing its workload or the hard limit.
+        var limits: RLimit
+        if getrlimit(RLIMIT_NOFILE, limits) != 0:
+          raiseOSError(osLastError())
+        var originalLimits = limits
+        var raisedLimit = false
+        defer:
+          if raisedLimit:
+            check setrlimit(RLIMIT_NOFILE, originalLimits) == 0
+        if limits.rlim_cur < 1024:
+          if limits.rlim_max < 1024:
+            raise newException(IOError,
+              "600-descriptor fixture needs a hard descriptor limit of at least 1024")
+          limits.rlim_cur = 1024
+          if setrlimit(RLIMIT_NOFILE, limits) != 0:
+            raiseOSError(osLastError())
+          raisedLimit = true
+
         var held: seq[cint] = @[]
+        var marker = -1.cint
+        defer:
+          if marker >= 0:
+            discard close(marker)
+          for fd in held:
+            discard close(fd)
         for _ in 0 ..< 600:
           let fd = posix.open(cstring("/dev/null"), O_RDONLY)
           if fd < 0:
             break
           held.add(fd)
         check held.len == 600
+        if held.len != 600:
+          raise newException(IOError, "could not open all 600 fixture descriptors")
         # Park one deliberately above the base so the assertion below has a
         # descriptor it can name, whatever numbers the bulk allocation took.
-        let marker = parkHigh(held[^1])
+        marker = parkHigh(held[^1])
         check not isCloseOnExec(marker)
 
         var lister = launchProcess(commandSpec([fixtureTool("ls"), fdDir]))
@@ -178,9 +206,6 @@ suite "inherited_fd_isolation":
         for fd in seenByChild:
           check fd < int(HighFdBase)
 
-        discard close(marker)
-        for fd in held:
-          discard close(fd)
     else:
       skip()
 
