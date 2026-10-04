@@ -43,6 +43,8 @@
 ## `owner_uid` read back out of the SQLite file the daemon wrote.
 ## Native builder tools are required immutable Nix-store inputs, not assumed
 ## /usr/bin or /bin executables. Their real closure is carried by each derivation.
+## The leased child is external printf, whose tool identity supports Nix
+## provisioning; the shell's echo builtin is only used inside builder scripts.
 ## Capture readiness is separate from socket readiness: sessions opened during
 ## store verification are intentionally not recorded (docs/database.md,
 ## "When the endpoint appears"). Wait for the capture-enabled startup line
@@ -104,7 +106,7 @@ else:
       result.add(int64(buffer[i]))
 
   const requiredFixtureTools = ["bash", "mkdir", "chmod", "mv", "cp", "rm",
-                                "sleep", "echo", "sqlite3"]
+                                "sleep", "printf", "sqlite3"]
 
   proc requireFixtureTool(name: string): string =
     # Preserve named argv[0] dispatch for Nix coreutils multicall aliases.
@@ -492,7 +494,8 @@ else:
               "  echo '--- lease ---'",
               "  RUNQUOTA_SOCKET=" & socketPath & " " & toolDir &
                 "/runquota acquire --cpu 1000 --mem 64MB" &
-                " --label m13d-second-uid -- " & quoteShell(fixtureTools["echo"]) & " m13d-second-uid-ok",
+                " --label m13d-second-uid -- " & quoteShell(fixtureTools["printf"]) &
+                " " & quoteShell("%s\\n") & " m13d-second-uid-ok",
               "} > \"$out\" 2>&1"))
 
             let honest = parseReport(section(clientText, "honest"))

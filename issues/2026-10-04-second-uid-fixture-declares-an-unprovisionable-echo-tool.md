@@ -37,3 +37,22 @@ real fixture with Nix provisioning after repair. Compare output bytes with the
 former real executable. Repeat complete native debug, optimized and forced
 Repro suites, including Nix provisioning, before updating PR 39. Retain the
 failed platform result and require a fresh complete matrix before promotion.
+
+## Local controls
+
+At `48d7d5f`, the original selected test fails locally with
+`--tool-provisioning=nix` and the identical missing `echo` metadata error.
+With the fixture repair, the real immutable `echo` and `printf` executables
+both return exactly `m13d-second-uid-ok` followed by one newline.
+
+The same selected test then succeeds with Nix provisioning: all four build
+and execution actions actually launch; all three second-UID cases pass. The
+real member build user differs from the host user, the member is served,
+the non-member is refused by the kernel, and the existing spoof and persisted
+owner assertions pass. Logs and reports are retained as
+`/tmp/runquota-echo-nix-original.log`,
+`/tmp/runquota-printf-focused-driver.log` and
+`/tmp/runquota-printf-nix-focused.json`.
+
+Complete debug, optimized and forced Nix-provisioned Repro suites remain
+required before PR 39 is updated. No permissions, assertion or timeout changes.

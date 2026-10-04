@@ -110,7 +110,7 @@ package runquota:
       "cp"
       "mv"
       "rm"
-      "echo"
+      "printf"
       "dirname"
       "uname"
       "ps"
@@ -330,7 +330,7 @@ package runquota:
         appendRegisteredActionToolIdentityRefs(executed.id, ["dirname", "uname", "ps", "find", "nix"])
       when not defined(windows):
         if name == "t_shared_endpoint_second_uid":
-          appendRegisteredActionToolIdentityRefs(executed.id, ["chmod", "cp", "mv", "rm", "echo"])
+          appendRegisteredActionToolIdentityRefs(executed.id, ["chmod", "cp", "mv", "rm", "printf"])
       run("test-" & name, build = executed.id, owningPackage = "runquota")
       testRuns.add(executed)
     discard collect("test-builds", testBuilds)
