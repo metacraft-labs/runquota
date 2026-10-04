@@ -609,7 +609,7 @@ suite "ambient_load_attribution":
       load.stopLoad()
     # Nothing below this line may run while a spinner is alive.
     check not load.running
-    check busyBefore <= maxBusyForMeasurement
+    require busyBefore <= maxBusyForMeasurement
     check inRange
     check onWindows.len == cpuCycles
     check offWindows.len == cpuCycles
