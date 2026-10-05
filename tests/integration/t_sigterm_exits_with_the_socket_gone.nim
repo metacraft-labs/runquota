@@ -68,10 +68,10 @@
 ## unless the accept loop accepted the connection and a worker answered it,
 ## and both of those are downstream of the arming.
 
-import std/[os, osproc, strutils, times, unittest]
+import std/[monotimes, os, osproc, strutils, times, unittest]
 
 when defined(posix):
-  import std/[monotimes, posix]
+  import std/posix
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
@@ -119,7 +119,7 @@ proc startDaemon(socketPath, stateDir: string): Process =
     sleep(25)
     waited += 25
 
-proc proveServing(socketPath: string) =
+proc requestServing(socketPath: string) =
   ## ONE REAL REQUEST, ANSWERED. `connect` already waits for `HelloOk` and
   ## `registerSession` for `SessionRegistered`, so returning from here means
   ## the accept loop accepted a connection and a worker replied to two
@@ -137,6 +137,58 @@ proc proveServing(socketPath: string) =
       client.close()
   finally:
     delEnv("RUNQUOTA_SOCKET")
+
+
+proc proveServing(socketPath: string; deadline: MonoTime) =
+  ## Binding publishes the inode before listen/worker readiness. Retry ONLY
+  ## transport-not-ready errors; protocol refusals and all other errors remain
+  ## failures. All three original real control exchanges must finish inside
+  ## the ORIGINAL bind budget, counted from before the daemon was started.
+  var lastFailure: ref OSError
+  while getMonoTime() < deadline:
+    let remaining = int((deadline - getMonoTime()).inMilliseconds)
+    if remaining <= 0:
+      break
+    if not endpointIsBound(socketPath):
+      sleep(min(25, remaining))
+      continue
+    let hadTimeout = existsEnv("RUNQUOTA_HANDSHAKE_TIMEOUT_MS")
+    let oldTimeout = getEnv("RUNQUOTA_HANDSHAKE_TIMEOUT_MS")
+    # Each of Hello/Register/Close has header and payload reads. Give those
+    # six reads only the remaining original budget; no unbounded fallback.
+    var readBudget = max(1, remaining div 6)
+    if hadTimeout:
+      try:
+        let requested = parseInt(oldTimeout)
+        if requested > 0:
+          readBudget = min(readBudget, requested)
+      except ValueError:
+        discard
+    putEnv("RUNQUOTA_HANDSHAKE_TIMEOUT_MS", $readBudget)
+    try:
+      requestServing(socketPath)
+      doAssert getMonoTime() <= deadline,
+        "daemon served the real request only after its original bind budget"
+      return
+    except OSError as exc:
+      when defined(posix):
+        if exc.errorCode != ECONNREFUSED and exc.errorCode != ENOENT:
+          raise
+      else:
+        raise
+      lastFailure = exc
+    finally:
+      if hadTimeout:
+        putEnv("RUNQUOTA_HANDSHAKE_TIMEOUT_MS", oldTimeout)
+      else:
+        delEnv("RUNQUOTA_HANDSHAKE_TIMEOUT_MS")
+    let left = int((deadline - getMonoTime()).inMilliseconds)
+    if left > 0:
+      sleep(min(25, left))
+  if lastFailure != nil:
+    raise lastFailure
+  raise newException(OSError,
+    "daemon did not serve the real request within the original bind budget")
 
 when defined(linux):
   proc parkedAt(pid: int): string =
@@ -220,6 +272,7 @@ suite "sigterm_exits_with_the_socket_gone":
       let state = hostStateDir(root)
       require fileExists(daemonPath())
 
+      let bindDeadline = getMonoTime() + initDuration(milliseconds = BindBudgetMillis)
       var daemon = startDaemon(socketPath, state)
       var ending: Ending
       try:
@@ -227,7 +280,7 @@ suite "sigterm_exits_with_the_socket_gone":
         # reached its accept loop would pass every clause below by never
         # having been in `accept` at all.
         require endpointIsBound(socketPath)
-        proveServing(socketPath)
+        proveServing(socketPath, bindDeadline)
         removeFile(socketPath)
         require not fileExists(socketPath)
         # AND THE DIRECTORY IS STILL THERE, which is what makes this case
@@ -256,11 +309,12 @@ suite "sigterm_exits_with_the_socket_gone":
       let state = hostStateDir(root)
       require fileExists(daemonPath())
 
+      let bindDeadline = getMonoTime() + initDuration(milliseconds = BindBudgetMillis)
       var daemon = startDaemon(socketPath, state)
       var ending: Ending
       try:
         require endpointIsBound(socketPath)
-        proveServing(socketPath)
+        proveServing(socketPath, bindDeadline)
         # EVERYTHING THE DAEMON WAS GIVEN, gone in one stroke: the socket,
         # the published stats table beside it, the host identity file and
         # the observation database. This is what happens to an orphan when
