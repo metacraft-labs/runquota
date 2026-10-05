@@ -25,7 +25,7 @@
 import core/config
 import core/base_path
 
-const docsSiteOrigin* = "https://metacraft-labs.github.io/runquota"
+const docsSiteOrigin* = "https://metacraft-labs.github.io"
   ## The canonical origin the sitemap, `robots.txt` and the `og:`/canonical
   ## URLs are built against.
   ##
@@ -35,11 +35,9 @@ const docsSiteOrigin* = "https://metacraft-labs.github.io/runquota"
   ## canonical URLs at all, not because the site is live; change it in one
   ## place when a home is chosen, and nothing else in the book has to move.
 
-proc bookDocsConfig*(basePath = ""): DocsConfig =
+proc bookDocsConfig*(basePath = "/runquota"): DocsConfig =
   ## This book's `DocsConfig`. `basePath` is the URL prefix the build is hosted
-  ## under (`""` = the site root); it is normalized by the framework's
-  ## `normalizeBasePath`, so `"nightly"`, `"/nightly"` and `"/nightly/"` are
-  ## all accepted.
+  ## under (`"/runquota"` for GitHub Pages project hosting).
   let base = normalizeBasePath(basePath)
   DocsConfig(
     siteTitle: "RunQuota",
@@ -49,7 +47,7 @@ proc bookDocsConfig*(basePath = ""): DocsConfig =
     stylesheetHref: "/assets/style.css",
     # Absolute canonical/og/sitemap URLs must carry the channel prefix too --
     # `basePath` only rewrites the root-relative URLs.
-    baseUrl: docsSiteOrigin & base,
+    baseUrl: docsSiteOrigin & (if base == "/": "" else: base),
     basePath: base,
     # The sidebar's top-level sections, in READING order. Without this the
     # framework sorts sections alphabetically, which would file `reference`
@@ -64,8 +62,24 @@ proc bookDocsConfig*(basePath = ""): DocsConfig =
     # Render every sidebar section expanded, so the article links are visible
     # and navigable on a plain page load before/without the client JS.
     expandAllNavSections: true,
-    # One theme toggle, in the sidebar-bottom pill rather than the header --
-    # this book configures no header links, so a header carrying nothing but a
-    # toggle glyph would be the only thing in it.
+    # Header links:
+    headerLinks: @[
+      (label: "GitHub", href: "https://github.com/metacraft-labs/runquota"),
+    ],
+    # Sidebar social links:
+    sidebarLinks: @[
+      (label: "Github", href: "https://github.com/metacraft-labs/runquota",
+       icon: "/assets/img/icon__github.svg"),
+    ],
+    # Theme toggle in the sidebar-bottom pill:
     sidebarThemeToggle: true,
+    needHelp: (
+      heading: "Need some help?",
+      links: @[
+        (label: "Open an issue", href: "https://github.com/metacraft-labs/runquota/issues",
+         icon: "/assets/img/icon__support.svg"),
+        (label: "CLI Reference", href: "/usage_guide/cli",
+         icon: "/assets/img/icon__faq.svg"),
+      ],
+    ),
   )
