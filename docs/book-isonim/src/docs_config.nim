@@ -25,7 +25,7 @@
 import core/config
 import core/base_path
 
-const docsSiteOrigin* = "https://metacraft-labs.github.io/runquota"
+const docsSiteOrigin* = "https://metacraft-labs.github.io"
   ## The canonical origin the sitemap, `robots.txt` and the `og:`/canonical
   ## URLs are built against.
   ##
@@ -78,6 +78,8 @@ proc bookDocsConfig*(basePath = "/runquota"): DocsConfig =
       links: @[
         (label: "Open an issue", href: "https://github.com/metacraft-labs/runquota/issues",
          icon: "/assets/img/icon__support.svg"),
+        (label: "CLI Reference", href: "/usage_guide/cli",
+         icon: "/assets/img/icon__faq.svg"),
       ],
     ),
   )
