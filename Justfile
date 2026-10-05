@@ -141,3 +141,16 @@ check-static-helpers:
 # Runs `nix develop`, so it is not part of the in-shell test recipes.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
+
+# Documentation-site recipes (delegating to docs/book-isonim)
+dev-docs *args:
+    just -f docs/book-isonim/Justfile --working-directory docs/book-isonim dev-docs {{args}}
+
+build-docs:
+    just -f docs/book-isonim/Justfile --working-directory docs/book-isonim build
+
+serve-docs:
+    just -f docs/book-isonim/Justfile --working-directory docs/book-isonim serve-docs
+
+open-docs *args:
+    just -f docs/book-isonim/Justfile --working-directory docs/book-isonim open-docs {{args}}

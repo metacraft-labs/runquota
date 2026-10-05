@@ -37,8 +37,8 @@ const basePathEnvVar* = "RUNQUOTA_DOCS_BASE_PATH"
 
 when isMainModule:
   # Normalized here so the value that reaches the config and the log line is
-  # the same one.
-  let channelBase = normalizeBasePath(getEnv(basePathEnvVar))
+  let envBase = getEnv(basePathEnvVar, "/runquota")
+  let channelBase = normalizeBasePath(envBase)
   let n = buildDocsSite(bookDocsConfig(channelBase),
                         docsTokensCss = metacraftDocsTokensCss(),
                         clientEntry = "src/main.nim")
