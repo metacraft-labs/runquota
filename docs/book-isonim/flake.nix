@@ -7,7 +7,7 @@
   inputs = {
     isonim.url = "github:metacraft-labs/isonim/dev";
 
-    isonim-docs.url = "github:metacraft-labs/isonim-docs/main";
+    isonim-docs.url = "github:metacraft-labs/isonim-docs/dev";
     isonim-docs.inputs.isonim.follows = "isonim";
 
     nim-everywhere = {
