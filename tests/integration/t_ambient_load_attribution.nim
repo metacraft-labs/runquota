@@ -972,6 +972,12 @@ suite "ambient_load_attribution":
       let cores = max(1, cpuinfo.countProcessors())
       let busyNow = waitForHeadroom(30)
       check busyNow >= 0.0
+      # unittest.require calls quit(1), which skips this fixture's finally.
+      # Reject the same invalid measurement by unwinding its owned cleanup.
+      if not (busyNow <= maxBusyForMeasurement):
+        raise newException(ValueError,
+          "CPU headroom precondition failed: busy=" & $busyNow &
+          " exceeds ceiling=" & $maxBusyForMeasurement)
       require busyNow <= maxBusyForMeasurement
       # THE LOAD IS SIZED FOR WHAT THIS CASE NEEDS, which is to be larger
       # than everything the admitted executions declared -- so that `self`
