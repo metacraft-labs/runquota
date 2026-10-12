@@ -16,7 +16,7 @@ proc handshakeTimeoutMs(): int =
   ## Bound for the quick control handshakes (Hello / RegisterSession /
   ## CloseSession). A runquota daemon that accepts the connection but never
   ## answers — wedged, stale, or protocol-incompatible — must not block the
-  ## caller forever; the read fails so the caller can fall back (the engine's
+  ## caller forever; transport I/O fails so the caller can fall back (the engine's
   ## documented ``fallbackToRunQuotaBypass`` path) instead of hanging. The
   ## default is deliberately generous so a merely busy daemon under heavy
   ## parallel load is never mistaken for an unresponsive one; operators can
@@ -72,13 +72,18 @@ proc forMachine*(request: ResourceRequest; machineId: string): ResourceRequest =
   result.resources = result.resources.forMachine(machineId)
 
 proc requestFrame(client: var RunQuotaClient; kind: RqspMessageKind;
-    payload: string): uint64 =
+    payload: string; timeoutMs = 0): uint64 =
   if uint32(client.inflightRequestIds.len) >= client.flow.maxInflightRequests:
     client.lastDiagnostic = diagnostic(diagProtocol, "in-flight request limit exceeded")
     raise newException(RunQuotaClientError, client.lastDiagnostic.message)
   inc client.nextRequestId
   let requestId = client.nextRequestId
-  client.connection.sendFrame(encodeFrame(kind, FrameFlagRequest, requestId, payload))
+  var frameDiagnostic: Diagnostic
+  if not client.connection.sendFrame(
+      encodeFrame(kind, FrameFlagRequest, requestId, payload),
+      frameDiagnostic, timeoutMs):
+    client.lastDiagnostic = frameDiagnostic
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
   client.inflightRequestIds.add(requestId)
   requestId
 
@@ -155,7 +160,7 @@ proc connect*(endpoint: Endpoint; clientName = "runquota-nim";
     userId: uid,
     desiredCapabilities: "m1-lease"
   )
-  let requestId = result.requestFrame(rqHello, encodeHello(hello))
+  let requestId = result.requestFrame(rqHello, encodeHello(hello), handshakeTimeoutMs())
   let frame = result.readResponse(requestId, handshakeTimeoutMs())
   if frame.header.messageKind != rqHelloOk:
     result.lastDiagnostic = diagnostic(diagProtocol, "daemon did not answer Hello with HelloOk")
@@ -181,7 +186,7 @@ proc registerSession*(client: var RunQuotaClient; name,
     version: string): RunQuotaSession =
   let msg = RegisterSessionMessage(name: name, version: version,
       metadata: metadataNone())
-  let requestId = client.requestFrame(rqRegisterSession, encodeRegisterSession(msg))
+  let requestId = client.requestFrame(rqRegisterSession, encodeRegisterSession(msg), handshakeTimeoutMs())
   let frame = client.readResponse(requestId, handshakeTimeoutMs())
   if frame.header.messageKind != rqSessionRegistered:
     client.lastDiagnostic = diagnostic(diagProtocol, "daemon did not register the session")
@@ -197,7 +202,7 @@ proc closeSession*(session: var RunQuotaSession) =
     return
   let msg = CloseSessionMessage(sessionId: session.id)
   let requestId = session.client[].requestFrame(rqCloseSession,
-      encodeCloseSession(msg))
+      encodeCloseSession(msg), handshakeTimeoutMs())
   let frame = session.client[].readResponse(requestId, handshakeTimeoutMs())
   if frame.header.messageKind != rqSessionClosed:
     session.client[].lastDiagnostic = diagnostic(diagProtocol, "daemon did not close the session")
@@ -367,7 +372,7 @@ proc pollNextGrantBounded*(session: var RunQuotaSession;
   if session.pendingGrantRequestId == 0'u64:
     let msg = GrantNextMessage(sessionId: session.id)
     session.pendingGrantRequestId =
-      session.client[].requestFrame(rqGrantNext, encodeGrantNext(msg))
+      session.client[].requestFrame(rqGrantNext, encodeGrantNext(msg), timeoutMs)
   let requestId = session.pendingGrantRequestId
   # If the response was already buffered by an earlier read, take it now.
   if session.client[].responseBuffer.hasKey(requestId):
@@ -752,7 +757,7 @@ proc declarePools*(session: var RunQuotaSession;
   for pool in pools:
     msg.pools.add(pool)
   let requestId = session.client[].requestFrame(rqDeclarePools,
-    encodeDeclarePools(msg))
+    encodeDeclarePools(msg), handshakeTimeoutMs())
   let frame = session.client[].readResponse(requestId, handshakeTimeoutMs())
   if frame.header.messageKind != rqPoolsDeclared:
     session.client[].lastDiagnostic = diagnostic(diagProtocol,
@@ -795,14 +800,14 @@ proc reloadHostConfig*(client: var RunQuotaClient): HostConfigReloadedMessage =
 
 proc daemonStatus*(client: var RunQuotaClient;
                    timeoutMs = 0): DaemonStatusMessage =
-  ## Round-trip a StatusRequest.  ``timeoutMs > 0`` bounds the read so a
+  ## Round-trip a StatusRequest.  ``timeoutMs > 0`` bounds the write and read so a
   ## wedged daemon (accepts the connection but never answers) raises
   ## ``RunQuotaClientError`` instead of blocking forever — this is what
   ## makes ``daemonStatus`` usable as a *liveness probe*: a bounded
   ## successful round-trip proves the daemon is alive, while a timeout (or
   ## a closed connection) is detectable as silence.  ``timeoutMs == 0``
   ## keeps the legacy unbounded behaviour.
-  let requestId = client.requestFrame(rqStatusRequest, "")
+  let requestId = client.requestFrame(rqStatusRequest, "", timeoutMs)
   let frame = client.readResponse(requestId, timeoutMs)
   if frame.header.messageKind != rqStatusResponse:
     client.lastDiagnostic = diagnostic(diagProtocol, "daemon did not answer with status")

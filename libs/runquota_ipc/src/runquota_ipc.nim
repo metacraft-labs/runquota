@@ -1,7 +1,8 @@
-import std/[net, nativesockets, os, strutils, times]
+import std/[net, nativesockets, os, strutils, times, monotimes]
 
 when defined(posix):
   import std/posix
+  var msgDontWait {.importc: "MSG_DONTWAIT", header: "<sys/socket.h>".}: cint
   when defined(macosx) or defined(freebsd) or defined(openbsd):
     proc getpeereid(socket: SocketHandle; euid: ptr Uid; egid: ptr Gid): cint {.
       importc, header: "<unistd.h>".}
@@ -1676,11 +1677,55 @@ proc readExactSocket(socket: Socket; size: int; data: var string;
     remaining -= part.len
   true
 
-proc sendFrame*(connection: var LocalConnection; frame: string) =
+proc sendFrame*(connection: var LocalConnection; frame: string;
+                frameDiagnostic: var Diagnostic; timeoutMs = 0): bool =
+  ## Positive timeouts bound the entire POSIX socket write. Zero retains
+  ## blocking writes. Windows named-pipe writes remain synchronous/unbounded.
+  ## After failure, discard the connection: a partial frame may have escaped.
+  frameDiagnostic = okDiagnostic()
   case connection.kind
   of endpointUnixSocket:
     # A frame must be delivered or fail. SafeDisconn suppresses EPIPE and can
     # leave std/net.send retrying a closed peer without making progress.
+    when defined(posix):
+      if timeoutMs > 0:
+        let deadline = getMonoTime() + initDuration(milliseconds = timeoutMs)
+        var offset = 0
+        while offset < frame.len:
+          let remainingMs = (deadline - getMonoTime()).inMilliseconds
+          if remainingMs <= 0:
+            frameDiagnostic = diagnostic(diagProtocol, "RQSP frame write timed out")
+            return false
+          var fds = TPollfd(fd: cint(connection.socket.getFd()), events: POLLOUT)
+          let ready = poll(addr fds, Tnfds(1),
+            cint(min(remainingMs, int64(high(cint)))))
+          if ready == 0:
+            frameDiagnostic = diagnostic(diagProtocol, "RQSP frame write timed out")
+            return false
+          if ready < 0:
+            let error = osLastError()
+            if error == OSErrorCode(EINTR):
+              continue
+            raiseOSError(error)
+          # Writability promises room for some bytes, not the whole frame.
+          # Per-call nonblocking sends avoid changing the socket's read mode.
+          # Nim buffers reads only; there is no userspace write buffer to flush.
+          var flags = msgDontWait
+          when declared(MSG_NOSIGNAL):
+            flags = flags or MSG_NOSIGNAL
+          let sent = posix.send(connection.socket.getFd(),
+            unsafeAddr frame[offset], frame.len - offset, flags)
+          if sent < 0:
+            let error = osLastError()
+            if error in [OSErrorCode(EINTR), OSErrorCode(EAGAIN),
+                         OSErrorCode(EWOULDBLOCK)]:
+              continue
+            raiseOSError(error)
+          if sent == 0:
+            frameDiagnostic = diagnostic(diagProtocol, "RQSP connection closed during write")
+            return false
+          offset += sent
+        return true
     connection.socket.send(frame, flags = {})
   of endpointNamedPipe:
     when defined(windows):
@@ -1690,6 +1735,13 @@ proc sendFrame*(connection: var LocalConnection; frame: string) =
       raise newException(OSError, "named-pipe send is only supported on Windows")
   else:
     raise newException(OSError, "unsupported RunQuota connection")
+  true
+
+proc sendFrame*(connection: var LocalConnection; frame: string; timeoutMs = 0) =
+  ## Convenience form for callers that use exceptions for transport failures.
+  var frameDiagnostic: Diagnostic
+  if not connection.sendFrame(frame, frameDiagnostic, timeoutMs):
+    raise newException(OSError, frameDiagnostic.message)
 
 proc readExact(connection: var LocalConnection; size: int; data: var string;
                timeoutMs = 0): bool =
