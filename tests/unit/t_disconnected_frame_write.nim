@@ -35,6 +35,27 @@ when defined(posix):
     connection.sendFrame(Frame, timeoutMs)
     return if peer.recv(Frame.len) == Frame: 0 else: 4
 
+  proc exerciseHugeTimeout(): int =
+    # An operator-sized RUNQUOTA_HANDSHAKE_TIMEOUT_MS beyond the nanosecond
+    # clock or poll's cint range must saturate, not raise a Defect.
+    var handles: array[2, cint]
+    doAssert posix.socketpair(posix.AF_UNIX, posix.SOCK_STREAM, 0, handles) == 0
+    var writer = LocalConnection(kind: endpointUnixSocket,
+      socket: newSocket(SocketHandle(handles[0]), net.AF_UNIX,
+        net.SOCK_STREAM, IPPROTO_NONE))
+    defer: writer.close()
+    var reader = LocalConnection(kind: endpointUnixSocket,
+      socket: newSocket(SocketHandle(handles[1]), net.AF_UNIX,
+        net.SOCK_STREAM, IPPROTO_NONE))
+    defer: reader.close()
+    var diag: Diagnostic
+    doAssert writer.sendFrame(
+      encodeFrame(rqStatusRequest, FrameFlagRequest, 7, "probe"), diag, high(int))
+    var frame: RqspFrame
+    doAssert reader.receiveFrame(frame, 3_000_000_000)
+    doAssert frame.header.requestId == 7 and frame.payload == "probe"
+    0
+
   proc exerciseSilentPeer(mode: string): int =
     let root = createTempDir("rq-write-", "")
     defer: removeDir(root)
@@ -68,6 +89,32 @@ when defined(posix):
       var received: array[4096, char]
       doAssert posix.recv(peer.getFd(), addr received[0], received.len,
         msgDontWait) > 0
+    elif mode == "partial":
+      var diag: Diagnostic
+      doAssert not connection.sendFrame(payload, diag, BudgetMs)
+      # A truncated frame leaves the stream unframeable. The peer must see end
+      # of input rather than wait forever for the frame's missing tail, and a
+      # later frame must not be spliced into the middle of the truncated one.
+      var drained = 0
+      var sawEof = false
+      var received: array[65536, char]
+      while drained <= payload.len:
+        var fds = TPollfd(fd: cint(peer.getFd()), events: POLLIN)
+        if poll(addr fds, Tnfds(1), cint(BudgetMs)) <= 0:
+          break
+        let got = posix.recv(peer.getFd(), addr received[0], received.len, 0)
+        if got <= 0:
+          sawEof = got == 0
+          break
+        drained += got
+      doAssert drained > 0 and drained < payload.len
+      doAssert sawEof
+      var spliced = false
+      try:
+        spliced = connection.sendFrame(Frame, diag, BudgetMs)
+      except OSError:
+        discard
+      doAssert not spliced
     else:
       var client = RunQuotaClient(connection: connection,
         flow: defaultFlowControlLimits())
@@ -75,8 +122,9 @@ when defined(posix):
       if mode == "status":
         # Fill the send buffer before the tiny status request, so only the
         # request's write deadline can release the caller.
-        var diag: Diagnostic
-        doAssert not connection.sendFrame(payload, diag, BudgetMs)
+        while posix.send(connection.socket.getFd(), unsafeAddr payload[0],
+            payload.len, msgDontWait) > 0:
+          discard
       let started = getMonoTime()
       var failed = false
       try:
@@ -96,7 +144,9 @@ when defined(posix):
 
   if paramCount() == 2 and paramStr(1) == "--frame-write-child":
     let mode = paramStr(2)
-    if mode in ["silent", "register", "status"]:
+    if mode == "huge-timeout":
+      quit(exerciseHugeTimeout())
+    if mode in ["silent", "partial", "register", "status"]:
       quit(exerciseSilentPeer(mode))
     quit(exerciseWrite(mode.startsWith("disconnected"),
       if mode.endsWith("-bounded"): 150 else: 0))
@@ -124,8 +174,14 @@ when defined(posix):
       checkWrite("connected-bounded")
       checkWrite("disconnected-bounded")
 
+    test "oversized timeouts saturate instead of overflowing":
+      checkWrite("huge-timeout")
+
     test "a peer that accepts but never reads times out a partial write":
       checkWrite("silent")
+
+    test "a partially written frame poisons the connection for both ends":
+      checkWrite("partial")
 
     test "session registration propagates its write timeout as a client error":
       checkWrite("register")
