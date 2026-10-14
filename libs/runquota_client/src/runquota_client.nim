@@ -1,4 +1,4 @@
-import std/[options, os, tables, strutils]
+import std/[options, os, tables, strutils, monotimes]
 
 import runquota_client/types as clientTypes
 import runquota_client/standalone as clientStandalone
@@ -103,9 +103,26 @@ proc readResponse(client: var RunQuotaClient; requestId: uint64;
     client.responseBuffer.del(requestId)
     client.forgetInflight(requestId)
   else:
+    let startedNs = getMonoTime().ticks
+    if timeoutMs > 0 and (startedNs < 0 or
+        int64(timeoutMs) > (high(int64) - startedNs) div 1_000_000):
+      client.lastDiagnostic = diagnostic(diagInvalidArgument,
+        "response timeout cannot be represented by the monotonic clock")
+      raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+    let responseDeadline =
+      if timeoutMs > 0: startedNs + int64(timeoutMs) * 1_000_000
+      else: 0'i64
     while true:
+      var remainingMs = timeoutMs
+      if responseDeadline != 0:
+        let remainingNs = responseDeadline - getMonoTime().ticks
+        if remainingNs <= 0:
+          client.lastDiagnostic = diagnostic(diagProtocol,
+            "daemon response deadline exceeded")
+          raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+        remainingMs = int((remainingNs + 999_999) div 1_000_000)
       var frame: RqspFrame
-      if not client.connection.receiveFrame(frame, timeoutMs):
+      if not client.connection.receiveFrame(frame, remainingMs):
         client.lastDiagnostic = diagnostic(diagProtocol, "daemon closed the RQSP connection")
         raise newException(RunQuotaClientError, client.lastDiagnostic.message)
       if frame.header.requestId == requestId:
@@ -215,7 +232,24 @@ proc closeSession*(session: var RunQuotaSession) =
   session.active = false
 
 proc requestLease*(session: var RunQuotaSession;
-    request: ResourceRequest): RunQuotaLease =
+    request: ResourceRequest; timeoutMs = 0): RunQuotaLease =
+  ## Optional transport bound for an immediate lease decision. Zero preserves
+  ## the existing blocking contract; this is not a workload/deadline budget.
+  ## Each frame write/read is bounded by the selected IPC implementation.
+  ## Finite uncertainty closes the connection and invalidates this session;
+  ## no late grant is accepted or reused. Other sessions on this connection
+  ## also lose transport access. The daemon must reclaim them on disconnect.
+  ## The bound is per frame write plus a read budget (each IPC header/payload
+  ## read can consume the remaining read budget), not one end-to-end timeout.
+  if timeoutMs < 0 or int64(timeoutMs) > int64(high(int32)):
+    session.client[].lastDiagnostic = diagnostic(diagInvalidArgument,
+      "lease request timeout is outside the supported transport range")
+    raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+  when defined(windows):
+    if timeoutMs > 0:
+      session.client[].lastDiagnostic = diagnostic(diagInvalidArgument,
+        "finite lease-request writes require POSIX socket transport")
+      raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
   if not session.active:
     session.client[].lastDiagnostic = diagnostic(diagInvalidArgument, "session is not active")
     raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
@@ -230,32 +264,40 @@ proc requestLease*(session: var RunQuotaSession;
     metadata: request.metadata,
     estimate: request.estimate
   )
-  let requestId = session.client[].requestFrame(rqRequestLease,
-      encodeLeaseRequest(msg))
-  let frame = session.client[].readResponse(requestId)
-  case frame.header.messageKind
-  of rqLeaseGranted:
-    var granted: LeaseGrantedMessage
-    if not decodeLeaseGranted(frame.payload, granted):
-      session.client[].lastDiagnostic = diagnostic(diagProtocol, "invalid LeaseGranted payload")
+  var validDenial = false
+  try:
+    let requestId = session.client[].requestFrame(rqRequestLease,
+        encodeLeaseRequest(msg), timeoutMs)
+    let frame = session.client[].readResponse(requestId, timeoutMs)
+    case frame.header.messageKind
+    of rqLeaseGranted:
+      var granted: LeaseGrantedMessage
+      if not decodeLeaseGranted(frame.payload, granted):
+        session.client[].lastDiagnostic = diagnostic(diagProtocol, "invalid LeaseGranted payload")
+        raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+      RunQuotaLease(
+        session: addr session,
+        id: granted.leaseId,
+        resources: granted.resources,
+        active: true,
+        state: leaseClientGranted
+      )
+    of rqLeaseDenied:
+      var denied: LeaseDeniedMessage
+      if decodeLeaseDenied(frame.payload, denied):
+        validDenial = true
+        session.client[].lastDiagnostic = denied.diagnostic
+        raise newException(RunQuotaClientError, denied.diagnostic.message)
+      session.client[].lastDiagnostic = diagnostic(diagProtocol, "invalid LeaseDenied payload")
       raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
-    RunQuotaLease(
-      session: addr session,
-      id: granted.leaseId,
-      resources: granted.resources,
-      active: true,
-      state: leaseClientGranted
-    )
-  of rqLeaseDenied:
-    var denied: LeaseDeniedMessage
-    if decodeLeaseDenied(frame.payload, denied):
-      session.client[].lastDiagnostic = denied.diagnostic
-      raise newException(RunQuotaClientError, denied.diagnostic.message)
-    session.client[].lastDiagnostic = diagnostic(diagProtocol, "invalid LeaseDenied payload")
-    raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
-  else:
-    session.client[].lastDiagnostic = diagnostic(diagProtocol, "daemon did not answer with a lease decision")
-    raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+    else:
+      session.client[].lastDiagnostic = diagnostic(diagProtocol, "daemon did not answer with a lease decision")
+      raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+  except CatchableError:
+    if timeoutMs > 0 and not validDenial:
+      session.active = false
+      session.client[].close()
+    raise
 
 proc toCandidate*(clientCandidateId: uint64;
     request: ResourceRequest): LeaseCandidate =

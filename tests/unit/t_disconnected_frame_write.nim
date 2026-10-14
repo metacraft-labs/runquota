@@ -75,8 +75,40 @@ when defined(posix):
     doAssert setsockopt(connection.socket.getFd(), SOL_SOCKET, SO_SNDBUF,
       addr bufferSize, SockLen(sizeof(bufferSize))) == 0
     let payload = repeat("x", 1024 * 1024)
+    let originalFlags = fcntl(connection.socket.getFd(), F_GETFL, 0)
+    doAssert originalFlags >= 0
     const BudgetMs = 150
-    if mode == "silent":
+    if mode == "slow":
+      when defined(macosx):
+        var lowWater = cint(128)
+        doAssert setsockopt(connection.socket.getFd(), SOL_SOCKET, SO_SNDLOWAT,
+          addr lowWater, SockLen(sizeof(lowWater))) == 0
+        var size = SockLen(sizeof(lowWater))
+        doAssert getsockopt(connection.socket.getFd(), SOL_SOCKET, SO_SNDLOWAT,
+          addr lowWater, addr size) == 0
+        doAssert lowWater > 1
+      let readerPid = fork()
+      doAssert readerPid >= 0
+      if readerPid == 0:
+        var bytesRead = 0
+        var chunk: array[128, char]
+        for iteration in 0 ..< 15:
+          sleep(20)
+          let received = posix.recv(peer.getFd(), addr chunk[0], chunk.len,
+            msgDontWait)
+          if received > 0:
+            bytesRead += received
+        quit(if bytesRead > 0: 0 else: 1)
+      var diag: Diagnostic
+      let started = getMonoTime()
+      doAssert not connection.sendFrame(payload, diag, BudgetMs)
+      let elapsed = (getMonoTime() - started).inMilliseconds
+      doAssert diag.code == diagProtocol and "timed out" in diag.message
+      doAssert elapsed >= 100 and elapsed < 1000
+      var status: cint
+      doAssert waitpid(readerPid, status, 0) == readerPid
+      doAssert WIFEXITED(status) and WEXITSTATUS(status) == 0
+    elif mode == "silent":
       var diag: Diagnostic
       let started = getMonoTime()
       doAssert not connection.sendFrame(payload, diag, BudgetMs)
@@ -122,9 +154,16 @@ when defined(posix):
       if mode == "status":
         # Fill the send buffer before the tiny status request, so only the
         # request's write deadline can release the caller.
-        while posix.send(connection.socket.getFd(), unsafeAddr payload[0],
-            payload.len, msgDontWait) > 0:
-          discard
+        when defined(macosx):
+          doAssert fcntl(connection.socket.getFd(), F_SETFL,
+            originalFlags or O_NONBLOCK) == 0
+        try:
+          while posix.send(connection.socket.getFd(), unsafeAddr payload[0],
+              payload.len, msgDontWait) > 0:
+            discard
+        finally:
+          when defined(macosx):
+            doAssert fcntl(connection.socket.getFd(), F_SETFL, originalFlags) == 0
       let started = getMonoTime()
       var failed = false
       try:
@@ -140,13 +179,14 @@ when defined(posix):
       doAssert "write timed out" in client.lastDiagnostic.message
       doAssert client.inflightRequestIds.len == 0
       doAssert elapsed >= 100 and elapsed < 1000
+    doAssert fcntl(connection.socket.getFd(), F_GETFL, 0) == originalFlags
     0
 
   if paramCount() == 2 and paramStr(1) == "--frame-write-child":
     let mode = paramStr(2)
     if mode == "huge-timeout":
       quit(exerciseHugeTimeout())
-    if mode in ["silent", "partial", "register", "status"]:
+    if mode in ["silent", "partial", "register", "status", "slow"]:
       quit(exerciseSilentPeer(mode))
     quit(exerciseWrite(mode.startsWith("disconnected"),
       if mode.endsWith("-bounded"): 150 else: 0))
@@ -179,6 +219,9 @@ when defined(posix):
 
     test "a peer that accepts but never reads times out a partial write":
       checkWrite("silent")
+
+    test "a slowly draining peer cannot restart the full-frame deadline":
+      checkWrite("slow")
 
     test "a partially written frame poisons the connection for both ends":
       checkWrite("partial")

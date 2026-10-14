@@ -8,12 +8,11 @@
 # job compiles `repro.nim`; the nix jobs never do (their `sqlite3` tool is
 # `pkgs.sqlite` in the dev shell).
 #
-# Pinned to an exact revision (reprobuild-packages dev 9d9176b) rather than
+# Pinned to an exact revision (published reprobuild-packages 4e2fd1d) rather than
 # `=dev`, which clone-siblings warns makes the build not reproducible. The
-# catalog is not in any lock yet, so this entry is its only pin
-# (reprobuild-specs Provisioning-Contributions.md, "Catalog Lookup And
-# Provisioning"); move it when a catalog change is needed here.
-reprobuild-packages=9d9176bff5c5aee175efcaa5d667c9ed7b9b8043
+# catalog is also locked by the flake input used by the owning Nix shell.
+# Keep this non-Nix CI pin aligned with that source constructor.
+reprobuild-packages=4e2fd1dcabf8ae8eac28a2d27c3160233589c1e6
 
 # RunQuota's published stats table requires this source-library interface.
 # Explicitly override the carried workspace pin until it includes the interface.
