@@ -265,6 +265,28 @@ The stats-table file is deliberately **left behind**. A table whose publisher
 has exited is stale, not invalid, and a reader that finds it says so:
 `(publisher not running; entries are stale)`.
 
+### Stopping with the process that started it
+
+A daemon started for **one** caller can be tied to it: start it with
+`RUNQUOTA_EXIT_WITH_PARENT=1` in its environment (POSIX only; Windows ignores
+the variable). The daemon records its parent at start, removes the variable
+from its own environment so nothing it starts inherits it, and checks its
+parent every 200 ms once `SIGTERM` is armed. When the parent has changed —
+the parent died and the daemon was re-parented to init or a subreaper — it
+sends itself `SIGTERM` and takes exactly the shutdown above, exiting 0. A
+parent that is already init at start counts as gone.
+
+Callers that need ownership guaranteed across startup also set
+`RUNQUOTA_EXIT_WITH_PARENT_PID` to their own pid before spawning. The daemon
+compares against that recorded owner, so a caller dying before daemon entry
+cannot cause the daemon to adopt init or a subreaper as its owner. Both
+variables are removed from the daemon's environment at entry.
+
+This is what `repro` does with the private daemon it starts on an
+unprovisioned host, and it is the only way such a daemon stops when its caller
+is `SIGKILL`ed or OOM-killed, since no handler in the caller runs then. The
+installed host-wide service is never started with it.
+
 ## When things go wrong at runtime
 
 A failed `accept` is counted (`connections_failed` in `runquota status`) and

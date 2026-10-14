@@ -88,6 +88,16 @@ const
     ## directory literally called `%ProgramData%` (reprobuild's M1 N22).
 
 when isMainModule:
+  # `RUNQUOTA_EXIT_WITH_PARENT=1` -- FIRST, before anything else runs. The
+  # parent is recorded at the earliest moment so a parent that dies while
+  # this daemon is still starting is still noticed (the watch sees a pid
+  # that differs from the one recorded here), and the variable is removed
+  # from this process's environment before it can reach anything the daemon
+  # starts. The watch itself is started by `serve` once SIGTERM is armed.
+  # POSIX only; Windows ignores the variable. See
+  # `runquota_daemon/parent_watch`.
+  let exitWithParentPid = takeExitWithParentRequest()
+
   # THE SCM CONNECTION IS MADE BEFORE ANYTHING IS PRINTED, and the order
   # is load-bearing rather than tidy.
   #
@@ -136,6 +146,7 @@ when isMainModule:
     quit 0
 
   var config = defaultDaemonConfig(defaultEndpoint())
+  config.exitWithParentPid = exitWithParentPid
   let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--log-file PATH]"
   var i = 0
   while i < args.len:
@@ -307,7 +318,15 @@ when isMainModule:
       config.hostIdentityFilePath = args[i + 1]
       i += 2
     of "--help", "-h":
-      echo "runquotad " & versionString() & "\n" & usage
+      # The one environment variable that changes the daemon's LIFETIME is
+      # named here, beside the flags, because it is set by whoever starts
+      # the daemon and a reader of `--help` is that person. The full list
+      # is the book's reference/environment_variables page.
+      echo "runquotad " & versionString() & "\n" & usage & "\n\n" &
+        "environment:\n" &
+        "  " & exitWithParentEnvVar & "=1  stop (as on SIGTERM) when the " &
+        "process that started runquotad exits; POSIX only, ignored on Windows\n" &
+        "  " & exitWithParentPidEnvVar & "=PID  expected owner recorded before spawning"
       quit 0
     else:
       echo "unknown runquotad argument: " & args[i]

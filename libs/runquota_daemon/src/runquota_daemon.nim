@@ -15,6 +15,7 @@ import runquota_daemon/host_config
 import runquota_daemon/host_memory
 import runquota_daemon/reload_report
 import runquota_daemon/child_identity
+import runquota_daemon/parent_watch
 import runquota_codec
 import runquota_core
 import runquota_core/process_owned
@@ -43,6 +44,8 @@ export daemonTypes
 # its first line.
 export windows_service
 export reload_report
+# `runquotad` reads `RUNQUOTA_EXIT_WITH_PARENT` through this, at start.
+export parent_watch
 
 const libraryName* = "runquota_daemon"
 
@@ -4321,6 +4324,13 @@ proc serve*(config: DaemonConfig): int =
   # before any worker exists, because the shutdown this arms is the one that
   # joins them.
   installShutdownHandler(config.endpoint.path)
+  # `RUNQUOTA_EXIT_WITH_PARENT`: AFTER the handler is armed, because the watch
+  # stops the daemon by sending it SIGTERM, and a SIGTERM that arrived before
+  # the arming would take the default disposition instead of the orderly
+  # shutdown below. A parent that died while the daemon was still starting is
+  # caught on the watch's first tick, since the pid was recorded at start
+  # (`takeExitWithParentRequest`). See `runquota_daemon/parent_watch`.
+  startParentWatch(config.exitWithParentPid)
   # Nim's thread wrapper borrows the Thread object's address through its exit
   # cleanup. Allocate every slot before starting workers so sequence growth
   # cannot move a live worker's storage.
@@ -4423,6 +4433,12 @@ proc serve*(config: DaemonConfig): int =
     # here, so a shutdown that started late would otherwise inherit whatever
     # was left of it. A no-op in a console run and on POSIX.
     reportWindowsServiceStopping()
+    # THE PARENT WATCH GOES BEFORE THE HANDLER IS DISARMED. A watcher that
+    # fired after the disarm would meet SIGTERM's default disposition and
+    # kill the process in the middle of the drain below; stopped first, its
+    # only possible signal is one the armed handler still turns into a flag
+    # this shutdown is already acting on. A no-op without a watch.
+    stopParentWatch()
     # FIRST OF THE SHUTDOWN PROPER, so the handler is disarmed and the waker
     # joined before the shutdown does anything else. A second SIGTERM arriving mid-shutdown
     # then takes the default disposition, which is the right answer: an

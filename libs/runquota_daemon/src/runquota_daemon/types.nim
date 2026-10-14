@@ -148,6 +148,13 @@ type
       ## waiting for a quiet tick is right; waiting for one forever is not
       ## a bound, and a machine that is never idle is the one whose store
       ## grows fastest.
+    exitWithParentPid*: int
+      ## The parent this daemon stops with, as `takeExitWithParentRequest`
+      ## requested by `RUNQUOTA_EXIT_WITH_PARENT=1`, optionally recorded
+      ## before spawning with `RUNQUOTA_EXIT_WITH_PARENT_PID`; 0 (the
+      ## default, and always on Windows) means no watch. `serve` starts the
+      ## watch once SIGTERM is armed, and the watch stops the daemon through
+      ## that same orderly SIGTERM path. See `runquota_daemon/parent_watch`.
 
   SessionRow* = object
     id*: SessionId

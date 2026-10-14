@@ -14,6 +14,13 @@ Every variable RunQuota's binaries read. Anything not on this list is not read.
 | `RUNQUOTA_ENDPOINT_GROUP` | daemon and clients | Overrides the rendezvous group name (default `runquota`). **A numeric gid is accepted**, for hosts whose group is real but not name-resolvable. If it does not resolve, the endpoint degrades visibly to single-user `0700`/`0600` rather than silently widening. |
 | `RUNQUOTA_ENDPOINT_OWNER_UID` | daemon and clients | Overrides the uid the rendezvous is expected to be owned by. Falls back to a lookup of the user `runquota`, then to the current uid. |
 
+## Daemon lifetime
+
+| Variable | Read by | Meaning |
+|---|---|---|
+| `RUNQUOTA_EXIT_WITH_PARENT_PID` | `runquotad` | Optional expected owner pid, recorded by the caller before spawning. With `RUNQUOTA_EXIT_WITH_PARENT=1`, a different current parent triggers shutdown even if the owner died before daemon entry. Removed from the environment at start; an invalid supplied pid requests immediate shutdown. POSIX only. |
+| `RUNQUOTA_EXIT_WITH_PARENT` | `runquotad` | Exactly `1` makes the daemon stop — through its ordinary `SIGTERM` shutdown, exiting 0 — when the process that started it exits (detected as a change of `getppid()`, polled every 200 ms; a parent of 1 at start counts as gone). The daemon removes the variable from its own environment at start whatever its value, so nothing it spawns inherits it. POSIX only; ignored on Windows. Set by `repro` for the private daemon it starts on an unprovisioned host; see [Running the daemon](/usage_guide/daemon#stopping-with-the-process-that-started-it). |
+
 ## The published aggregate table
 
 | Variable | Meaning |
