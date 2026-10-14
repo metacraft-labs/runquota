@@ -1,7 +1,8 @@
-import std/[net, nativesockets, os, strutils, times]
+import std/[net, nativesockets, os, strutils, times, monotimes]
 
 when defined(posix):
   import std/posix
+  var msgDontWait {.importc: "MSG_DONTWAIT", header: "<sys/socket.h>".}: cint
   when defined(macosx) or defined(freebsd) or defined(openbsd):
     proc getpeereid(socket: SocketHandle; euid: ptr Uid; egid: ptr Gid): cint {.
       importc, header: "<unistd.h>".}
@@ -1565,6 +1566,18 @@ proc close*(listener: var LocalListener) =
   else:
     discard
 
+proc ioDeadline(timeoutMs: int): MonoTime =
+  ## Monotonic deadline for a bounded transport operation. Wall-clock steps
+  ## (NTP, manual changes) must neither expire nor extend a handshake, and an
+  ## oversized operator timeout such as ``RUNQUOTA_HANDSHAKE_TIMEOUT_MS`` must
+  ## saturate (about 146 years) rather than overflow the nanosecond clock.
+  const MaxTimeoutMs = high(int64) div 2_000_000
+  getMonoTime() + initDuration(milliseconds = min(int64(timeoutMs), MaxTimeoutMs))
+
+proc remainingMs(deadline: MonoTime): int =
+  ## Milliseconds left before ``deadline``, clamped to what ``poll`` accepts.
+  int(min((deadline - getMonoTime()).inMilliseconds, int64(high(cint))))
+
 when defined(windows):
   proc winReadExact(handle: WinHandle; size: int; data: var string;
                     timeoutMs = 0): bool =
@@ -1579,13 +1592,11 @@ when defined(windows):
     ## deadline either.
     data.setLen(size)
     var offset = 0
-    let deadline =
-      if timeoutMs > 0: epochTime() + timeoutMs.float / 1000.0
-      else: 0.0
+    let deadline = ioDeadline(timeoutMs)
     while offset < size:
       var got: int32 = 0
       var want = int32(size - offset)
-      if deadline > 0.0:
+      if timeoutMs > 0:
         var available = 0'i32
         while true:
           if not peekNamedPipe(handle, lpTotalBytesAvail = addr available):
@@ -1594,7 +1605,7 @@ when defined(windows):
             return false
           if available > 0:
             break
-          if epochTime() >= deadline:
+          if deadline.remainingMs <= 0:
             data.setLen(0)
             return false
           sleep(1)
@@ -1653,13 +1664,11 @@ proc readExactSocket(socket: Socket; size: int; data: var string;
   ## wait on the kernel fd when Nim's userspace buffer is actually empty.
   data.setLen(0)
   var remaining = size
-  let deadline =
-    if timeoutMs > 0: epochTime() + timeoutMs.float / 1000.0
-    else: 0.0
+  let deadline = ioDeadline(timeoutMs)
   while remaining > 0:
     when defined(posix):
-      if deadline > 0.0 and not socket.hasDataBuffered():
-        let remainingMs = int((deadline - epochTime()) * 1000.0)
+      if timeoutMs > 0 and not socket.hasDataBuffered():
+        let remainingMs = deadline.remainingMs
         if remainingMs <= 0:
           return false
         let fd = socket.getFd()
@@ -1676,11 +1685,84 @@ proc readExactSocket(socket: Socket; size: int; data: var string;
     remaining -= part.len
   true
 
-proc sendFrame*(connection: var LocalConnection; frame: string) =
+when defined(posix):
+  proc poisonAfterPartialWrite(socket: Socket) =
+    ## A timed-out write that already sent part of a frame leaves the stream
+    ## unframeable. Shut both directions down so a reused connection fails
+    ## instead of splicing a new frame into the truncated one, and so the peer
+    ## reads end of input instead of waiting forever for the missing tail.
+    discard posix.shutdown(socket.getFd(), SHUT_RDWR)
+
+proc sendFrame*(connection: var LocalConnection; frame: string;
+                frameDiagnostic: var Diagnostic; timeoutMs = 0): bool =
+  ## Positive timeouts bound the entire POSIX socket write. Zero retains
+  ## blocking writes. Windows named-pipe writes remain synchronous/unbounded.
+  ## After failure, discard the connection. A POSIX timeout after a partial
+  ## frame shuts the socket down so neither end can reuse the broken stream.
+  frameDiagnostic = okDiagnostic()
   case connection.kind
   of endpointUnixSocket:
     # A frame must be delivered or fail. SafeDisconn suppresses EPIPE and can
     # leave std/net.send retrying a closed peer without making progress.
+    when defined(posix):
+      if timeoutMs > 0:
+        when defined(macosx):
+          # Writers on a framed stream must be serialized; concurrent reads
+          # remain supported. Darwin POLLOUT promises at least SO_SNDLOWAT
+          # bytes in both the sender and its connected UNIX peer buffers.
+          var sendLowWater: cint
+          var optionSize = SockLen(sizeof(sendLowWater))
+          if getsockopt(connection.socket.getFd(), SOL_SOCKET, SO_SNDLOWAT,
+              addr sendLowWater, addr optionSize) < 0:
+            raiseOSError(osLastError())
+          if optionSize != SockLen(sizeof(sendLowWater)) or sendLowWater <= 0:
+            raise newException(OSError, "Invalid socket send low-water mark")
+        let deadline = ioDeadline(timeoutMs)
+        var offset = 0
+        while offset < frame.len:
+          let remainingMs = deadline.remainingMs
+          if remainingMs <= 0:
+            if offset > 0:
+              connection.socket.poisonAfterPartialWrite()
+            frameDiagnostic = diagnostic(diagProtocol, "RQSP frame write timed out")
+            return false
+          var fds = TPollfd(fd: cint(connection.socket.getFd()), events: POLLOUT)
+          let ready = poll(addr fds, Tnfds(1), cint(remainingMs))
+          if ready == 0:
+            if offset > 0:
+              connection.socket.poisonAfterPartialWrite()
+            frameDiagnostic = diagnostic(diagProtocol, "RQSP frame write timed out")
+            return false
+          if ready < 0:
+            let error = osLastError()
+            if error == OSErrorCode(EINTR):
+              continue
+            raiseOSError(error)
+          # Writability promises room for some bytes, not the whole frame.
+          # Per-call nonblocking sends avoid changing the socket's read mode.
+          # Nim buffers reads only; there is no userspace write buffer to flush.
+          var flags = msgDontWait
+          when declared(MSG_NOSIGNAL):
+            flags = flags or MSG_NOSIGNAL
+          var sendSize = frame.len - offset
+          when defined(macosx):
+            # Avoid Darwin's blocking send-space loop: this non-atomic stream
+            # chunk fits the space established by POLLOUT, even for a slowly
+            # draining peer. Recheck the absolute deadline before each chunk.
+            sendSize = min(sendSize, int(sendLowWater))
+          let sent = posix.send(connection.socket.getFd(),
+            unsafeAddr frame[offset], sendSize, flags)
+          if sent < 0:
+            let error = osLastError()
+            if error in [OSErrorCode(EINTR), OSErrorCode(EAGAIN),
+                         OSErrorCode(EWOULDBLOCK)]:
+              continue
+            raiseOSError(error)
+          if sent == 0:
+            frameDiagnostic = diagnostic(diagProtocol, "RQSP connection closed during write")
+            return false
+          offset += sent
+        return true
     connection.socket.send(frame, flags = {})
   of endpointNamedPipe:
     when defined(windows):
@@ -1690,6 +1772,13 @@ proc sendFrame*(connection: var LocalConnection; frame: string) =
       raise newException(OSError, "named-pipe send is only supported on Windows")
   else:
     raise newException(OSError, "unsupported RunQuota connection")
+  true
+
+proc sendFrame*(connection: var LocalConnection; frame: string; timeoutMs = 0) =
+  ## Convenience form for callers that use exceptions for transport failures.
+  var frameDiagnostic: Diagnostic
+  if not connection.sendFrame(frame, frameDiagnostic, timeoutMs):
+    raise newException(OSError, frameDiagnostic.message)
 
 proc readExact(connection: var LocalConnection; size: int; data: var string;
                timeoutMs = 0): bool =
