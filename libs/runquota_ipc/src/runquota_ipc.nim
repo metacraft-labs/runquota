@@ -1706,6 +1706,17 @@ proc sendFrame*(connection: var LocalConnection; frame: string;
     # leave std/net.send retrying a closed peer without making progress.
     when defined(posix):
       if timeoutMs > 0:
+        when defined(macosx):
+          # Writers on a framed stream must be serialized; concurrent reads
+          # remain supported. Darwin POLLOUT promises at least SO_SNDLOWAT
+          # bytes in both the sender and its connected UNIX peer buffers.
+          var sendLowWater: cint
+          var optionSize = SockLen(sizeof(sendLowWater))
+          if getsockopt(connection.socket.getFd(), SOL_SOCKET, SO_SNDLOWAT,
+              addr sendLowWater, addr optionSize) < 0:
+            raiseOSError(osLastError())
+          if optionSize != SockLen(sizeof(sendLowWater)) or sendLowWater <= 0:
+            raise newException(OSError, "Invalid socket send low-water mark")
         let deadline = ioDeadline(timeoutMs)
         var offset = 0
         while offset < frame.len:
@@ -1733,8 +1744,14 @@ proc sendFrame*(connection: var LocalConnection; frame: string;
           var flags = msgDontWait
           when declared(MSG_NOSIGNAL):
             flags = flags or MSG_NOSIGNAL
+          var sendSize = frame.len - offset
+          when defined(macosx):
+            # Avoid Darwin's blocking send-space loop: this non-atomic stream
+            # chunk fits the space established by POLLOUT, even for a slowly
+            # draining peer. Recheck the absolute deadline before each chunk.
+            sendSize = min(sendSize, int(sendLowWater))
           let sent = posix.send(connection.socket.getFd(),
-            unsafeAddr frame[offset], frame.len - offset, flags)
+            unsafeAddr frame[offset], sendSize, flags)
           if sent < 0:
             let error = osLastError()
             if error in [OSErrorCode(EINTR), OSErrorCode(EAGAIN),

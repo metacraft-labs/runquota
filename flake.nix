@@ -7,6 +7,13 @@
     flake-parts.follows = "nixos-modules/flake-parts";
     git-hooks.follows = "nixos-modules/git-hooks-nix";
 
+    # Interface catalog consumed by the selected reprobuild SDK. Keep this
+    # immutable pin independent of an older workspace catalog checkout.
+    runquota-package-catalog = {
+      url = "github:metacraft-labs/reprobuild-packages/4e2fd1dcabf8ae8eac28a2d27c3160233589c1e6";
+      flake = false;
+    };
+
     # Pure package renderers used by release_metadata.nim. Pin their sources
     # independently of the operator's installed repro executable.
     release-packaging-src = {
@@ -245,6 +252,7 @@
             # published aggregate table does not compile, and the point of
             # setting it HERE is that the packaged daemon is built from the
             # same sources as the developer's.
+            REPROBUILD_PACKAGES_ROOT = inputs.runquota-package-catalog;
             SHM_LEASE_SRC = shmLeaseSrc;
 
             nativeBuildInputs = [
@@ -438,6 +446,7 @@
               pkgs.rpm
               pkgs.libarchive
             ];
+            REPROBUILD_PACKAGES_ROOT = inputs.runquota-package-catalog;
             SHM_LEASE_SRC = shmLeaseSrc;
             RELEASE_PACKAGING_SRC = inputs.release-packaging-src;
             RELEASE_NIMCRYPTO_SRC = inputs.release-nimcrypto-src;
