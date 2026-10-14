@@ -9,6 +9,12 @@
 ##
 ##   runquota static-capacity deadlock for 'repro provider compile edge' ...
 ##   lease request exceeds machine memory budget: local
+##     (requested 30709016166 bytes, budget 16 GiB)
+##
+## -- the request in bytes rather than in GiB because a LEARNED figure is
+## 1.25x a measured peak and so is almost never a round multiple, and the
+## refusal abbreviates only what it can abbreviate losslessly
+## (`t_denial_names_the_amounts.nim`).
 ##
 ## Observed on a shared Windows workstation: a ~2 GB nim provider compile had
 ## learned 28.6 GiB against a 16 GiB budget (a peak that absorbed an

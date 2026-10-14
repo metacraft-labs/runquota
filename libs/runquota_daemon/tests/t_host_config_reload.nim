@@ -169,8 +169,11 @@ suite "host configuration reload":
         inc denied
         check decision.kind == leaseDecisionDenied
         check decision.diagnostic.code == diagDenied
+        # The amounts are part of the reason, measured against the budget
+        # the reload put in force (`t_denial_names_the_amounts.nim`).
         check decision.diagnostic.message ==
-          "lease request exceeds machine memory budget: local"
+          "lease request exceeds machine memory budget: local " &
+          "(requested 12 GiB, budget 8 GiB)"
     check denied == 1
     # Delivered once.
     for decision in daemon.grantNext(2):

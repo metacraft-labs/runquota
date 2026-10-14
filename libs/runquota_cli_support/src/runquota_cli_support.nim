@@ -336,6 +336,30 @@ proc runStandaloneAcquire(label, statsKey: string;
     stderr.writeLine(standaloneReport(capture, reason))
   exitCode
 
+proc clientFailureText(message: string; last: Diagnostic): string =
+  ## A client failure as an operator should read it: the daemon's `message`,
+  ## and its `detail` under it when the daemon sent one.
+  ##
+  ## A CLIENT RENDERS THE TWO TOGETHER, which the protocol requires of every
+  ## client (`RunQuota-Protocol-And-Client-Libraries.md`, §"What A Budget
+  ## Refusal Says"), because on a budget refusal the `detail` is the half
+  ## that says WHICH DAEMON refused -- and one runquotad serves the whole
+  ## host, so that is routinely another workspace's with another workspace's
+  ## budget. Printing the message alone left the reader to find the process
+  ## and read its command line
+  ## (`issues/2026-09-24-runquota-denial-omits-the-amounts.md`).
+  ##
+  ## WHY THE GUARD, rather than always appending. `RunQuotaClientError`
+  ## carries the message only, so the detail has to come from the client's
+  ## record of the last diagnostic it saw. That is this error's detail
+  ## exactly when the two messages agree; a failure raised anywhere else --
+  ## a command that would not start -- must not be dressed in a stale daemon
+  ## diagnostic.
+  if last.message == message and last.detail.len > 0:
+    message & "\n  " & last.detail
+  else:
+    message
+
 proc runDebugAcquire(args: seq[string]): int =
   var cpu = 1000'u32
   var memory = 128'u64 * 1024'u64 * 1024'u64
@@ -417,27 +441,35 @@ proc runDebugAcquire(args: seq[string]): int =
         " " & statsTableReport(table)
   if benchmark:
     request = request.benchmarkRequest()
-  if command.len > 0:
-    let execution = session.runWithLease(request, command,
-        waitForQueued = benchmark)
-    stdout.write(execution.process.stdout)
-    stderr.write(execution.process.stderr)
+  # CAUGHT HERE, WHERE THE CLIENT IS STILL IN SCOPE, which is the whole
+  # reason this handler exists rather than `runThinApp`'s: by the time the
+  # error reaches the dispatcher the `defer` above has closed the client and
+  # the diagnostic's detail is gone with it.
+  try:
+    if command.len > 0:
+      let execution = session.runWithLease(request, command,
+          waitForQueued = benchmark)
+      stdout.write(execution.process.stdout)
+      stderr.write(execution.process.stderr)
+      session.closeSession()
+      if execution.process.exited:
+        return execution.process.exitCode
+      if execution.process.signaled:
+        return 128 + execution.process.signal
+      return 1
+    var lease =
+      if benchmark:
+        session.requestLeaseWaiting(request)
+      else:
+        session.requestLease(request)
+    echo "lease " & $lease.id & " granted"
+    lease.release()
     session.closeSession()
-    if execution.process.exited:
-      return execution.process.exitCode
-    if execution.process.signaled:
-      return 128 + execution.process.signal
+    echo "lease " & $lease.id & " released"
+    return 0
+  except RunQuotaClientError as error:
+    echo clientFailureText(error.msg, client.lastDiagnostic)
     return 1
-  var lease =
-    if benchmark:
-      session.requestLeaseWaiting(request)
-    else:
-      session.requestLease(request)
-  echo "lease " & $lease.id & " granted"
-  lease.release()
-  session.closeSession()
-  echo "lease " & $lease.id & " released"
-  0
 
 # ---------------------------------------------------------------------------
 # `runquota stats` — the observation store's read path, over the socket

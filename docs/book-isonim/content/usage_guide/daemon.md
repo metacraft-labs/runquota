@@ -127,7 +127,7 @@ What a new budget does to leases already in flight:
 |---|---|---|
 | Grow | untouched | promoted now, if they fit; clients see the grant on their next poll |
 | Shrink | **never revoked** — they keep running, and the granted total may exceed the new budget | admitted against the new budget, so nothing new starts until the total falls below it |
-| Shrink below a queued lease's size | untouched | **denied** on its session's next poll, with the reason a fresh request of that size gets (`lease request exceeds machine memory budget: local`) — waiting could never end |
+| Shrink below a queued lease's size | untouched | **denied** on its session's next poll, with the reason a fresh request of that size gets (`lease request exceeds machine memory budget: local (requested 12 GiB, budget 8 GiB)`) — waiting could never end |
 | A pool removed from the file | untouched | denied, as above |
 
 A file that does not parse changes **nothing**: the reload is refused with the

@@ -59,9 +59,22 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
   ## remains the way to say anything else.
   let cpu = milliCpu(max(1, countProcessors()) * 1000)
   let memory = bytes(defaultMemoryBudgetBytes(hostPhysicalMemoryBytes()))
+  # THE DAEMON'S OWN EXECUTABLE, read once here so every denial can name it
+  # (`refusedByText`). A DIAGNOSTIC MUST NEVER BE THE THING THAT FAILS: a
+  # platform that will not answer leaves the path empty and the denial names
+  # the pid alone, rather than taking the whole daemon down over a clause in
+  # an error message.
+  let ownPath =
+    try:
+      getAppFilename()
+    except OSError:
+      ""
+    except CatchableError:
+      ""
   DaemonConfig(
     endpoint: endpoint,
     daemonId: uint64(getCurrentProcessId()),
+    daemonPath: ownPath,
     cpuSlots: cpu,
     memoryBytes: memory,
     hostConfigPath: host_config.hostConfigPath,
@@ -750,38 +763,140 @@ proc removeLeaseFromTable(daemon: var RunQuotaDaemon; id: uint64) =
     daemon.applyLeaseResourceUsage(lease, false)
   daemon.leases.del(id)
 
+proc milliCpuText(cpu: MilliCpu): string =
+  ## CPU in the ONE spelling the product uses for it: milli-CPU with an `m`
+  ## suffix, as `runquotad --cpu-milli` takes it and as the specification's
+  ## §"Resource Model" writes it. A denial that said "12 cores" would be read
+  ## back against a flag that does not take cores.
+  $cpu.value & "m"
+
+proc countText(count: uint32; noun: string): string =
+  ## `1 slot`, `4 units`, `0 slots`. The noun travels with the number because
+  ## a bare count sitting beside a budget of some other kind reads as bytes
+  ## or as milli-CPU to anybody who did not write the line.
+  $count & " " & noun & (if count == 1'u32: "" else: "s")
+
 proc possible(daemon: RunQuotaDaemon; resources: ResourceVector;
     reason: var string): bool =
+  ## Can this request EVER fit the budget in force -- as opposed to fitting
+  ## right now, which is `fitsNow` and a queue rather than a refusal.
+  ##
+  ## EVERY REFUSAL NAMES THE SCOPE, THE AMOUNT ASKED FOR AND THE BUDGET IN
+  ## FORCE, in that budget's own unit
+  ## (`RunQuota-Protocol-And-Client-Libraries.md`, §"What A Budget Refusal
+  ## Says"). Which of the two numbers is wrong is the whole of the remedy --
+  ## lower the request, or raise a budget -- and the request is the EFFECTIVE
+  ## vector, which a client cannot read back off its own call because a
+  ## learned estimate may have raised it. Printing the scope alone, which is
+  ## all this did until 2026-10-14, left the reader with neither.
   var machine: MachineCapacity
   if not daemon.machineFor(resources.resolvedMachineId(), machine):
+    # NOT A BUDGET REFUSAL: nothing was measured against anything, so there
+    # is no pair of amounts to name. The id is the whole of the fault.
     reason = "lease request targets unknown machine: " &
         resources.resolvedMachineId()
     return false
   let group = daemon.cpuShareGroupFor(machine)
   if resources.cpu.value == 0 or resources.memory.value == 0:
-    reason = "lease request must reserve CPU and memory"
+    # BOTH HALVES, not only the missing one: a client that asked for CPU and
+    # forgot memory has to see that its CPU figure did arrive, or the obvious
+    # reading is that the request was lost on the way.
+    reason = "lease request must reserve CPU and memory (requested " &
+        milliCpuText(resources.cpu) & " CPU and " &
+        humanBytes(resources.memory.value) & ")"
     return false
   if resources.cpu.value > machine.cpuSlots.value:
-    reason = "lease request exceeds machine CPU budget: " & machine.id
+    reason = "lease request exceeds machine CPU budget: " & machine.id &
+        " (requested " & milliCpuText(resources.cpu) & ", budget " &
+        milliCpuText(machine.cpuSlots) & ")"
     return false
   if resources.cpu.value > group.cpuSlots.value:
-    reason = "lease request exceeds shared CPU budget: " & group.id
+    # The GROUP's budget, not the machine's: a request can fit its machine
+    # and not the socket that machine shares, and naming the machine's figure
+    # here would send the reader to raise a budget that is not refusing.
+    reason = "lease request exceeds shared CPU budget: " & group.id &
+        " (requested " & milliCpuText(resources.cpu) & ", budget " &
+        milliCpuText(group.cpuSlots) & ")"
     return false
   if resources.memory.value > machine.memoryBytes.value:
-    reason = "lease request exceeds machine memory budget: " & machine.id
+    # `humanBytes` is the spelling `runquota config` already uses -- `96 GiB`,
+    # `512 MiB`, else the byte count -- and it abbreviates only exact
+    # multiples, so neither figure is rounded away. A reader comparing a
+    # request against a budget has to be able to trust both to the byte.
+    reason = "lease request exceeds machine memory budget: " & machine.id &
+        " (requested " & humanBytes(resources.memory.value) & ", budget " &
+        humanBytes(machine.memoryBytes.value) & ")"
     return false
   if resources.ioSlots(machine.ioSlots) > machine.ioSlots:
-    reason = "lease request exceeds machine IO budget: " & machine.id
+    # REACHED ONLY BY A MACHINE WITH NO IO BUDGET AT ALL: `ioSlots` maps an
+    # exclusive request to the cap ITSELF and a heavy one to a single slot,
+    # so the demand can exceed nothing but a cap of zero. The reason says the
+    # budget is zero for that reason -- a reader who is not told cannot tell
+    # this from a request that was simply too large.
+    reason = "lease request exceeds machine IO budget: " & machine.id &
+        " (requested " &
+        countText(resources.ioSlots(machine.ioSlots), "slot") & ", budget " &
+        countText(machine.ioSlots, "slot") & ")"
     return false
   for demand in resources.namedPools:
     if demand.units == 0:
-      reason = "named-pool demand must be non-zero"
+      # NAMED, like every other scope here: the loop walks each pool the
+      # request declares, and a reason that named none of them leaves the
+      # reader unable to tell which demand is at fault.
+      reason = "named-pool demand must be non-zero: " & demand.name
       return false
     let cap = daemon.config.namedPoolCaps.getOrDefault(demand.name, 0'u32)
-    if cap == 0 or demand.units > cap:
-      reason = "lease request exceeds named-pool budget: " & demand.name
+    if cap == 0:
+      # ITS OWN CLAUSE, because the remedy is a different one. A cap of zero
+      # means NOTHING SIZES THE POOL -- neither the host file's `[pools]`,
+      # nor a `--pool` flag, nor an open session's declaration names it -- so
+      # the fix is to name it in one of the three. `budget 0 units` would
+      # read as a budget somebody set to zero on purpose and send the reader
+      # to edit a number that does not exist.
+      reason = "lease request exceeds named-pool budget: " & demand.name &
+          " (requested " & countText(demand.units, "unit") &
+          ", no layer sizes this pool)"
+      return false
+    if demand.units > cap:
+      reason = "lease request exceeds named-pool budget: " & demand.name &
+          " (requested " & countText(demand.units, "unit") & ", budget " &
+          countText(cap, "unit") & ")"
       return false
   true
+
+proc refusedByText(daemon: RunQuotaDaemon): string =
+  ## WHO REFUSED, in the `detail` of every denial `possible` produces --
+  ## every budget one, which the specification requires, and the
+  ## unknown-machine one beside them, which it permits: that refusal is
+  ## decided by the same static check, and which daemon's topology lacks the
+  ## machine is the same fact a reader needs.
+  ##
+  ## ONE runquotad SERVES THE WHOLE HOST, so the daemon that refused a lease
+  ## is routinely another checkout's, started by somebody else with a budget
+  ## this workspace never set -- and the remedy differs by whose it is.
+  ## Establishing it otherwise means finding the process and reading its
+  ## command line, which is exactly what
+  ## `issues/2026-09-24-runquota-denial-omits-the-amounts.md` recorded.
+  ##
+  ## UNCONDITIONAL, and not only when the client did not start this daemon. A
+  ## daemon cannot know who started it: nothing on the wire says so, and
+  ## `Hello` carries the client's identity rather than its intentions. The
+  ## distinction is the client's to draw, and suppressing the identity here
+  ## would need every client to draw it. It costs one clause on a message
+  ## that is already a failure.
+  ##
+  ## It points at `topology` rather than restating where the budget came
+  ## from, because that subject already reports `host_config.source` and
+  ## `pinned_by_flags`. The pid is always there -- it is the `daemonId` the
+  ## handshake already carries -- and the path is dropped when the platform
+  ## would not report this daemon's own executable.
+  result = "refused by runquotad pid " & $daemon.config.daemonId
+  if daemon.config.daemonPath.len > 0:
+    result.add(" at " & daemon.config.daemonPath)
+  result.add("; one runquotad serves the whole host, so this may be another " &
+    "workspace's daemon and another workspace's budget -- " &
+    "`runquota topology --json` reports the budget in force and where it " &
+    "came from")
 
 proc readDeterministicPressureRaw(daemon: var RunQuotaDaemon;
                                   raw: var string): bool =
@@ -2514,9 +2629,13 @@ proc rebudgetQueuedLeases(daemon: var RunQuotaDaemon;
     let lease = daemon.leases[id]
     var reason = ""
     discard daemon.possible(lease.resources, reason)
+    # THE CAUSE AND THE DAEMON, both: they answer different questions --
+    # WHY NOW (the budget changed under a lease that was already waiting)
+    # and WHO (which daemon holds that budget) -- so the identity is
+    # appended to `deniedBecause` rather than replacing it.
     daemon.pendingDenials.mgetOrPut(lease.sessionId.value, @[]).add(
       lease.leaseDecision(leaseDecisionDenied, diagnostic(diagDenied, reason,
-        deniedBecause)))
+        deniedBecause & "; " & daemon.refusedByText())))
     daemon.removeLeaseFromTable(id)
   daemon.tryPromoteQueued()
 
@@ -2801,7 +2920,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     if not daemon.possible(effective, reason):
       let denied = LeaseDeniedMessage(
         sessionId: msg.sessionId,
-        diagnostic: diagnostic(diagDenied, reason)
+        diagnostic: diagnostic(diagDenied, reason, daemon.refusedByText())
       )
       connection.sendResponse(rqLeaseDenied, frame.header.requestId,
           encodeLeaseDenied(denied))
@@ -2889,7 +3008,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           leaseId: leaseId(0),
           kind: leaseDecisionDenied,
           resources: effective,
-          diagnostic: diagnostic(diagDenied, reason)
+          diagnostic: diagnostic(diagDenied, reason, daemon.refusedByText())
         ))
       else:
         let lease = daemon.createQueuedLease(

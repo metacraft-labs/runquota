@@ -61,6 +61,15 @@ type
   DaemonConfig* = object
     endpoint*: Endpoint
     daemonId*: uint64
+    daemonPath*: string
+      ## This daemon's own executable, as `getAppFilename()` reported it at
+      ## start. ONE runquotad SERVES THE WHOLE HOST, so the daemon that
+      ## refuses a lease is routinely another checkout's, started with
+      ## another budget -- and the remedy differs by whose it is (lower the
+      ## request, or raise the budget of a daemon somebody else started).
+      ## Every denial names it, because establishing it otherwise means
+      ## finding the process and reading its command line. Empty when the
+      ## platform would not report it.
     cpuSlots*: MilliCpu
     memoryBytes*: Bytes
     ioSlots*: uint32
