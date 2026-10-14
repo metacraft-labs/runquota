@@ -274,13 +274,16 @@ from its own environment so nothing it starts inherits it, and checks its
 parent every 200 ms once `SIGTERM` is armed. When the parent has changed —
 the parent died and the daemon was re-parented to init or a subreaper — it
 sends itself `SIGTERM` and takes exactly the shutdown above, exiting 0. A
-parent that is already init at start counts as gone.
+parent that is already init at start counts as gone when no explicit owner
+was supplied.
 
 Callers that need ownership guaranteed across startup also set
 `RUNQUOTA_EXIT_WITH_PARENT_PID` to their own pid before spawning. The daemon
 compares against that recorded owner, so a caller dying before daemon entry
 cannot cause the daemon to adopt init or a subreaper as its owner. Both
 variables are removed from the daemon's environment at entry.
+An explicitly supplied PID 1 is valid, allowing the caller to be a container
+entrypoint; the daemon stays alive while its observed parent is still 1.
 
 This is what `repro` does with the private daemon it starts on an
 unprovisioned host, and it is the only way such a daemon stops when its caller

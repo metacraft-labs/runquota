@@ -35,11 +35,11 @@
 ## the subreaper, but the supplied expectation still names the real owner.
 ## Without this optional variable the daemon records getppid() at entry.
 ##
-## A PARENT THAT IS ALREADY INIT AT START is treated as gone. With the variable
-## set, the requester wanted this daemon tied to it; a `getppid()` of 1 at
-## start means the requester died before the daemon got this far (or it never
-## was the parent), and a daemon that adopted init as its owner would never
-## stop.
+## A FALLBACK PARENT THAT IS ALREADY INIT AT START is treated as gone, because
+## adopting init after the caller died would otherwise leave the daemon alive
+## forever. An EXPLICIT expected owner of 1 remains valid: the caller may be
+## the entrypoint of a container's PID namespace. Immediate shutdown uses a
+## negative sentinel, keeping those two meanings of PID 1 distinct.
 ##
 ## THE VARIABLE IS REMOVED FROM THE DAEMON'S OWN ENVIRONMENT as soon as it is
 ## read, so nothing this process starts -- the `sqlite3` children of the
@@ -68,29 +68,44 @@ const
     ## starts, and how long the watcher's join can delay a shutdown that
     ## started for another reason.
 
+proc resolveParentWatchOwner*(currentParent: int; expectedParent: string;
+                              hasExpectedParent: bool): int =
+  ## Resolves the expected owner from the startup observation and optional
+  ## caller-supplied identity. Kept pure so PID-namespace identities can be
+  ## checked without requiring privileges to create a namespace.
+  if hasExpectedParent:
+    try:
+      result = parseInt(expectedParent)
+      if result <= 0:
+        result = -1
+    except ValueError:
+      result = -1
+  else:
+    result = if currentParent <= 1: -1 else: currentParent
+
+proc parentHasExited*(expectedParent, currentParent: int): bool =
+  ## Ownership predicate used on every watcher tick. The observation is
+  ## supplied separately from the expectation for pure boundary tests.
+  expectedParent < 0 or currentParent != expectedParent
+
 proc takeExitWithParentRequest*(): int =
   ## Reads and REMOVES `RUNQUOTA_EXIT_WITH_PARENT`. Answers the parent pid to
   ## watch -- supplied by the caller before spawning when
   ## `RUNQUOTA_EXIT_WITH_PARENT_PID` is present, otherwise recorded at entry
-  ## -- or 0 when no watch was asked for (always 0 on Windows). Both variables
+  ## -- or 0 when no watch was asked for (always 0 on Windows). A negative
+  ## value requests immediate shutdown for invalid ownership or fallback init.
+  ## Both variables
   ## are removed, so descendants cannot inherit the ownership request.
   ## Call it once, first thing in the daemon's entry point.
   when defined(posix):
     let requested = getEnv(exitWithParentEnvVar) == "1"
+    let hasExpectedParent = existsEnv(exitWithParentPidEnvVar)
     let expectedParent = getEnv(exitWithParentPidEnvVar)
     delEnv(exitWithParentEnvVar)
     delEnv(exitWithParentPidEnvVar)
     if requested:
-      result = int(getppid())
-      if expectedParent.len > 0:
-        # An invalid expectation must fail closed rather than adopt an
-        # unrelated current parent and leave a daemon running indefinitely.
-        try:
-          result = parseInt(expectedParent)
-          if result <= 0:
-            result = 1
-        except ValueError:
-          result = 1
+      result = resolveParentWatchOwner(int(getppid()), expectedParent,
+        hasExpectedParent)
   else:
     result = 0
 
@@ -100,12 +115,9 @@ when defined(posix):
     parentWatchRunning = false
     parentWatchStop: Atomic[bool]
 
-  proc parentIsGone(parent: int): bool =
-    parent <= 1 or int(getppid()) != parent
-
   proc parentWatchMain(parent: int) {.thread.} =
     while not parentWatchStop.load(moAcquire):
-      if parentIsGone(parent):
+      if parentHasExited(parent, int(getppid())):
         # THE OPERATOR'S STOP, self-addressed. See the module header.
         discard kill(getpid(), SIGTERM)
         return

@@ -18,8 +18,8 @@ Every variable RunQuota's binaries read. Anything not on this list is not read.
 
 | Variable | Read by | Meaning |
 |---|---|---|
-| `RUNQUOTA_EXIT_WITH_PARENT_PID` | `runquotad` | Optional expected owner pid, recorded by the caller before spawning. With `RUNQUOTA_EXIT_WITH_PARENT=1`, a different current parent triggers shutdown even if the owner died before daemon entry. Removed from the environment at start; an invalid supplied pid requests immediate shutdown. POSIX only. |
-| `RUNQUOTA_EXIT_WITH_PARENT` | `runquotad` | Exactly `1` makes the daemon stop — through its ordinary `SIGTERM` shutdown, exiting 0 — when the process that started it exits (detected as a change of `getppid()`, polled every 200 ms; a parent of 1 at start counts as gone). The daemon removes the variable from its own environment at start whatever its value, so nothing it spawns inherits it. POSIX only; ignored on Windows. Set by `repro` for the private daemon it starts on an unprovisioned host; see [Running the daemon](/usage_guide/daemon#stopping-with-the-process-that-started-it). |
+| `RUNQUOTA_EXIT_WITH_PARENT_PID` | `runquotad` | Optional expected owner pid, recorded by the caller before spawning. With `RUNQUOTA_EXIT_WITH_PARENT=1`, a different current parent triggers shutdown even if the owner died before daemon entry. Removed from the environment at start; an invalid or nonpositive supplied pid requests immediate shutdown; an explicit PID 1 is valid for a container entrypoint. POSIX only. |
+| `RUNQUOTA_EXIT_WITH_PARENT` | `runquotad` | Exactly `1` makes the daemon stop — through its ordinary `SIGTERM` shutdown, exiting 0 — when the process that started it exits (detected as a change of `getppid()`, polled every 200 ms; a parent of 1 at start counts as gone only without an explicitly supplied owner). The daemon removes the variable from its own environment at start whatever its value, so nothing it spawns inherits it. POSIX only; ignored on Windows. Set by `repro` for the private daemon it starts on an unprovisioned host; see [Running the daemon](/usage_guide/daemon#stopping-with-the-process-that-started-it). |
 
 ## The published aggregate table
 
