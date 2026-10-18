@@ -964,6 +964,20 @@ policy does not redact branches" from "it does, and there were none". A store
 with no manifest has never been exported, which is a third state and must not
 read as either of the others.
 
+**The tests hold on any `sqlite3` build, Apple's included.** Whether closing
+the last connection checks the write-ahead log in and deletes it is the
+build's choice and not SQLite's contract: Apple's `/usr/bin/sqlite3` keeps the
+`-wal` file, and a build can skip the closing checkpoint altogether
+([`SQLITE_FCNTL_PERSIST_WAL`](https://sqlite.org/c3ref/c_fcntl_begin_atomic_write.html#sqlitefcntlpersistwal),
+[`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`](https://sqlite.org/c3ref/c_dbconfig_defensive.html#sqlitedbconfignockptonclose)).
+A test that reuses a built store therefore copies a `backupTo` snapshot of it,
+never the store's main file, and does not assert that a log is gone.
+`tests/unit/t_observation_store_export.nim` builds its local store once per
+run this way, and its last case rebuilds that template under a `sqlite3` that
+keeps the log and leaves every row in it — the condition in which a copy of
+the main file alone holds an empty store — and requires the template to equal
+the built store row for row.
+
 ## State-boundary requirements
 
 Any persistent RunQuota state must document schema ownership, migrations, backup,
