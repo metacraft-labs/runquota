@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Status | open |
+| Status | in-progress (eli-pc:fix-windows-test-watchdog-does-not-kill-desc) |
 | Recorded | 2026-10-01 |
 | Observed in | RunQuota `2d3897c` (same helper at dev `2c50aaf`) |
 | Area | `tests/support/child_watchdog.nim` |
