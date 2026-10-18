@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Status | open |
+| Status | in-progress (nixos-ci-bare-002:fix-export-fixture-assumes-sqlite-removes-wa) |
 | Recorded | 2026-10-01 |
 | Observed in | runquota `a173bafd35ce3eef607f6062bde5175f1aadeede` |
 | Area | `tests/unit/t_observation_store_export.nim`, `buildLocalStore` |
