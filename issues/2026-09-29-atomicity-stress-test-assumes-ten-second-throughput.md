@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Status | open |
+| Status | in-progress (nixos-ci-bare-002:fix-atomicity-stress-test-assumes-ten-second) |
 | Recorded | 2026-09-29 |
 | Observed in | RunQuota `0622770` |
 | Area | `t_ambient_sample_atomicity.nim` |
