@@ -171,7 +171,8 @@ suite "runquota config and a running daemon":
     let denial = two.pollFor(4)
     check not denial.lease.active
     check denial.diagnostic.message ==
-      "lease request exceeds machine memory budget: local"
+      "lease request exceeds machine memory budget: local " &
+      "(requested 14 GiB, budget 8 GiB)"
     # The 5 GiB one fits 8 GiB but not while 12 GiB is held: still queued.
     var stillQueued = true
     for decision in one.pollNextGrant():
@@ -188,7 +189,16 @@ suite "runquota config and a running daemon":
     let tooBig = one.offerOne(5, "too-big", 9)
     check not tooBig.lease.active
     check tooBig.diagnostic.message ==
-      "lease request exceeds machine memory budget: local"
+      "lease request exceeds machine memory budget: local " &
+      "(requested 9 GiB, budget 8 GiB)"
+    # AND WHICH DAEMON REFUSED, through a real one: this is the
+    # `OfferCandidates` denial path, and the detail is the fact that
+    # otherwise takes finding the process and reading its command line. The
+    # pid is not asserted literally -- the daemon was started by
+    # `startProcess` and this test does not own the number -- but its
+    # presence is the contract (`t_denial_names_the_amounts.nim`).
+    check tooBig.diagnostic.detail.startsWith("refused by runquotad pid ")
+    check "one runquotad serves the whole host" in tooBig.diagnostic.detail
 
     # ---- A hand edit that does not parse changes nothing ---------------
     writeFile(file, readFile(file) & "[network]\n")
@@ -269,7 +279,8 @@ suite "runquota config and a running daemon":
     let refused = pooled(1, "compile")
     check not refused.lease.active and not refused.queued
     check refused.diagnostic.message ==
-      "lease request exceeds named-pool budget: compile"
+      "lease request exceeds named-pool budget: compile " &
+      "(requested 1 unit, no layer sizes this pool)"
 
     let answer = session.declarePools([
       NamedPoolCapWire(name: "compile", units: 2'u32)])

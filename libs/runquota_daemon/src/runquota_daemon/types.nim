@@ -61,6 +61,15 @@ type
   DaemonConfig* = object
     endpoint*: Endpoint
     daemonId*: uint64
+    daemonPath*: string
+      ## This daemon's own executable, as `getAppFilename()` reported it at
+      ## start. ONE runquotad SERVES THE WHOLE HOST, so the daemon that
+      ## refuses a lease is routinely another checkout's, started with
+      ## another budget -- and the remedy differs by whose it is (lower the
+      ## request, or raise the budget of a daemon somebody else started).
+      ## Every denial names it, because establishing it otherwise means
+      ## finding the process and reading its command line. Empty when the
+      ## platform would not report it.
     cpuSlots*: MilliCpu
     memoryBytes*: Bytes
     ioSlots*: uint32
@@ -139,6 +148,13 @@ type
       ## waiting for a quiet tick is right; waiting for one forever is not
       ## a bound, and a machine that is never idle is the one whose store
       ## grows fastest.
+    exitWithParentPid*: int
+      ## The parent this daemon stops with, as `takeExitWithParentRequest`
+      ## requested by `RUNQUOTA_EXIT_WITH_PARENT=1`, optionally recorded
+      ## before spawning with `RUNQUOTA_EXIT_WITH_PARENT_PID`; 0 (the
+      ## default, and always on Windows) means no watch. `serve` starts the
+      ## watch once SIGTERM is armed, and the watch stops the daemon through
+      ## that same orderly SIGTERM path. See `runquota_daemon/parent_watch`.
 
   SessionRow* = object
     id*: SessionId
