@@ -497,7 +497,8 @@ const windowsCancelledExitCode* = 1'u32
 
 proc commandSpec*(argv: openArray[string]; cwd = ""; env: openArray[string] = [];
                   stdoutLimit = DefaultOutputLimit; stderrLimit = DefaultOutputLimit;
-                  createProcessGroup = true; inheritEnv = true): CommandSpec =
+                  createProcessGroup = true; inheritEnv = true;
+                  inheritStdio = false): CommandSpec =
   for item in argv:
     result.argv.add(item)
   result.cwd = cwd
@@ -507,6 +508,7 @@ proc commandSpec*(argv: openArray[string]; cwd = ""; env: openArray[string] = []
   result.stdoutLimit = stdoutLimit
   result.stderrLimit = stderrLimit
   result.createProcessGroup = createProcessGroup
+  result.inheritStdio = inheritStdio
 
 proc launchResult*(processId: uint64; running: bool): LaunchResult =
   LaunchResult(
@@ -788,6 +790,8 @@ when defined(windows):
     # on POSIX: every consumer writes `completion.stdout` and
     # `completion.stderr` to different places, and `stderrLimit` bounds the
     # second one.
+    if child.winStdoutClosed and child.winStderrClosed:
+      return
     winDrainPipe(process.outputHandle, process.outputStream,
       child.winStdoutClosed, child.stdoutText, child.stdoutBytes,
       child.stdoutLimit)
@@ -902,7 +906,8 @@ when defined(windows):
         # stdout and stderr on SEPARATE pipes, as on POSIX. They used to be
         # merged here, which left `completion.stderr` empty on Windows and
         # made `stderrLimit` bound nothing.
-        options = {poUsePath}
+        options = if spec.inheritStdio: {poUsePath, poParentStreams}
+                  else: {poUsePath}
       )
     except CatchableError:
       for path in prepared.temporaryFiles:
@@ -957,7 +962,9 @@ when defined(windows):
       ),
       winProcess: process,
       winJobHandle: uint64(job),
-      temporaryLaunchFiles: prepared.temporaryFiles
+      temporaryLaunchFiles: prepared.temporaryFiles,
+      winStdoutClosed: spec.inheritStdio,
+      winStderrClosed: spec.inheritStdio
     )
 
 proc launchProcess*(spec: CommandSpec): LaunchedProcess =
@@ -972,17 +979,18 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     let program = resolveProgram(spec.argv[0], execSearchPath(childEnv))
     let shellArgv = shellFallbackArgv(program, spec.argv)
 
-    var stdoutPipe: array[0..1, cint]
-    var stderrPipe: array[0..1, cint]
+    var stdoutPipe = [cint(-1), cint(-1)]
+    var stderrPipe = [cint(-1), cint(-1)]
     # Close-on-exec from birth: these are runquota's own control descriptors,
     # and a concurrent lease's child must never inherit them. The kernel drops
     # them at `execve` at no per-launch cost.
-    if not createControlPipe(stdoutPipe):
-      raise newException(OSError, "stdout pipe failed")
-    if not createControlPipe(stderrPipe):
-      discard close(stdoutPipe[0])
-      discard close(stdoutPipe[1])
-      raise newException(OSError, "stderr pipe failed")
+    if not spec.inheritStdio:
+      if not createControlPipe(stdoutPipe):
+        raise newException(OSError, "stdout pipe failed")
+      if not createControlPipe(stderrPipe):
+        discard close(stdoutPipe[0])
+        discard close(stdoutPipe[1])
+        raise newException(OSError, "stderr pipe failed")
 
     # `argv[0]` stays whatever the caller passed, exactly as `execvp` leaves it;
     # only the path handed to the kernel is the resolved one.
@@ -996,19 +1004,20 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     if pid == 0:
       discard close(stdoutPipe[0])
       discard close(stderrPipe[0])
-      if spec.createProcessGroup:
-        discard setpgid(0, 0)
+      if spec.createProcessGroup and setpgid(0, 0) != 0:
+        childExit(126)
       if spec.cwd.len > 0 and chdir(cstring(spec.cwd)) != 0:
         childExit(126)
-      let devNull = open(cstring("/dev/null"), O_RDONLY)
-      if devNull >= 0:
-        discard dup2(devNull, STDIN_FILENO)
-        if devNull != STDIN_FILENO:
-          discard close(devNull)
-      discard dup2(stdoutPipe[1], STDOUT_FILENO)
-      discard dup2(stderrPipe[1], STDERR_FILENO)
-      discard close(stdoutPipe[1])
-      discard close(stderrPipe[1])
+      if not spec.inheritStdio:
+        let devNull = open(cstring("/dev/null"), O_RDONLY)
+        if devNull >= 0:
+          discard dup2(devNull, STDIN_FILENO)
+          if devNull != STDIN_FILENO:
+            discard close(devNull)
+        discard dup2(stdoutPipe[1], STDOUT_FILENO)
+        discard dup2(stderrPipe[1], STDERR_FILENO)
+        discard close(stdoutPipe[1])
+        discard close(stderrPipe[1])
       closeInheritedChildFds()
       discard execve(cstring(program), argv, envp)
       if errno == ENOEXEC:
@@ -1023,8 +1032,9 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
 
     discard close(stdoutPipe[1])
     discard close(stderrPipe[1])
-    setNonblock(int(stdoutPipe[0]))
-    setNonblock(int(stderrPipe[0]))
+    if not spec.inheritStdio:
+      setNonblock(int(stdoutPipe[0]))
+      setNonblock(int(stderrPipe[0]))
     if spec.createProcessGroup:
       discard setpgid(pid, pid)
     let pgid = if spec.createProcessGroup: int(pid) else: int(getpgid(pid))

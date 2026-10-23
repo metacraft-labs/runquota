@@ -33,6 +33,9 @@ type
     stdoutLimit*: int
     stderrLimit*: int
     createProcessGroup*: bool
+    inheritStdio*: bool
+      ## Inherit stdin/stdout/stderr directly instead of creating capture pipes.
+      ## False by default; inherited output is not included in completion.
 
   LaunchResult* = object
     processId*: uint64
