@@ -54,6 +54,25 @@ import std/[os, osproc, strutils, times]
 
 when defined(posix):
   import std/posix
+  import runquota_process
+
+  type SupervisedChild* = ref object
+    child: LaunchedProcess
+
+  proc processID*(process: SupervisedChild): int = process.child.pid
+
+  proc peekExitCode*(process: SupervisedChild): int =
+    if not process.child.pollCompletion():
+      return -1
+    let completion = process.child.completion
+    if completion.signaled: 128 + completion.signal else: completion.exitCode
+
+  proc running*(process: SupervisedChild): bool =
+    not process.child.pollCompletion()
+
+  proc close*(process: SupervisedChild) = process.child.close()
+else:
+  type SupervisedChild* = Process
 
 when defined(windows):
   import std/[tables, widestrs, winlean]
@@ -227,20 +246,18 @@ when defined(windows):
     var code = 0'i32
     getExitCodeProcess(process, code) != 0 and code == STILL_ACTIVE
 
-proc startSupervisedChild*(command: string; args: openArray[string]): Process =
+proc startSupervisedChild*(command: string; args: openArray[string]): SupervisedChild =
   ## Start ``command`` so that everything it spawns can be ended as a unit.
   ##
-  ## On POSIX, ``poDaemon`` asks for a new process group and that is all it
-  ## does. On Windows it only suppresses a console window; the unit is a Job
-  ## Object the child is assigned to here, with any descendant it already
-  ## managed to start. ``poParentStreams`` keeps the child on this process's
-  ## own stdio, so supervising it needs no pipes of our own -- which matters in
-  ## tests whose entire subject is pipes.
-  result = startProcess(
-    command,
-    args = @args,
-    options = {poParentStreams, poDaemon}
-  )
+  ## POSIX process groups come from the client process substrate, rather
+  ## than osproc's platform-dependent daemon option. Inherited stdio adds no
+  ## undrained pipes to the deadlock fixtures being supervised.
+  when defined(posix):
+    result = SupervisedChild(child: launchProcess(commandSpec(
+      @[command] & @args, stdio = inheritStdio, createProcessGroup = true)))
+  else:
+    result = startProcess(command, args = @args,
+      options = {poParentStreams, poDaemon})
   when defined(windows):
     let pid = result.processID
     let job = createJobObjectW(nil, nil)
@@ -265,7 +282,7 @@ proc startSupervisedChild*(command: string; args: openArray[string]): Process =
       discard closeHandle(descendant)
     supervisedJobs[pid] = job
 
-proc waitBounded*(process: Process; seconds: int): int =
+proc waitBounded*(process: SupervisedChild; seconds: int): int =
   ## The child's exit code, or -1 if it was still running at the deadline.
   let deadline = epochTime() + float(seconds)
   while epochTime() < deadline:
@@ -275,14 +292,15 @@ proc waitBounded*(process: Process; seconds: int): int =
     sleep(25)
   -1
 
-proc killProcessTree*(process: Process) =
+proc killProcessTree*(process: SupervisedChild) =
   ## End the child's whole tree, then reap the child.
   ##
   ## The tree is the point: a wedged grandchild holding a sibling's pipe will
   ## not exit just because its parent did, so ending only the direct child is
   ## what strands it.
   when defined(posix):
-    discard posix.kill(Pid(-process.processID), SIGKILL)
+    process.child.killNow()
+    discard process.child.waitForCompletion()
   when defined(windows):
     # The descendants are found BEFORE anything is ended: once the child is
     # gone its children name a parent that no longer exists, and the walk can
@@ -303,11 +321,12 @@ proc killProcessTree*(process: Process) =
       supervisedJobs.del(pid)
     for handle in doomed:
       discard terminateProcess(handle, 1)
-  try:
-    kill(process)
-  except CatchableError:
-    discard
-  discard process.waitForExit()
+  when not defined(posix):
+    try:
+      kill(process)
+    except CatchableError:
+      discard
+    discard process.waitForExit()
   when defined(windows):
     # Termination is asynchronous; return only once every descendant has
     # actually gone, so a survivor check that follows sees the end state.
