@@ -14,6 +14,7 @@ while read -r name path _; do
     ""|\#*) continue ;;
   esac
   nim c \
+    --parallelBuild:"${NIX_BUILD_CORES:-0}" \
     --threads:on \
     ${nim_mode_flags[@]+"${nim_mode_flags[@]}"} \
     --nimcache:"build/nimcache/${name}" \
