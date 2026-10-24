@@ -14,6 +14,10 @@ type
     directArgv*: bool
     implicitShell*: bool
 
+  ProcessStdio* = enum
+    ## Captured output is bounded; inherited stdio creates no capture pipes.
+    captureStdio, inheritStdio
+
   CommandSpec* = object
     argv*: seq[string]
     cwd*: string
@@ -33,9 +37,7 @@ type
     stdoutLimit*: int
     stderrLimit*: int
     createProcessGroup*: bool
-    inheritStdio*: bool
-      ## Inherit stdin/stdout/stderr directly instead of creating capture pipes.
-      ## False by default; inherited output is not included in completion.
+    stdio*: ProcessStdio
 
   LaunchResult* = object
     processId*: uint64

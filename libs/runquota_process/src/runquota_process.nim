@@ -498,7 +498,7 @@ const windowsCancelledExitCode* = 1'u32
 proc commandSpec*(argv: openArray[string]; cwd = ""; env: openArray[string] = [];
                   stdoutLimit = DefaultOutputLimit; stderrLimit = DefaultOutputLimit;
                   createProcessGroup = true; inheritEnv = true;
-                  inheritStdio = false): CommandSpec =
+                  stdio = captureStdio): CommandSpec =
   for item in argv:
     result.argv.add(item)
   result.cwd = cwd
@@ -508,7 +508,7 @@ proc commandSpec*(argv: openArray[string]; cwd = ""; env: openArray[string] = []
   result.stdoutLimit = stdoutLimit
   result.stderrLimit = stderrLimit
   result.createProcessGroup = createProcessGroup
-  result.inheritStdio = inheritStdio
+  result.stdio = stdio
 
 proc launchResult*(processId: uint64; running: bool): LaunchResult =
   LaunchResult(
@@ -906,8 +906,8 @@ when defined(windows):
         # stdout and stderr on SEPARATE pipes, as on POSIX. They used to be
         # merged here, which left `completion.stderr` empty on Windows and
         # made `stderrLimit` bound nothing.
-        options = if spec.inheritStdio: {poUsePath, poParentStreams}
-                  else: {poUsePath}
+        options = (if spec.stdio == inheritStdio:
+          {poUsePath, poParentStreams} else: {poUsePath})
       )
     except CatchableError:
       for path in prepared.temporaryFiles:
@@ -960,11 +960,11 @@ when defined(windows):
         running: true,
         backend: backendProfile()
       ),
+      winStdoutClosed: spec.stdio == inheritStdio,
+      winStderrClosed: spec.stdio == inheritStdio,
       winProcess: process,
       winJobHandle: uint64(job),
-      temporaryLaunchFiles: prepared.temporaryFiles,
-      winStdoutClosed: spec.inheritStdio,
-      winStderrClosed: spec.inheritStdio
+      temporaryLaunchFiles: prepared.temporaryFiles
     )
 
 proc launchProcess*(spec: CommandSpec): LaunchedProcess =
@@ -984,7 +984,7 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     # Close-on-exec from birth: these are runquota's own control descriptors,
     # and a concurrent lease's child must never inherit them. The kernel drops
     # them at `execve` at no per-launch cost.
-    if not spec.inheritStdio:
+    if spec.stdio == captureStdio:
       if not createControlPipe(stdoutPipe):
         raise newException(OSError, "stdout pipe failed")
       if not createControlPipe(stderrPipe):
@@ -1002,13 +1002,14 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     defer: deallocCStringArray(shellArgvC)
     let pid = fork()
     if pid == 0:
-      discard close(stdoutPipe[0])
-      discard close(stderrPipe[0])
+      if spec.stdio == captureStdio:
+        discard close(stdoutPipe[0])
+        discard close(stderrPipe[0])
       if spec.createProcessGroup and setpgid(0, 0) != 0:
         childExit(126)
       if spec.cwd.len > 0 and chdir(cstring(spec.cwd)) != 0:
         childExit(126)
-      if not spec.inheritStdio:
+      if spec.stdio == captureStdio:
         let devNull = open(cstring("/dev/null"), O_RDONLY)
         if devNull >= 0:
           discard dup2(devNull, STDIN_FILENO)
@@ -1024,15 +1025,16 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         discard execve(cstring(ExecShellPath), shellArgvC, envp)
       childExit(127)
     if pid < 0:
-      discard close(stdoutPipe[0])
-      discard close(stdoutPipe[1])
-      discard close(stderrPipe[0])
-      discard close(stderrPipe[1])
+      if spec.stdio == captureStdio:
+        discard close(stdoutPipe[0])
+        discard close(stdoutPipe[1])
+        discard close(stderrPipe[0])
+        discard close(stderrPipe[1])
       raise newException(OSError, "fork failed")
 
-    discard close(stdoutPipe[1])
-    discard close(stderrPipe[1])
-    if not spec.inheritStdio:
+    if spec.stdio == captureStdio:
+      discard close(stdoutPipe[1])
+      discard close(stderrPipe[1])
       setNonblock(int(stdoutPipe[0]))
       setNonblock(int(stderrPipe[0]))
     if spec.createProcessGroup:

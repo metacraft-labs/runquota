@@ -29,7 +29,7 @@ if paramCount() == 1 and paramStr(1) == InheritedInner:
 
 if paramCount() == 1 and paramStr(1) == InheritedOuter:
   var child = launchProcess(commandSpec([getAppFilename(), InheritedInner],
-    inheritStdio = true))
+    stdio = inheritStdio))
   let completion = child.waitForCompletion(10_000)
   child.close()
   if not completion.exited or completion.exitCode != 7 or

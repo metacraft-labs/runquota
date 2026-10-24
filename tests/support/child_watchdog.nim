@@ -56,6 +56,24 @@ when defined(posix):
   import std/posix
   import runquota_process
 
+  type SupervisedChild* = ref object
+    child: LaunchedProcess
+
+  proc processID*(process: SupervisedChild): int = process.child.pid
+
+  proc peekExitCode*(process: SupervisedChild): int =
+    if not process.child.pollCompletion():
+      return -1
+    let completion = process.child.completion
+    if completion.signaled: 128 + completion.signal else: completion.exitCode
+
+  proc running*(process: SupervisedChild): bool =
+    not process.child.pollCompletion()
+
+  proc close*(process: SupervisedChild) = process.child.close()
+else:
+  type SupervisedChild* = Process
+
 when defined(windows):
   import std/[tables, widestrs, winlean]
 
@@ -228,26 +246,15 @@ when defined(windows):
     var code = 0'i32
     getExitCodeProcess(process, code) != 0 and code == STILL_ACTIVE
 
-when defined(posix):
-  type SupervisedChild* = ref object
-    child: LaunchedProcess
-
-  proc processID*(process: SupervisedChild): int = process.child.pid
-  proc running*(process: SupervisedChild): bool = process.child.running()
-  proc close*(process: SupervisedChild) = process.child.close()
-else:
-  type SupervisedChild* = Process
-
 proc startSupervisedChild*(command: string; args: openArray[string]): SupervisedChild =
   ## Start ``command`` so that everything it spawns can be ended as a unit.
   ##
-  ## POSIX uses the shared process substrate's real child-owned group and
-  ## inherited stdio. No supervisor pipes may change a pipe regression's
-  ## behavior. Windows retains its Job Object and checked descendant adoption.
+  ## POSIX process groups come from the client process substrate, rather
+  ## than osproc's platform-dependent daemon option. Inherited stdio adds no
+  ## undrained pipes to the deadlock fixtures being supervised.
   when defined(posix):
-    new(result)
-    result.child = launchProcess(commandSpec(@[command] & @args,
-      inheritStdio = true))
+    result = SupervisedChild(child: launchProcess(commandSpec(
+      @[command] & @args, stdio = inheritStdio, createProcessGroup = true)))
   else:
     result = startProcess(command, args = @args,
       options = {poParentStreams, poDaemon})
@@ -279,13 +286,9 @@ proc waitBounded*(process: SupervisedChild; seconds: int): int =
   ## The child's exit code, or -1 if it was still running at the deadline.
   let deadline = epochTime() + float(seconds)
   while epochTime() < deadline:
-    when defined(posix):
-      if process.child.pollCompletion():
-        return process.child.waitForExit()
-    else:
-      let code = process.peekExitCode()
-      if code != -1:
-        return code
+    let code = process.peekExitCode()
+    if code != -1:
+      return code
     sleep(25)
   -1
 
@@ -296,8 +299,6 @@ proc killProcessTree*(process: SupervisedChild) =
   ## not exit just because its parent did, so ending only the direct child is
   ## what strands it.
   when defined(posix):
-    # Kill the retained group even after its leader was reaped; never signal
-    # a reaped leader by its reusable positive PID.
     process.child.killNow()
     discard process.child.waitForCompletion()
   when defined(windows):
