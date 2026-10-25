@@ -1,5 +1,6 @@
 import std/[os, osproc, unittest]
 
+import private_broker_owner
 import runquota_client
 import runquota_protocol
 from runquota_ipc import endpointDirectoryPermissions
@@ -57,18 +58,18 @@ proc waitForQuietDaemon(totalFinished: uint64): DaemonStatusMessage =
 
 suite "e2e_runquota_concurrent_short_lived_clients":
   test "real daemon accepts many concurrent short-lived acquire clients":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let clientCount = 32
     let socketDir = "/tmp" / ("rq-concurrent-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeScratchRoot(socketDir)
     createDir(socketDir)
-    # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-    # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-    # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-    # where it does not -- so a fixture hardcoding either one is green on one
-    # kind of host and red on the other. Fixture only; the modes themselves
-    # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    # Use the declared fixture policy for this endpoint. Private broker cases
+    # bind its independently inspected GID before this mode and all participants.
     setFilePermissions(socketDir, endpointDirectoryPermissions())
     check fileExists(daemonPath())
     check fileExists(cliPath())

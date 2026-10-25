@@ -13,6 +13,7 @@
 ## NO MOCKS. The shipped `runquota` and `runquotad` binaries, a real endpoint,
 ## real files; the leases are taken with the real client library.
 
+import private_broker_owner
 import std/[os, osproc, streams, strutils, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions, endpointForPath
@@ -31,9 +32,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -61,8 +63,7 @@ proc startDaemon(socketPath, hostConfig, stateDir: string;
     if endpointIsBound(socketPath): break
     sleep(25)
   doAssert endpointIsBound(socketPath), "runquotad did not bind " & socketPath
-  for _ in 0 ..< 3:
-    discard process.outputStream.readLine()
+  discard readRequiredStartupLines(process, 3, "t_runquota_config_reload")
   DaemonHandle(process: process)
 
 proc stop(handle: var DaemonHandle) =
@@ -111,9 +112,13 @@ proc pollFor(session: var RunQuotaSession; id: uint64): OfferedLease =
 suite "runquota config and a running daemon":
 
   test "set writes the file, the daemon reloads, and leases follow the rule":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("reload")
     defer: removeScratchRoot(root)
-    let socket = rendezvousDir(root) / "d.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let socket = rendezvousDir(root, endpointPolicy1) / "d.sock"
     let state = hostStateDir(root)
     let file = root / "etc" / "runquotad.toml"
     createDir(root / "etc")
@@ -232,9 +237,13 @@ suite "runquota config and a running daemon":
     two.closeSession()
 
   test "a flag pins its key across a reload, and the verb says so":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("pinned")
     defer: removeScratchRoot(root)
-    let socket = rendezvousDir(root) / "d.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let socket = rendezvousDir(root, endpointPolicy2) / "d.sock"
     let state = hostStateDir(root)
     let file = root / "runquotad.toml"
     putEnv("RUNQUOTA_SOCKET", socket)
@@ -250,13 +259,17 @@ suite "runquota config and a running daemon":
     check "machine.memory_bytes" in answer.output
 
   test "a pool a session declares: admitted, under the file, gone with it":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # A daemon started with NO budget flags -- what reprobuild's auto-spawn
     # and the installed service both start now -- and a client that declares
     # the pools its work uses (reprobuild-specs/RunQuota-Host-Configuration.md,
     # "Pools a build declares").
     let root = scratchRoot("declared")
     defer: removeScratchRoot(root)
-    let socket = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socket = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let state = hostStateDir(root)
     let file = root / "runquotad.toml"
     putEnv("RUNQUOTA_SOCKET", socket)
@@ -311,9 +324,13 @@ suite "runquota config and a running daemon":
       file).output
 
   test "a file the daemon does not read is reported as not in force":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("elsewhere")
     defer: removeScratchRoot(root)
-    let socket = rendezvousDir(root) / "d.sock"
+    var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy4)
+    let socket = rendezvousDir(root, endpointPolicy4) / "d.sock"
     let state = hostStateDir(root)
     putEnv("RUNQUOTA_SOCKET", socket)
     var daemon = startDaemon(socket, root / "daemon.toml", state)

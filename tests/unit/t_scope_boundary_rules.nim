@@ -28,6 +28,7 @@
 ## `host_id` needs root or a container, and the single-uid substitute below
 ## is labelled as a substitute rather than passed off as the clause.
 
+import private_broker_owner
 import std/[os, strutils, unittest]
 
 when defined(posix):
@@ -135,6 +136,8 @@ when defined(posix):
 when defined(posix):
   suite "scope_boundary_rules_endpoint_directory":
     test "the endpoint directory is created 0750 by an explicit mode, not by the umask":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       # THE UMASK IS SET WIDE OPEN ON PURPOSE. `createDir` with no mode asks
       # for 0777 and gets whatever the umask leaves, so on a developer box
       # with umask 022 it lands on 0755 and the defect is invisible. Under
@@ -163,6 +166,8 @@ when defined(posix):
       check endpointDirectoryRefusal(unixEndpoint(dir / "runquotad.sock")) == ""
 
     test "a pre-created world-writable endpoint directory is REFUSED, and named":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       let root = scratchDir("world")
       defer: removeDir(root)
       let dir = root / "ep"
@@ -187,6 +192,8 @@ when defined(posix):
         trust.message
 
     test "a group-writable endpoint directory is REFUSED too":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       # 0770 is the mode a lax deployment reaches for when it wants "the
       # team" to share a build box. It is still a directory every member of
       # that group can plant a socket in.
@@ -205,6 +212,8 @@ when defined(posix):
       check "group- or world-writable" in trust.message
 
     test "a merely loose 0755 endpoint directory is REFUSED as well":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       # This is the one a lax umask produces, and it is the reason "mode is
       # verified" is not the same statement as "mode is not writable by
       # others". Nobody else can write here, and it is still refused,
@@ -224,6 +233,8 @@ when defined(posix):
       check "0750" in trust.message
 
     test "an endpoint directory owned by another uid is REFUSED, as an OWNERSHIP problem":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       # THE ATTACK IS ON THE PATH, NOT ON THE CONNECTION. `getpeereid`
       # validates who connects; it cannot tell that the socket they are
       # connecting to sits in a directory somebody else owns and could have
@@ -248,6 +259,8 @@ when defined(posix):
         check modeText(trust.mode) in trust.message
 
     test "a symlink at the rendezvous path is refused rather than followed":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       # Following it would check the mode of whatever it points at while the
       # daemon binds through the link, so the check would be reading a
       # different object from the one being used.
@@ -263,6 +276,8 @@ when defined(posix):
       check link in trust.message
 
     test "a directory that is not there yet is not a refusal":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       # The daemon is about to create it with an explicit mode, and a client
       # gets an ordinary connect failure. Refusing here would make the first
       # start of a daemon impossible.
@@ -274,6 +289,8 @@ when defined(posix):
       check endpointDirectoryRefusal(unixEndpoint(dir / "runquotad.sock")) == ""
 
     test "connecting through a widened directory is REFUSED at attach time":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       # Verification happens on EVERY CLIENT ATTACH and not only at daemon
       # start: the directory was fine when the daemon bound and was widened
       # afterwards, which is precisely the window a start-only check leaves

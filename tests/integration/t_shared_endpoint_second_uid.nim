@@ -106,7 +106,7 @@ else:
       result.add(int64(buffer[i]))
 
   const requiredFixtureTools = ["bash", "mkdir", "chmod", "mv", "cp", "rm",
-                                "sleep", "printf", "sqlite3"]
+                                "sleep", "printf", "id", "sqlite3"]
 
   proc requireFixtureTool(name: string): string =
     # Preserve named argv[0] dispatch for Nix coreutils multicall aliases.
@@ -371,6 +371,11 @@ else:
           "set -e",
           "export PATH=" & quoteShell(fixturePath()),
           "export RUNQUOTA_ENDPOINT_GROUP=" & $memberGid,
+          # This actual builder owns the broker, not the outer test or an
+          # earlier build-user probe. Keep the real group/kernel boundary.
+          "broker_uid=$(" & quoteShell(fixtureTools["id"]) & " -u)",
+          "case \"$broker_uid\" in ''|*[!0-9]*) exit 1;; esac",
+          "export RUNQUOTA_ENDPOINT_OWNER_UID=\"$broker_uid\"",
           "mkdir -p " & rv & "/state",
           "chmod 0755 " & rv & "/state",
           toolDir & "/runquotad --socket " & socketPath &
@@ -454,12 +459,21 @@ else:
             # ---------------------------------------------------------------
             # NON-MEMBER: this process. Not the owner, not in the group.
             # ---------------------------------------------------------------
-            putEnv("RUNQUOTA_ENDPOINT_OWNER_UID", $daemonUid)
-            putEnv("RUNQUOTA_ENDPOINT_GROUP", $memberGid)
-            let outsider = parseReport(execProcess(probeBinary,
-              args = [socketPath], env = nil, options = {poStdErrToStdOut}))
-            delEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
-            delEnv("RUNQUOTA_ENDPOINT_GROUP")
+            let outsider = block:
+              let ownerHad = existsEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+              let ownerOld = getEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+              let groupHad = existsEnv("RUNQUOTA_ENDPOINT_GROUP")
+              let groupOld = getEnv("RUNQUOTA_ENDPOINT_GROUP")
+              try:
+                putEnv("RUNQUOTA_ENDPOINT_OWNER_UID", $daemonUid)
+                putEnv("RUNQUOTA_ENDPOINT_GROUP", $memberGid)
+                parseReport(execProcess(probeBinary,
+                  args = [socketPath], env = nil, options = {poStdErrToStdOut}))
+              finally:
+                if ownerHad: putEnv("RUNQUOTA_ENDPOINT_OWNER_UID", ownerOld)
+                else: delEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+                if groupHad: putEnv("RUNQUOTA_ENDPOINT_GROUP", groupOld)
+                else: delEnv("RUNQUOTA_ENDPOINT_GROUP")
             check outsider.getOrDefault("uid") == $int64(getuid())
             check memberGid notin gidsIn(outsider.getOrDefault("groups"))
             # THE DECIDING OBSERVATION. Our own predicate looked at the

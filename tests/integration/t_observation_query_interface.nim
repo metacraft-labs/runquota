@@ -24,6 +24,7 @@
 ## reason M10, M11 and M13 give: a mutation that only recompiles the test
 ## reports green while the code under test never executes.
 
+import private_broker_owner
 import std/[options, os, osproc, streams, strutils, unittest]
 
 
@@ -86,9 +87,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -113,8 +115,7 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   # Exactly three startup lines, as `t_observation_socket_write_path`
   # asserts: reading them keeps the pipe from filling and wedging the
   # daemon on a write nobody is draining.
-  for _ in 0 ..< 3:
-    discard process.outputStream.readLine()
+  discard readRequiredStartupLines(process, 3, "t_observation_query_interface")
   DaemonHandle(process: process)
 
 proc stop(handle: var DaemonHandle) =
@@ -223,9 +224,13 @@ suite "observation_query_interface":
   # -------------------------------------------------------------------------
 
   test "runquotad answers both aggregations over the socket":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("read")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let socketPath = rendezvousDir(root, endpointPolicy1) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let dbPath = state / "observations.sqlite3"
@@ -502,9 +507,13 @@ suite "observation_query_interface":
   # -------------------------------------------------------------------------
 
   test "a supplied estimate is passed through unmodified, learned is fallback":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("est")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let socketPath = rendezvousDir(root, endpointPolicy2) / "d.sock"
     let state = hostStateDir(root)
 
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -645,6 +654,8 @@ suite "observation_query_interface":
   # -------------------------------------------------------------------------
 
   test "a query immediately after a lease finishes sees that execution":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # WHY THIS TEST EXISTS SEPARATELY FROM THE GATE ABOVE. Every other arm
     # in this file reaches the store through `waitForExecutions`, which
     # polls for up to ten seconds -- and polling MASKS the daemon's flush
@@ -656,7 +667,9 @@ suite "observation_query_interface":
     # does: it finishes a lease and asks, with nothing in between.
     let root = scratchRoot("flush")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socketPath = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
 

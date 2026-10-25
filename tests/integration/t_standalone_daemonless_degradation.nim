@@ -55,6 +55,8 @@
 ## implementation is the wrong one. What is wrong with it is not visible in
 ## its results; it is visible only in the counter.
 
+import daemon_endpoint
+import private_broker_owner
 import std/[json, options, os, osproc, streams, strutils, unittest]
 
 # `readToEnd`, not `streams.readAll`: on Windows `readAll` stops at the
@@ -227,9 +229,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc selfPath(): string = getAppFilename()
@@ -407,8 +410,7 @@ proc startDaemon(socketPath, dbPath, identityFile: string): DaemonHandle =
     if fileExists(socketPath): break
     sleep(25)
   var lines: seq[string] = @[]
-  for _ in 0 ..< 3:
-    lines.add(process.outputStream.readLine())
+  lines = readRequiredStartupLines(process, 3, "t_standalone_daemonless_degradation")
   DaemonHandle(process: process, startupLines: lines)
 
 proc stop(handle: var DaemonHandle) =
@@ -509,7 +511,9 @@ suite "standalone_daemonless_degradation":
     # missing is the daemon -- which is the situation the milestone is
     # about, and a harsher one than an unreachable path, because every
     # earlier layer looks healthy.
-    let socketPath = rendezvousDir(root) / "runquotad.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let socketPath = rendezvousDir(root, endpointPolicy1) / "runquotad.sock"
     putEnv("RUNQUOTA_SOCKET", socketPath)
     check not fileExists(socketPath)
 
@@ -558,7 +562,9 @@ suite "standalone_daemonless_degradation":
     defer: probe.disarm()
     let fixture = compileFixture(root, "passing", PassingTestSource)
     let report = root / "honest-report"
-    let socketPath = rendezvousDir(root) / "runquotad.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let socketPath = rendezvousDir(root, endpointPolicy2) / "runquotad.sock"
 
     putEnv(HonestRoleEnv, socketPath)
     putEnv(RoleRunsEnv, $Runs)
@@ -597,13 +603,17 @@ suite "standalone_daemonless_degradation":
   # -------------------------------------------------------------------------
 
   test "the one exit flush lands, and its rows say the window was incomplete":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("f")
     defer: removeScratchRoot(root)
     let probe = installSqliteProbe(root)
     defer: probe.disarm()
     let fixture = compileFixture(root, "passing", PassingTestSource)
     let report = root / "honest-report"
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socketPath = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let dbPath = root / "observations.sqlite3"
     check fileExists(daemonPath())
 
@@ -681,13 +691,17 @@ suite "standalone_daemonless_degradation":
   # -------------------------------------------------------------------------
 
   test "a flush claiming a complete window is refused, and a degraded one is not":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # A FIXTURE A WELL-BEHAVED CLIENT CANNOT PRODUCE. `StandaloneCapture`
     # has no path that emits `ccComplete`, so this frame is hand-built and
     # written straight to the socket -- a real dishonest client, not a
     # stand-in for one.
     let root = scratchRoot("r")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy4)
+    let socketPath = rendezvousDir(root, endpointPolicy4) / "d.sock"
     let dbPath = root / "observations.sqlite3"
     var daemon = startDaemon(socketPath, dbPath, root / "host-id")
     try:
@@ -741,6 +755,8 @@ suite "standalone_daemonless_degradation":
       daemon.stop()
 
   test "one self-contradicting record is dropped, and the rest of its batch is not":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE SAME RULE THE LEASED PATH APPLIES, on the shape a standalone
     # client flushes. It is asserted here as well as on the pure predicate
     # because the DAEMON is what decides how much of a batch a single bad
@@ -758,7 +774,9 @@ suite "standalone_daemonless_degradation":
     const HonestKey = "m14-honest-key"
     let root = scratchRoot("t")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy5: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy5)
+    let socketPath = rendezvousDir(root, endpointPolicy5) / "d.sock"
     let dbPath = root / "observations.sqlite3"
     var daemon = startDaemon(socketPath, dbPath, root / "host-id")
     try:
@@ -849,7 +867,9 @@ suite "standalone_daemonless_degradation":
   test "with no daemon, aggregation and learned estimates are unavailable":
     let root = scratchRoot("s")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "runquotad.sock"
+    var endpointPolicy6: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy6)
+    let socketPath = rendezvousDir(root, endpointPolicy6) / "runquotad.sock"
     putEnv("RUNQUOTA_SOCKET", socketPath)
     check not fileExists(socketPath)
 
@@ -888,11 +908,15 @@ suite "standalone_daemonless_degradation":
     check "flush " & $sfAttempted notin acquire.output
 
   test "the same command with a daemon does NOT report unavailable":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE CONTROL. Without it, "unavailable" is what this command says
     # everywhere, and clause 6 is satisfied by a CLI that never answers.
     let root = scratchRoot("c")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy7: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy7)
+    let socketPath = rendezvousDir(root, endpointPolicy7) / "d.sock"
     var daemon = startDaemon(socketPath, root / "observations.sqlite3",
       root / "host-id")
     try:

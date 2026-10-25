@@ -24,6 +24,7 @@
 ## SECOND real user connect and be attributed correctly; see the milestone
 ## report for that clause's status.
 
+import private_broker_owner
 import std/[options, os, osproc, streams, strutils, unittest]
 
 when defined(posix):
@@ -211,8 +212,7 @@ proc startDaemon(socketPath, observationDb, identityFile: string):
   var lines: seq[string] = @[]
   # Exactly three startup lines whenever a store path was given, then the
   # daemon goes quiet. Reading precisely three cannot deadlock against it.
-  for _ in 0 ..< 3:
-    lines.add(process.outputStream.readLine())
+  lines = readRequiredStartupLines(process, 3, "t_scope_boundary_enforcement")
   DaemonHandle(process: process, startupLines: lines)
 
 proc stop(handle: var DaemonHandle) =
@@ -267,6 +267,8 @@ proc waitForExecutionRows(path: string; atLeast: int): int =
 when defined(posix):
   suite "scope_boundary_enforcement_daemon_start":
     test "a real daemon REFUSES a pre-created world-writable endpoint directory":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       let root = scratchDir("wide")
       defer: removeScratchRoot(root)
       let dir = root / "ep"
@@ -293,6 +295,8 @@ when defined(posix):
       check not pathPresent(socketPath)
 
     test "a real daemon REFUSES an endpoint directory owned by another uid":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       let foreign = foreignOwnedDirectory()
       check foreign.len > 0
       if foreign.len > 0:
@@ -309,6 +313,8 @@ when defined(posix):
         check not pathPresent(socketPath)
 
     test "a real daemon accepts a directory it created itself, at 0750":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       # The acceptance half. Without it, a build that refused every start
       # would satisfy both refusals above.
       let root = scratchDir("good")
@@ -343,6 +349,8 @@ else:
 
 suite "scope_boundary_enforcement_owner_uid":
   test "a client declaring somebody else's uid is REFUSED, and one declaring its own is not":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchDir("owner")
     defer: removeScratchRoot(root)
     let dir = root / "ep"
@@ -374,6 +382,8 @@ suite "scope_boundary_enforcement_owner_uid":
       daemon.stop()
 
   test "owner_uid on an execution comes from peer credentials":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchDir("exec")
     defer: removeScratchRoot(root)
     let dir = root / "ep"

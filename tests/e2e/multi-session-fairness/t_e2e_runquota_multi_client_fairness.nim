@@ -1,5 +1,6 @@
 import std/[os, osproc, strutils, unittest]
 
+import private_broker_owner
 import runquota_client
 import runquota_codec
 import runquota_core
@@ -148,17 +149,17 @@ template finishLease(lease: var RunQuotaLease; progress: var int) =
 
 suite "e2e_runquota_multi_client_fairness":
   test "real daemon admits batched multi-session work fairly without oversubscription":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let socketDir = getTempDir() / ("runquota-m3-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeScratchRoot(socketDir)
     createDir(socketDir)
-    # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-    # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-    # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-    # where it does not -- so a fixture hardcoding either one is green on one
-    # kind of host and red on the other. Fixture only; the modes themselves
-    # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    # Use the declared fixture policy for this endpoint. Private broker cases
+    # bind its independently inspected GID before this mode and all participants.
     setFilePermissions(socketDir, endpointDirectoryPermissions())
     check fileExists(daemonPath())
     check fileExists(cliPath())
@@ -291,17 +292,17 @@ suite "e2e_runquota_multi_client_fairness":
         removeScratchRoot(socketDir)
 
   test "real daemon queues IO admission without blocking fitting non-IO work":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let socketDir = getTempDir() / ("runquota-m3-io-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeScratchRoot(socketDir)
     createDir(socketDir)
-    # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-    # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-    # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-    # where it does not -- so a fixture hardcoding either one is green on one
-    # kind of host and red on the other. Fixture only; the modes themselves
-    # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    # Use the declared fixture policy for this endpoint. Private broker cases
+    # bind its independently inspected GID before this mode and all participants.
     setFilePermissions(socketDir, endpointDirectoryPermissions())
     check fileExists(daemonPath())
     check fileExists(cliPath())
@@ -407,18 +408,18 @@ suite "e2e_runquota_multi_client_fairness":
         removeScratchRoot(socketDir)
 
   test "real daemon grants benchmark leases only after outstanding work drains":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let socketDir = getTempDir() / ("runquota-m3-benchmark-" &
         $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeScratchRoot(socketDir)
     createDir(socketDir)
-    # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-    # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-    # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-    # where it does not -- so a fixture hardcoding either one is green on one
-    # kind of host and red on the other. Fixture only; the modes themselves
-    # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    # Use the declared fixture policy for this endpoint. Private broker cases
+    # bind its independently inspected GID before this mode and all participants.
     setFilePermissions(socketDir, endpointDirectoryPermissions())
     check fileExists(daemonPath())
     check fileExists(cliPath())
@@ -544,18 +545,18 @@ suite "e2e_runquota_multi_client_fairness":
         removeScratchRoot(socketDir)
 
   test "real daemon models host and VM shared CPU topology":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let socketDir = getTempDir() / ("runquota-m3-topology-" &
         $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeScratchRoot(socketDir)
     createDir(socketDir)
-    # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-    # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-    # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-    # where it does not -- so a fixture hardcoding either one is green on one
-    # kind of host and red on the other. Fixture only; the modes themselves
-    # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    # Use the declared fixture policy for this endpoint. Private broker cases
+    # bind its independently inspected GID before this mode and all participants.
     setFilePermissions(socketDir, endpointDirectoryPermissions())
     check fileExists(daemonPath())
     check fileExists(cliPath())
@@ -651,17 +652,17 @@ suite "e2e_runquota_multi_client_fairness":
         removeScratchRoot(socketDir)
 
   test "real daemon reports candidate batch and frame flow-control diagnostics":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let socketDir = getTempDir() / ("runquota-m3-flow-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeScratchRoot(socketDir)
     createDir(socketDir)
-    # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-    # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-    # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-    # where it does not -- so a fixture hardcoding either one is green on one
-    # kind of host and red on the other. Fixture only; the modes themselves
-    # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    # Use the declared fixture policy for this endpoint. Private broker cases
+    # bind its independently inspected GID before this mode and all participants.
     setFilePermissions(socketDir, endpointDirectoryPermissions())
     check fileExists(daemonPath())
 

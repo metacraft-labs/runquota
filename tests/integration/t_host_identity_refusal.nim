@@ -27,6 +27,8 @@
 ## `defaultHostIdentityFile()` — the thing that actually ships — had never
 ## been resolved by a test at all.
 
+import daemon_endpoint
+import private_broker_owner
 import std/[os, osproc, streams, strutils, unittest]
 
 import runquota_ipc
@@ -53,13 +55,9 @@ proc scratchDir(name: string): string =
   result = getTempDir() / ("rq-hi-" & $getCurrentProcessId() & name)
   removeDir(result)
   createDir(result)
-  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal: some of these
-  # fixtures ARE the rendezvous directory the daemon binds in, and the
-  # rendezvous mode is 0750 where a `runquota` group exists and 0700
-  # (owner-only, single-user mode) where it does not. Nothing in this file
-  # asserts the fixture's own mode; the modes themselves are asserted in
-  # `tests/unit/t_shared_endpoint_rules.nim`.
-  setFilePermissions(result, endpointDirectoryPermissions())
+  # Generic scratch storage starts owner-private. Broker cases inspect the
+  # actual endpoint group before selecting their rendezvous permissions.
+  setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
 
 proc contents(path: string): string =
   ## Deliberately not `readFile`. A missing artifact must fail its own
@@ -116,8 +114,7 @@ proc startDaemon(socketPath, observationDb, identityFile: string):
   # unfolded message would make this a four-line startup and every reader
   # of the third line would misread or block.
   var lines: seq[string] = @[]
-  for _ in 0 ..< 3:
-    lines.add(process.outputStream.readLine())
+  lines = readRequiredStartupLines(process, 3, "t_host_identity_refusal")
   DaemonHandle(process: process, startupLines: lines)
 
 proc stop(handle: var DaemonHandle) =
@@ -302,6 +299,8 @@ suite "host_identity_refusal":
       check readFile(file) == expected
 
   test "the daemon starts, serves leases, and says capture is off":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     ## Refuse-vs-disable, decided and asserted. RunQuota's mission is
     ## ADMISSION: a daemon that cannot record history can still keep a
     ## machine from thrashing itself to death, and refusing to admit
@@ -309,6 +308,9 @@ suite "host_identity_refusal":
     ## advisory subsystem take out the host's build capacity. So the
     ## daemon starts and serves -- and says which path and why.
     let dir = scratchDir("c")
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(dir, endpointDirectoryPermissions())
     defer: removeScratchRoot(dir)
     let socketPath = dir / "d.sock"
     let dbPath = dir / "obs.sqlite"
