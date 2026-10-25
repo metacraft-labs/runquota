@@ -36,13 +36,9 @@ proc scratchDir(name: string): string =
   result = getTempDir() / ("rq-obs-" & $getCurrentProcessId() & "-" & name)
   removeDir(result)
   createDir(result)
-  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-  # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-  # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-  # where it does not -- so a fixture hardcoding either one is green on one
-  # kind of host and red on the other. Fixture only; the modes themselves
-  # are asserted in tests/unit/t_shared_endpoint_rules.nim.
-  setFilePermissions(result, endpointDirectoryPermissions())
+  # Generic scratch storage starts owner-private. Broker cases inspect this
+  # actual endpoint GID and select the declared rendezvous mode afterward.
+  setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
 
 proc waitForSocket(socketPath: string) =
   for _ in 0 ..< 200:
@@ -114,6 +110,9 @@ suite "observation_store_degraded_capture_build":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
     defer: restorePrivateBrokerOwner(privateOwner)
     let dir = scratchDir("h")
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(dir, endpointDirectoryPermissions())
     defer: removeScratchRoot(dir)
     let socketPath = dir / "runquotad.sock"
     let dbPath = dir / "observations.sqlite"
@@ -219,6 +218,9 @@ suite "observation_store_degraded_capture_build":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
     defer: restorePrivateBrokerOwner(privateOwner)
     let dir = scratchDir("c")
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(dir, endpointDirectoryPermissions())
     defer: removeScratchRoot(dir)
     let socketPath = dir / "runquotad.sock"
     let dbPath = dir / "observations.sqlite"

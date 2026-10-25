@@ -87,9 +87,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -215,7 +216,9 @@ suite "completion_report_does_not_wait_on_the_store":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("lat")
     defer: removeScratchRoot(root)
-    let endpointDir = rendezvousDir(root)
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let endpointDir = rendezvousDir(root, endpointPolicy1)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)
     require fileExists(daemonPath())

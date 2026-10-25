@@ -113,6 +113,10 @@ suite "runquota daemon start":
   test "returns with its output closed, and the daemon writes to its log":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
     defer: restorePrivateBrokerOwner(privateOwner)
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(root))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    when defined(posix):
+      setFilePermissions(root, endpointDirectoryPermissions())
     putEnv("RUNQUOTA_SOCKET", socketPath)
     defer: delEnv("RUNQUOTA_SOCKET")
 
@@ -166,6 +170,10 @@ suite "runquota daemon start":
   test "a daemon that already answers is left alone":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
     defer: restorePrivateBrokerOwner(privateOwner)
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(root))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    when defined(posix):
+      setFilePermissions(root, endpointDirectoryPermissions())
     putEnv("RUNQUOTA_SOCKET", socketPath)
     defer: delEnv("RUNQUOTA_SOCKET")
     let first = startProcess(cliPath(),

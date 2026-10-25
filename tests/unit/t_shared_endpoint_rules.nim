@@ -710,6 +710,133 @@ when defined(posix):
         check ("owned by uid " & $int64(getuid())) in trust.message
         check "0750" in trust.message
 
+    test "private caller policy restores both exact environment states":
+      let ownerHad = existsEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+      let ownerOld = getEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+      let groupHad = existsEnv("RUNQUOTA_ENDPOINT_GROUP")
+      let groupOld = getEnv("RUNQUOTA_ENDPOINT_GROUP")
+      defer:
+        try:
+          if groupHad: putEnv("RUNQUOTA_ENDPOINT_GROUP", groupOld)
+          else: delEnv("RUNQUOTA_ENDPOINT_GROUP")
+        finally:
+          if ownerHad: putEnv("RUNQUOTA_ENDPOINT_OWNER_UID", ownerOld)
+          else: delEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+      let root = scratchDir("policystates")
+      defer: removeDir(root)
+      let dir = makeDir(root / "ep", 0o750)
+      let fixtureGid = privateEndpointGroup(dir)
+      for ownerState in 0 .. 2:
+        for groupState in 0 .. 2:
+          if ownerState == 0: delEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+          else: putEnv("RUNQUOTA_ENDPOINT_OWNER_UID", if ownerState == 1: "" else: "0")
+          if groupState == 0: delEnv("RUNQUOTA_ENDPOINT_GROUP")
+          else: putEnv("RUNQUOTA_ENDPOINT_GROUP", if groupState == 1: "" else: $otherThan(fixtureGid))
+          let ownerBefore = getEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+          let groupBefore = getEnv("RUNQUOTA_ENDPOINT_GROUP")
+          block:
+            let binding = bindPrivateBrokerPolicyToCaller(fixtureGid)
+            defer: restorePrivateBrokerPolicy(binding)
+            check rendezvousPolicy().ownerUid == int64(getuid())
+            check rendezvousPolicy().groupGid == fixtureGid
+          check existsEnv("RUNQUOTA_ENDPOINT_OWNER_UID") == (ownerState != 0)
+          check getEnv("RUNQUOTA_ENDPOINT_OWNER_UID") == ownerBefore
+          check existsEnv("RUNQUOTA_ENDPOINT_GROUP") == (groupState != 0)
+          check getEnv("RUNQUOTA_ENDPOINT_GROUP") == groupBefore
+          var raised = false
+          try:
+            let binding = bindPrivateBrokerPolicyToCaller(fixtureGid)
+            defer: restorePrivateBrokerPolicy(binding)
+            check rendezvousPolicy().ownerUid == int64(getuid())
+            check rendezvousPolicy().groupGid == fixtureGid
+            raise newException(ValueError, "private policy body exception")
+          except ValueError:
+            raised = true
+          check raised
+          check existsEnv("RUNQUOTA_ENDPOINT_OWNER_UID") == (ownerState != 0)
+          check getEnv("RUNQUOTA_ENDPOINT_OWNER_UID") == ownerBefore
+          check existsEnv("RUNQUOTA_ENDPOINT_GROUP") == (groupState != 0)
+          check getEnv("RUNQUOTA_ENDPOINT_GROUP") == groupBefore
+          # Match callers that defer restoration before endpoint setup. A
+          # genuine missing endpoint fails before assignment, leaving the token
+          # inactive; its deferred restore must leave inherited state intact.
+          block:
+            var unbound: PrivateBrokerCallerPolicyBinding
+            defer: restorePrivateBrokerPolicy(unbound)
+            expect OSError:
+              unbound = bindPrivateBrokerPolicyToCaller(
+                privateEndpointGroup(dir / "not-created"))
+          check existsEnv("RUNQUOTA_ENDPOINT_OWNER_UID") == (ownerState != 0)
+          check getEnv("RUNQUOTA_ENDPOINT_OWNER_UID") == ownerBefore
+          check existsEnv("RUNQUOTA_ENDPOINT_GROUP") == (groupState != 0)
+          check getEnv("RUNQUOTA_ENDPOINT_GROUP") == groupBefore
+          # A real rejected setup argument must not mutate either variable.
+          expect ValueError:
+            discard bindPrivateBrokerPolicyToCaller(-1)
+          check existsEnv("RUNQUOTA_ENDPOINT_OWNER_UID") == (ownerState != 0)
+          check getEnv("RUNQUOTA_ENDPOINT_OWNER_UID") == ownerBefore
+          check existsEnv("RUNQUOTA_ENDPOINT_GROUP") == (groupState != 0)
+          check getEnv("RUNQUOTA_ENDPOINT_GROUP") == groupBefore
+
+    test "private policy does not replace the real named default group":
+      let groupHad = existsEnv("RUNQUOTA_ENDPOINT_GROUP")
+      let groupOld = getEnv("RUNQUOTA_ENDPOINT_GROUP")
+      defer:
+        if groupHad: putEnv("RUNQUOTA_ENDPOINT_GROUP", groupOld)
+        else: delEnv("RUNQUOTA_ENDPOINT_GROUP")
+      delEnv("RUNQUOTA_ENDPOINT_GROUP")
+      let named = getgrnam("runquota")
+      let expected = if named == nil: -1'i64 else: int64(named.gr_gid)
+      check rendezvousPolicy().groupGid == expected
+      let root = scratchDir("policydefault")
+      defer: removeDir(root)
+      let dir = makeDir(root / "ep", 0o750)
+      block:
+        let binding = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+        defer: restorePrivateBrokerPolicy(binding)
+        check rendezvousPolicy().groupGid == groupOf(dir)
+      check not existsEnv("RUNQUOTA_ENDPOINT_GROUP")
+      check rendezvousPolicy().groupGid == expected
+
+    test "private policy accepts the actual endpoint group and still refuses a foreign policy":
+      let root = scratchDir("policyactual")
+      defer: removeDir(root)
+      let dir = makeDir(root / "ep", 0o750)
+      let fixtureGid = privateEndpointGroup(dir)
+      let endpoint = unixEndpoint(dir / "d.sock")
+      let groupHad = existsEnv("RUNQUOTA_ENDPOINT_GROUP")
+      let groupOld = getEnv("RUNQUOTA_ENDPOINT_GROUP")
+      defer:
+        if groupHad: putEnv("RUNQUOTA_ENDPOINT_GROUP", groupOld)
+        else: delEnv("RUNQUOTA_ENDPOINT_GROUP")
+      let foreignGid = otherThan(fixtureGid)
+      putEnv("RUNQUOTA_ENDPOINT_GROUP", $foreignGid)
+      block:
+        # Owner-only selection intentionally preserves the inherited wrong
+        # group. The same real endpoint therefore refuses before opt-in.
+        let ownerOnly = bindPrivateBrokerOwnerToCaller()
+        defer: restorePrivateBrokerOwner(ownerOnly)
+        check rendezvousPolicy().groupGid == foreignGid
+        check endpointDirectoryTrust(endpoint).reason == trustForeignGroup
+      block:
+        let binding = bindPrivateBrokerPolicyToCaller(fixtureGid)
+        defer: restorePrivateBrokerPolicy(binding)
+        check endpointDirectoryTrust(endpoint).reason == trustOk
+        let wrong = policyFor(foreignGid)
+        check endpointDirectoryTrust(endpoint, wrong).reason == trustForeignGroup
+        var listener = bindEndpoint(endpoint)
+        try:
+          check modeOf(dir) == 0o750
+          check groupOf(dir) == fixtureGid
+          check modeOf(dir / "d.sock") == 0o660
+          check groupOf(dir / "d.sock") == fixtureGid
+          var client = connectEndpoint(endpoint)
+          client.close()
+        finally:
+          listener.close()
+      check existsEnv("RUNQUOTA_ENDPOINT_GROUP")
+      check getEnv("RUNQUOTA_ENDPOINT_GROUP") == $foreignGid
+
     test "startup reader keeps the complete original three-line protocol":
       let child = startProcess(getAppFilename(),
         args = ["--startup-reader-control", "complete"],

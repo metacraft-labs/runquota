@@ -51,9 +51,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -140,7 +141,9 @@ suite "estimate_write_failures_are_visible":
     # -- exactly the population that can still be touching the scratch tree
     # when `daemon.stop()` returns. See `tests/support/scratch_root`.
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let socketPath = rendezvousDir(root, endpointPolicy1) / "d.sock"
     let state = hostStateDir(root)
     # A DIRECTORY, which `sqlite3` cannot open as a database. Every batch
     # the writer sends therefore fails at the tool.
@@ -192,7 +195,9 @@ suite "estimate_write_failures_are_visible":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("good")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let socketPath = rendezvousDir(root, endpointPolicy2) / "d.sock"
     let state = hostStateDir(root)
     let estimateDb = root / "estimates.sqlite3"
     require fileExists(daemonPath())

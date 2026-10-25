@@ -55,9 +55,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -210,7 +211,9 @@ suite "stats_table_cache_control":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("empty")
     defer: removeScratchRoot(root)
-    let endpointDir = rendezvousDir(root)
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let endpointDir = rendezvousDir(root, endpointPolicy1)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)
     require fileExists(daemonPath())
@@ -330,7 +333,9 @@ suite "stats_table_cache_control":
     ## nobody can exercise is a claim rather than a property.
     let root = scratchRoot("off")
     defer: removeScratchRoot(root)
-    let endpointDir = rendezvousDir(root)
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let endpointDir = rendezvousDir(root, endpointPolicy2)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)
     require fileExists(daemonPath())

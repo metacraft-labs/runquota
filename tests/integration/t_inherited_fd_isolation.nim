@@ -236,7 +236,8 @@ suite "inherited_fd_isolation":
       # A directory of its own rather than `getTempDir()` itself. On Linux
       # that is a world-writable `/tmp` owned by root, and `bindEndpoint`
       # refuses a rendezvous directory it cannot vouch for -- correctly, so
-      # the fixture has to be one it can. `bindEndpoint` creates it 0700.
+      # the fixture has to be one it can. The endpoint declares its inspected
+      # group and exact shared mode before `bindEndpoint` verifies it.
       #
       # BOTH NAMES ARE TERSE ON PURPOSE. Nim's `Sockaddr_un_path_length` is
       # 92 on macOS and `toSockAddr` refuses `path.len >= 92`, so the whole
@@ -247,6 +248,10 @@ suite "inherited_fd_isolation":
       # spends 18 characters instead of 39 and leaves the margin visible.
       let socketDir = getTempDir() / ("rq-fd-" & $getCurrentProcessId())
       removeDir(socketDir)
+      createDir(socketDir)
+      let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+      defer: restorePrivateBrokerPolicy(endpointPolicy)
+      setFilePermissions(socketDir, endpointDirectoryPermissions())
       let socketPath = socketDir / "fd.sock"
       defer: removeDir(socketDir)
       var listener = bindEndpoint(unixEndpoint(socketPath))

@@ -69,9 +69,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -245,7 +246,9 @@ suite "observation_retention_scheduled":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("gate")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let socketPath = rendezvousDir(root, endpointPolicy1) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let expectedDb = state / "observations.sqlite3"
@@ -359,7 +362,9 @@ suite "observation_retention_scheduled":
     # for, and no assertion here covers it.
     let root = scratchRoot("hold")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let socketPath = rendezvousDir(root, endpointPolicy2) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let dbPath = state / "observations.sqlite3"
@@ -497,7 +502,9 @@ suite "observation_retention_scheduled":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("off")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socketPath = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let dbPath = state / "observations.sqlite3"
@@ -550,7 +557,9 @@ suite "observation_retention_scheduled":
     # every other arm in this file green.
     let root = scratchRoot("zero")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy4)
+    let socketPath = rendezvousDir(root, endpointPolicy4) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let dbPath = state / "observations.sqlite3"
@@ -615,7 +624,9 @@ suite "observation_retention_scheduled":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("nostats")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy5: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy5)
+    let socketPath = rendezvousDir(root, endpointPolicy5) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let defaultDb = state / "observations.sqlite3"
@@ -648,7 +659,9 @@ suite "observation_retention_scheduled":
     # take out a machine's build capacity.
     let root = scratchRoot("corrupt")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy6: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy6)
+    let socketPath = rendezvousDir(root, endpointPolicy6) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let dbPath = state / "observations.sqlite3"
@@ -714,7 +727,9 @@ suite "observation_retention_scheduled":
         if fileExists(dbPath & suffix):
           setFilePermissions(dbPath & suffix, {fpUserRead, fpUserWrite})
       removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy7: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy7)
+    let socketPath = rendezvousDir(root, endpointPolicy7) / "d.sock"
     let identityFile = state / "host-id"
     let hostId = mintIdentity(identityFile)
     seedStore(dbPath, hostId, 300, unixMillisNow() - 300)

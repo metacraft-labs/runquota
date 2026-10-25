@@ -37,7 +37,7 @@ else:
 import runquota_client
 import runquota_core
 import runquota_protocol
-from runquota_ipc import endpointForPath
+from runquota_ipc import endpointForPath, endpointDirectoryPermissions
 # The daemon's own identity probe, used here only to make CLEANUP safe: a
 # child is killed by pid only while that pid still names the child.
 import runquota_daemon/child_identity
@@ -165,8 +165,10 @@ proc childEnv(socketPath: string): StringTableRef =
     result[key] = value
   result["RUNQUOTA_SOCKET"] = socketPath
 
-proc startPrivateDaemon(tag: string; log: CaseLog): PrivateDaemon =
+proc startPrivateDaemon(fixturePolicy: var PrivateBrokerCallerPolicyBinding; tag: string; log: CaseLog): PrivateDaemon =
   result.root = scratchRoot(tag)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result.root))
+  setFilePermissions(result.root, endpointDirectoryPermissions())
   result.socketPath = result.root / "d.sock"
   # Every piece of host state in the scratch directory, and an explicit
   # budget: the daemon reads the host budget file at start, and a flag is
@@ -353,7 +355,9 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
     defer: restorePrivateBrokerOwner(privateOwner)
     let log = openCaseLog("held-then-reclaimed")
-    var daemon = startPrivateDaemon("held", log)
+    var endpointPolicy: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    var daemon = startPrivateDaemon(endpointPolicy, "held", log)
     var holder: Process = nil
     var child = ChildRef()
     try:
@@ -432,7 +436,9 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
     # seconds later. Either way the waiter must be granted inside the bound,
     # and before the fix it never was.
     let log = openCaseLog("killed-cli")
-    var daemon = startPrivateDaemon("cli", log)
+    var endpointPolicy: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    var daemon = startPrivateDaemon(endpointPolicy, "cli", log)
     var cli: Process = nil
     var child = ChildRef()
     try:

@@ -390,13 +390,9 @@ proc scratchDir(name: string): string =
   result = getTempDir() / ("rq-m11-" & $getCurrentProcessId() & "-" & name)
   removeDir(result)
   createDir(result)
-  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-  # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-  # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-  # where it does not -- so a fixture hardcoding either one is green on one
-  # kind of host and red on the other. Fixture only; the modes themselves
-  # are asserted in tests/unit/t_shared_endpoint_rules.nim.
-  setFilePermissions(result, endpointDirectoryPermissions())
+  # Generic scratch storage starts owner-private. Broker cases inspect this
+  # actual endpoint GID and select the declared rendezvous mode afterward.
+  setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
 
 proc openSampledStore(dir: string; cadenceMillis: int):
     tuple[store: ObservationStore; hostId: string] =
@@ -906,6 +902,9 @@ suite "ambient_load_attribution":
     # client reports its own execution and exactly what makes the
     # assertion falsifiable: no measurement produces 7.5 and 2.25.
     let dir = scratchDir("self")
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(dir, endpointDirectoryPermissions())
     defer: removeScratchRoot(dir)
     let socketPath = dir / "d.sock"
     let daemonBinary = daemonPath()
@@ -1118,6 +1117,9 @@ suite "ambient_load_attribution":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
     defer: restorePrivateBrokerOwner(privateOwner)
     let dir = scratchDir("dmn")
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(dir, endpointDirectoryPermissions())
     defer: removeScratchRoot(dir)
     let socketPath = dir / "d.sock"
     let dbPath = dir / "observations.sqlite"
@@ -1385,6 +1387,9 @@ suite "ambient_load_attribution":
     # about 86,000 of them per host per day whether the machine is
     # building or asleep.
     let dir = scratchDir("gate")
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(dir, endpointDirectoryPermissions())
     defer: removeScratchRoot(dir)
     stopAmbientSampler()
 

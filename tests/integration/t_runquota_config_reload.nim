@@ -32,9 +32,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -115,7 +116,9 @@ suite "runquota config and a running daemon":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("reload")
     defer: removeScratchRoot(root)
-    let socket = rendezvousDir(root) / "d.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let socket = rendezvousDir(root, endpointPolicy1) / "d.sock"
     let state = hostStateDir(root)
     let file = root / "etc" / "runquotad.toml"
     createDir(root / "etc")
@@ -238,7 +241,9 @@ suite "runquota config and a running daemon":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("pinned")
     defer: removeScratchRoot(root)
-    let socket = rendezvousDir(root) / "d.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let socket = rendezvousDir(root, endpointPolicy2) / "d.sock"
     let state = hostStateDir(root)
     let file = root / "runquotad.toml"
     putEnv("RUNQUOTA_SOCKET", socket)
@@ -262,7 +267,9 @@ suite "runquota config and a running daemon":
     # "Pools a build declares").
     let root = scratchRoot("declared")
     defer: removeScratchRoot(root)
-    let socket = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socket = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let state = hostStateDir(root)
     let file = root / "runquotad.toml"
     putEnv("RUNQUOTA_SOCKET", socket)
@@ -321,7 +328,9 @@ suite "runquota config and a running daemon":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("elsewhere")
     defer: removeScratchRoot(root)
-    let socket = rendezvousDir(root) / "d.sock"
+    var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy4)
+    let socket = rendezvousDir(root, endpointPolicy4) / "d.sock"
     let state = hostStateDir(root)
     putEnv("RUNQUOTA_SOCKET", socket)
     var daemon = startDaemon(socket, root / "daemon.toml", state)

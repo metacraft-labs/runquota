@@ -93,13 +93,12 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
-  # THE MODE THE SHIPPED POLICY REQUIRES, derived rather than written as a
-  # literal: the rendezvous mode is 0750 where a `runquota` group exists
-  # and 0700 where it does not, so a hardcoded fixture is green on one kind
-  # of host and red on the other.
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
+  # Use the declared fixture policy for this endpoint. Private broker cases
+  # bind its independently inspected GID before this mode and all participants.
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -252,7 +251,9 @@ suite "observation_socket_write_path":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("on")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let socketPath = rendezvousDir(root, endpointPolicy1) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     # THE DEFAULT STORE PATH IS DERIVED, NOT PASSED. Nothing below names a
@@ -363,7 +364,9 @@ suite "observation_socket_write_path":
 
     let root = scratchRoot("contra")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let socketPath = rendezvousDir(root, endpointPolicy2) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let expectedDb = state / "observations.sqlite3"
@@ -487,7 +490,9 @@ suite "observation_socket_write_path":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("off")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socketPath = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let defaultDb = state / "observations.sqlite3"
@@ -550,7 +555,9 @@ suite "observation_socket_write_path":
     # SAYS and WHETHER IT TOUCHED THE FILE.
     let root = scratchRoot("precedence")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy4)
+    let socketPath = rendezvousDir(root, endpointPolicy4) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     # A REAL STORE FROM A NEWER BUILD. It opens far enough to read its
@@ -646,7 +653,9 @@ suite "observation_socket_write_path":
     defer:
       setFilePermissions(locked, {fpUserRead, fpUserWrite, fpUserExec})
       removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy5: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy5)
+    let socketPath = rendezvousDir(root, endpointPolicy5) / "d.sock"
     let identityFile = locked / "nostate" / "host-id"
     let expectedDb = locked / "nostate" / "observations.sqlite3"
 
@@ -707,7 +716,9 @@ suite "observation_socket_write_path":
     # makes the pair reachable without any flag naming a database.
     let root = scratchRoot("untrusted")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy6: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy6)
+    let socketPath = rendezvousDir(root, endpointPolicy6) / "d.sock"
     let state = root / "state"
     createDir(state)
     when defined(windows):
@@ -786,7 +797,9 @@ suite "observation_socket_write_path":
     # and the clamp absorbs the overshoot.
     let root = scratchRoot("own")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy7: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy7)
+    let socketPath = rendezvousDir(root, endpointPolicy7) / "d.sock"
     let state = hostStateDir(root)
 
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -935,7 +948,9 @@ suite "observation_socket_write_path":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("bad")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy8: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy8)
+    let socketPath = rendezvousDir(root, endpointPolicy8) / "d.sock"
     let state = hostStateDir(root)
 
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -1065,7 +1080,9 @@ suite "observation_socket_write_path":
     # zero. Nothing about that is visible in the data.
     let root = scratchRoot("kill")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy9: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy9)
+    let socketPath = rendezvousDir(root, endpointPolicy9) / "d.sock"
     let state = hostStateDir(root)
     let expectedDb = state / "observations.sqlite3"
     let readyPath = root / "child-ready"
@@ -1159,7 +1176,9 @@ suite "observation_socket_write_path":
     # normally with nobody telling it anything went wrong.
     let root = scratchRoot("ro")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy10: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy10)
+    let socketPath = rendezvousDir(root, endpointPolicy10) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
 

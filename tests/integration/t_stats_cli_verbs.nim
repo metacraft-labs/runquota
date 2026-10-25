@@ -68,9 +68,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -234,7 +235,9 @@ suite "stats_cli_verbs":
     check fileExists(cliPath())
 
     # ---- capture OFF -----------------------------------------------------
-    let offSocket = rendezvousDir(offRoot) / "d.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let offSocket = rendezvousDir(offRoot, endpointPolicy1) / "d.sock"
     let offState = hostStateDir(offRoot)
     putEnv("RUNQUOTA_SOCKET", offSocket)
     var offDaemon = startDaemon(offSocket,
@@ -265,7 +268,10 @@ suite "stats_cli_verbs":
     check offTopJson["exit_code"].getInt == 4
 
     # ---- capture ON, store empty ----------------------------------------
-    let onSocket = rendezvousDir(onRoot) / "d.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let onSocket = rendezvousDir(onRoot, endpointPolicy2) / "d.sock"
+    require privateEndpointGroup(offSocket.parentDir) == privateEndpointGroup(onSocket.parentDir)
     let onState = hostStateDir(onRoot)
     let dbPath = onState / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", onSocket)
@@ -320,7 +326,9 @@ suite "stats_cli_verbs":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("stream")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socketPath = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -367,7 +375,9 @@ suite "stats_cli_verbs":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("rows")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy4)
+    let socketPath = rendezvousDir(root, endpointPolicy4) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -499,7 +509,9 @@ suite "stats_cli_verbs":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("top")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy5: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy5)
+    let socketPath = rendezvousDir(root, endpointPolicy5) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)

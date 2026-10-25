@@ -62,9 +62,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -229,7 +230,9 @@ suite "stats_table_publication":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("pub")
     defer: removeScratchRoot(root)
-    let endpointDir = rendezvousDir(root)
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let endpointDir = rendezvousDir(root, endpointPolicy1)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)
     require fileExists(daemonPath())
@@ -285,7 +288,9 @@ suite "stats_table_publication":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("sysc")
     defer: removeScratchRoot(root)
-    let endpointDir = rendezvousDir(root)
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let endpointDir = rendezvousDir(root, endpointPolicy2)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)
     require fileExists(daemonPath())
@@ -366,7 +371,9 @@ suite "stats_table_publication":
     ## nobody stored through.
     let root = scratchRoot("ro")
     defer: removeScratchRoot(root)
-    let endpointDir = rendezvousDir(root)
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let endpointDir = rendezvousDir(root, endpointPolicy3)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)
     require fileExists(daemonPath())
@@ -457,7 +464,9 @@ suite "stats_table_publication":
     ## and every other clause in this file would still pass.
     let root = scratchRoot("stale")
     defer: removeScratchRoot(root)
-    let endpointDir = rendezvousDir(root)
+    var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy4)
+    let endpointDir = rendezvousDir(root, endpointPolicy4)
     let socketPath = endpointDir / "d.sock"
     let state = hostStateDir(root)
     require fileExists(daemonPath())

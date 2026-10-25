@@ -92,9 +92,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -173,7 +174,9 @@ suite "extension_rows_do_not_query_the_registry":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("rows")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let socketPath = rendezvousDir(root, endpointPolicy1) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     require fileExists(daemonPath())
@@ -261,7 +264,9 @@ suite "extension_rows_do_not_query_the_registry":
     # every extension registered before this daemon started.
     let root = scratchRoot("miss")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let socketPath = rendezvousDir(root, endpointPolicy2) / "d.sock"
     let state = hostStateDir(root)
     require fileExists(daemonPath())
 
@@ -300,7 +305,9 @@ suite "extension_rows_do_not_query_the_registry":
     # read back afterwards as a complete observation of an older schema.
     let root = scratchRoot("ver")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socketPath = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let state = hostStateDir(root)
     require fileExists(daemonPath())
 

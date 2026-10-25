@@ -61,9 +61,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -192,7 +193,9 @@ suite "observation_extension_write_path":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("ok")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let socketPath = rendezvousDir(root, endpointPolicy1) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     check fileExists(daemonPath())
@@ -242,7 +245,9 @@ suite "observation_extension_write_path":
     # session it named" passes every other arm and fails this one.
     let root = scratchRoot("own")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let socketPath = rendezvousDir(root, endpointPolicy2) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -292,7 +297,9 @@ suite "observation_extension_write_path":
     # one.
     let root = scratchRoot("conn")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socketPath = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -346,7 +353,9 @@ suite "observation_extension_write_path":
     # one-way message it is never told was rejected.
     let root = scratchRoot("late")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy4)
+    let socketPath = rendezvousDir(root, endpointPolicy4) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -389,7 +398,9 @@ suite "observation_extension_write_path":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("undecl")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy5: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy5)
+    let socketPath = rendezvousDir(root, endpointPolicy5) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -441,7 +452,9 @@ suite "observation_extension_write_path":
     # running one.
     let root = scratchRoot("declconn")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy6: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy6)
+    let socketPath = rendezvousDir(root, endpointPolicy6) / "d.sock"
     let state = hostStateDir(root)
     putEnv("RUNQUOTA_SOCKET", socketPath)
     var daemon = startDaemon(socketPath, state / "host-id")
@@ -476,7 +489,9 @@ suite "observation_extension_write_path":
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("ver")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy7: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy7)
+    let socketPath = rendezvousDir(root, endpointPolicy7) / "d.sock"
     let state = hostStateDir(root)
     putEnv("RUNQUOTA_SOCKET", socketPath)
     var daemon = startDaemon(socketPath, state / "host-id")

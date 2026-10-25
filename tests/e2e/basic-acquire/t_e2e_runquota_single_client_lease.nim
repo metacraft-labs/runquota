@@ -22,19 +22,16 @@ proc waitForDaemon(socketPath: string) =
 
 suite "e2e_runquota_single_client_lease":
   test "real daemon grants and releases one local IPC lease":
-    let privateOwner = bindPrivateBrokerOwnerToCaller()
-    defer: restorePrivateBrokerOwner(privateOwner)
     let socketDir = getTempDir() / ("runquota-e2e-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeScratchRoot(socketDir)
     createDir(socketDir)
-    # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-    # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-    # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-    # where it does not -- so a fixture hardcoding either one is green on one
-    # kind of host and red on the other. Fixture only; the modes themselves
-    # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+    let privatePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+    defer: restorePrivateBrokerPolicy(privatePolicy)
+    # Declare this newly created endpoint's independently inspected group
+    # before selecting its mode or launching either participant. It therefore
+    # exercises shared0750/0660; named-service defaults are tested separately.
     setFilePermissions(socketDir, endpointDirectoryPermissions())
     check fileExists(daemonPath())
 

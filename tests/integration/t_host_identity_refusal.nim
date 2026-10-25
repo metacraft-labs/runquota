@@ -55,13 +55,9 @@ proc scratchDir(name: string): string =
   result = getTempDir() / ("rq-hi-" & $getCurrentProcessId() & name)
   removeDir(result)
   createDir(result)
-  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal: some of these
-  # fixtures ARE the rendezvous directory the daemon binds in, and the
-  # rendezvous mode is 0750 where a `runquota` group exists and 0700
-  # (owner-only, single-user mode) where it does not. Nothing in this file
-  # asserts the fixture's own mode; the modes themselves are asserted in
-  # `tests/unit/t_shared_endpoint_rules.nim`.
-  setFilePermissions(result, endpointDirectoryPermissions())
+  # Generic scratch storage starts owner-private. Broker cases inspect this
+  # actual endpoint GID and select the declared rendezvous mode afterward.
+  setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
 
 proc contents(path: string): string =
   ## Deliberately not `readFile`. A missing artifact must fail its own
@@ -292,6 +288,9 @@ suite "host_identity_refusal":
     ## advisory subsystem take out the host's build capacity. So the
     ## daemon starts and serves -- and says which path and why.
     let dir = scratchDir("c")
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(dir, endpointDirectoryPermissions())
     defer: removeScratchRoot(dir)
     let socketPath = dir / "d.sock"
     let dbPath = dir / "obs.sqlite"

@@ -250,6 +250,9 @@ suite "connection_failure_does_not_stop_the_daemon":
 
     let root = scratchRoot("connfail")
     defer: removeScratchRoot(root)
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(root))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(root, endpointDirectoryPermissions())
     let socketPath = root / "d.sock"
 
     var daemon = startDaemon(socketPath)
@@ -323,6 +326,9 @@ suite "connection_failure_does_not_stop_the_daemon":
 
     let root = scratchRoot("connrefuse")
     defer: removeScratchRoot(root)
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(root))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(root, endpointDirectoryPermissions())
     let socketPath = root / "d.sock"
 
     var daemon = startDaemon(socketPath)

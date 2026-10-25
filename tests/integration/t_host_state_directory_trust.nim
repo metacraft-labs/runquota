@@ -326,8 +326,10 @@ when defined(windows):
 else:
   import std/[os, osproc, posix, streams, strutils, unittest]
 
+  from runquota_ipc import endpointDirectoryPermissions
   import runquota_observation_store
   import daemon_binary
+  import daemon_endpoint
 
   proc scratchDir(name: string): string =
     # Short on purpose: Nim's `Sockaddr_un_path_length` is 92 on macOS and
@@ -385,8 +387,13 @@ else:
     process: Process
     startupLines: seq[string]
 
-  proc startDaemon(socketPath, observationDb, identityFile: string):
+  proc startDaemon(fixturePolicy: var PrivateBrokerCallerPolicyBinding;
+                   socketPath, observationDb, identityFile: string):
       DaemonHandle =
+    let endpointDir = socketPath.parentDir
+    if not dirExists(endpointDir): createDir(endpointDir)
+    fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(endpointDir))
+    setFilePermissions(endpointDir, endpointDirectoryPermissions())
     let process = startProcess(daemonPath(),
       args = ["--socket", socketPath, "--observation-db", observationDb,
               "--host-identity-file", identityFile],
@@ -424,7 +431,9 @@ else:
       createDir(state)
       check chmod(state.cstring, Mode(0o700)) == 0
       check ownerOf(state) == int64(getuid())
-      var daemon = startDaemon(root / "ep" / "d.sock", root / "obs.sqlite",
+      var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy1)
+      var daemon = startDaemon(endpointPolicy1, root / "ep" / "d.sock", root / "obs.sqlite",
         state / "host-id")
       try:
         check daemon.startupLines[1].contains("capture enabled")
@@ -446,7 +455,9 @@ else:
       createDir(state)
       check chmod(state.cstring, Mode(0o777)) == 0
       check modeOf(state) == 0o777
-      var daemon = startDaemon(root / "ep" / "d.sock", root / "obs.sqlite",
+      var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy2)
+      var daemon = startDaemon(endpointPolicy2, root / "ep" / "d.sock", root / "obs.sqlite",
         state / "host-id")
       try:
         check daemon.startupLines[1].contains("capture enabled")
@@ -480,11 +491,15 @@ else:
       let state = root / "state"
       createDir(state)
       check chmod(state.cstring, Mode(0o777)) == 0
-      var first = startDaemon(root / "ep" / "d1.sock", root / "obs.sqlite",
+      var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy3)
+      var first = startDaemon(endpointPolicy3, root / "ep" / "d1.sock", root / "obs.sqlite",
         state / "host-id")
       let firstReport = first.startupLines[2]
       first.stop()
-      var second = startDaemon(root / "ep" / "d2.sock", root / "obs.sqlite",
+      var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy4)
+      var second = startDaemon(endpointPolicy4, root / "ep" / "d2.sock", root / "obs.sqlite",
         state / "host-id")
       try:
         check second.startupLines[2] == firstReport
@@ -506,7 +521,9 @@ else:
         check ownerOf(foreign) != int64(getuid())
         let root = scratchDir("hsforeign")
         defer: removeDir(root)
-        var daemon = startDaemon(root / "ep" / "d.sock", root / "obs.sqlite",
+        var endpointPolicy5: PrivateBrokerCallerPolicyBinding
+        defer: restorePrivateBrokerPolicy(endpointPolicy5)
+        var daemon = startDaemon(endpointPolicy5, root / "ep" / "d.sock", root / "obs.sqlite",
           foreign / "rq-m13d-host-id")
         try:
           let report = daemon.startupLines[2]
@@ -530,7 +547,9 @@ else:
       ## This clause pins which of the two speaks.
       let root = scratchDir("hsmissing")
       defer: removeDir(root)
-      var daemon = startDaemon(root / "ep" / "d.sock", root / "obs.sqlite",
+      var endpointPolicy6: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy6)
+      var daemon = startDaemon(endpointPolicy6, root / "ep" / "d.sock", root / "obs.sqlite",
         root / "absent" / "host-id")
       try:
         let report = daemon.startupLines[2]

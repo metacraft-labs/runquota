@@ -62,7 +62,9 @@ when defined(posix):
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = createTempDir("rq-write-", "")
     defer: removeDir(root)
-    setFilePermissions(root, {fpUserRead, fpUserWrite, fpUserExec})
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(root))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(root, endpointDirectoryPermissions())
     let path = root / "s"
     let listener = newSocket(net.AF_UNIX, net.SOCK_STREAM, IPPROTO_NONE)
     defer: listener.close()

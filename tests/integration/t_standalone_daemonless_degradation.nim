@@ -229,9 +229,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc selfPath(): string = getAppFilename()
@@ -510,7 +511,9 @@ suite "standalone_daemonless_degradation":
     # missing is the daemon -- which is the situation the milestone is
     # about, and a harsher one than an unreachable path, because every
     # earlier layer looks healthy.
-    let socketPath = rendezvousDir(root) / "runquotad.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let socketPath = rendezvousDir(root, endpointPolicy1) / "runquotad.sock"
     putEnv("RUNQUOTA_SOCKET", socketPath)
     check not fileExists(socketPath)
 
@@ -559,7 +562,9 @@ suite "standalone_daemonless_degradation":
     defer: probe.disarm()
     let fixture = compileFixture(root, "passing", PassingTestSource)
     let report = root / "honest-report"
-    let socketPath = rendezvousDir(root) / "runquotad.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let socketPath = rendezvousDir(root, endpointPolicy2) / "runquotad.sock"
 
     putEnv(HonestRoleEnv, socketPath)
     putEnv(RoleRunsEnv, $Runs)
@@ -606,7 +611,9 @@ suite "standalone_daemonless_degradation":
     defer: probe.disarm()
     let fixture = compileFixture(root, "passing", PassingTestSource)
     let report = root / "honest-report"
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socketPath = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let dbPath = root / "observations.sqlite3"
     check fileExists(daemonPath())
 
@@ -692,7 +699,9 @@ suite "standalone_daemonless_degradation":
     # stand-in for one.
     let root = scratchRoot("r")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy4)
+    let socketPath = rendezvousDir(root, endpointPolicy4) / "d.sock"
     let dbPath = root / "observations.sqlite3"
     var daemon = startDaemon(socketPath, dbPath, root / "host-id")
     try:
@@ -765,7 +774,9 @@ suite "standalone_daemonless_degradation":
     const HonestKey = "m14-honest-key"
     let root = scratchRoot("t")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy5: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy5)
+    let socketPath = rendezvousDir(root, endpointPolicy5) / "d.sock"
     let dbPath = root / "observations.sqlite3"
     var daemon = startDaemon(socketPath, dbPath, root / "host-id")
     try:
@@ -856,7 +867,9 @@ suite "standalone_daemonless_degradation":
   test "with no daemon, aggregation and learned estimates are unavailable":
     let root = scratchRoot("s")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "runquotad.sock"
+    var endpointPolicy6: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy6)
+    let socketPath = rendezvousDir(root, endpointPolicy6) / "runquotad.sock"
     putEnv("RUNQUOTA_SOCKET", socketPath)
     check not fileExists(socketPath)
 
@@ -901,7 +914,9 @@ suite "standalone_daemonless_degradation":
     # everywhere, and clause 6 is satisfied by a CLI that never answers.
     let root = scratchRoot("c")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy7: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy7)
+    let socketPath = rendezvousDir(root, endpointPolicy7) / "d.sock"
     var daemon = startDaemon(socketPath, root / "observations.sqlite3",
       root / "host-id")
     try:
