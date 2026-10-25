@@ -68,6 +68,7 @@
 ## unless the accept loop accepted the connection and a worker answered it,
 ## and both of those are downstream of the arming.
 
+import private_broker_owner
 import std/[monotimes, os, osproc, strutils, times, unittest]
 
 when defined(posix):
@@ -260,6 +261,8 @@ proc report(label: string; ending: Ending) =
 suite "sigterm_exits_with_the_socket_gone":
 
   test "a TERMed daemon exits after its socket file has been unlinked":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # POSIX ONLY, BY DESIGN: there is no SIGTERM on Windows, and no socket
     # file to unlink either -- the Windows endpoint is a named pipe, reached
     # by name rather than through the filesystem, so the hazard has no form
@@ -302,6 +305,8 @@ suite "sigterm_exits_with_the_socket_gone":
       skip()
 
   test "a TERMed daemon exits after its whole scratch tree has been removed":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     when defined(posix):
       let root = scratchRoot("tree")
       let endpointDir = rendezvousDir(root)

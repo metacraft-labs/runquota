@@ -45,6 +45,7 @@
 ## Unix-domain socket, the shipped client library, the daemon's own
 ## inspection subject, and the SQLite file the daemon really wrote.
 
+import private_broker_owner
 import std/[json, os, osproc, streams, strutils, times, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions
@@ -117,8 +118,7 @@ proc startDaemon(socketPath, stateDir: string): DaemonHandle =
     if endpointIsBound(socketPath): break
     sleep(25)
   # EXACTLY THREE STARTUP LINES, consumed by count.
-  for _ in 0 ..< 3:
-    discard process.outputStream.readLine()
+  discard readRequiredStartupLines(process, 3, "t_extension_rows_do_not_query_the_registry")
   DaemonHandle(process: process)
 
 proc stop(handle: var DaemonHandle) =
@@ -169,6 +169,8 @@ proc waitForProbeRows(path: string; atLeast: int64): int64 =
 suite "extension_rows_do_not_query_the_registry":
 
   test "a burst of extension rows reads the registry no more than a declaration does":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("rows")
     defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
@@ -250,6 +252,8 @@ suite "extension_rows_do_not_query_the_registry":
       delEnv("RUNQUOTA_SOCKET")
 
   test "an undeclared extension still costs a read and is still refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # CLAUSE 2. Answering the row path from memory is only sound because a
     # MISS falls through to the database. Without the fallthrough, "this
     # process has not heard of that extension" and "this store has no such
@@ -288,6 +292,8 @@ suite "extension_rows_do_not_query_the_registry":
       delEnv("RUNQUOTA_SOCKET")
 
   test "a row claiming a version the registry does not carry is still refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # CLAUSE 3. The remembered entry is compared, not merely found. A memo
     # that returned "registered" without its schema version would write a
     # row shaped for columns this database does not have, and the row would

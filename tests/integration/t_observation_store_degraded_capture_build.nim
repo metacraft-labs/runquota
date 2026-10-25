@@ -12,6 +12,8 @@
 ## really does produce spine rows. That is what makes the corrupt arm's
 ## success a statement about degradation rather than about dead code.
 
+import daemon_endpoint
+import private_broker_owner
 import std/[nativesockets, options, os, osproc, streams, strutils, unittest]
 
 # `readToEnd`, not `streams.readAll`: on Windows `readAll` stops at the
@@ -89,8 +91,7 @@ proc startDaemon(socketPath, observationDb, identityFile: string):
   # given, and then goes quiet: the endpoint, the observation-store report,
   # and the host-identity/hardware-profile report. Reading precisely those
   # three cannot deadlock against a daemon that never writes again.
-  for _ in 0 ..< 3:
-    lines.add(process.outputStream.readLine())
+  lines = readRequiredStartupLines(process, 3, "t_observation_store_degraded_capture_build")
   DaemonHandle(process: process, startupLines: lines)
 
 proc stop(handle: var DaemonHandle) =
@@ -110,6 +111,8 @@ proc waitForExecutionRows(path: string; atLeast: int): int =
 
 suite "observation_store_degraded_capture_build":
   test "a build over a healthy store succeeds and is recorded":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let dir = scratchDir("h")
     defer: removeScratchRoot(dir)
     let socketPath = dir / "runquotad.sock"
@@ -213,6 +216,8 @@ suite "observation_store_degraded_capture_build":
       restarted.stop()
 
   test "a build over a corrupt store still succeeds, and capture is off":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let dir = scratchDir("c")
     defer: removeScratchRoot(dir)
     let socketPath = dir / "runquotad.sock"

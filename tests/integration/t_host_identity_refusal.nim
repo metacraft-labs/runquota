@@ -27,6 +27,8 @@
 ## `defaultHostIdentityFile()` — the thing that actually ships — had never
 ## been resolved by a test at all.
 
+import daemon_endpoint
+import private_broker_owner
 import std/[os, osproc, streams, strutils, unittest]
 
 import runquota_ipc
@@ -116,8 +118,7 @@ proc startDaemon(socketPath, observationDb, identityFile: string):
   # unfolded message would make this a four-line startup and every reader
   # of the third line would misread or block.
   var lines: seq[string] = @[]
-  for _ in 0 ..< 3:
-    lines.add(process.outputStream.readLine())
+  lines = readRequiredStartupLines(process, 3, "t_host_identity_refusal")
   DaemonHandle(process: process, startupLines: lines)
 
 proc stop(handle: var DaemonHandle) =
@@ -195,6 +196,38 @@ suite "host_identity_refusal":
     check readFile(file).strip() == first.hostId
     check first.report.splitLines.len == 1
 
+  when defined(posix):
+    test "an actually unreadable private identity yields the same refusal twice":
+      let dir = scratchDir("unreadable")
+      defer: removeScratchRoot(dir)
+      let file = dir / "host-id"
+      let provisioned = resolveHostIdentity(file)
+      check provisioned.persisted
+      check isOpaqueId(provisioned.hostId, "host-")
+      let previousPermissions = getFilePermissions(file)
+      var first, second: HostIdentity
+      try:
+        setFilePermissions(file, {})
+        var unreadable = false
+        try:
+          discard readFile(file)
+        except IOError:
+          unreadable = true
+        check unreadable
+        first = resolveHostIdentity(file)
+        second = resolveHostIdentity(file)
+      finally:
+        setFilePermissions(file, previousPermissions)
+      check not first.persisted
+      check not second.persisted
+      check first.hostId.len == 0
+      check second.hostId.len == 0
+      check first.report == second.report
+      check "cannot persist" in first.report
+      check "unreadable" in first.report
+      check file in first.report
+      check readFile(file).strip() == provisioned.hostId
+
   test "the REAL default path resolves to one outcome, not one per call":
     ## M13c's same-`host_id` clause, re-run against what actually ships.
     ## Both earlier experiments passed an explicit path in `/private/tmp`,
@@ -202,14 +235,22 @@ suite "host_identity_refusal":
     ##
     ## Deliberately asserted in a form that holds in BOTH host states, so
     ## it is not a check that only fires on a machine somebody remembered
-    ## to prepare:
-    ##   * provisioned   -> the same persisted id twice;
-    ##   * unprovisioned -> the same refusal twice, and no id at all.
+    ## to prepare, nor does it assume that an installed daemon-owned file
+    ## is accessible to the current caller:
+    ##   * accessible valid state -> the same persisted id twice;
+    ##   * absent or inaccessible state -> the same refusal, and no id.
     ## Either way, TWO DIFFERENT IDS IS A FAILURE. That is the clause.
     ##
     ## It is also uid-independent by construction -- `defaultHostIdentityFile`
     ## reads no environment -- so running this same binary under a second
     ## uid re-runs the two-uid clause directly. See the milestone report.
+    let defaultPath = defaultHostIdentityFile()
+    let directoryExisted = dirExists(defaultPath.parentDir)
+    var readableExisting = ""
+    try:
+      readableExisting = readFile(defaultPath).strip()
+    except CatchableError:
+      discard
     let first = resolveHostIdentity()
     let second = resolveHostIdentity()
 
@@ -225,21 +266,25 @@ suite "host_identity_refusal":
       " hostId=[", first.hostId, "] persisted=", first.persisted,
       " provisioned=", dirExists(first.path.parentDir)
 
-    if dirExists(first.path.parentDir):
-      # A provisioned host: this machine has ONE identity and it is on
-      # disk. `hosts` gains no row per daemon start.
+    # Existing daemon-owned state need not be accessible to this caller.
+    # A readable valid existing id MUST be reused; an unreadable/unwritable
+    # identity must instead yield the stable explicit refusal above.
+    if isOpaqueId(readableExisting, "host-"):
       check first.persisted
+      check first.hostId == readableExisting
+    if first.persisted:
       check isOpaqueId(first.hostId, "host-")
       check readFile(first.path).strip() == first.hostId
     else:
-      # An unprovisioned host: refused, and STILL not created.
-      check not first.persisted
       check first.hostId.len == 0
       check "cannot persist" in first.report
       check hostWideStateDir in first.report
-      check not dirExists(first.path.parentDir)
+      if not directoryExisted:
+        check not dirExists(first.path.parentDir)
 
   test "the daemon starts, serves leases, and says capture is off":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     ## Refuse-vs-disable, decided and asserted. RunQuota's mission is
     ## ADMISSION: a daemon that cannot record history can still keep a
     ## machine from thrashing itself to death, and refusing to admit

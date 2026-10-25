@@ -56,6 +56,7 @@
 ## Unix-domain socket, the shipped client library, the daemon's own
 ## inspection subject, and the segment the daemon really wrote.
 
+import private_broker_owner
 import std/[json, monotimes, os, osproc, streams, strutils, times, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions
@@ -110,8 +111,7 @@ proc startDaemon(socketPath, stateDir: string): DaemonHandle =
     if endpointIsBound(socketPath): break
     sleep(25)
   # EXACTLY THREE STARTUP LINES, consumed by count.
-  for _ in 0 ..< 3:
-    discard process.outputStream.readLine()
+  discard readRequiredStartupLines(process, 3, "t_completion_report_does_not_wait_on_the_store")
   DaemonHandle(process: process)
 
 proc stop(handle: var DaemonHandle) =
@@ -211,6 +211,8 @@ proc waitForPublished(path, statsKey: string; timeoutMs: int;
 suite "completion_report_does_not_wait_on_the_store":
 
   test "a completion report does not drain the writer, and costs what a keyless one costs":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("lat")
     defer: removeScratchRoot(root)
     let endpointDir = rendezvousDir(root)

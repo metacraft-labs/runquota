@@ -1,5 +1,6 @@
 import std/[os, osproc, unittest]
 
+import private_broker_owner
 import runquota_client
 import runquota_protocol
 from runquota_ipc import endpointDirectoryPermissions
@@ -57,6 +58,8 @@ proc waitForQuietDaemon(totalFinished: uint64): DaemonStatusMessage =
 
 suite "e2e_runquota_concurrent_short_lived_clients":
   test "real daemon accepts many concurrent short-lived acquire clients":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let clientCount = 32
     let socketDir = "/tmp" / ("rq-concurrent-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"

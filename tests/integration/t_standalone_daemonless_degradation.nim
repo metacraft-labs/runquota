@@ -55,6 +55,8 @@
 ## implementation is the wrong one. What is wrong with it is not visible in
 ## its results; it is visible only in the counter.
 
+import daemon_endpoint
+import private_broker_owner
 import std/[json, options, os, osproc, streams, strutils, unittest]
 
 # `readToEnd`, not `streams.readAll`: on Windows `readAll` stops at the
@@ -407,8 +409,7 @@ proc startDaemon(socketPath, dbPath, identityFile: string): DaemonHandle =
     if fileExists(socketPath): break
     sleep(25)
   var lines: seq[string] = @[]
-  for _ in 0 ..< 3:
-    lines.add(process.outputStream.readLine())
+  lines = readRequiredStartupLines(process, 3, "t_standalone_daemonless_degradation")
   DaemonHandle(process: process, startupLines: lines)
 
 proc stop(handle: var DaemonHandle) =
@@ -597,6 +598,8 @@ suite "standalone_daemonless_degradation":
   # -------------------------------------------------------------------------
 
   test "the one exit flush lands, and its rows say the window was incomplete":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("f")
     defer: removeScratchRoot(root)
     let probe = installSqliteProbe(root)
@@ -681,6 +684,8 @@ suite "standalone_daemonless_degradation":
   # -------------------------------------------------------------------------
 
   test "a flush claiming a complete window is refused, and a degraded one is not":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # A FIXTURE A WELL-BEHAVED CLIENT CANNOT PRODUCE. `StandaloneCapture`
     # has no path that emits `ccComplete`, so this frame is hand-built and
     # written straight to the socket -- a real dishonest client, not a
@@ -741,6 +746,8 @@ suite "standalone_daemonless_degradation":
       daemon.stop()
 
   test "one self-contradicting record is dropped, and the rest of its batch is not":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE SAME RULE THE LEASED PATH APPLIES, on the shape a standalone
     # client flushes. It is asserted here as well as on the pure predicate
     # because the DAEMON is what decides how much of a batch a single bad
@@ -888,6 +895,8 @@ suite "standalone_daemonless_degradation":
     check "flush " & $sfAttempted notin acquire.output
 
   test "the same command with a daemon does NOT report unavailable":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE CONTROL. Without it, "unavailable" is what this command says
     # everywhere, and clause 6 is satisfied by a CLI that never answers.
     let root = scratchRoot("c")

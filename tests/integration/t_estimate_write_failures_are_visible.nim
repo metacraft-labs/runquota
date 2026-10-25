@@ -26,6 +26,7 @@
 ## the real fault (a store on a full or read-only filesystem) and needs no
 ## privileges to arrange.
 
+import private_broker_owner
 import std/[json, os, osproc, streams, strutils, times, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions
@@ -75,8 +76,7 @@ proc startDaemon(socketPath, stateDir, estimateDb: string): DaemonHandle =
     if endpointIsBound(socketPath): break
     sleep(25)
   # EXACTLY THREE STARTUP LINES, consumed by count.
-  for _ in 0 ..< 3:
-    discard process.outputStream.readLine()
+  discard readRequiredStartupLines(process, 3, "t_estimate_write_failures_are_visible")
   DaemonHandle(process: process)
 
 proc stop(handle: var DaemonHandle) =
@@ -131,6 +131,8 @@ proc waitForFailures(client: var RunQuotaClient; timeoutMs: int):
 suite "estimate_write_failures_are_visible":
 
   test "a store that cannot be written reports its dropped batches and rows":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("bad")
     # NOT `removeDir`. This case points `--estimate-db` at a directory so
     # that every batch the writer sends FAILS at the tool, which means a
@@ -186,6 +188,8 @@ suite "estimate_write_failures_are_visible":
       delEnv("RUNQUOTA_SOCKET")
 
   test "a healthy store reports zero, so a non-zero count means something":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("good")
     defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"

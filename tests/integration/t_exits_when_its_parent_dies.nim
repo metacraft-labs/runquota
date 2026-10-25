@@ -45,6 +45,7 @@
 ## the question; only a child the daemon spawns could, and the daemon spawns
 ## none on a path a test can steer.
 
+import private_broker_owner
 import std/[monotimes, os, osproc, streams, strtabs, strutils, times, unittest]
 
 when defined(posix):
@@ -187,6 +188,8 @@ suite "exits_when_its_parent_dies":
         "could not make the test a child subreaper"
 
   test "with RUNQUOTA_EXIT_WITH_PARENT=1, a SIGKILLed parent stops the daemon cleanly":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     when defined(posix):
       doAssert fileExists(daemonPath())
       var tree: Tree
@@ -212,6 +215,8 @@ suite "exits_when_its_parent_dies":
       skip()
 
   test "without the variable, the daemon outlives its parent (control)":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     when defined(posix):
       doAssert fileExists(daemonPath())
       var tree: Tree
@@ -230,6 +235,8 @@ suite "exits_when_its_parent_dies":
       skip()
 
   test "the recorded owner dying before daemon entry is still detected":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     when defined(linux):
       doAssert fileExists(daemonPath())
       var tree: Tree

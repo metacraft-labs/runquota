@@ -25,6 +25,7 @@
 ## under `test-logs/t_e2e_runquota_killed_owner_lease_reclaimed/`, and names
 ## it only when the case fails.
 
+import private_broker_owner
 import std/[envvars, json, os, osproc, streams, strtabs, strutils, times,
   unittest]
 
@@ -349,6 +350,8 @@ proc leaseRow(daemon: PrivateDaemon; label: string): JsonNode =
 suite "e2e_runquota_killed_owner_lease_reclaimed":
 
   test "a killed owner's lease is held while its child runs, then reclaimed for a waiting client":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let log = openCaseLog("held-then-reclaimed")
     var daemon = startPrivateDaemon("held", log)
     var holder: Process = nil
@@ -419,6 +422,8 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
       log.reportOnFailure(currentCaseFailed())
 
   test "a killed `runquota acquire` releases its reservation to a waiting client":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE HOST SCENARIO END TO END, through the shipped CLI and the shipped
     # launcher. On Windows the launcher binds the child to a kill-on-close
     # job, so killing the CLI kills the child with it and the reservation is

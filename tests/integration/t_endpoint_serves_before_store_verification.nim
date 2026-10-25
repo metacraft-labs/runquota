@@ -57,6 +57,7 @@
 ## socket, the shipped client library, and the store read back through the
 ## store library.
 
+import private_broker_owner
 import std/[json, os, osproc, streams, strutils, times, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions
@@ -174,6 +175,8 @@ proc runTools(dbPath: string): seq[string] =
 suite "endpoint_serves_before_store_verification":
 
   test "the endpoint answers while the store's integrity check is still running":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("v")
     defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"

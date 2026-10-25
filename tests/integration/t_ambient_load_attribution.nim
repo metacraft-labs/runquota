@@ -89,6 +89,8 @@
 ## whose own OFF baseline turned out to have been out of range, and then
 ## FAILS saying so rather than reporting a ratio it cannot support.
 
+import daemon_endpoint
+import private_broker_owner
 import std/[algorithm, atomics, cpuinfo, math, os, osproc, streams,
             strutils, sysrand, times, unittest]
 
@@ -896,6 +898,8 @@ suite "ambient_load_attribution":
       check row.foreignRssBytes > 0
 
   test "self is what admitted executions reported, foreign is the rest":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # The gate's "alongside a known set of RunQuota-admitted executions".
     # The leases are real, granted by a real daemon over a real socket;
     # the figures attached to them are DECLARED, which is exactly how a
@@ -1111,6 +1115,8 @@ suite "ambient_load_attribution":
     check not load.running
 
   test "a real daemon samples on a fixed cadence, independent of executions":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let dir = scratchDir("dmn")
     defer: removeScratchRoot(dir)
     let socketPath = dir / "d.sock"
@@ -1361,6 +1367,8 @@ suite "ambient_load_attribution":
     check openObservationStore(dbPath).readAmbientSamples().len == settled.len
 
   test "an idle daemon writes NO ambient rows, a leased one writes rows":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE GATE, BOTH DIRECTIONS, AS AN A/B WITH ONE DIFFERENCE BETWEEN THE
     # ARMS. Two real daemons, same binary, same cadence, same wall-clock
     # window, same store shape. One is never asked for anything; the other
@@ -1395,8 +1403,7 @@ suite "ambient_load_attribution":
         options = {poStdErrToStdOut})
       # The three startup lines, so the daemon is past initialisation and
       # the sampler has been started before the window opens.
-      for _ in 0 ..< 3:
-        discard process.outputStream.readLine()
+      discard readRequiredStartupLines(process, 3, "t_ambient_load_attribution")
       (process, dbPath)
 
     # -- ARM ONE: nothing is ever leased. -----------------------------------

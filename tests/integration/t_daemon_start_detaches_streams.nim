@@ -16,6 +16,7 @@
 ## Revert `runDaemonStart` to `poParentStreams` and the first case fails: the
 ## verb's output never reaches end of file within the deadline.
 
+import private_broker_owner
 import std/[os, osproc, streams, strutils, tempfiles, times, unittest]
 
 import runquota_ipc
@@ -110,6 +111,8 @@ suite "runquota daemon start":
     removeDir(root)
 
   test "returns with its output closed, and the daemon writes to its log":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     putEnv("RUNQUOTA_SOCKET", socketPath)
     defer: delEnv("RUNQUOTA_SOCKET")
 
@@ -161,6 +164,8 @@ suite "runquota daemon start":
     check "capture disabled by --no-write-stats" in readFile(logFile)
 
   test "a daemon that already answers is left alone":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     putEnv("RUNQUOTA_SOCKET", socketPath)
     defer: delEnv("RUNQUOTA_SOCKET")
     let first = startProcess(cliPath(),

@@ -1,6 +1,7 @@
 ## Real daemon and SQLite integration; no mocks. The persistence probe opens
 ## the database read-only so polling cannot create the asynchronous writer's
 ## database before its schema and journal are initialized.
+import private_broker_owner
 import std/[os, osproc, streams, strutils, unittest]
 
 import runquota_client
@@ -187,6 +188,8 @@ suite "integration_runquota_memory_pressure_gate":
     check not fileExists(dbPath)
 
   test "real daemon gates memory-heavy work and persists learned estimates":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let socketDir = getTempDir() / ("runquota-m4-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     let pressurePath = socketDir / "pressure.txt"

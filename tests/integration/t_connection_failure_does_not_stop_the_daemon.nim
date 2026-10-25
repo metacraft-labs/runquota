@@ -32,6 +32,7 @@
 ## being measured -- so the leak is checked against the daemon's real open-fd
 ## count rather than argued from the source.
 
+import private_broker_owner
 import std/[envvars, json, os, osproc, streams, strtabs, strutils, unittest]
 
 when defined(windows):
@@ -65,8 +66,7 @@ proc startDaemon(socketPath: string): DaemonHandle =
   # Exactly three startup lines, as the rest of this suite asserts: reading
   # them keeps the pipe from filling and wedging the daemon on a write
   # nobody is draining.
-  for _ in 0 ..< 3:
-    discard process.outputStream.readLine()
+  discard readRequiredStartupLines(process, 3, "t_connection_failure_does_not_stop_the_daemon")
   DaemonHandle(process: process)
 
 proc stop(handle: var DaemonHandle) =
@@ -244,6 +244,8 @@ suite "connection_failure_does_not_stop_the_daemon":
       check name notin after
 
   test "a peer that connects and vanishes cannot take the daemon with it":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     const AbortedConnections = 50
 
     let root = scratchRoot("connfail")
@@ -304,6 +306,8 @@ suite "connection_failure_does_not_stop_the_daemon":
       check descriptorsAfter - descriptorsBefore < AbortedConnections div 2
 
   test "a peer refused at Hello is counted too, and the daemon keeps serving":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     ## THE OTHER PRE-HELLO EXIT. A connection can also end before a session
     ## exists by being REFUSED: the daemon answers the opening frame with a
     ## diagnostic and closes. Like the vanishing peer above, that path raises

@@ -24,6 +24,7 @@
 ## are refusals or degradations, and each is reached by doing something a
 ## client library cannot be asked to do.
 
+import private_broker_owner
 import std/[json, options, os, osproc, streams, strutils, tables,
   unittest]
 
@@ -128,8 +129,7 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   # assertion: a daemon that printed a different number would leave this
   # read blocked or misaligned.
   var lines: seq[string] = @[]
-  for _ in 0 ..< 3:
-    lines.add(process.outputStream.readLine())
+  lines = readRequiredStartupLines(process, 3, "t_observation_socket_write_path")
   DaemonHandle(process: process, startupLines: lines)
 
 proc stop(handle: var DaemonHandle) =
@@ -248,6 +248,8 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "with NO capture flag a real run produces complete, correct spine rows":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("on")
     defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
@@ -351,6 +353,8 @@ suite "observation_socket_write_path":
   # the daemon answers as a malformed frame rather than acknowledging.
 
   test "bytes that spell no finish write no row, and say so":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     const
       ExitedKey = "m13-contra-exited"
       OomKey = "m13-contra-oom"
@@ -479,6 +483,8 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "--no-write-stats writes nothing at all, and the daemon serves anyway":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("off")
     defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
@@ -532,6 +538,8 @@ suite "observation_socket_write_path":
     check status.totalFinished >= 1'u64
 
   test "--no-write-stats wins over a named store, and does not blame it":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE PRECEDENCE CLAUSE, AGAINST A DAEMON RATHER THAN A CONFIG. The
     # unit file asserts `effectiveObservationDbPath` returns "" for
     # `--observation-db X --no-write-stats`, and that is a statement about
@@ -613,6 +621,8 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "an unprovisioned host state directory degrades capture to off":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THIS IS THE SHIPPED DEFAULT, NOT AN EDGE CASE, and that is new with
     # M13. The host-wide state directory is created by the install step and
     # by nothing else, so on every host where that step has not run --
@@ -687,6 +697,8 @@ suite "observation_socket_write_path":
     check status.totalFinished >= 1'u64
 
   test "an untrusted host state directory refuses the identity, not the daemon":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE OTHER HALF, and the one that only exists because the store path
     # is now DERIVED from the identity file. The store and the host
     # identity live in the same directory, so a directory that opens fine
@@ -760,6 +772,8 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "a session reporting figures for a lease it does not own is refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # A FIXTURE NO CLIENT LIBRARY CAN PRODUCE. `reportObservation` takes a
     # lease and reads the session out of it, so a well-behaved client can
     # never name a lease belonging to somebody else. The frame is therefore
@@ -917,6 +931,8 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "a damaged or oversized report is refused entirely, leaving no half-state":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("bad")
     defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
@@ -1038,6 +1054,8 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "a client SIGKILLed mid-execution leaves no self figures and no half-row":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE FIXTURE IS A REAL KILLED PROCESS. This is M11's deferral (1) in
     # its dangerous form: `SelfReport` had no timestamp, no TTL and no
     # liveness handle, and its only exits were an explicit end or a
@@ -1130,6 +1148,8 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "a store that turns unwritable mid-flight degrades and never fails a client":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # A FIXTURE THE HAPPY PATH CANNOT CONSTRUCT. M9 covers a store that is
     # already corrupt when the daemon opens it; this is the other half —
     # a store that was healthy at startup, was written to successfully, and

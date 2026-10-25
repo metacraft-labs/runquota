@@ -27,12 +27,53 @@
 ## No mocks. Real directories, real modes, real groups this host already
 ## has, and a real bound socket.
 
-import std/[os, strutils, unittest]
+import private_broker_owner
+import std/[os, osproc, streams, strutils, unittest]
+import daemon_endpoint
 
 when defined(posix):
   import std/posix
+  import runquota_process
 
 import runquota_ipc
+
+# Real re-executed children exercise the startup reader's OS pipe/EOF boundary.
+# Their small explicit output protocol is the fixture under test, not a mock
+# broker or a replacement for any daemon/kernel integration assertion.
+when defined(posix):
+  if paramCount() >= 2 and paramStr(1) == "--startup-reader-control":
+    case paramStr(2)
+    of "complete":
+      doAssert paramCount() == 2
+      echo "startup-one"
+      echo "startup-two"
+      echo "startup-three"
+      quit(0)
+    of "short":
+      doAssert paramCount() == 2
+      echo "owned-child-refusal"
+      quit(7)
+    of "waiting":
+      doAssert paramCount() == 5
+      let ready = paramStr(3)
+      let release = paramStr(4)
+      let parent = parseInt(paramStr(5))
+      doAssert not fileExists(release)
+      echo "owned-child-still-running"
+      stdout.flushFile()
+      # Publish readiness BEFORE EOF can wake the parent. EOF itself, not
+      # this marker, proves every real stdout writer has closed.
+      writeFile(ready, $getCurrentProcessId())
+      stdout.close()
+      stderr.close()
+      while not fileExists(release):
+        # A timed-out parent must not strand this owned control child.
+        if int(getppid()) != parent: quit(9)
+        sleep(10)
+      quit(0)
+    else:
+      quit(8)
+
 
 proc scratchDir(name: string): string =
   # SHORT ON PURPOSE. Nim's `Sockaddr_un_path_length` is 92 on macOS and
@@ -412,6 +453,8 @@ when defined(posix):
     # host and another on a bare one. Each scope is pinned and asserted.
 
     test "with a group, the rendezvous is 0750 and the socket is 0660":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       let saved = getEnv("RUNQUOTA_ENDPOINT_GROUP")
       putEnv("RUNQUOTA_ENDPOINT_GROUP", $int64(getgid()))
       defer:
@@ -441,6 +484,8 @@ when defined(posix):
         listener.close()
 
     test "with NO resolvable group, the rendezvous degrades to 0700 / 0600":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## THE DECIDING CONTROL FOR THE NO-GROUP RULING, and the reason it is a
       ## bound socket rather than a comment: on a host with no `runquota`
       ## group the endpoint is owner-only and SAYS so, instead of keeping a
@@ -589,3 +634,167 @@ suite "shared_endpoint_per_user_state_is_unaffected":
 
       check setMode(path, 0o640)
       check segmentTrust(path, segmentPerUser).reason == trustBadMode
+
+when defined(posix):
+  suite "private_broker_owner_and_startup_controls":
+    test "private owner scope restores absent, empty and configured values on error":
+      let originalExists = existsEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+      let originalValue = getEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+      let groupExists = existsEnv("RUNQUOTA_ENDPOINT_GROUP")
+      let groupValue = getEnv("RUNQUOTA_ENDPOINT_GROUP")
+      defer:
+        if originalExists: putEnv("RUNQUOTA_ENDPOINT_OWNER_UID", originalValue)
+        else: delEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+      for state in ["absent", "empty", "configured"]:
+        case state
+        of "absent": delEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+        of "empty": putEnv("RUNQUOTA_ENDPOINT_OWNER_UID", "")
+        else: putEnv("RUNQUOTA_ENDPOINT_OWNER_UID", "0")
+        let beforeExists = existsEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+        let beforeValue = getEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+        var raised = false
+        try:
+          let privateOwner = bindPrivateBrokerOwnerToCaller()
+          defer: restorePrivateBrokerOwner(privateOwner)
+          check rendezvousPolicy().ownerUid == int64(getuid())
+          check existsEnv("RUNQUOTA_ENDPOINT_GROUP") == groupExists
+          check getEnv("RUNQUOTA_ENDPOINT_GROUP") == groupValue
+          raise newException(ValueError, "owned scope exception control")
+        except ValueError:
+          raised = true
+        check raised
+        check existsEnv("RUNQUOTA_ENDPOINT_OWNER_UID") == beforeExists
+        check getEnv("RUNQUOTA_ENDPOINT_OWNER_UID") == beforeValue
+        block:
+          let privateOwner = bindPrivateBrokerOwnerToCaller()
+          defer: restorePrivateBrokerOwner(privateOwner)
+          check rendezvousPolicy().ownerUid == int64(getuid())
+        check existsEnv("RUNQUOTA_ENDPOINT_OWNER_UID") == beforeExists
+        check getEnv("RUNQUOTA_ENDPOINT_OWNER_UID") == beforeValue
+
+    test "default owner remains the real named account, or the actual caller":
+      let originalExists = existsEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+      let originalValue = getEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+      defer:
+        if originalExists: putEnv("RUNQUOTA_ENDPOINT_OWNER_UID", originalValue)
+        else: delEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+      delEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+      let named = getpwnam("runquota")
+      let expected = if named == nil: int64(getuid()) else: int64(named.pw_uid)
+      check rendezvousPolicy().ownerUid == expected
+      block:
+        let privateOwner = bindPrivateBrokerOwnerToCaller()
+        defer: restorePrivateBrokerOwner(privateOwner)
+        check rendezvousPolicy().ownerUid == int64(getuid())
+      check not existsEnv("RUNQUOTA_ENDPOINT_OWNER_UID")
+      check rendezvousPolicy().ownerUid == expected
+      putEnv("RUNQUOTA_ENDPOINT_OWNER_UID", "0")
+      check rendezvousPolicy().ownerUid == 0
+
+    test "owner refusal names the configured owner without claiming the caller uid":
+      let root = scratchDir("ownerdiag")
+      defer: removeDir(root)
+      let dir = makeDir(root / "ep", 0o750)
+      let foreign = systemDirectory()
+      check foreign.len > 0
+      if foreign.len > 0:
+        let configured = ownerOf(foreign)
+        check configured != int64(getuid())
+        var policy = policyFor(groupOf(dir))
+        policy.ownerUid = configured
+        let trust = endpointDirectoryTrust(unixEndpoint(dir / "d.sock"), policy)
+        check trust.reason == trustForeignOwner
+        check trust.ownerUid == int64(getuid())
+        check ("configured daemon owner uid " & $configured) in trust.message
+        check "this process runs as uid" notin trust.message
+        check ("owned by uid " & $int64(getuid())) in trust.message
+        check "0750" in trust.message
+
+    test "startup reader keeps the complete original three-line protocol":
+      let child = startProcess(getAppFilename(),
+        args = ["--startup-reader-control", "complete"],
+        options = {poStdErrToStdOut})
+      defer: child.close()
+      check readRequiredStartupLines(child, 3, "complete control") ==
+        @["startup-one", "startup-two", "startup-three"]
+      check child.waitForExit() == 0
+
+    test "startup EOF preserves the real child prefix and remains a failure":
+      let child = startProcess(getAppFilename(),
+        args = ["--startup-reader-control", "short"],
+        options = {poStdErrToStdOut})
+      defer: child.close()
+      var message = ""
+      try:
+        discard readRequiredStartupLines(child, 3, "short control")
+      except IOError as error:
+        message = error.msg
+      check "1 of 3 required lines" in message
+      check "owned-child-refusal" in message
+      check "child exit=" in message
+      check child.waitForExit() == 7
+
+    test "EOF diagnostics do not wait for a still-running child":
+      let root = scratchDir("runningeof")
+      setFilePermissions(root, {fpUserRead, fpUserWrite, fpUserExec})
+      defer: removeDir(root)
+      let ready = root / "ready"
+      let release = root / "release"
+      check not fileExists(ready)
+      check not fileExists(release)
+      # The declared launcher closes the original pipe writer aliases and
+      # inherited non-stdio descriptors before exec. Closing 1/2 therefore
+      # produces real EOF while this actual child is still waiting for us.
+      var child = launchProcess(commandSpec([getAppFilename(),
+        "--startup-reader-control", "waiting", ready, release,
+        $getCurrentProcessId()], createProcessGroup = false))
+      check child.processGroupId == int(getpgrp())
+      check getpgid(Pid(child.pid)) == getpgrp()
+      var output: Stream = nil
+      var pendingFd = cint(child.stdoutFd)
+      child.stdoutFd = -1
+      try:
+        var info: Stat
+        doAssert pendingFd >= 0 and fstat(pendingFd, info) == 0
+        doAssert S_ISFIFO(info.st_mode)
+        let flags = fcntl(pendingFd, F_GETFL, 0)
+        doAssert flags >= 0
+        doAssert fcntl(pendingFd, F_SETFL, flags and not O_NONBLOCK) == 0
+        var file: File
+        if not open(file, FileHandle(pendingFd), fmRead):
+          raise newException(IOError, "could not take owned stdout pipe")
+        output = newFileStream(file)
+        pendingFd = -1 # FileStream is now the sole owner of this descriptor.
+        var message = ""
+        try:
+          discard readRequiredStartupLines(child, output, 3, "waiting control")
+        except IOError as error:
+          message = error.msg
+        check output.atEnd()
+        check "1 of 3 required lines" in message
+        check "owned-child-still-running" in message
+        check "child exit=-1" in message
+        check runquota_process.running(child)
+        check fileExists(ready)
+        check readFile(ready) == $child.pid
+        check not fileExists(release)
+      finally:
+        try:
+          # Release only AFTER true EOF and live-child assertions. No made-up
+          # stream/status or extra startup retry can satisfy this control.
+          writeFile(release, "release")
+        except CatchableError:
+          # This child stays in the original test's bounded process group.
+          # Do not use group cancellation: only this still-owned, unreaped
+          # child PID may be signalled if its release marker cannot be written.
+          if runquota_process.running(child):
+            discard posix.kill(Pid(child.pid), SIGTERM)
+          raise
+        finally:
+          if not output.isNil: output.close()
+          elif pendingFd >= 0: discard posix.close(pendingFd)
+          let completion = child.waitForCompletion()
+          check completion.exited and completion.exitCode == 0
+          child.close()
+      removeFile(ready)
+      removeFile(release)

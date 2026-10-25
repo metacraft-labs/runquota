@@ -24,6 +24,7 @@
 ## reason M10, M11 and M13 give: a mutation that only recompiles the test
 ## reports green while the code under test never executes.
 
+import private_broker_owner
 import std/[options, os, osproc, streams, strutils, unittest]
 
 
@@ -113,8 +114,7 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   # Exactly three startup lines, as `t_observation_socket_write_path`
   # asserts: reading them keeps the pipe from filling and wedging the
   # daemon on a write nobody is draining.
-  for _ in 0 ..< 3:
-    discard process.outputStream.readLine()
+  discard readRequiredStartupLines(process, 3, "t_observation_query_interface")
   DaemonHandle(process: process)
 
 proc stop(handle: var DaemonHandle) =
@@ -223,6 +223,8 @@ suite "observation_query_interface":
   # -------------------------------------------------------------------------
 
   test "runquotad answers both aggregations over the socket":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("read")
     defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
@@ -502,6 +504,8 @@ suite "observation_query_interface":
   # -------------------------------------------------------------------------
 
   test "a supplied estimate is passed through unmodified, learned is fallback":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("est")
     defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
@@ -645,6 +649,8 @@ suite "observation_query_interface":
   # -------------------------------------------------------------------------
 
   test "a query immediately after a lease finishes sees that execution":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # WHY THIS TEST EXISTS SEPARATELY FROM THE GATE ABOVE. Every other arm
     # in this file reaches the store through `waitForExecutions`, which
     # polls for up to ten seconds -- and polling MASKS the daemon's flush

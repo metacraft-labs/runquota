@@ -1,6 +1,7 @@
 ## No mocks: real child processes, a real daemon, and the actual benchmark
 ## build script. The benchmark gets its own source/output tree so it cannot
 ## replace applications being exercised by concurrent integration tests.
+import private_broker_owner
 import std/[json, os, osproc, sha1, strtabs, strutils, tempfiles, unittest]
 
 when defined(posix):
@@ -352,6 +353,8 @@ suite "m5_process_exec_bench_contract":
       skip()
 
   test "lease-bound helper and CLI use real daemon protocol":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let socketDir = getTempDir() / ("runquota-m5-test-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
@@ -450,6 +453,8 @@ suite "m5_process_exec_bench_contract":
         removeScratchRoot(socketDir)
 
   test "process benchmark quick path emits cwd env workload evidence":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # This runs a BUILD SCRIPT -- `nim c` of the benchmark, then the benchmark
     # itself -- through a helper that used to read stdout and nothing else.
     # The script routes the compiler's own stdout to /dev/null but not its

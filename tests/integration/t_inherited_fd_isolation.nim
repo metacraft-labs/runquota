@@ -30,6 +30,7 @@
 ## No mocks: this runs the real `launchProcess` against the real kernel and
 ## inspects the real child's descriptor table via /dev/fd (or /proc/self/fd).
 
+import private_broker_owner
 import std/[os, strutils, unittest]
 from std/net import getFd
 
@@ -226,6 +227,8 @@ suite "inherited_fd_isolation":
       skip()
 
   test "daemon sockets are close-on-exec from birth":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     when defined(posix):
       # A RunQuotaSession keeps its daemon connection open across the fork+exec
       # of the leased command, so this socket is the single most likely thing

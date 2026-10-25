@@ -13,6 +13,7 @@
 ## NO MOCKS. The shipped `runquota` and `runquotad` binaries, a real endpoint,
 ## real files; the leases are taken with the real client library.
 
+import private_broker_owner
 import std/[os, osproc, streams, strutils, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions, endpointForPath
@@ -61,8 +62,7 @@ proc startDaemon(socketPath, hostConfig, stateDir: string;
     if endpointIsBound(socketPath): break
     sleep(25)
   doAssert endpointIsBound(socketPath), "runquotad did not bind " & socketPath
-  for _ in 0 ..< 3:
-    discard process.outputStream.readLine()
+  discard readRequiredStartupLines(process, 3, "t_runquota_config_reload")
   DaemonHandle(process: process)
 
 proc stop(handle: var DaemonHandle) =
@@ -111,6 +111,8 @@ proc pollFor(session: var RunQuotaSession; id: uint64): OfferedLease =
 suite "runquota config and a running daemon":
 
   test "set writes the file, the daemon reloads, and leases follow the rule":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("reload")
     defer: removeScratchRoot(root)
     let socket = rendezvousDir(root) / "d.sock"
@@ -232,6 +234,8 @@ suite "runquota config and a running daemon":
     two.closeSession()
 
   test "a flag pins its key across a reload, and the verb says so":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("pinned")
     defer: removeScratchRoot(root)
     let socket = rendezvousDir(root) / "d.sock"
@@ -250,6 +254,8 @@ suite "runquota config and a running daemon":
     check "machine.memory_bytes" in answer.output
 
   test "a pool a session declares: admitted, under the file, gone with it":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # A daemon started with NO budget flags -- what reprobuild's auto-spawn
     # and the installed service both start now -- and a client that declares
     # the pools its work uses (reprobuild-specs/RunQuota-Host-Configuration.md,
@@ -311,6 +317,8 @@ suite "runquota config and a running daemon":
       file).output
 
   test "a file the daemon does not read is reported as not in force":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("elsewhere")
     defer: removeScratchRoot(root)
     let socket = rendezvousDir(root) / "d.sock"

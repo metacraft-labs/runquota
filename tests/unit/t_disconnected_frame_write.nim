@@ -5,6 +5,7 @@ import std/[os, osproc, unittest]
 
 when defined(posix):
   import std/[net, nativesockets, posix, monotimes, times, strutils, tempfiles]
+  import private_broker_owner
   import runquota_ipc
   import runquota_client
   import runquota_core
@@ -57,6 +58,8 @@ when defined(posix):
     0
 
   proc exerciseSilentPeer(mode: string): int =
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = createTempDir("rq-write-", "")
     defer: removeDir(root)
     setFilePermissions(root, {fpUserRead, fpUserWrite, fpUserExec})

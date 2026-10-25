@@ -32,6 +32,7 @@
 ## NO MOCKS. The real `runquotad` binary, a real socket, the shipped client,
 ## a real signal, and the database file the daemon left behind.
 
+import private_broker_owner
 import std/[os, osproc, streams, strutils, times, unittest]
 
 when defined(posix):
@@ -84,8 +85,7 @@ proc startDaemon(socketPath, stateDir: string): Process =
     if endpointIsBound(socketPath): break
     sleep(25)
   # EXACTLY THREE STARTUP LINES, consumed by count.
-  for _ in 0 ..< 3:
-    discard result.outputStream.readLine()
+  discard readRequiredStartupLines(result, 3, "t_sigterm_drains_before_exit")
 
 proc completeOne(session: var RunQuotaSession; peakBytes: uint64) =
   var request = resourceRequest("sigterm-drain", milliCpu(100),
@@ -102,6 +102,8 @@ proc completeOne(session: var RunQuotaSession; peakBytes: uint64) =
 suite "sigterm_drains_before_exit":
 
   test "a TERMed daemon runs its shutdown and keeps what was reported":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # POSIX ONLY, BY DESIGN: there is no SIGTERM on Windows. `runquotad`'s
     # Windows stop request arrives from the Service Control Manager instead,
     # and the shutdown watcher that turns it into the same orderly `serve`

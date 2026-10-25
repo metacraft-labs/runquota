@@ -25,6 +25,7 @@
 ## disagrees with its column count, a storage class the daemon has no name
 ## for, a row for an extension that was never declared.
 
+import private_broker_owner
 import std/[json, options, os, osproc, streams, strutils, times,
     unittest]
 
@@ -83,8 +84,7 @@ proc startDaemon(socketPath, identityFile: string): DaemonHandle =
   for _ in 0 ..< 400:
     if endpointIsBound(socketPath): break
     sleep(25)
-  for _ in 0 ..< 3:
-    discard process.outputStream.readLine()
+  discard readRequiredStartupLines(process, 3, "t_observation_extension_write_path")
   DaemonHandle(process: process)
 
 proc stop(handle: var DaemonHandle) =
@@ -188,6 +188,8 @@ proc waitForProbeRows(path: string; atLeast: int64): int64 =
 suite "observation_extension_write_path":
 
   test "a client declares its extension and attaches a row to its execution":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("ok")
     defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
@@ -228,6 +230,8 @@ suite "observation_extension_write_path":
       daemon.stop()
 
   test "a row naming another session's lease is refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE FIXTURE A WELL-BEHAVED CLIENT CANNOT PRODUCE. One host-wide
     # daemon holds every user's executions; a row accepted here would
     # attach one client's facts to another's execution, and the store
@@ -275,6 +279,8 @@ suite "observation_extension_write_path":
       daemon.stop()
 
   test "a row from a connection that never registered the session is refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE STRONGER FORM OF THE OWNERSHIP VIOLATION, and the one the
     # intruder arm below cannot reach. There both sessions live on ONE
     # connection, so "does this connection own the session it named" is
@@ -322,6 +328,8 @@ suite "observation_extension_write_path":
       daemon.stop()
 
   test "a row for a lease with no recorded execution is refused, not fatal":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE LATE ROW, AND THE ONE ARM THAT FOUND A LIVE DEFECT. A client
     # sends its rows when the facts are complete, which for a build system
     # is long after the lease finished -- so the daemon remembers a BOUNDED
@@ -377,6 +385,8 @@ suite "observation_extension_write_path":
       daemon.stop()
 
   test "a row for an extension nobody declared is refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("undecl")
     defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"
@@ -415,6 +425,8 @@ suite "observation_extension_write_path":
       daemon.stop()
 
   test "a declaration from a connection that never registered the session is refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE DECLARE-SIDE OWNERSHIP VIOLATION, AND IT WAS THE ONE VACUOUS
     # CLAUSE IN THIS FILE. Removing ``declareClientExtension``'s
     # ``ownsSession`` check left every other arm here green, for exactly
@@ -460,6 +472,8 @@ suite "observation_extension_write_path":
       daemon.stop()
 
   test "a declaration naming a version its ladder cannot reach is refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("ver")
     defer: removeScratchRoot(root)
     let socketPath = rendezvousDir(root) / "d.sock"

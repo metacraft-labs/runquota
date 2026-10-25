@@ -6,6 +6,7 @@ else:
   import std/winlean
 
 from runquota_ipc import endpointDirectoryPermissions
+import private_broker_owner
 import runquota_client
 import runquota_core
 import runquota_exec
@@ -102,6 +103,8 @@ suite "forking_lease_completion":
       reapLinger(completion.stdout)
 
   test "leased forking action completes and emits LeaseFinished":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let socketDir = getTempDir() / ("runquota-bug2-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):

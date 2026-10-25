@@ -5,6 +5,7 @@ import runquota_core
 from runquota_ipc import endpointDirectoryPermissions
 import daemon_binary
 import scratch_root
+import private_broker_owner
 
 proc waitForDaemon(socketPath: string) =
   putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -21,6 +22,8 @@ proc waitForDaemon(socketPath: string) =
 
 suite "e2e_runquota_single_client_lease":
   test "real daemon grants and releases one local IPC lease":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let socketDir = getTempDir() / ("runquota-e2e-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):

@@ -32,6 +32,7 @@
 ## hardware profile, orphans nothing, and accepts new writes and a new
 ## extension of its own.
 
+import private_broker_owner
 import std/[options, os, osproc, streams, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions
@@ -80,8 +81,7 @@ proc startDaemon(socketPath: string;
     if endpointIsBound(socketPath): break
     sleep(25)
   var lines: seq[string] = @[]
-  for _ in 0 ..< 3:
-    lines.add(process.outputStream.readLine())
+  lines = readRequiredStartupLines(process, 3, "t_observation_store_backup_standalone")
   DaemonHandle(process: process, startupLines: lines)
 
 proc stop(handle: var DaemonHandle) =
@@ -138,6 +138,8 @@ proc restoredExtension(): ExtensionDeclaration =
 suite "observation_store_backup_standalone":
 
   test "a store copied under a live daemon is usable with the daemon gone":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("live")
     # The copies live OUTSIDE the root, because the root is deleted before
     # the copy is opened.

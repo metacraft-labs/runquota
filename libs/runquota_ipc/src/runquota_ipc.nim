@@ -677,7 +677,7 @@ when defined(posix):
       result.message = "runquota " & label & " " & path &
         ": refusing a path owned by uid " & $result.ownerUid &
         " with mode " & modeText(result.mode) &
-        "; this process runs as uid " & $expectedOwnerUid &
+        "; configured daemon owner uid " & $expectedOwnerUid &
         ", and a rendezvous point another user owns is a rendezvous point " &
         "another user controls"
       return

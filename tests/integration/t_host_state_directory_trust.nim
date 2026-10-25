@@ -37,6 +37,8 @@
 ## daemon accepts. The rule is `docs/database.md` §"Provisioning the host-wide
 ## state directory and the rendezvous".
 
+import private_broker_owner
+
 when defined(windows):
   import std/[os, osproc, streams, strutils, unittest]
 
@@ -124,8 +126,7 @@ when defined(windows):
     # EXACTLY THREE LINES, as on POSIX: a refusal that spilled onto a fourth
     # would leave every reader of the third misreading.
     var lines: seq[string] = @[]
-    for _ in 0 ..< 3:
-      lines.add(process.outputStream.readLine())
+    lines = readRequiredStartupLines(process, 3, "t_host_state_directory_trust")
     DaemonHandle(process: process, startupLines: lines)
 
   proc stop(handle: var DaemonHandle) =
@@ -152,6 +153,8 @@ when defined(windows):
 
   suite "host_state_directory_trust":
     test "a state directory this daemon owns and nobody else can write is ACCEPTED":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## THE PAIRED ACCEPTANCE, built the way the runbook builds it: the
       ## provisioning command the daemon itself prints, run through cmd.exe
       ## verbatim. Without this a build that refused every directory would
@@ -175,6 +178,8 @@ when defined(windows):
         daemon.stop()
 
     test "a WORLD-WRITABLE state directory is REFUSED, naming path and mode":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## The Windows "world-writable" is an ACE, and this one is not
       ## invented: it is what `C:\ProgramData` hands every directory created
       ## under it, so a bare `mkdir C:\ProgramData\runquota` -- what this
@@ -209,6 +214,8 @@ when defined(windows):
         daemon.stop()
 
     test "the refusal is the SAME on a second start":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       let root = scratchDir("hstwice")
       defer: removeFixture(root)
       let state = root / "state"
@@ -229,6 +236,8 @@ when defined(windows):
         second.stop()
 
     test "the icacls repair the refusal prints makes the directory ACCEPTED":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## WINDOWS ONLY, because only the Windows refusal prints a repair. A
       ## repair line that did not in fact produce an acceptable DACL would
       ## send an operator in a circle, so it is run -- verbatim, as printed --
@@ -261,6 +270,8 @@ when defined(windows):
         accepted.stop()
 
     test "a state directory owned by ANOTHER uid is REFUSED as an ownership problem":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## The DACL cannot be what refuses this one: `foreignOwnedDirectory`
       ## only returns a directory nobody but its owner (and the principals
       ## that already control the host) can write. If the ownership check
@@ -292,6 +303,8 @@ when defined(windows):
           daemon.stop()
 
     test "a directory that is not there yet is reported by the PROVISIONING refusal, not this one":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       let root = scratchDir("hsmissing")
       defer: removeFixture(root)
       let absent = root / "absent"
@@ -386,8 +399,7 @@ else:
     # fourth line would leave every reader of the third one misreading or
     # blocked.
     var lines: seq[string] = @[]
-    for _ in 0 ..< 3:
-      lines.add(process.outputStream.readLine())
+    lines = readRequiredStartupLines(process, 3, "t_host_state_directory_trust")
     DaemonHandle(process: process, startupLines: lines)
 
   proc stop(handle: var DaemonHandle) =
@@ -402,6 +414,8 @@ else:
 
   suite "host_state_directory_trust":
     test "a state directory this daemon owns and nobody else can write is ACCEPTED":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## THE PAIRED ACCEPTANCE. Without it a build that refused every
       ## directory would satisfy both refusals below.
       let root = scratchDir("hsok")
@@ -420,6 +434,8 @@ else:
         daemon.stop()
 
     test "a WORLD-WRITABLE state directory is REFUSED, naming path and mode":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## `sudo mkdir -p` with a lax umask, or an operator reaching for
       ## `chmod 777` when the daemon could not write. Any local user can
       ## replace `host-id` in such a directory, and replacing `host-id` is
@@ -453,6 +469,8 @@ else:
         daemon.stop()
 
     test "the refusal is the SAME on a second start":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## REPETITION, against a real process. The defect class this whole
       ## check belongs to is invisible within one invocation and only shows
       ## up across two: the pre-M13c code answered an unusable directory by
@@ -475,6 +493,8 @@ else:
         second.stop()
 
     test "a state directory owned by ANOTHER uid is REFUSED as an ownership problem":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## The mode cannot be what refuses this one: the directory is `0755`,
       ## which is not group- or world-writable. If the ownership check were
       ## removed this path would be ACCEPTED, and the daemon would mint into
@@ -503,6 +523,8 @@ else:
           daemon.stop()
 
     test "a directory that is not there yet is reported by the PROVISIONING refusal, not this one":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## Two reports for one condition would be one report too many, and the
       ## provisioning refusal is the useful one because it names the command.
       ## This clause pins which of the two speaks.

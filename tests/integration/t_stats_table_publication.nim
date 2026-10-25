@@ -32,6 +32,7 @@
 ## the precondition for ``t_stats_table_cache_control.nim``, whose emptied
 ## table has to produce the SAME answer over the socket.
 
+import private_broker_owner
 import std/[options, os, osproc, streams, strutils, times, unittest]
 
 when defined(posix):
@@ -159,9 +160,8 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   # EXACTLY THREE STARTUP LINES, still. M13b appends its report to the
   # listening line rather than printing a fourth, because the startup output
   # is consumed by count and a reader that guessed wrong would block.
-  let listening = process.outputStream.readLine()
-  discard process.outputStream.readLine()
-  discard process.outputStream.readLine()
+  let startupLines = readRequiredStartupLines(process, 3, "t_stats_table_publication")
+  let listening = startupLines[0]
   DaemonHandle(process: process, listeningLine: listening)
 
 proc stop(handle: var DaemonHandle) =
@@ -225,6 +225,8 @@ proc socketPeakFor(client: var RunQuotaClient; statsKey: string): uint64 =
 suite "stats_table_publication":
 
   test "runquotad publishes the aggregate, at a group-readable host-wide mode":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("pub")
     defer: removeScratchRoot(root)
     let endpointDir = rendezvousDir(root)
@@ -279,6 +281,8 @@ suite "stats_table_publication":
       delEnv("RUNQUOTA_SOCKET")
 
   test "a client reads its estimate with ZERO syscalls, against a control that is not zero":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("sysc")
     defer: removeScratchRoot(root)
     let endpointDir = rendezvousDir(root)
@@ -352,6 +356,8 @@ suite "stats_table_publication":
       delEnv("RUNQUOTA_SOCKET")
 
   test "a client's mapping is READ-ONLY, and the kernel is what enforces it":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     ## Mutation (3) of the gate — "let a client hold a WRITABLE mapping" —
     ## has two independent detectors, and this is the one that can see what
     ## the kernel did. `t_stats_table_rules` carries the other, a source
@@ -441,6 +447,8 @@ suite "stats_table_publication":
       delEnv("RUNQUOTA_SOCKET")
 
   test "a STALE table -- publisher gone -- is still read, and says it is stale":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     ## "Readers tolerate everything ... a stale entry is a slightly worse
     ## estimate, never an incorrect admission." A table whose publisher has
     ## exited is the only form of staleness a client can actually observe,

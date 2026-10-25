@@ -32,6 +32,7 @@
 ## ``socketEstimateFallback``, the same two procs the CLI calls), and the
 ## shipped ``runquota acquire`` for the end-to-end arm.
 
+import private_broker_owner
 import std/[os, osproc, streams, strutils, unittest]
 
 from runquota_ipc import endpointDirectoryPermissions
@@ -77,8 +78,7 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   for _ in 0 ..< 400:
     if endpointIsBound(socketPath): break
     sleep(25)
-  for _ in 0 ..< 3:
-    discard process.outputStream.readLine()
+  discard readRequiredStartupLines(process, 3, "t_stats_table_cache_control")
   DaemonHandle(process: process)
 
 proc stop(handle: var DaemonHandle) =
@@ -206,6 +206,8 @@ proc emptyTheTable(path: string) =
 suite "stats_table_cache_control":
 
   test "EMPTIED: every store gate and every client gate still passes, unchanged":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("empty")
     defer: removeScratchRoot(root)
     let endpointDir = rendezvousDir(root)
@@ -321,6 +323,8 @@ suite "stats_table_cache_control":
       delEnv("RUNQUOTA_SOCKET")
 
   test "OFF: a daemon that never publishes answers exactly the same":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     ## "Skipped in a degraded mode without any correctness argument at all"
     ## is one of the things being a cache is supposed to buy, and an option
     ## nobody can exercise is a claim rather than a property.
