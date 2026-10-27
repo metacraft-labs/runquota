@@ -19,6 +19,7 @@ import runquota_daemon/parent_watch
 import runquota_codec
 import runquota_core
 import runquota_core/process_owned
+import runquota_core/image_digest
 import runquota_host
 import runquota_host_macos
 when defined(windows):
@@ -2855,6 +2856,171 @@ proc cleanupConnection(daemon: var RunQuotaDaemon; context: ConnectionContext) =
   for id in context.sessionIds:
     daemon.cleanupLostSession(id)
 
+# ---------------------------------------------------------------------------
+# Retirement: a daemon from another build makes way.
+#
+# WHAT WAS WRONG. On Windows the daemon serves the per-user pipe and is left
+# running for every invocation that adopts it, so when an installer replaced
+# the bundle it came from, it kept serving the NEW `repro` from the OLD image
+# for as long as its user stayed logged on. Nothing could stop it short of
+# killing it, and killing a lease coordinator ends whatever leases it holds
+# (reprobuild-specs/RunQuota-Host-Configuration.md, "A daemon from another
+# build makes way").
+#
+# WHAT RETIREMENT IS. A client asks (`RetireDaemon`), naming the image digest
+# of the runquotad it would start. A daemon running exactly that image answers
+# `retirementCurrent` and nothing changes. Otherwise the daemon RETIRES: it
+# keeps serving every connection, including new ones, until the moment no
+# client connection is open at all, and at that moment it stops accepting,
+# frees its endpoint, and exits through the same orderly shutdown SIGTERM and
+# the SCM take. The next client finds the endpoint free and starts its own.
+#
+# WHY "NO CONNECTION OPEN" AND NOT "NO LEASE HELD". Leases live in sessions
+# and sessions live on connections, so a connection with no session is the
+# only kind this rule waits for that the lease rule would not -- and it waits
+# for it on purpose. A client between its Hello and its first lease has
+# already chosen this daemon; dropping it would turn "make way when idle" into
+# "fail whoever arrives at the wrong instant". Counting connections makes the
+# decision and the refusal of later connections one step under one lock, so
+# no connection is ever admitted to a daemon that has decided to go, and no
+# admitted connection is ever cut off by the decision.
+#
+# WHO MAY ASK. Only the daemon's own principal: retiring is ending the
+# process, and on a host-wide endpoint any member of the group could
+# otherwise end it for everyone. A daemon the Windows Service Control Manager
+# runs refuses outright -- the SCM owns that lifetime, and a service that
+# exited on a client's request would stay stopped.
+# ---------------------------------------------------------------------------
+
+var
+  retirementLock: Lock
+    ## Guards the three fields below, and nothing else. The INNERMOST lock:
+    ## `retirementAnswer` takes it while `handleRequest` holds the daemon
+    ## lock, so nothing may take the daemon lock while holding this one, and
+    ## it is never held across any I/O.
+  retirementRequested = false
+    ## A `RetireDaemon` was granted: exit once no client connection is open.
+  retirementDecided = false
+    ## The moment came. No connection is admitted after this is set.
+  openClientConnections = 0
+    ## Connections the accept loop has handed to a worker and the worker has
+    ## not finished with. The accept loop's own wake-up dials are never
+    ## counted: they are closed before they are admitted.
+initLock(retirementLock)
+
+proc wakeAcceptLoopForRetirement(endpointPath: string) {.gcsafe.}
+  ## Defined beside the shutdown wake it reuses, below.
+
+var retirementEndpointPath = ""
+  ## The endpoint the wake dials. Written by `serve` before any worker
+  ## exists, read only by workers.
+
+proc admitConnection(): bool =
+  ## The accept loop asks this before handing a connection to a worker.
+  ## False once retirement has been decided: the caller closes the
+  ## connection, and its peer retries against the daemon that follows.
+  acquire(retirementLock)
+  try:
+    if retirementDecided:
+      return false
+    inc openClientConnections
+    true
+  finally:
+    release(retirementLock)
+
+proc connectionEnded() {.gcsafe.} =
+  ## A worker is finished with an admitted connection. If it was the last one
+  ## and retirement was requested, this is the moment: decide, and wake the
+  ## accept loop so it stops.
+  var decideNow = false
+  {.cast(gcsafe).}:
+    acquire(retirementLock)
+    try:
+      if openClientConnections > 0:
+        dec openClientConnections
+      if retirementRequested and not retirementDecided and
+          openClientConnections == 0:
+        retirementDecided = true
+        decideNow = true
+    finally:
+      release(retirementLock)
+    if decideNow:
+      try:
+        echo "runquotad: retiring now: no client connection remains"
+        flushFile(stdout)
+      except CatchableError:
+        discard
+      wakeAcceptLoopForRetirement(retirementEndpointPath)
+
+proc retirementWasDecided(): bool =
+  acquire(retirementLock)
+  try:
+    retirementDecided
+  finally:
+    release(retirementLock)
+
+proc resetRetirementState() =
+  ## `serve` starts from a clean slate, so a test that runs two daemons in
+  ## one process does not inherit the first one's decision.
+  acquire(retirementLock)
+  try:
+    retirementRequested = false
+    retirementDecided = false
+    openClientConnections = 0
+  finally:
+    release(retirementLock)
+
+proc retirementAnswer*(daemon: RunQuotaDaemon; peer: PeerIdentity;
+                       request: RetireDaemonMessage): DaemonRetirementMessage =
+  ## Decide a `RetireDaemon` request, and record a granted one. Exported for
+  ## the unit tests of the decision table; the daemon reaches it only from
+  ## `handleRequest`.
+  result = DaemonRetirementMessage(
+    daemonProcessId: uint64(getCurrentProcessId()),
+    daemonImageDigest: daemon.imageDigest)
+  if runningAsWindowsService():
+    result.decision = retirementManaged
+    result.detail = "this runquotad runs as a Windows service; the Service " &
+      "Control Manager owns its lifetime (sc stop runquotad)"
+    return
+  # THE PRINCIPALS THEMSELVES ARE COMPARED -- the uid, or the SID string --
+  # not the owner ids derived from them. A Windows owner id is a truncated
+  # hash of the SID, which is right for keying rows and wrong for deciding
+  # who may end this process.
+  let own = currentProcessPrincipal()
+  let asker = ownerPrincipalOf(peer)
+  if own.isNone or asker.isNone or own.get.kind != asker.get.kind or
+      own.get.principal != asker.get.principal:
+    result.decision = retirementRefused
+    result.detail = "only the principal this runquotad runs as may retire it" &
+      (if asker.isNone: " (the peer's credentials are unavailable)" else: "")
+    return
+  if request.expectedImageDigest.len > 0 and daemon.imageDigest.len > 0 and
+      request.expectedImageDigest == daemon.imageDigest:
+    result.decision = retirementCurrent
+    result.detail = "this runquotad runs the image the request names"
+    return
+  # A DAEMON THAT COULD NOT DIGEST ITSELF RETIRES. It cannot show that it is
+  # the build the client would start, and being wrong costs one restart while
+  # the endpoint is idle; staying costs serving a client from a build it does
+  # not ship for as long as the session lasts.
+  result.decision = retirementRetiring
+  acquire(retirementLock)
+  try:
+    retirementRequested = true
+    # The requester's own connection is one of the open ones whenever the
+    # request arrived over the endpoint; it is not "another" client.
+    result.otherConnections =
+      uint32(max(0, openClientConnections - 1))
+  finally:
+    release(retirementLock)
+  result.detail =
+    if result.otherConnections == 0:
+      "exits when this connection closes"
+    else:
+      "exits once its " & $result.otherConnections &
+        " other client connection(s) close"
+
 proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
                    context: var ConnectionContext; frame: RqspFrame) =
   case frame.header.messageKind
@@ -3267,6 +3433,25 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
         discard
       connection.sendError(frame.header.requestId, diagnostic(
           diagInvalidArgument, message))
+  of rqRetireDaemon:
+    # AUTHORITY IS THE PEER'S CREDENTIALS, decided in `retirementAnswer`; a
+    # refusal is an ANSWER rather than an error, so the client can tell "may
+    # not" from "did not understand".
+    var msg: RetireDaemonMessage
+    if not decodeRetireDaemon(frame.payload, msg):
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "invalid RetireDaemon payload"))
+      return
+    let answer = daemon.retirementAnswer(context.peer, msg)
+    try:
+      echo "runquotad: RetireDaemon from pid " & $context.peer.processId &
+        (if msg.reason.len > 0: " (" & msg.reason & ")" else: "") & ": " &
+        retirementWord(answer.decision) & ", " & answer.detail
+      flushFile(stdout)
+    except CatchableError:
+      discard
+    connection.sendResponse(rqDaemonRetirement, frame.header.requestId,
+        encodeDaemonRetirement(answer))
   of rqDeclarePools:
     # ONLY FOR A SESSION THIS CONNECTION REGISTERED. A declaration is part of
     # the session's account of its own work and leaves with it, so it is
@@ -3687,6 +3872,11 @@ proc connectionWorker() {.thread, gcsafe.} =
       # NOTHING AT ALL -- a peer that says nothing, and a Hello that was
       # answered with a refusal -- which is the case an `except` cannot see.
       noteConnectionFailure("runquota connection handling failed: " & error.msg)
+    finally:
+      # EVERY ADMITTED CONNECTION IS COUNTED OUT, however its handling
+      # ended: a retiring daemon waits for this count to reach zero, and a
+      # connection that raised is as finished as one that returned.
+      connectionEnded()
 
 # ---------------------------------------------------------------------------
 # SIGTERM, and the orderly shutdown it now reaches.
@@ -3936,6 +4126,18 @@ when defined(posix):
           break
       dialOwnEndpoint(shutdownEndpointPath)
 
+  proc wakeAcceptLoopForRetirement(endpointPath: string) {.gcsafe.} =
+    ## The retirement decision, delivered the way SIGTERM is: set the flag
+    ## the accept loop reads, write the byte its `poll` waits on, and dial
+    ## for good measure. Runs on a connection worker, not in signal context,
+    ## but every step is the handler's own and none can block.
+    {.cast(gcsafe).}:
+      shutdownRequested.store(true, moRelease)
+      var token = '\0'
+      if acceptWakePipe[1] >= 0:
+        discard write(acceptWakePipe[1], addr token, 1)
+      dialOwnEndpoint(endpointPath)
+
   proc waitForAcceptOrShutdown(acceptHandle: int) =
     ## PARK UNTIL THERE IS A CONNECTION TO ACCEPT, OR UNTIL WE ARE STOPPING.
     ## Returns with no answer of its own: the caller re-reads the flag and
@@ -4096,6 +4298,14 @@ else:
           dialOwnEndpoint(shutdownEndpointPath)
           return
         sleep(50)
+
+  proc wakeAcceptLoopForRetirement(endpointPath: string) {.gcsafe.} =
+    ## The retirement decision, delivered the way the SCM stop is: set the
+    ## flag the accept loop reads and open our own pipe so the parked
+    ## `ConnectNamedPipe` returns and the loop looks at it.
+    {.cast(gcsafe).}:
+      shutdownRequested.store(true, moRelease)
+      dialOwnEndpoint(endpointPath)
 
   proc waitForAcceptOrShutdown(acceptHandle: int) =
     ## NOTHING TO WAIT ON HERE, and that is a property of the transport
@@ -4320,6 +4530,12 @@ proc serve*(config: DaemonConfig): int =
   # The listening line goes out now, on its own, so a reader that waits for
   # it is not made to wait for the store.
   flushFile(stdout)
+  # WHICH BUILD THIS IS, taken now -- after the listening line, so a client
+  # waiting for it is not made to wait for a hash, and long before an
+  # installer could rename the file aside. See `RunQuotaDaemon.imageDigest`.
+  sharedDaemon.daemon.imageDigest = imageDigestOf(getAppFilename())
+  resetRetirementState()
+  retirementEndpointPath = config.endpoint.path
   # AFTER the endpoint is bound, because the waker has a socket to dial, and
   # before any worker exists, because the shutdown this arms is the one that
   # joins them.
@@ -4423,8 +4639,26 @@ proc serve*(config: DaemonConfig): int =
         # retry against the next daemon whatever this one does.
         accepted.close()
         break
+      if not admitConnection():
+        # RETIREMENT WAS DECIDED between the wait and here. The connection is
+        # closed unserved, exactly like one that arrives during a SIGTERM:
+        # its peer retries against the daemon that follows this one.
+        accepted.close()
+        break
       enqueueConnection(accepted)
   finally:
+    # A RETIRING DAEMON FREES ITS ENDPOINT FIRST. It decided to go because
+    # no client was connected, and the next client is the reason it is
+    # going: that client starts the runquotad it ships, which can bind the
+    # name only once this listener is closed (a named pipe is created with
+    # FILE_FLAG_FIRST_PIPE_INSTANCE). Everything below -- joining idle
+    # workers, draining the observation writer -- can take a moment, and
+    # need not hold the name while it does. The store tolerates the overlap
+    # through its busy timeout. SIGTERM and the SCM keep the old order.
+    var listenerClosed = false
+    if retirementWasDecided():
+      listener.close()
+      listenerClosed = true
     # THE SCM'S STOP GRACE IS RE-ARMED BEFORE THE LONG PART BEGINS. What
     # follows joins a worker pool, stops four background threads and lets a
     # retention pass and an observation-store drain finish; under load that
@@ -4500,7 +4734,8 @@ proc serve*(config: DaemonConfig): int =
         captureOpenerRunning = false
         deinitCond(captureOpenerCond)
         deinitLock(captureOpenerLock)
-      listener.close()
+      if not listenerClosed:
+        listener.close()
       deinitLock(sharedDaemon.lock)
       deinitConnectionQueue()
   0

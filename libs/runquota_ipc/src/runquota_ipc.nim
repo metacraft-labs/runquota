@@ -1282,7 +1282,13 @@ proc bindEndpoint*(endpoint: Endpoint): LocalListener =
       # runs.
       applySocketMode(endpoint.path, policy)
       socket.listen()
-      LocalListener(kind: endpointUnixSocket, socket: socket, endpoint: endpoint)
+      var bound: Stat
+      var device, inode: uint64
+      if lstat(endpoint.path.cstring, bound) == 0 and S_ISSOCK(bound.st_mode):
+        device = uint64(bound.st_dev)
+        inode = uint64(bound.st_ino)
+      LocalListener(kind: endpointUnixSocket, socket: socket, endpoint: endpoint,
+        boundDevice: device, boundInode: inode)
   of endpointNamedPipe:
     when defined(windows):
       # Windows: pre-create the first pipe instance so the listener has an
@@ -1554,8 +1560,22 @@ proc close*(listener: var LocalListener) =
   of endpointUnixSocket:
     if listener.socket != nil:
       listener.socket.close()
-    if listener.endpoint.path.len > 0 and fileExists(listener.endpoint.path):
-      removeFile(listener.endpoint.path)
+      listener.socket = nil
+    # THE SOCKET INODE IS UNLINKED, which `fileExists` never did: it answers
+    # false for a socket, so the path used to outlive every daemon that
+    # bound it, and a client dialling it got ECONNREFUSED instead of "no
+    # daemon here" -- which also kept the next daemon from binding the path.
+    # Only while the path still names the inode this listener created: a
+    # socket another daemon has bound there since is not ours to remove.
+    when defined(posix):
+      if listener.endpoint.path.len > 0 and listener.boundInode != 0:
+        var current: Stat
+        if lstat(listener.endpoint.path.cstring, current) == 0 and
+            S_ISSOCK(current.st_mode) and
+            uint64(current.st_dev) == listener.boundDevice and
+            uint64(current.st_ino) == listener.boundInode:
+          discard posix.unlink(listener.endpoint.path.cstring)
+      listener.boundInode = 0
   of endpointNamedPipe:
     when defined(windows):
       if listener.pendingPipeHandle != 0:

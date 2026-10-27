@@ -53,6 +53,16 @@ type
       ## an older one closes the connection on a kind it does not know, and
       ## the session with it.
     rqPoolsDeclared = 36
+    rqRetireDaemon = 37
+      ## Ask the daemon to make way for another build of itself: stop taking
+      ## connections and exit once no client connection is open, so the next
+      ## client starts the runquotad it ships. The request names the image
+      ## digest the client would start; a daemon running exactly that image
+      ## answers `retirementCurrent` and changes nothing. An empty digest asks
+      ## unconditionally (`runquota daemon stop`). Sent only to a daemon whose
+      ## `HelloOk` reports protocol minor >= `RetirementMinor`, for the reason
+      ## `rqDeclarePools` gives.
+    rqDaemonRetirement = 38
 
   MessageKind* = RqspMessageKind
 
@@ -346,6 +356,38 @@ type
     pools*: seq[DeclaredPoolWire]
     promotedLeases*: uint32
       ## Queued leases granted because the declaration made room for them.
+
+  RetirementDecision* = enum
+    ## What a daemon did with a `RetireDaemon` request.
+    retirementRetiring = 0
+      ## It will exit once no client connection is open, and accepts none
+      ## after that moment.
+    retirementCurrent = 1
+      ## Its running image is the one the request named; nothing changed.
+    retirementRefused = 2
+      ## It may not be retired by this peer (`detail` says why).
+    retirementManaged = 3
+      ## A service manager owns its lifetime (the Windows Service Control
+      ## Manager), so no client may retire it. Not a skew a client should
+      ## report: the installed service is a deliberate choice of daemon.
+
+  RetireDaemonMessage* = object
+    expectedImageDigest*: string
+      ## `imageDigestOf` of the runquotad the client would start in this
+      ## daemon's place. Empty: retire whatever image is running.
+    reason*: string
+      ## Free text for the daemon's log: who asked, and why.
+
+  DaemonRetirementMessage* = object
+    decision*: RetirementDecision
+    daemonProcessId*: uint64
+    daemonImageDigest*: string
+      ## The digest of the image this daemon was started from, taken at
+      ## start; empty when the daemon could not read its own image.
+    otherConnections*: uint32
+      ## Client connections open besides the requester's own. The daemon
+      ## exits when the requester disconnects if this is 0.
+    detail*: string
 
   HostConfigReloadedMessage* = object
     ## The budget in force after a `ReloadHostConfig`. A file that does not

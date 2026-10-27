@@ -812,6 +812,44 @@ proc declarePools*(session: var RunQuotaSession;
     raise newException(RunQuotaClientError,
       session.client[].lastDiagnostic.message)
 
+proc supportsRetirement*(client: RunQuotaClient): bool =
+  ## Whether the daemon this client is connected to understands
+  ## `RetireDaemon`: its `HelloOk` reported protocol minor `RetirementMinor`
+  ## or later.
+  client.capabilities.protocolMinor >= RetirementMinor
+
+proc retireDaemon*(client: var RunQuotaClient; expectedImageDigest = "";
+                   reason = ""; timeoutMs = 0): DaemonRetirementMessage =
+  ## Ask the daemon to make way for another build of itself (`RetireDaemon`).
+  ## With `expectedImageDigest` (`imageDigestOf` the runquotad the caller
+  ## would start) a daemon running that image answers `retirementCurrent` and
+  ## stays; with none it retires whatever it runs. A retiring daemon exits
+  ## once no client connection is open -- this one included, so the caller
+  ## closes it when it has read the answer.
+  ##
+  ## NOTHING IS SENT TO A DAEMON THAT PREDATES THE MESSAGE, for the reason
+  ## `declarePools` gives: it would close the connection. The call raises
+  ## `RunQuotaClientError` (`diagUnsupportedVersion`) instead, naming the
+  ## daemon's version and minor.
+  if not client.supportsRetirement():
+    client.lastDiagnostic = diagnostic(diagUnsupportedVersion,
+      "the running runquotad (" & client.daemonVersion & ", protocol minor " &
+      $client.capabilities.protocolMinor & ") predates RetireDaemon, so it " &
+      "cannot be asked to make way; it keeps serving until it exits")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  let requestId = client.requestFrame(rqRetireDaemon, encodeRetireDaemon(
+    RetireDaemonMessage(expectedImageDigest: expectedImageDigest,
+      reason: reason)), timeoutMs)
+  let frame = client.readResponse(requestId, timeoutMs)
+  if frame.header.messageKind != rqDaemonRetirement:
+    client.lastDiagnostic = diagnostic(diagProtocol,
+      "daemon did not answer RetireDaemon")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  if not decodeDaemonRetirement(frame.payload, result):
+    client.lastDiagnostic = diagnostic(diagProtocol,
+      "invalid DaemonRetirement payload")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+
 proc reloadHostConfig*(client: var RunQuotaClient): HostConfigReloadedMessage =
   ## Ask the daemon to re-read its host budget file and put it in force
   ## (`ReloadHostConfig`). Raises `RunQuotaClientError` with the daemon's

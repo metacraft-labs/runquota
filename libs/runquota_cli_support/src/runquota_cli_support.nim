@@ -32,6 +32,9 @@ proc renderUsage*(programName: string): string =
     "  " & programName & " daemon start [RUNQUOTAD_ARG...]\n" &
     "    starts a detached runquotad (with those flags) unless one answers;\n" &
     "    its output goes to --log-file, by default the per-user runquotad.log\n" &
+    "  " & programName & " daemon stop [--wait] [--timeout SECONDS]\n" &
+    "    the daemon exits once no client is connected to it; it cuts off no\n" &
+    "    build in flight. --wait waits for the exit (exit 3 on timeout)\n" &
     "  " & programName & " daemon status\n" &
     configUsage.replace("  runquota ", "  " & programName & " ") &
     "  " & programName & " stats-table [KEY]\n" &
@@ -148,6 +151,102 @@ when defined(windows):
       raiseOSError(osLastError(), "starting " & program)
     discard closeHandle(info.hThread)
     discard closeHandle(info.hProcess)
+
+const daemonStopNotReachedExitCode* = 3
+  ## `daemon stop --wait`: the daemon accepted the stop but still answered
+  ## when the timeout ran out, because clients were still connected to it.
+
+proc runDaemonStop*(args: seq[string]): int =
+  ## Ask the daemon at the default endpoint (`RUNQUOTA_SOCKET`, else the
+  ## platform default) to stop: it RETIRES -- finishes serving every client
+  ## connection it has, admits no new one once none is left, and exits
+  ## (reprobuild-specs/RunQuota-Host-Configuration.md, "A daemon from another
+  ## build makes way"). It does not cut off a build in flight; that is what
+  ## makes the verb safe for an installer to call.
+  ##
+  ## `--wait` waits until the endpoint stops answering, at most `--timeout`
+  ## seconds (default 60), and exits `daemonStopNotReachedExitCode` if it is
+  ## still answering then. Without `--wait` the verb returns once the daemon
+  ## has accepted the request.
+  ##
+  ## A daemon the Windows Service Control Manager runs refuses: `sc stop`
+  ## owns that lifetime. So does one running as another principal.
+  var wait = false
+  var timeoutSeconds = 60
+  var i = 0
+  while i < args.len:
+    case args[i]
+    of "--wait":
+      wait = true
+    of "--timeout":
+      if i + 1 >= args.len:
+        echo "daemon stop: --timeout needs a number of seconds"
+        return 2
+      try:
+        timeoutSeconds = parseInt(args[i + 1])
+      except ValueError:
+        echo "daemon stop: --timeout needs a number of seconds, not " &
+          args[i + 1]
+        return 2
+      if timeoutSeconds < 0:
+        echo "daemon stop: --timeout must not be negative"
+        return 2
+      inc i
+    else:
+      echo "daemon stop: unknown argument " & args[i]
+      return 2
+    inc i
+  let endpoint = defaultEndpoint()
+  var client: RunQuotaClient
+  try:
+    client = connectDefault()
+  except CatchableError:
+    # NOTHING TO STOP IS SUCCESS for a stop verb: the state asked for is the
+    # state the host is in.
+    echo "no runquotad answers at " & endpoint.path & "; nothing to stop"
+    return 0
+  var answer: DaemonRetirementMessage
+  try:
+    answer = client.retireDaemon(reason = "runquota daemon stop")
+  except RunQuotaClientError as error:
+    client.close()
+    echo "runquotad at " & endpoint.path & " was not stopped: " & error.msg
+    return 1
+  client.close()
+  case answer.decision
+  of retirementRefused:
+    echo "runquotad (pid " & $answer.daemonProcessId & ") refused to stop: " &
+      answer.detail
+    return 1
+  of retirementManaged:
+    echo "runquotad (pid " & $answer.daemonProcessId & ") was not stopped: " &
+      answer.detail
+    return 1
+  of retirementCurrent:
+    # Not reachable for an unconditional request; reported rather than
+    # assumed away, so a daemon that answered it is visible.
+    echo "runquotad (pid " & $answer.daemonProcessId & ") did not stop: " &
+      answer.detail
+    return 1
+  of retirementRetiring:
+    if answer.otherConnections == 0:
+      echo "runquotad (pid " & $answer.daemonProcessId & ") is stopping"
+    else:
+      echo "runquotad (pid " & $answer.daemonProcessId & ") is stopping " &
+        "once its " & $answer.otherConnections &
+        " other client connection(s) close; it admits no new one after that"
+  if not wait:
+    return 0
+  let deadline = epochTime() + float(timeoutSeconds)
+  while true:
+    if not daemonReachable(endpoint):
+      echo "runquotad (pid " & $answer.daemonProcessId & ") has stopped"
+      return 0
+    if epochTime() >= deadline:
+      echo "runquotad (pid " & $answer.daemonProcessId & ") still answers " &
+        "after " & $timeoutSeconds & "s: clients are still connected to it"
+      return daemonStopNotReachedExitCode
+    sleep(100)
 
 proc runDaemonStart(daemonArgs: seq[string]): int =
   ## Start a detached `runquotad`, unless one already answers.
@@ -734,6 +833,8 @@ proc runThinApp*(programName: string): int =
       of "daemon":
         if args.len >= 2 and args[1] == "start":
           return runDaemonStart(args[2 .. ^1])
+        if args.len >= 2 and args[1] == "stop":
+          return runDaemonStop(args[2 .. ^1])
         if args.len == 2 and args[1] == "status":
           return printStatus(false)
       of "stats-table":

@@ -1,4 +1,4 @@
-import std/unittest
+import std/[strutils, unittest]
 
 import runquota_client
 import runquota_codec
@@ -390,3 +390,50 @@ suite "RQSP protocol and codec":
     check decoded.candidates[0].label == longId
     check decoded.candidates[0].commandStatsId.len == MaxCommandStatsIdBytes
     check decoded.candidates[0].commandStatsId == longId[0 ..< MaxCommandStatsIdBytes]
+
+  test "RetireDaemon and its answer round trip, and an unknown decision is refused":
+    # The request a client sends to make a daemon from another build make way
+    # (reprobuild-specs/RunQuota-Host-Configuration.md, "A daemon from another
+    # build makes way"), and the answer it acts on.
+    let request = RetireDaemonMessage(
+      expectedImageDigest: "sha256:" & repeat('a', 64),
+      reason: "repro 0.2.17 adopting the per-user daemon")
+    var decodedRequest: RetireDaemonMessage
+    check decodeRetireDaemon(encodeRetireDaemon(request), decodedRequest)
+    check decodedRequest == request
+    # The unconditional form (`runquota daemon stop`) is the empty digest.
+    check decodeRetireDaemon(encodeRetireDaemon(RetireDaemonMessage()),
+      decodedRequest)
+    check decodedRequest.expectedImageDigest.len == 0
+    # Trailing bytes are a malformed frame, not a longer message.
+    check not decodeRetireDaemon(encodeRetireDaemon(request) & "x",
+      decodedRequest)
+
+    for decision in RetirementDecision:
+      let answer = DaemonRetirementMessage(decision: decision,
+        daemonProcessId: 4242'u64, daemonImageDigest: "sha256:" & repeat('b', 64),
+        otherConnections: 3'u32, detail: "exits once its 3 other client " &
+          "connection(s) close")
+      var decodedAnswer: DaemonRetirementMessage
+      check decodeDaemonRetirement(encodeDaemonRetirement(answer),
+        decodedAnswer)
+      check decodedAnswer == answer
+    # A decision ordinal this build does not know must not be read as one it
+    # does: a client that took it for `retirementRetiring` would wait for an
+    # exit that is not coming.
+    var unknown = encodeDaemonRetirement(DaemonRetirementMessage(
+      decision: retirementRetiring))
+    unknown[0] = char(ord(high(RetirementDecision)) + 1)
+    var refused: DaemonRetirementMessage
+    check not decodeDaemonRetirement(unknown, refused)
+
+  test "the daemon announces RetireDaemon by its protocol minor":
+    # A client asks only a daemon whose HelloOk minor says it understands
+    # the message; an older one closes the connection on an unknown kind.
+    check RetirementMinor > PoolDeclarationsMinor
+    check RqspProtocolMinor >= RetirementMinor
+    check defaultCapabilities("linux", "unix-socket", milliCpu(1000),
+      bytes(1)).protocolMinor >= RetirementMinor
+    var kind: RqspMessageKind
+    check messageKindFromWire(37'u16, kind) and kind == rqRetireDaemon
+    check messageKindFromWire(38'u16, kind) and kind == rqDaemonRetirement
