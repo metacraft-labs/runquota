@@ -4464,7 +4464,13 @@ proc serve*(config: DaemonConfig): int =
   # spawned its writer thread has done work on behalf of a directory it is
   # about to refuse. `bindEndpoint` verifies again after creating the
   # directory; this one is about not getting that far.
-  let refusal = endpointDirectoryRefusal(config.endpoint)
+  var refusal: string
+  try:
+    refusal = endpointDirectoryRefusal(config.endpoint)
+  except EndpointTrustError as error:
+    # A malformed explicit policy is a trust refusal too, before threads,
+    # capture or an endpoint are created.
+    refusal = error.msg
   if refusal.len > 0:
     echo refusal
     flushFile(stdout)

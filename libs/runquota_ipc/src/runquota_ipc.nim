@@ -419,6 +419,9 @@ type
     rendezvousSingleUser
       ## The group could not be resolved. Directory ``0700``, socket
       ## ``0600``, owner-only. Reported by ``rendezvousDegradationReport``.
+    rendezvousPrivate
+      ## Explicit invocation-owned POSIX endpoint, independent of host NSS
+      ## configuration. Never used for the canonical host rendezvous.
 
   RendezvousPolicy* = object
     ## WHO the rendezvous must belong to, and HOW it must be moded. Carried
@@ -432,7 +435,8 @@ type
       ## daemon, so a client asserting "owned by me" would refuse every
       ## correctly-deployed host and accept nothing else.
     groupGid*: int64
-      ## The gid of ``groupName``, or -1 when the host has no such group.
+      ## The gid of ``groupName``, or -1 for private policy or when the
+      ## host has no such group.
       ## -1 means the group EQUALITY check cannot be made; the
       ## never-group-writable invariant still is, because it lives in the
       ## mode.
@@ -440,9 +444,10 @@ type
     directoryMode*: int
     socketMode*: int
     scope*: RendezvousScope
-      ## ``rendezvousSingleUser`` EXACTLY WHEN ``groupGid < 0``. Carried as
+      ## Private and missing-group scopes are distinct even though both
+      ## are owner-only. Carried as
       ## its own field rather than recomputed at each site so a caller
-      ## cannot forget to ask, and so a test can assert which of the two a
+      ## cannot forget to ask, and so a test can assert which scope a
       ## host is in without inferring it from a mode.
 
 const statsTableSegmentName* = "stats-table"
@@ -520,8 +525,22 @@ when defined(posix):
     let entry = getgrnam(name.cstring)
     if entry == nil: -1 else: int64(entry.gr_gid)
 
+proc privateRendezvousPolicy*(): RendezvousPolicy =
+  ## Explicit owner-only policy for an invocation's unique POSIX endpoint.
+  ## Host account/group overrides do not define this endpoint's principal.
+  when defined(posix):
+    RendezvousPolicy(ownerUid: int64(geteuid()), groupGid: -1,
+      directoryMode: singleUserEndpointDirectoryMode,
+      socketMode: singleUserEndpointSocketMode, scope: rendezvousPrivate)
+  else:
+    raise newException(EndpointTrustError,
+      "private RunQuota endpoints require POSIX")
+
 proc rendezvousPolicy*(): RendezvousPolicy =
   ## The configuration both halves verify against.
+  ## ``RUNQUOTA_ENDPOINT_SCOPE=private`` explicitly selects the invoking
+  ## effective uid and owner-only modes; absent selection or ``host`` keeps
+  ## the host resolution below. Unknown values fail at the trust boundary.
   ##
   ## ``ownerUid`` resolves, in order: an explicit
   ## ``RUNQUOTA_ENDPOINT_OWNER_UID``; the ``runquota`` account, when the
@@ -538,6 +557,12 @@ proc rendezvousPolicy*(): RendezvousPolicy =
   ## owner-only, and ``rendezvousDegradationReport`` says so. See
   ## ``RendezvousScope`` for why silently dropping the group comparison is
   ## the one answer that is not available.
+  let scope = getEnv("RUNQUOTA_ENDPOINT_SCOPE", "host")
+  if scope == "private":
+    return privateRendezvousPolicy()
+  if scope != "host":
+    raise newException(EndpointTrustError,
+      "RUNQUOTA_ENDPOINT_SCOPE must be host or private, got: " & scope)
   when defined(posix):
     let groupName = getEnv("RUNQUOTA_ENDPOINT_GROUP", defaultRendezvousGroup)
     var owner = -1'i64
@@ -590,6 +615,8 @@ proc rendezvousDegradationReport*(policy = rendezvousPolicy()): string =
   ## line.
   case policy.scope
   of rendezvousShared: ""
+  of rendezvousPrivate:
+    " (private invocation endpoint: owner-only -- directory 0700, socket 0600)"
   of rendezvousSingleUser:
     " (single-user mode: no group \"" & policy.groupName &
       "\" on this host, so the endpoint is owner-only -- directory " &
@@ -620,7 +647,7 @@ proc endpointDirectoryPermissions*(policy = rendezvousPolicy()):
 when defined(posix):
   proc inspectPath*(path: string; wantDirectory: bool; requiredMode: int;
                     expectedOwnerUid: int64; label: string;
-                    expectedGroupGid = -1'i64): PathTrust =
+                    expectedGroupGid = -1'i64; wantSocket = false): PathTrust =
     ## The single implementation of "is this path trustworthy", shared by
     ## the rendezvous directory and by segment files.
     ##
@@ -665,11 +692,13 @@ when defined(posix):
     let isDirectory = S_ISDIR(info.st_mode)
     let isRegular = S_ISREG(info.st_mode)
     if (wantDirectory and not isDirectory) or
-        ((not wantDirectory) and not isRegular):
+        (wantSocket and not S_ISSOCK(info.st_mode)) or
+        ((not wantDirectory) and not wantSocket and not isRegular):
       result.reason = trustWrongType
       result.message = "runquota " & label & " " & path & ": mode " &
         modeText(result.mode) & " is not a " &
-        (if wantDirectory: "directory" else: "regular file") &
+        (if wantDirectory: "directory" elif wantSocket: "socket"
+         else: "regular file") &
         "; refusing to use it as a rendezvous path"
       return
     if result.ownerUid != expectedOwnerUid:
@@ -905,6 +934,63 @@ when defined(windows):
           "cannot be vetted is not one that grants nothing"
       return
 
+when defined(posix):
+  proc resolveDirectoryPath*(path: string): string =
+    ## Resolve existing symlinks in filesystem order, retaining an absent
+    ## suffix. Unlike lexical normalization followed by realpath, this keeps
+    ## `link/..` relative to the link's target. Missing components may be
+    ## created later, so their names still participate in the exclusion.
+    if not isAbsolute(path) or '\0' in path:
+      raise newException(OSError, "directory path must be absolute and contain no NUL")
+    result = "/"
+    var pending = path.split('/')
+    var index, links: int
+    while index < pending.len:
+      let component = pending[index]
+      inc index
+      if component.len == 0 or component == ".": continue
+      if component == "..":
+        if result != "/": result = parentDir(result)
+        continue
+      let candidate =
+        if result == "/": result & component
+        else: result & "/" & component
+      var info: Stat
+      if lstat(candidate.cstring, info) == 0:
+        if S_ISLNK(info.st_mode):
+          inc links
+          if links > 40:
+            raiseOSError(OSErrorCode(ELOOP), "resolving directory " & path)
+          let target = expandSymlink(candidate)
+          if isAbsolute(target): result = "/"
+          let remaining =
+            if index < pending.len: pending[index .. ^1]
+            else: newSeq[string]()
+          pending = target.split('/') & remaining
+          index = 0
+          continue
+        if not S_ISDIR(info.st_mode):
+          raiseOSError(OSErrorCode(ENOTDIR), "resolving directory " & candidate)
+      elif errno != ENOENT:
+        raiseOSError(osLastError(), "resolving directory " & candidate)
+      result = candidate
+
+  proc directoryResolvesWithin*(path, directory: string): bool =
+    ## Compare directory identities including absent suffixes; separators
+    ## distinguish a descendant from an unrelated name sharing its prefix.
+    let candidate = resolveDirectoryPath(path)
+    let boundary = resolveDirectoryPath(directory)
+    boundary == "/" or candidate == boundary or
+      candidate.startsWith(boundary & "/")
+
+  proc privateEndpointParent(path: string): string =
+    # parentDir normalizes `..` before looking at symlinks. Remove only the
+    # socket's final component here, leaving filesystem traversal intact.
+    let separator = path.rfind('/')
+    if separator < 0: ""
+    elif separator == 0: "/"
+    else: path[0 ..< separator]
+
 proc endpointDirectoryTrust*(endpoint: Endpoint;
                              policy = rendezvousPolicy()): PathTrust =
   ## Whether the directory the endpoint's socket lives in may be used.
@@ -922,7 +1008,34 @@ proc endpointDirectoryTrust*(endpoint: Endpoint;
   case endpoint.kind
   of endpointUnixSocket:
     when defined(posix):
-      inspectPath(parentDir(endpoint.path), wantDirectory = true,
+      var directory = parentDir(endpoint.path)
+      if policy.scope == rendezvousPrivate:
+        # Policy values are public API. Revalidate the fixed private
+        # contract here even when a caller changed a constructor's fields.
+        if policy.ownerUid != int64(geteuid()):
+          return PathTrust(reason: trustForeignOwner, path: endpoint.path,
+            message: "private RunQuota policy requires the effective caller uid")
+        if policy.groupGid != -1:
+          return PathTrust(reason: trustForeignGroup, path: endpoint.path,
+            message: "private RunQuota policy must be owner-only")
+        if policy.directoryMode != 0o700 or policy.socketMode != 0o600:
+          return PathTrust(reason: trustBadMode, path: endpoint.path,
+            message: "private RunQuota policy requires directory 0700 and socket 0600")
+        directory = privateEndpointParent(endpoint.path)
+        if not isAbsolute(endpoint.path) or '\0' in endpoint.path:
+          return PathTrust(reason: trustWrongType, path: endpoint.path,
+            message: "private RunQuota policy requires an explicit absolute " &
+              "socket outside the host rendezvous directory")
+        try:
+          if directoryResolvesWithin(directory, hostWideEndpointDir):
+            return PathTrust(reason: trustWrongType, path: endpoint.path,
+              message: "private RunQuota policy requires an explicit absolute " &
+                "socket outside the host rendezvous directory")
+        except OSError as error:
+          return PathTrust(reason: trustUnreadable, path: endpoint.path,
+            message: "runquota private endpoint directory cannot be resolved: " &
+              error.msg)
+      inspectPath(directory, wantDirectory = true,
         requiredMode = policy.directoryMode,
         expectedOwnerUid = policy.ownerUid,
         label = "endpoint directory",
@@ -1142,16 +1255,26 @@ proc ensureEndpointDir*(endpoint: Endpoint; policy = rendezvousPolicy()) =
   ## still created on demand.
   case endpoint.kind
   of endpointUnixSocket:
+    when defined(posix):
+      # Validate even an empty path: Linux can otherwise bind it as an
+      # abstract socket, bypassing the explicit private-path contract.
+      if policy.scope == rendezvousPrivate:
+        requireTrustedEndpointDir(endpoint, policy)
     if endpoint.path.len > 0:
       let directory = parentDir(endpoint.path)
       when defined(posix):
-        if directory == hostWideEndpointDir and not dirExists(directory):
+        if policy.scope != rendezvousPrivate and
+            directory == hostWideEndpointDir and not dirExists(directory):
           raise newException(EndpointTrustError,
             "runquota endpoint directory " & directory &
               ": does not exist. It is created by the RunQuota install " &
               "step, never by the daemon; provision it with: " &
               provisionEndpointDirCommand(directory, policy))
-        createRendezvousDirTree(directory, policy)
+        let creationDirectory =
+          if policy.scope == rendezvousPrivate:
+            resolveDirectoryPath(privateEndpointParent(endpoint.path))
+          else: directory
+        createRendezvousDirTree(creationDirectory, policy)
       else:
         createDir(directory)
       requireTrustedEndpointDir(endpoint, policy)
@@ -1209,7 +1332,8 @@ when defined(windows):
       return true
     false
 
-proc connectEndpoint*(endpoint: Endpoint): LocalConnection =
+proc connectEndpoint*(endpoint: Endpoint;
+                      policy: RendezvousPolicy): LocalConnection =
   case endpoint.kind
   of endpointUnixSocket:
     when defined(windows):
@@ -1219,7 +1343,14 @@ proc connectEndpoint*(endpoint: Endpoint): LocalConnection =
       # validates who CONNECTS; this validates the path they connect
       # through, and a client that skipped it would happily hand its
       # requests to a socket another user planted.
-      requireTrustedEndpointDir(endpoint)
+      requireTrustedEndpointDir(endpoint, policy)
+      when defined(posix):
+        if policy.scope == rendezvousPrivate:
+          let trust = inspectPath(endpoint.path, wantDirectory = false,
+            wantSocket = true, requiredMode = policy.socketMode,
+            expectedOwnerUid = policy.ownerUid, label = "private socket")
+          if trust.reason notin {trustOk, trustMissing}:
+            raise newException(EndpointTrustError, trust.message)
       var socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE)
       # A session holds this socket open across `runWithLease`, i.e. across the
       # fork+exec of the leased command. Close-on-exec keeps the daemon
@@ -1261,17 +1392,29 @@ proc connectEndpoint*(endpoint: Endpoint): LocalConnection =
   else:
     raise newException(OSError, "unsupported RunQuota endpoint")
 
+proc connectEndpoint*(endpoint: Endpoint): LocalConnection =
+  ## Preserve the one-argument procedure type for callback consumers.
+  connectEndpoint(endpoint, rendezvousPolicy())
+
 proc connectDefault*(): LocalConnection =
   connectEndpoint(defaultEndpoint())
 
-proc bindEndpoint*(endpoint: Endpoint): LocalListener =
+proc bindEndpoint*(endpoint: Endpoint;
+                   policy: RendezvousPolicy): LocalListener =
   case endpoint.kind
   of endpointUnixSocket:
     when defined(windows):
       raise newException(OSError, "Unix-socket endpoints are not supported on Windows")
     else:
-      let policy = rendezvousPolicy()
       ensureEndpointDir(endpoint, policy)
+      when defined(posix):
+        if policy.scope == rendezvousPrivate:
+          var existing: Stat
+          if lstat(endpoint.path.cstring, existing) == 0:
+            raise newException(EndpointTrustError,
+              "private RunQuota endpoint already exists: " & endpoint.path)
+          if errno != ENOENT:
+            raiseOSError(osLastError())
       if fileExists(endpoint.path):
         removeFile(endpoint.path)
       var socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE)
@@ -1303,6 +1446,10 @@ proc bindEndpoint*(endpoint: Endpoint): LocalListener =
       raise newException(OSError, "named-pipe endpoints are only supported on Windows")
   else:
     raise newException(OSError, "unsupported RunQuota endpoint")
+
+proc bindEndpoint*(endpoint: Endpoint): LocalListener =
+  ## Preserve the one-argument procedure type for callback consumers.
+  bindEndpoint(endpoint, rendezvousPolicy())
 
 proc acceptWaitHandle*(listener: LocalListener): int =
   ## THE DESCRIPTOR A CALLER MAY WAIT ON for "there is a connection to

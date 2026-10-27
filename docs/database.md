@@ -399,6 +399,30 @@ on every invocation, no two rows would ever pool, and the aggregates would still
 carry a hardware dimension, so nothing would look wrong. That failure has no
 symptom at the point of use, which is why it is a refusal.
 
+### Explicit private endpoints on POSIX
+
+An invocation that owns its own temporary daemon can select
+`RUNQUOTA_ENDPOINT_SCOPE=private`. Set it for **both** the daemon and its
+clients, and give them the same absolute socket path (`runquotad --socket`
+and `RUNQUOTA_SOCKET`). Create a unique private directory for the invocation.
+The directory must belong to its effective uid with mode `0700`; the socket
+is created and verified as `0600`. Installed `runquota` accounts, and the
+host owner/group overrides, do not change this explicit private policy.
+The listening line identifies the endpoint as private.
+
+Absent this selection, or with `RUNQUOTA_ENDPOINT_SCOPE=host`, the existing
+host policy applies. Unknown values are refused. Private selection cannot
+use the implicit default endpoint or a path inside the canonical host
+rendezvous directory. It refuses existing endpoint objects on bind, and wrong
+owner, modes or symbolic links on attach. Shutdown removes only the socket
+inode the listener created.
+
+This capability does not discover services or authorize bypassing them. Use
+the configured host service when one governs the invocation; a trust or access
+refusal from that service must not trigger a competing private daemon. The
+launcher owns the private daemon's lifetime and must stop it when the invocation
+ends. Windows named-pipe discovery and daemon lifetime are unchanged.
+
 ### On Windows: the owner and the DACL
 
 Windows has no mode bits to read -- the kernel checks an object's **owner** and
