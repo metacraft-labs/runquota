@@ -49,16 +49,14 @@
 ##
 ## WHAT IS STILL NOT COVERED, stated rather than implied.
 ##
-## * THE LINUX BRANCH. ``readHostLoad`` has a second implementation, read
-##   out of ``/proc``, and it HAS NEVER EXECUTED ANYWHERE -- not before
-##   this file and not because of it. Every figure quoted below is
-##   macOS/arm64. The three CPU assertions are written in terms the Linux
-##   branch would satisfy unchanged if it ever ran, and the two memory
-##   oracles are macOS tools compiled only on macOS, so on Linux this file
-##   would drop to the CPU assertions and the burst. Until it is run
-##   there, ``USER_HZ``, the iowait-is-idle decision, the aggregate-``cpu``
-##   line parse, ``MemAvailable``, ``pswpin`` and the ``/proc/diskstats``
-##   in-flight sum are all unexercised.
+## * LINUX HAS NOW EXECUTED. The complete debug suite at published
+##   2c115da3 ran this whole program in a true two-vCPU Linux guest:
+##   the burst and saturation cases passed, while ambient capacity failed
+##   one original span at 1.1322011322011323 > 1.05. The separate finite
+##   two-vCPU collection did not reproduce it; its five ratios were within the
+##   original band. Neither result establishes that incident's cause.
+##   The macOS figures below retain their original platform scope; Linux
+##   execution does not independently validate every memory/I/O field.
 ## * THE 32-BIT WRAP. macOS reports the tick counters as ``natural_t``,
 ##   which wraps a few times a month per state on a busy machine. The
 ##   reader widens to ``int64`` WITHOUT unwrapping, by design: the
@@ -78,7 +76,8 @@
 ##   the "kernel reported a zero capacity" branch, are unreachable from a
 ##   test that is not allowed to mock the kernel.
 
-import std/[algorithm, atomics, cpuinfo, os, osproc, strutils, times, unittest]
+import std/[algorithm, atomics, cpuinfo, json, monotimes, os, osproc, strutils, times, unittest]
+import runquota_observation_store/ids
 
 when defined(windows):
   import std/winlean
@@ -327,7 +326,51 @@ const
     ## cluster) and reads as one: the printed figure collapses towards
     ## the E-core fraction rather than wandering near the floor.
 
-proc advancedReading(baseline: HostLoadReading): HostLoadReading =
+type CapacityEndpointEvidence = object
+  # Clocks bracket the SAME candidate returned by the original pinning loop.
+  # The independently read raw kernel text is explicitly AFTER that reading;
+  # it must not be mistaken for the kernel snapshot used inside readHostLoad.
+  monoOpenedNs, monoClosedNs: int64
+  wallOpenedMs, wallClosedMs: int64
+  polls: int
+  rawAfter: JsonNode
+
+proc rawCapacityEvidence(): JsonNode =
+  let openedMono = getMonoTime().ticks
+  let openedWall = unixMillisNow()
+  result = newJObject()
+  when defined(linux):
+    try:
+      var cpuLines = newJArray()
+      for line in readFile("/proc/stat").splitLines():
+        let fields = line.splitWhitespace()
+        if fields.len > 0 and fields[0].startsWith("cpu"):
+          cpuLines.add(%line)
+      result["procStatCpuLines"] = cpuLines
+      result["procUptimeRaw"] = %readFile("/proc/uptime").strip()
+    except CatchableError as err:
+      # A diagnostic read failure cannot erase the original assertion/result.
+      result["diagnosticError"] = %err.msg
+  result["monoOpenedNs"] = %openedMono
+  result["wallOpenedMs"] = %openedWall
+  result["monoClosedNs"] = %getMonoTime().ticks
+  result["wallClosedMs"] = %unixMillisNow()
+
+proc capacityEndpointJson(reading: HostLoadReading;
+                          evidence: CapacityEndpointEvidence): JsonNode =
+  %*{"available": reading.available, "detail": reading.detail,
+     "source": reading.source, "atUnixMillis": reading.atUnixMillis,
+     "cpuTotalMillis": reading.cpuTotalMillis,
+     "cpuBusyMillis": reading.cpuBusyMillis,
+     "monoOpenedNs": evidence.monoOpenedNs,
+     "monoClosedNs": evidence.monoClosedNs,
+     "wallOpenedMs": evidence.wallOpenedMs,
+     "wallClosedMs": evidence.wallClosedMs,
+     "pinPolls": evidence.polls,
+     "rawKernelAfterSelectedReading": evidence.rawAfter}
+
+proc advancedReading(baseline: HostLoadReading;
+                     evidence: ptr CapacityEndpointEvidence = nil): HostLoadReading =
   ## The first reading whose cumulative total has moved past ``baseline``.
   ##
   ## Not a retry-until-green: it is how a span is pinned to the kernel's
@@ -335,11 +378,25 @@ proc advancedReading(baseline: HostLoadReading): HostLoadReading =
   ## machine whose counters never move again yields an UNAVAILABLE reading
   ## with a zero total, which the caller counts and asserts against rather
   ## than skipping.
-  for _ in 0 ..< advancePollAttempts:
+  for attempt in 0 ..< advancePollAttempts:
+    var openedMono, openedWall: int64
+    if evidence != nil:
+      openedMono = getMonoTime().ticks
+      openedWall = unixMillisNow()
     let current = readHostLoad()
+    if evidence != nil:
+      evidence[].monoOpenedNs = openedMono
+      evidence[].wallOpenedMs = openedWall
+      evidence[].wallClosedMs = unixMillisNow()
+      evidence[].monoClosedNs = getMonoTime().ticks
+      evidence[].polls = attempt + 1
     if current.cpuTotalMillis > baseline.cpuTotalMillis:
+      if evidence != nil:
+        evidence[].rawAfter = rawCapacityEvidence()
       return current
     sleep(advancePollMillis)
+  if evidence != nil:
+    evidence[].rawAfter = rawCapacityEvidence()
   HostLoadReading(available: false)
 
 suite "host_load_reading_invariants":
@@ -430,10 +487,20 @@ suite "host_load_reading_invariants":
     check cores >= 1
     var ratios: seq[float] = @[]
     var pinFailures = 0
-    for _ in 0 ..< capacitySpans:
-      let before = advancedReading(readHostLoad())
+    for span in 0 ..< capacitySpans:
+      var beforeEvidence, afterEvidence: CapacityEndpointEvidence
+      let before = advancedReading(readHostLoad(), addr beforeEvidence)
       sleep(capacitySpanMillis)
-      let after = advancedReading(readHostLoad())
+      let after = advancedReading(readHostLoad(), addr afterEvidence)
+      # Emit original endpoints before any assertion/continue. No remeasurement,
+      # filtering or change to the denominator: failed spans stay failed.
+      echo $(%*{"kind": "hostload-capacity-span-evidence", "span": span,
+        "cores": cores, "before": capacityEndpointJson(before, beforeEvidence),
+        "after": capacityEndpointJson(after, afterEvidence),
+        "wallDeltaMillis": after.atUnixMillis - before.atUnixMillis,
+        "totalDeltaMillis": after.cpuTotalMillis - before.cpuTotalMillis,
+        "monoEndpointLowerNs": afterEvidence.monoOpenedNs - beforeEvidence.monoClosedNs,
+        "monoEndpointUpperNs": afterEvidence.monoClosedNs - beforeEvidence.monoOpenedNs})
       # A span whose endpoint could not be pinned to a counter update is
       # a MACHINE that stopped reporting, not a tolerance to widen: it is
       # counted and asserted to be zero rather than skipped.
