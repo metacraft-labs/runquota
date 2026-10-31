@@ -34,6 +34,7 @@
 ##    safe to write, and the error paths are precisely the ones a caller
 ##    has not tried yet.
 
+import private_broker_owner
 import std/[json, options, os, osproc, streams, strutils, unittest]
 
 
@@ -67,9 +68,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -91,8 +93,7 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   for _ in 0 ..< 400:
     if endpointIsBound(socketPath): break
     sleep(25)
-  for _ in 0 ..< 3:
-    discard process.outputStream.readLine()
+  discard readRequiredStartupLines(process, 3, "t_stats_cli_verbs")
   DaemonHandle(process: process)
 
 proc stop(handle: var DaemonHandle) =
@@ -225,6 +226,8 @@ suite "stats_cli_verbs":
   # -------------------------------------------------------------------------
 
   test "capture-off, empty and populated are three different answers":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let offRoot = scratchRoot("off")
     let onRoot = scratchRoot("on")
     defer: removeScratchRoot(offRoot)
@@ -232,7 +235,9 @@ suite "stats_cli_verbs":
     check fileExists(cliPath())
 
     # ---- capture OFF -----------------------------------------------------
-    let offSocket = rendezvousDir(offRoot) / "d.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let offSocket = rendezvousDir(offRoot, endpointPolicy1) / "d.sock"
     let offState = hostStateDir(offRoot)
     putEnv("RUNQUOTA_SOCKET", offSocket)
     var offDaemon = startDaemon(offSocket,
@@ -263,7 +268,10 @@ suite "stats_cli_verbs":
     check offTopJson["exit_code"].getInt == 4
 
     # ---- capture ON, store empty ----------------------------------------
-    let onSocket = rendezvousDir(onRoot) / "d.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let onSocket = rendezvousDir(onRoot, endpointPolicy2) / "d.sock"
+    require privateEndpointGroup(offSocket.parentDir) == privateEndpointGroup(onSocket.parentDir)
     let onState = hostStateDir(onRoot)
     let dbPath = onState / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", onSocket)
@@ -314,9 +322,13 @@ suite "stats_cli_verbs":
   # -------------------------------------------------------------------------
 
   test "stats export writes only JSON to stdout, including when it fails":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("stream")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socketPath = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -359,9 +371,13 @@ suite "stats_cli_verbs":
   # -------------------------------------------------------------------------
 
   test "an exported row is self-describing and scoped to the caller":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("rows")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy4)
+    let socketPath = rendezvousDir(root, endpointPolicy4) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -489,9 +505,13 @@ suite "stats_cli_verbs":
   # -------------------------------------------------------------------------
 
   test "top ranks within a hardware profile and never pools two":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("top")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy5: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy5)
+    let socketPath = rendezvousDir(root, endpointPolicy5) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)

@@ -25,6 +25,7 @@
 ## under `test-logs/t_e2e_runquota_killed_owner_lease_reclaimed/`, and names
 ## it only when the case fails.
 
+import private_broker_owner
 import std/[envvars, json, os, osproc, streams, strtabs, strutils, times,
   unittest]
 
@@ -36,7 +37,7 @@ else:
 import runquota_client
 import runquota_core
 import runquota_protocol
-from runquota_ipc import endpointForPath
+from runquota_ipc import endpointForPath, endpointDirectoryPermissions
 # The daemon's own identity probe, used here only to make CLEANUP safe: a
 # child is killed by pid only while that pid still names the child.
 import runquota_daemon/child_identity
@@ -164,8 +165,10 @@ proc childEnv(socketPath: string): StringTableRef =
     result[key] = value
   result["RUNQUOTA_SOCKET"] = socketPath
 
-proc startPrivateDaemon(tag: string; log: CaseLog): PrivateDaemon =
+proc startPrivateDaemon(fixturePolicy: var PrivateBrokerCallerPolicyBinding; tag: string; log: CaseLog): PrivateDaemon =
   result.root = scratchRoot(tag)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result.root))
+  setFilePermissions(result.root, endpointDirectoryPermissions())
   result.socketPath = result.root / "d.sock"
   # Every piece of host state in the scratch directory, and an explicit
   # budget: the daemon reads the host budget file at start, and a flag is
@@ -349,8 +352,12 @@ proc leaseRow(daemon: PrivateDaemon; label: string): JsonNode =
 suite "e2e_runquota_killed_owner_lease_reclaimed":
 
   test "a killed owner's lease is held while its child runs, then reclaimed for a waiting client":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let log = openCaseLog("held-then-reclaimed")
-    var daemon = startPrivateDaemon("held", log)
+    var endpointPolicy: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    var daemon = startPrivateDaemon(endpointPolicy, "held", log)
     var holder: Process = nil
     var child = ChildRef()
     try:
@@ -419,6 +426,8 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
       log.reportOnFailure(currentCaseFailed())
 
   test "a killed `runquota acquire` releases its reservation to a waiting client":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE HOST SCENARIO END TO END, through the shipped CLI and the shipped
     # launcher. On Windows the launcher binds the child to a kill-on-close
     # job, so killing the CLI kills the child with it and the reservation is
@@ -427,7 +436,9 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
     # seconds later. Either way the waiter must be granted inside the bound,
     # and before the fix it never was.
     let log = openCaseLog("killed-cli")
-    var daemon = startPrivateDaemon("cli", log)
+    var endpointPolicy: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    var daemon = startPrivateDaemon(endpointPolicy, "cli", log)
     var cli: Process = nil
     var child = ChildRef()
     try:

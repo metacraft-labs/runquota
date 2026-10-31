@@ -45,6 +45,7 @@
 ## the question; only a child the daemon spawns could, and the daemon spawns
 ## none on a path a test can steer.
 
+import private_broker_owner
 import std/[monotimes, os, osproc, streams, strtabs, strutils, times, unittest]
 
 when defined(posix):
@@ -78,7 +79,7 @@ when defined(posix):
     reaped: bool
     exitStatus: cint
 
-  proc startTree(result: var Tree; tag: string; exitWithParent: bool;
+  proc startTree(result: var Tree; fixturePolicy: var PrivateBrokerCallerPolicyBinding; tag: string; exitWithParent: bool;
                  dieBeforeExec = false) =
     ## `/bin/sh` starting `runquotad` in the background and waiting for it.
     # Short on purpose: `Sockaddr_un_path_length` is 104 on macOS.
@@ -87,6 +88,7 @@ when defined(posix):
     createDir(result.root)
     let endpointDir = result.root / "ep"
     createDir(endpointDir)
+    fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(endpointDir))
     setFilePermissions(endpointDir, endpointDirectoryPermissions())
     let state = result.root / "state"
     createDir(state)
@@ -187,11 +189,15 @@ suite "exits_when_its_parent_dies":
         "could not make the test a child subreaper"
 
   test "with RUNQUOTA_EXIT_WITH_PARENT=1, a SIGKILLed parent stops the daemon cleanly":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     when defined(posix):
       doAssert fileExists(daemonPath())
+      var endpointPolicy: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy)
       var tree: Tree
       try:
-        startTree(tree, "on", exitWithParent = true)
+        startTree(tree, endpointPolicy, "on", exitWithParent = true)
         doAssert daemonExists(tree)
         killShell(tree)
         let started = getMonoTime()
@@ -212,11 +218,15 @@ suite "exits_when_its_parent_dies":
       skip()
 
   test "without the variable, the daemon outlives its parent (control)":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     when defined(posix):
       doAssert fileExists(daemonPath())
+      var endpointPolicy: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy)
       var tree: Tree
       try:
-        startTree(tree, "off", exitWithParent = false)
+        startTree(tree, endpointPolicy, "off", exitWithParent = false)
         doAssert daemonExists(tree)
         killShell(tree)
         let ended = reapWithin(tree, SurvivalWindowMillis)
@@ -230,11 +240,15 @@ suite "exits_when_its_parent_dies":
       skip()
 
   test "the recorded owner dying before daemon entry is still detected":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     when defined(linux):
       doAssert fileExists(daemonPath())
+      var endpointPolicy: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy)
       var tree: Tree
       try:
-        startTree(tree, "startup", exitWithParent = true, dieBeforeExec = true)
+        startTree(tree, endpointPolicy, "startup", exitWithParent = true, dieBeforeExec = true)
         let ended = reapWithin(tree, ExitBudgetMillis)
         checkpoint("daemon ended=" & $ended & "; log:\n" & daemonLog(tree))
         check ended

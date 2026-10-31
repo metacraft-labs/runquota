@@ -89,6 +89,8 @@
 ## whose own OFF baseline turned out to have been out of range, and then
 ## FAILS saying so rather than reporting a ratio it cannot support.
 
+import daemon_endpoint
+import private_broker_owner
 import std/[algorithm, atomics, cpuinfo, math, os, osproc, streams,
             strutils, sysrand, times, unittest]
 
@@ -388,13 +390,9 @@ proc scratchDir(name: string): string =
   result = getTempDir() / ("rq-m11-" & $getCurrentProcessId() & "-" & name)
   removeDir(result)
   createDir(result)
-  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-  # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-  # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-  # where it does not -- so a fixture hardcoding either one is green on one
-  # kind of host and red on the other. Fixture only; the modes themselves
-  # are asserted in tests/unit/t_shared_endpoint_rules.nim.
-  setFilePermissions(result, endpointDirectoryPermissions())
+  # Generic scratch storage starts owner-private. Broker cases inspect this
+  # actual endpoint GID and select the declared rendezvous mode afterward.
+  setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
 
 proc openSampledStore(dir: string; cadenceMillis: int):
     tuple[store: ObservationStore; hostId: string] =
@@ -896,12 +894,17 @@ suite "ambient_load_attribution":
       check row.foreignRssBytes > 0
 
   test "self is what admitted executions reported, foreign is the rest":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # The gate's "alongside a known set of RunQuota-admitted executions".
     # The leases are real, granted by a real daemon over a real socket;
     # the figures attached to them are DECLARED, which is exactly how a
     # client reports its own execution and exactly what makes the
     # assertion falsifiable: no measurement produces 7.5 and 2.25.
     let dir = scratchDir("self")
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(dir, endpointDirectoryPermissions())
     defer: removeScratchRoot(dir)
     let socketPath = dir / "d.sock"
     let daemonBinary = daemonPath()
@@ -1111,7 +1114,12 @@ suite "ambient_load_attribution":
     check not load.running
 
   test "a real daemon samples on a fixed cadence, independent of executions":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let dir = scratchDir("dmn")
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(dir, endpointDirectoryPermissions())
     defer: removeScratchRoot(dir)
     let socketPath = dir / "d.sock"
     let dbPath = dir / "observations.sqlite"
@@ -1361,6 +1369,8 @@ suite "ambient_load_attribution":
     check openObservationStore(dbPath).readAmbientSamples().len == settled.len
 
   test "an idle daemon writes NO ambient rows, a leased one writes rows":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE GATE, BOTH DIRECTIONS, AS AN A/B WITH ONE DIFFERENCE BETWEEN THE
     # ARMS. Two real daemons, same binary, same cadence, same wall-clock
     # window, same store shape. One is never asked for anything; the other
@@ -1377,6 +1387,9 @@ suite "ambient_load_attribution":
     # about 86,000 of them per host per day whether the machine is
     # building or asleep.
     let dir = scratchDir("gate")
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(dir, endpointDirectoryPermissions())
     defer: removeScratchRoot(dir)
     stopAmbientSampler()
 
@@ -1395,8 +1408,7 @@ suite "ambient_load_attribution":
         options = {poStdErrToStdOut})
       # The three startup lines, so the daemon is past initialisation and
       # the sampler has been started before the window opens.
-      for _ in 0 ..< 3:
-        discard process.outputStream.readLine()
+      discard readRequiredStartupLines(process, 3, "t_ambient_load_attribution")
       (process, dbPath)
 
     # -- ARM ONE: nothing is ever leased. -----------------------------------

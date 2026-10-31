@@ -27,6 +27,7 @@
 ## answered. Both endpoints are MEASURED, not sampled, which is the defect
 ## class M15's own crash test had to repair.
 
+import private_broker_owner
 import std/[algorithm, json, options, os, osproc, streams, strutils,
   unittest]
 
@@ -68,9 +69,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -99,8 +101,7 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   # output is consumed by count and a fourth line leaves every reader of
   # the third one blocked or misaligned.
   var lines: seq[string] = @[]
-  for _ in 0 ..< 3:
-    lines.add(process.outputStream.readLine())
+  lines = readRequiredStartupLines(process, 3, "t_observation_retention_scheduled")
   DaemonHandle(process: process, startupLines: lines)
 
 proc stop(handle: var DaemonHandle) =
@@ -241,9 +242,13 @@ suite "observation_retention_scheduled":
   # -------------------------------------------------------------------------
 
   test "a daemon prunes its own store on a cadence nobody asked it to run":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("gate")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let socketPath = rendezvousDir(root, endpointPolicy1) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let expectedDb = state / "observations.sqlite3"
@@ -321,6 +326,8 @@ suite "observation_retention_scheduled":
   # -------------------------------------------------------------------------
 
   test "a lease is granted and an observation recorded while a prune runs":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # A FIXTURE THE HAPPY PATH CANNOT CONSTRUCT: a prune long enough to
     # drive a client through it. It needs a store with a year's worth of
     # rows in it before the daemon ever starts, which is why the store is
@@ -355,7 +362,9 @@ suite "observation_retention_scheduled":
     # for, and no assertion here covers it.
     let root = scratchRoot("hold")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let socketPath = rendezvousDir(root, endpointPolicy2) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let dbPath = state / "observations.sqlite3"
@@ -489,9 +498,13 @@ suite "observation_retention_scheduled":
   # -------------------------------------------------------------------------
 
   test "a zero sweep interval leaves every row where it is":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("off")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socketPath = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let dbPath = state / "observations.sqlite3"
@@ -531,6 +544,8 @@ suite "observation_retention_scheduled":
     check status.totalFinished >= 1'u64
 
   test "a bound of zero keeps nothing, and is not the absence of a bound":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE OTHER HALF OF THE OFF SWITCH, and the half a well-behaved client
     # never exercises. `--retention-...` spells "this bound does not apply"
     # as a NEGATIVE value, so zero has to survive the flag as a REAL bound
@@ -542,7 +557,9 @@ suite "observation_retention_scheduled":
     # every other arm in this file green.
     let root = scratchRoot("zero")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy4)
+    let socketPath = rendezvousDir(root, endpointPolicy4) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let dbPath = state / "observations.sqlite3"
@@ -603,9 +620,13 @@ suite "observation_retention_scheduled":
     check status.totalFinished >= 1'u64
 
   test "--no-write-stats leaves no store to sweep and no sweeper to do it":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("nostats")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy5: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy5)
+    let socketPath = rendezvousDir(root, endpointPolicy5) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let defaultDb = state / "observations.sqlite3"
@@ -628,6 +649,8 @@ suite "observation_retention_scheduled":
     check not fileExists(defaultDb)
 
   test "a corrupt store leaves no sweeper and a daemon that still grants leases":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # OS-4's third named failure, beside a missing daemon and a full disk.
     # A store that will not open has nothing to prune and no schema to
     # prune it with, so a sweeper started against one would spend the
@@ -636,7 +659,9 @@ suite "observation_retention_scheduled":
     # take out a machine's build capacity.
     let root = scratchRoot("corrupt")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy6: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy6)
+    let socketPath = rendezvousDir(root, endpointPolicy6) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let dbPath = state / "observations.sqlite3"
@@ -688,6 +713,8 @@ suite "observation_retention_scheduled":
   # -------------------------------------------------------------------------
 
   test "a store that turns unwritable mid-flight costs pruning and nothing else":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # OS-4 AND OS-1 TOGETHER. Retention failing must degrade, never fail a
     # build: the daemon has to keep granting leases with nobody telling
     # the client anything went wrong.
@@ -700,7 +727,9 @@ suite "observation_retention_scheduled":
         if fileExists(dbPath & suffix):
           setFilePermissions(dbPath & suffix, {fpUserRead, fpUserWrite})
       removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy7: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy7)
+    let socketPath = rendezvousDir(root, endpointPolicy7) / "d.sock"
     let identityFile = state / "host-id"
     let hostId = mintIdentity(identityFile)
     seedStore(dbPath, hostId, 300, unixMillisNow() - 300)

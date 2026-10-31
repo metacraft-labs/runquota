@@ -41,6 +41,8 @@
 ## `trustOk` for a named pipe because "there is no directory to own and no
 ## mode to widen". So on Windows every case is reported skipped.
 
+import private_broker_owner
+
 when not defined(posix):
   import std/unittest
 
@@ -120,6 +122,8 @@ else:
 
   suite "rendezvous_degradation":
     test "a resolvable group gives a SHARED, group-gated endpoint and says nothing":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       let root = scratchDir("rdvS")
       defer: removeDir(root)
       let dir = root / "ep"
@@ -146,6 +150,8 @@ else:
         daemon.stop()
 
     test "an UNRESOLVABLE group degrades to owner-only, and SAYS so":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       let root = scratchDir("rdv1")
       defer: removeDir(root)
       let dir = root / "ep"
@@ -176,6 +182,8 @@ else:
         daemon.stop()
 
     test "the two daemons differ in every observable the ruling is about":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## Stated as a comparison rather than as two independent expectations,
       ## so an implementation that produced the same endpoint either way --
       ## which is exactly what "silently disable the group check" does --
