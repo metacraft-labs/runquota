@@ -313,6 +313,7 @@ for test_file in "${test_files[@]}"; do
   ran=$((ran + 1))
   status=0
   run_started=${SECONDS}
+  echo "=== runtime start: ${test_file}; runnerElapsedSeconds=${run_started}"
   # STDIN IS `/dev/null`, and that is part of the bound rather than tidiness.
   # `timeout` runs the test in a BACKGROUND process group, so a test that
   # read the terminal would take SIGTTIN and stop forever -- a second way to
@@ -328,6 +329,7 @@ for test_file in "${test_files[@]}"; do
     wait "${bounded_pgid}" || status=$?
   fi
   run_elapsed=$((SECONDS - run_started))
+  echo "=== runtime end: ${test_file}; exit=${status}; elapsedSeconds=${run_elapsed}; runnerElapsedSeconds=${SECONDS}"
 
   # A TIMEOUT IS ITS OWN OUTCOME AND NOT AN ORDINARY FAILURE. `timeout` exits
   # 124 when its own SIGTERM ended the command and 137 when the

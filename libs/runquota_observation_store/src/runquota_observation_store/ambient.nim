@@ -263,7 +263,7 @@ when defined(macosx):
       result.detail = "kernel reported a zero capacity"
 
 elif defined(linux):
-  import ./linux_cpu_ticks
+  import ./linux_cpu_ticks, ./cpu_clock_pair
 
   proc readFileOrEmpty(path: string): string =
     try:
@@ -319,16 +319,20 @@ elif defined(linux):
 
   proc readHostLoad*(): HostLoadReading =
     result = unavailableReading("linux-proc", "")
-    let stat = readFileOrEmpty("/proc/stat")
-    let cpu = parseLinuxCpuTicks(stat)
-    let busyTicks = cpu.busy
-    let idleTicks = cpu.idle
-    if busyTicks + idleTicks <= 0:
-      result.detail = "/proc/stat carried no aggregate cpu line"
+    let pair = captureCpuClockPair(proc(): CpuCounters =
+      let cpu = parseLinuxCpuTicks(readFileOrEmpty("/proc/stat"))
+      # `/proc/stat` is in USER_HZ, which is 100 on every Linux ABI.
+      CpuCounters(available: cpu.busy + cpu.idle > 0,
+        busyMillis: cpu.busy * 10'i64,
+        totalMillis: (cpu.busy + cpu.idle) * 10'i64))
+    if not pair.available:
+      result.detail = "/proc/stat CPU/timestamp pair unavailable"
       return
-    # `/proc/stat` is in USER_HZ, which is 100 on every Linux ABI.
-    result.cpuBusyMillis = busyTicks * 10'i64
-    result.cpuTotalMillis = (busyTicks + idleTicks) * 10'i64
+    result.cpuBusyMillis = pair.counters.busyMillis
+    result.cpuTotalMillis = pair.counters.totalMillis
+    result.atUnixMillis = pair.atUnixMillis
+    # Memory, swap and storage reads may block or be descheduled. They must
+    # not stamp the earlier CPU counters with an unrelated later instant.
 
     let meminfo = readFileOrEmpty("/proc/meminfo")
     result.memTotalBytes = kilobytesField(meminfo, "MemTotal")
@@ -340,7 +344,6 @@ elif defined(linux):
         try: parseFloat(loadavg[0]) except ValueError: 0.0
       else: 0.0
     result.ioQueueDepth = inFlightRequests()
-    result.atUnixMillis = unixMillisNow()
     result.available = result.memTotalBytes > 0
     if not result.available:
       result.detail = "/proc/meminfo carried no MemTotal"

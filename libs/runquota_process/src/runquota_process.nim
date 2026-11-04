@@ -1005,8 +1005,8 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       if spec.stdio == captureStdio:
         discard close(stdoutPipe[0])
         discard close(stderrPipe[0])
-      if spec.createProcessGroup:
-        discard setpgid(0, 0)
+      if spec.createProcessGroup and setpgid(0, 0) != 0:
+        childExit(126)
       if spec.cwd.len > 0 and chdir(cstring(spec.cwd)) != 0:
         childExit(126)
       if spec.stdio == captureStdio:
