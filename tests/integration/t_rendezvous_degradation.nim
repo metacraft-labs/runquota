@@ -58,6 +58,9 @@ else:
 
   import runquota_ipc
   import daemon_binary
+  # The engine exports RUNQUOTA_ENDPOINT_SCOPE=private to every action it runs;
+  # this file asserts host-scope policy, so it must not inherit that.
+  useHostEndpointScope()
 
   proc scratchDir(name: string): string =
     # Short on purpose. Nim's `Sockaddr_un_path_length` is 92 on macOS and

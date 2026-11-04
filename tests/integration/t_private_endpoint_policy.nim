@@ -33,6 +33,15 @@ when defined(posix):
     if lstat(path.cstring, info) != 0: return -1
     int(info.st_mode) and 0o7777
 
+  proc groupOf(path: string): int64 =
+    ## The group a fixture was born with. BSD/macOS inherit the parent's group
+    ## (`/tmp` is group wheel, gid 0), Linux uses the creator's egid, so a
+    ## fixture that must pass the group check names its real group instead of
+    ## assuming `getegid()`; the mode check under test runs after that one.
+    var info: Stat
+    if lstat(path.cstring, info) != 0: return -1
+    int64(info.st_gid)
+
   proc isSocket(path: string): bool =
     var info: Stat
     lstat(path.cstring, info) == 0 and S_ISSOCK(info.st_mode)
@@ -147,7 +156,7 @@ when defined(posix):
       let hostClient = cleanEnvironment()
       hostClient["RUNQUOTA_SOCKET"] = socket
       hostClient["RUNQUOTA_ENDPOINT_OWNER_UID"] = $int64(geteuid())
-      hostClient["RUNQUOTA_ENDPOINT_GROUP"] = $int64(getegid())
+      hostClient["RUNQUOTA_ENDPOINT_GROUP"] = $groupOf(root / "ep")
       let refused = cli(hostClient)
       check refused.code != 0
       check "required 0750" in refused.output
@@ -166,7 +175,7 @@ when defined(posix):
         let env = cleanEnvironment()
         env["RUNQUOTA_ENDPOINT_OWNER_UID"] =
           $(int64(geteuid()) + (if foreignOwner: 1 else: 0))
-        env["RUNQUOTA_ENDPOINT_GROUP"] = $int64(getegid())
+        env["RUNQUOTA_ENDPOINT_GROUP"] = $groupOf(dir)
         let daemon = launch(root, socket, env)
         defer: stop(daemon)
         check daemon.waitForExit(5000) == 3
