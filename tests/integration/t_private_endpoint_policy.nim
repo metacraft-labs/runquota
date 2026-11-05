@@ -8,6 +8,10 @@ when defined(posix):
   import std/[json, monotimes, os, osproc, posix, streams, strutils, strtabs,
     tempfiles, unittest]
   import runquota_ipc
+  import runquota_client
+  import runquota_core
+  import runquota_protocol
+  import runquota_stats_table
   import daemon_binary
   from runquota_core/child_process import runCapturedProcess
 
@@ -315,6 +319,128 @@ when defined(posix):
       let connected = cli(privateEnv(socket))
       check connected.code == 0
       check "active_sessions" in connected.output
+
+    test "the published table follows a symlink dotdot socket into its actual directory":
+      let root = scratchDir("rqt")
+      defer: removeDir(root)
+      let actual = root / "actual"
+      createDir(actual / "child")
+      setFilePermissions(actual, {fpUserRead, fpUserWrite, fpUserExec})
+      setFilePermissions(actual / "child", {fpUserRead, fpUserWrite, fpUserExec})
+      let alias = root / "alias"
+      createSymlink(actual / "child", alias)
+      let socket = alias & "/../ep/d.sock"
+      let actualTable = actual / "ep" / "stats-table"
+      # THE CONTROL: lexical parent derivation folds `alias/..` away before
+      # the kernel can follow the symlink, and names a directory beside the
+      # alias that this daemon never creates or verifies.
+      let lexicalTable = parentDir(socket) / "stats-table"
+      check lexicalTable == root / "ep" / "stats-table"
+      check lexicalTable != actualTable
+      let derived = defaultStatsTablePath(unixEndpoint(socket))
+      check derived == alias & "/../ep/stats-table"
+      let daemon = launch(root, socket, privateEnv(socket))
+      defer: stop(daemon)
+      prerequisite awaitSocket(daemon, socket), "ancestor-alias daemon did not bind"
+      let listening = daemon.outputStream.readLine()
+      checkpoint listening
+      check ("published stats table: " & derived & " ") in listening
+      check fileExists(actualTable)
+      check not dirExists(root / "ep")
+      check not fileExists(lexicalTable)
+      # Daemon-owned, written with the host-wide segment mode, inside the
+      # private 0700 directory that gates who can reach it.
+      var info: Stat
+      prerequisite lstat(actualTable.cstring, info) == 0,
+        "no table in the socket's actual directory"
+      check S_ISREG(info.st_mode)
+      check info.st_uid == geteuid()
+      check modeOf(actualTable) == 0o640
+      check modeOf(actual / "ep") == 0o700
+      check sameFile(derived, actualTable)
+
+      # An execution finished before store verification is not recorded.
+      # Wait for capture as the first case does, within the same window.
+      let captureDeadline = getMonoTime().ticks + 10_000_000_000'i64
+      var captureReady = false
+      while not captureReady and getMonoTime().ticks < captureDeadline:
+        let inspection = cli(privateEnv(socket), @["observations", "--json"])
+        prerequisite inspection.code == 0, inspection.output
+        captureReady = parseJson(inspection.output)["observations"][
+          "capture_enabled"].getBool()
+        if not captureReady: sleep(25)
+      prerequisite captureReady, "private alias daemon did not enable capture"
+
+      # A real client over the same raw spelling. Private selection is
+      # process environment, restored before the next case.
+      let hadScope = existsEnv("RUNQUOTA_ENDPOINT_SCOPE")
+      let previousScope = getEnv("RUNQUOTA_ENDPOINT_SCOPE")
+      putEnv("RUNQUOTA_ENDPOINT_SCOPE", "private")
+      defer:
+        if hadScope: putEnv("RUNQUOTA_ENDPOINT_SCOPE", previousScope)
+        else: delEnv("RUNQUOTA_ENDPOINT_SCOPE")
+      const statsKey = "rq-private-alias-table"
+      const peakBytes = 700'u64 * 1024'u64 * 1024'u64
+      var client = connect(unixEndpoint(socket))
+      defer: client.close()
+      var session = client.registerSession("rq-private-alias", "0.1.0")
+      var request = resourceRequest(statsKey, milliCpu(1000),
+        bytes(64'u64 * 1024'u64 * 1024'u64))
+      request.commandStatsId = statsKey
+      var lease = session.requestLease(request)
+      prerequisite lease.active, "private alias daemon refused the lease"
+      lease.markStarting()
+      lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
+      lease.finish(outcome = succeeded(), peakMemoryBytes = peakBytes,
+        processCount = 1'u32, majorPageFaults = 0'u64)
+      lease.release()
+      session.closeSession()
+
+      # The answer of record comes from the socket.
+      var overSocket = 0'u64
+      let answer = client.queryStats(statsSubjectDistribution,
+        statsKey = statsKey)
+      for entry in answer.distributions:
+        if entry.knowledge == statsKnowledgeWireKnown:
+          overSocket = entry.peakRssBytesMax
+      check overSocket == peakBytes
+
+      # The table a client derives from the raw spelling carries it.
+      var published: PublishedEstimate
+      var hit = false
+      let deadline = getMonoTime().ticks + 10_000_000_000'i64
+      while not hit and getMonoTime().ticks < deadline:
+        var probe = openStatsTable(derived)
+        if probe.available:
+          hit = probe.lookupEstimate(statsKey, published) == stlHit
+        probe.close()
+        if not hit: sleep(25)
+      check hit
+      check published.knowledge == statsTableKnown
+      check published.memoryBytes == overSocket
+
+      # The client's mapping is read-only: the kernel kills a store through
+      # it, and the daemon's table is unchanged for the next reader.
+      var table = openStatsTable(derived)
+      defer: table.close()
+      prerequisite table.available, "derived stats table did not attach"
+      let base = table.unsafeMappedBase()
+      prerequisite base != nil, "derived stats table has no mapping"
+      let child = fork()
+      prerequisite child >= 0, "fork failed"
+      if child == 0:
+        cast[ptr uint64](base)[] = 0xdeadbeef'u64
+        exitnow(0)
+      var status: cint = 0
+      prerequisite waitpid(child, status, 0) == child, "waitpid failed"
+      check WIFSIGNALED(status)
+      if WIFSIGNALED(status):
+        check WTERMSIG(status) in [SIGSEGV, SIGBUS]
+      var reopened = openStatsTable(derived)
+      defer: reopened.close()
+      var after: PublishedEstimate
+      check reopened.lookupEstimate(statsKey, after) == stlHit
+      check after.memoryBytes == peakBytes
 
     test "path resolution retains missing suffixes and refuses malformed ancestors before mutation":
       let root = scratchDir("rqr")

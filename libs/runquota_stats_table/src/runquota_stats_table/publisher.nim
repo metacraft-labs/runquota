@@ -243,10 +243,10 @@ proc createStatsPublisher*(path: string; slotCount = DefaultStatsSlotCount;
     if (slotCount and (slotCount - 1)) != 0: return # power of two
     let size = statsSegmentSize(slotCount)
     let boot = bootId()
-    try:
-      let dir = parentDir(path)
-      if dir.len > 0 and not dirExists(dir): return
-    except CatchableError: return
+    # No lexical `parentDir` pre-check here: it folds `..` before the kernel
+    # follows an ancestor symlink, and would refuse a directory that exists.
+    # The exclusive create below fails on a missing directory by itself, and
+    # resolves the path in filesystem order the way the socket's bind did.
     let uniq = int(epochTime() * 1_000_000) mod 1_000_000
     let tmp = path & ".tmp." & $getpid() & "." & $uniq
     discard unlink(tmp.cstring)

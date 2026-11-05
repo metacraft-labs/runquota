@@ -457,12 +457,34 @@ const statsTableSegmentName* = "stats-table"
   ## the state directory: that holds durable identity, and this is a
   ## working set that may be dropped, resized or zeroed at any moment.
 
+when defined(posix):
+  proc socketDirectorySpelling(path: string): string =
+    # `parentDir` and `/` normalize `..` before looking at symlinks, so
+    # `alias/../ep/d.sock` would lose the alias the kernel follows. Remove
+    # only the socket's final component, leaving filesystem traversal intact.
+    let separator = path.rfind('/')
+    if separator < 0: ""
+    elif separator == 0: "/"
+    else: path[0 ..< separator]
+
+  proc besideSocket(path, name: string): string =
+    let directory = socketDirectorySpelling(path)
+    if directory.len == 0: name
+    elif directory.endsWith('/'): directory & name
+    else: directory & "/" & name
+
 proc defaultStatsTablePath*(endpoint: Endpoint): string =
   ## Where the published aggregate table is, derived from the endpoint so
   ## the two cannot end up in different directories — a table published
   ## somewhere the clients of THIS daemon do not look is an unpublished
   ## table with extra moving parts, and it fails silently as a permanently
   ## cold cache.
+  ##
+  ## POSIX: beside the socket in the directory the kernel binds it in. The
+  ## socket's spelling is kept up to its last separator, so an ancestor
+  ## symlink followed by ``..`` names the symlink target's parent exactly as
+  ## it does for the socket, and the derived path resolves to the same
+  ## verified directory the socket lives in.
   ##
   ## WINDOWS: beside the path the pipe was derived from, and nowhere for a
   ## pipe named outright. A named pipe has no directory, so the table goes
@@ -476,7 +498,9 @@ proc defaultStatsTablePath*(endpoint: Endpoint): string =
   ## `RunQuota-Shared-Memory-Structures.md` §"Where the table lives on
   ## Windows" records the decision and what would change it.
   case endpoint.kind
-  of endpointUnixSocket: parentDir(endpoint.path) / statsTableSegmentName
+  of endpointUnixSocket:
+    when defined(posix): besideSocket(endpoint.path, statsTableSegmentName)
+    else: parentDir(endpoint.path) / statsTableSegmentName
   of endpointNamedPipe:
     if endpoint.rendezvousPath.len == 0: ""
     else: parentDir(endpoint.rendezvousPath) / statsTableSegmentName
@@ -983,14 +1007,6 @@ when defined(posix):
     boundary == "/" or candidate == boundary or
       candidate.startsWith(boundary & "/")
 
-  proc privateEndpointParent(path: string): string =
-    # parentDir normalizes `..` before looking at symlinks. Remove only the
-    # socket's final component here, leaving filesystem traversal intact.
-    let separator = path.rfind('/')
-    if separator < 0: ""
-    elif separator == 0: "/"
-    else: path[0 ..< separator]
-
 proc endpointDirectoryTrust*(endpoint: Endpoint;
                              policy = rendezvousPolicy()): PathTrust =
   ## Whether the directory the endpoint's socket lives in may be used.
@@ -1021,7 +1037,7 @@ proc endpointDirectoryTrust*(endpoint: Endpoint;
         if policy.directoryMode != 0o700 or policy.socketMode != 0o600:
           return PathTrust(reason: trustBadMode, path: endpoint.path,
             message: "private RunQuota policy requires directory 0700 and socket 0600")
-        directory = privateEndpointParent(endpoint.path)
+        directory = socketDirectorySpelling(endpoint.path)
         if not isAbsolute(endpoint.path) or '\0' in endpoint.path:
           return PathTrust(reason: trustWrongType, path: endpoint.path,
             message: "private RunQuota policy requires an explicit absolute " &
@@ -1272,7 +1288,7 @@ proc ensureEndpointDir*(endpoint: Endpoint; policy = rendezvousPolicy()) =
               provisionEndpointDirCommand(directory, policy))
         let creationDirectory =
           if policy.scope == rendezvousPrivate:
-            resolveDirectoryPath(privateEndpointParent(endpoint.path))
+            resolveDirectoryPath(socketDirectorySpelling(endpoint.path))
           else: directory
         createRendezvousDirTree(creationDirectory, policy)
       else:
