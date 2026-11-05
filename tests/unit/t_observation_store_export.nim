@@ -61,7 +61,10 @@
 ##
 ## NO MOCKS. Real SQLite files, real exports, and the local store is built
 ## by the same library the daemon writes with; the carried rows arrive
-## through the real ``merge``.
+## through the real ``merge``. The one substitution is in the last case: a
+## ``sqlite3`` on PATH that runs the real tool after switching on SQLite's
+## own WAL-keeping settings, because that is the only way to put this
+## host's ``sqlite3`` in the condition Apple's build is in by default.
 
 import std/[exitprocs, options, os, strutils, times, unittest]
 
@@ -251,8 +254,32 @@ proc buildLocalStoreOnce(dir, path: string): ObservationStore =
   discard vendorSource(vendor)
   doAssert result.mergeObservationStore(vendor).outcome == moMerged
 
+proc buildLocalStoreTemplate(dir: string): string =
+  ## Builds the local store in ``dir`` and returns a file ``buildLocalStore``
+  ## may copy byte for byte.
+  ##
+  ## The file returned is a SNAPSHOT of the built store, taken with
+  ## ``vacuum into`` (``backupTo``), and not the built store itself. A WAL
+  ## database's main file is complete only once the log has been checked
+  ## in and removed, and whether closing the last connection does that is
+  ## the ``sqlite3`` build's choice: Apple's keeps the ``-wal`` file, and a
+  ## build that skips the closing checkpoint leaves committed rows in it.
+  ## ``vacuum into`` reads through the log and writes one self-contained
+  ## database that no connection has ever opened, so the copy is whole on
+  ## every build (https://sqlite.org/lang_vacuum.html#vacuuminto).
+  let built = dir / "built.sqlite"
+  let store = buildLocalStoreOnce(dir, built)
+  result = dir / "template.sqlite"
+  doAssert store.backupTo(result), "could not snapshot " & built
+  # Nothing has opened the snapshot, so nothing can have left a log beside
+  # it for a copy of the file alone to miss. This says so rather than
+  # assuming it.
+  for suffix in ["-wal", "-shm"]:
+    doAssert not fileExists(result & suffix),
+      "the template snapshot has a " & suffix & " file"
+
 var localStoreTemplate = ""
-  ## The one store `buildLocalStoreOnce` wrote, for `buildLocalStore` to copy.
+  ## The file `buildLocalStoreTemplate` returned, for `buildLocalStore`.
 
 proc buildLocalStore(dir, path: string): ObservationStore =
   ## A fresh copy of the local store at ``path``, opened.
@@ -271,16 +298,7 @@ proc buildLocalStore(dir, path: string): ObservationStore =
   if localStoreTemplate.len == 0:
     let templateDir = scratchDir("template")
     addExitProc(proc () = removeDir(templateDir))
-    let templatePath = templateDir / "local.sqlite"
-    discard buildLocalStoreOnce(templateDir, templatePath)
-    localStoreTemplate = templatePath
-  # A write-ahead log still beside the template would hold rows the main
-  # file does not, and a copy of the main file alone would silently lose
-  # them. Every connection that wrote the template has exited, which checks
-  # the log in and removes it; this says so rather than assuming it.
-  for suffix in ["-wal", "-shm"]:
-    doAssert not fileExists(localStoreTemplate & suffix),
-      "the template store still has a " & suffix & " file"
+    localStoreTemplate = buildLocalStoreTemplate(templateDir)
   copyFile(localStoreTemplate, path)
   result = openObservationStore(path)
   doAssert result.captureEnabled, result.report
@@ -981,3 +999,69 @@ create table ext_m16x_rowidless (
     check exportObservationStore(local, dir / "none.sqlite",
       rpNone).outcome == xoExported
     check fileHolds(dir / "none.sqlite", secretAbsolutePath)
+
+  # -------------------------------------------------------------------
+  test "the fixture's template is whole under a SQLite that keeps its WAL":
+    # THE FIXTURE ITSELF, ON A HOST WHOSE `sqlite3` IS NOT THIS ONE'S.
+    # Apple's `/usr/bin/sqlite3` leaves `-wal` beside a WAL database after
+    # its last connection closes, and every case in this file then failed
+    # inside the fixture before it had asserted anything. The condition is
+    # reproduced here, on any POSIX host, by a `sqlite3` on PATH that runs
+    # the REAL tool with three of SQLite's own documented switches set
+    # first: `persist_wal` keeps both sidecars
+    # (https://sqlite.org/c3ref/c_fcntl_begin_atomic_write.html#sqlitefcntlpersistwal),
+    # and `no_ckpt_on_close`
+    # (https://sqlite.org/c3ref/c_dbconfig_defensive.html#sqlitedbconfignockptonclose)
+    # with `wal_autocheckpoint = 0` leaves the committed rows in the log
+    # and not in the main file. That is the worst case of the same
+    # condition: the main file copied alone holds an empty store.
+    #
+    # It is a WRAPPER, not a fake: the arguments, input, output and exit
+    # status are the real tool's, and the three settings are switched on
+    # with stdout discarded so their echoes cannot reach a caller.
+    when defined(windows):
+      skip()  # a `#!/bin/sh` wrapper cannot stand in for `sqlite3.exe`
+    else:
+      let dir = scratchDir("keptwal")
+      defer: removeDir(dir)
+      let realSqlite = findExe(sqliteTool)
+      require realSqlite.len > 0
+      let tools = dir / "tools"
+      createDir(tools)
+      let wrapper = tools / sqliteTool
+      writeFile(wrapper, "#!/bin/sh\n" &
+        "{ printf '%s\\n' '.output /dev/null' '.filectrl persist_wal 1' " &
+        "'.dbconfig no_ckpt_on_close on' 'pragma wal_autocheckpoint = 0;' " &
+        "'.output'; cat; } | " & quoteShell(realSqlite) & " \"$@\"\n")
+      setFilePermissions(wrapper, {fpUserRead, fpUserWrite, fpUserExec})
+      let savedPath = getEnv("PATH")
+      defer: putEnv("PATH", savedPath)
+      putEnv("PATH", tools & PathSep & savedPath)
+      require findExe(sqliteTool) == wrapper
+
+      let templateDir = dir / "template"
+      createDir(templateDir)
+      let copyable = buildLocalStoreTemplate(templateDir)
+      let built = templateDir / "built.sqlite"
+
+      # POSITIVE CONTROLS: the condition really holds. The sidecars are
+      # there, and the main file copied alone has lost rows. Without these
+      # a wrapper that quietly stopped working would turn this case green
+      # against the very fixture it exists to catch.
+      check fileExists(built & "-wal")
+      check fileExists(built & "-shm")
+      let mainOnly = dir / "main-only.sqlite"
+      copyFile(built, mainOnly)
+      check rowCounts(mainOnly) != rowCounts(built)
+
+      # THE TEMPLATE IS COMPLETE AND INDEPENDENT: a copy of that one file,
+      # with no sidecar beside it, holds what the built store holds, row
+      # for row and cell for cell, and opens as a working store.
+      for suffix in ["-wal", "-shm"]:
+        check not fileExists(copyable & suffix)
+      let copy = dir / "copy.sqlite"
+      copyFile(copyable, copy)
+      check rowCounts(copy) == rowCounts(built)
+      check "executions=5" in rowCounts(copy)
+      check canonicalDigest(copy) == canonicalDigest(built)
+      check openObservationStore(copy).captureEnabled

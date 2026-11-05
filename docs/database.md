@@ -399,6 +399,30 @@ on every invocation, no two rows would ever pool, and the aggregates would still
 carry a hardware dimension, so nothing would look wrong. That failure has no
 symptom at the point of use, which is why it is a refusal.
 
+### Explicit private endpoints on POSIX
+
+An invocation that owns its own temporary daemon can select
+`RUNQUOTA_ENDPOINT_SCOPE=private`. Set it for **both** the daemon and its
+clients, and give them the same absolute socket path (`runquotad --socket`
+and `RUNQUOTA_SOCKET`). Create a unique private directory for the invocation.
+The directory must belong to its effective uid with mode `0700`; the socket
+is created and verified as `0600`. Installed `runquota` accounts, and the
+host owner/group overrides, do not change this explicit private policy.
+The listening line identifies the endpoint as private.
+
+Absent this selection, or with `RUNQUOTA_ENDPOINT_SCOPE=host`, the existing
+host policy applies. Unknown values are refused. Private selection cannot
+use the implicit default endpoint or a path inside the canonical host
+rendezvous directory. It refuses existing endpoint objects on bind, and wrong
+owner, modes or symbolic links on attach. Shutdown removes only the socket
+inode the listener created.
+
+This capability does not discover services or authorize bypassing them. Use
+the configured host service when one governs the invocation; a trust or access
+refusal from that service must not trigger a competing private daemon. The
+launcher owns the private daemon's lifetime and must stop it when the invocation
+ends. Windows named-pipe discovery and daemon lifetime are unchanged.
+
 ### On Windows: the owner and the DACL
 
 Windows has no mode bits to read -- the kernel checks an object's **owner** and
@@ -963,6 +987,20 @@ the policy activated** and a per-category count, so a reader can tell "this
 policy does not redact branches" from "it does, and there were none". A store
 with no manifest has never been exported, which is a third state and must not
 read as either of the others.
+
+**The tests hold on any `sqlite3` build, Apple's included.** Whether closing
+the last connection checks the write-ahead log in and deletes it is the
+build's choice and not SQLite's contract: Apple's `/usr/bin/sqlite3` keeps the
+`-wal` file, and a build can skip the closing checkpoint altogether
+([`SQLITE_FCNTL_PERSIST_WAL`](https://sqlite.org/c3ref/c_fcntl_begin_atomic_write.html#sqlitefcntlpersistwal),
+[`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`](https://sqlite.org/c3ref/c_dbconfig_defensive.html#sqlitedbconfignockptonclose)).
+A test that reuses a built store therefore copies a `backupTo` snapshot of it,
+never the store's main file, and does not assert that a log is gone.
+`tests/unit/t_observation_store_export.nim` builds its local store once per
+run this way, and its last case rebuilds that template under a `sqlite3` that
+keeps the log and leaves every row in it — the condition in which a copy of
+the main file alone holds an empty store — and requires the template to equal
+the built store row for row.
 
 ## State-boundary requirements
 

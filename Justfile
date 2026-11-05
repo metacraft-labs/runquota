@@ -154,3 +154,8 @@ serve-docs:
 
 open-docs *args:
     just -f docs/book-isonim/Justfile --working-directory docs/book-isonim open-docs {{args}}
+
+# Compile each workflow-selected engine's real reader against the shipping lock.
+# Needs an adjacent Reprobuild Git checkout containing the selected revisions.
+test-ci-engine-lock:
+    python3 tests/test_ci_engine_reads_committed_lock.py

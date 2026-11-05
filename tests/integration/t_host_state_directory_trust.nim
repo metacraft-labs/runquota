@@ -37,6 +37,8 @@
 ## daemon accepts. The rule is `docs/database.md` §"Provisioning the host-wide
 ## state directory and the rendezvous".
 
+import private_broker_owner
+
 when defined(windows):
   import std/[os, osproc, streams, strutils, unittest]
 
@@ -124,8 +126,7 @@ when defined(windows):
     # EXACTLY THREE LINES, as on POSIX: a refusal that spilled onto a fourth
     # would leave every reader of the third misreading.
     var lines: seq[string] = @[]
-    for _ in 0 ..< 3:
-      lines.add(process.outputStream.readLine())
+    lines = readRequiredStartupLines(process, 3, "t_host_state_directory_trust")
     DaemonHandle(process: process, startupLines: lines)
 
   proc stop(handle: var DaemonHandle) =
@@ -152,6 +153,8 @@ when defined(windows):
 
   suite "host_state_directory_trust":
     test "a state directory this daemon owns and nobody else can write is ACCEPTED":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## THE PAIRED ACCEPTANCE, built the way the runbook builds it: the
       ## provisioning command the daemon itself prints, run through cmd.exe
       ## verbatim. Without this a build that refused every directory would
@@ -175,6 +178,8 @@ when defined(windows):
         daemon.stop()
 
     test "a WORLD-WRITABLE state directory is REFUSED, naming path and mode":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## The Windows "world-writable" is an ACE, and this one is not
       ## invented: it is what `C:\ProgramData` hands every directory created
       ## under it, so a bare `mkdir C:\ProgramData\runquota` -- what this
@@ -209,6 +214,8 @@ when defined(windows):
         daemon.stop()
 
     test "the refusal is the SAME on a second start":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       let root = scratchDir("hstwice")
       defer: removeFixture(root)
       let state = root / "state"
@@ -229,6 +236,8 @@ when defined(windows):
         second.stop()
 
     test "the icacls repair the refusal prints makes the directory ACCEPTED":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## WINDOWS ONLY, because only the Windows refusal prints a repair. A
       ## repair line that did not in fact produce an acceptable DACL would
       ## send an operator in a circle, so it is run -- verbatim, as printed --
@@ -261,6 +270,8 @@ when defined(windows):
         accepted.stop()
 
     test "a state directory owned by ANOTHER uid is REFUSED as an ownership problem":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## The DACL cannot be what refuses this one: `foreignOwnedDirectory`
       ## only returns a directory nobody but its owner (and the principals
       ## that already control the host) can write. If the ownership check
@@ -292,6 +303,8 @@ when defined(windows):
           daemon.stop()
 
     test "a directory that is not there yet is reported by the PROVISIONING refusal, not this one":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       let root = scratchDir("hsmissing")
       defer: removeFixture(root)
       let absent = root / "absent"
@@ -313,8 +326,10 @@ when defined(windows):
 else:
   import std/[os, osproc, posix, streams, strutils, unittest]
 
+  from runquota_ipc import endpointDirectoryPermissions
   import runquota_observation_store
   import daemon_binary
+  import daemon_endpoint
 
   proc scratchDir(name: string): string =
     # Short on purpose: Nim's `Sockaddr_un_path_length` is 92 on macOS and
@@ -372,8 +387,13 @@ else:
     process: Process
     startupLines: seq[string]
 
-  proc startDaemon(socketPath, observationDb, identityFile: string):
+  proc startDaemon(fixturePolicy: var PrivateBrokerCallerPolicyBinding;
+                   socketPath, observationDb, identityFile: string):
       DaemonHandle =
+    let endpointDir = socketPath.parentDir
+    if not dirExists(endpointDir): createDir(endpointDir)
+    fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(endpointDir))
+    setFilePermissions(endpointDir, endpointDirectoryPermissions())
     let process = startProcess(daemonPath(),
       args = ["--socket", socketPath, "--observation-db", observationDb,
               "--host-identity-file", identityFile],
@@ -386,8 +406,7 @@ else:
     # fourth line would leave every reader of the third one misreading or
     # blocked.
     var lines: seq[string] = @[]
-    for _ in 0 ..< 3:
-      lines.add(process.outputStream.readLine())
+    lines = readRequiredStartupLines(process, 3, "t_host_state_directory_trust")
     DaemonHandle(process: process, startupLines: lines)
 
   proc stop(handle: var DaemonHandle) =
@@ -402,6 +421,8 @@ else:
 
   suite "host_state_directory_trust":
     test "a state directory this daemon owns and nobody else can write is ACCEPTED":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## THE PAIRED ACCEPTANCE. Without it a build that refused every
       ## directory would satisfy both refusals below.
       let root = scratchDir("hsok")
@@ -410,7 +431,9 @@ else:
       createDir(state)
       check chmod(state.cstring, Mode(0o700)) == 0
       check ownerOf(state) == int64(getuid())
-      var daemon = startDaemon(root / "ep" / "d.sock", root / "obs.sqlite",
+      var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy1)
+      var daemon = startDaemon(endpointPolicy1, root / "ep" / "d.sock", root / "obs.sqlite",
         state / "host-id")
       try:
         check daemon.startupLines[1].contains("capture enabled")
@@ -420,6 +443,8 @@ else:
         daemon.stop()
 
     test "a WORLD-WRITABLE state directory is REFUSED, naming path and mode":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## `sudo mkdir -p` with a lax umask, or an operator reaching for
       ## `chmod 777` when the daemon could not write. Any local user can
       ## replace `host-id` in such a directory, and replacing `host-id` is
@@ -430,7 +455,9 @@ else:
       createDir(state)
       check chmod(state.cstring, Mode(0o777)) == 0
       check modeOf(state) == 0o777
-      var daemon = startDaemon(root / "ep" / "d.sock", root / "obs.sqlite",
+      var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy2)
+      var daemon = startDaemon(endpointPolicy2, root / "ep" / "d.sock", root / "obs.sqlite",
         state / "host-id")
       try:
         check daemon.startupLines[1].contains("capture enabled")
@@ -453,6 +480,8 @@ else:
         daemon.stop()
 
     test "the refusal is the SAME on a second start":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## REPETITION, against a real process. The defect class this whole
       ## check belongs to is invisible within one invocation and only shows
       ## up across two: the pre-M13c code answered an unusable directory by
@@ -462,11 +491,15 @@ else:
       let state = root / "state"
       createDir(state)
       check chmod(state.cstring, Mode(0o777)) == 0
-      var first = startDaemon(root / "ep" / "d1.sock", root / "obs.sqlite",
+      var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy3)
+      var first = startDaemon(endpointPolicy3, root / "ep" / "d1.sock", root / "obs.sqlite",
         state / "host-id")
       let firstReport = first.startupLines[2]
       first.stop()
-      var second = startDaemon(root / "ep" / "d2.sock", root / "obs.sqlite",
+      var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy4)
+      var second = startDaemon(endpointPolicy4, root / "ep" / "d2.sock", root / "obs.sqlite",
         state / "host-id")
       try:
         check second.startupLines[2] == firstReport
@@ -475,6 +508,8 @@ else:
         second.stop()
 
     test "a state directory owned by ANOTHER uid is REFUSED as an ownership problem":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## The mode cannot be what refuses this one: the directory is `0755`,
       ## which is not group- or world-writable. If the ownership check were
       ## removed this path would be ACCEPTED, and the daemon would mint into
@@ -486,7 +521,9 @@ else:
         check ownerOf(foreign) != int64(getuid())
         let root = scratchDir("hsforeign")
         defer: removeDir(root)
-        var daemon = startDaemon(root / "ep" / "d.sock", root / "obs.sqlite",
+        var endpointPolicy5: PrivateBrokerCallerPolicyBinding
+        defer: restorePrivateBrokerPolicy(endpointPolicy5)
+        var daemon = startDaemon(endpointPolicy5, root / "ep" / "d.sock", root / "obs.sqlite",
           foreign / "rq-m13d-host-id")
         try:
           let report = daemon.startupLines[2]
@@ -503,12 +540,16 @@ else:
           daemon.stop()
 
     test "a directory that is not there yet is reported by the PROVISIONING refusal, not this one":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## Two reports for one condition would be one report too many, and the
       ## provisioning refusal is the useful one because it names the command.
       ## This clause pins which of the two speaks.
       let root = scratchDir("hsmissing")
       defer: removeDir(root)
-      var daemon = startDaemon(root / "ep" / "d.sock", root / "obs.sqlite",
+      var endpointPolicy6: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy6)
+      var daemon = startDaemon(endpointPolicy6, root / "ep" / "d.sock", root / "obs.sqlite",
         root / "absent" / "host-id")
       try:
         let report = daemon.startupLines[2]

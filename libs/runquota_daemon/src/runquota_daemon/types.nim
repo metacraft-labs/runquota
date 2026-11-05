@@ -231,6 +231,12 @@ type
   RunQuotaDaemon* = object
     config*: DaemonConfig
     state*: DaemonState
+    imageDigest*: string
+      ## `imageDigestOf` this daemon's own executable, taken on a thread
+      ## `serve` starts before an installer can rename the file aside, and
+      ## filled in by the first `RetireDaemon` request. Compared
+      ## with the digest a `RetireDaemon` request names. Empty when the image
+      ## could not be read, which proves nothing either way.
     nextSessionId*: uint64
     nextLeaseId*: uint64
     nextQueueOrder*: uint64

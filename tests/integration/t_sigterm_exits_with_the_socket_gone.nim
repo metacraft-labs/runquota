@@ -68,6 +68,7 @@
 ## unless the accept loop accepted the connection and a worker answered it,
 ## and both of those are downstream of the arming.
 
+import private_broker_owner
 import std/[monotimes, os, osproc, strutils, times, unittest]
 
 when defined(posix):
@@ -95,9 +96,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -260,6 +262,8 @@ proc report(label: string; ending: Ending) =
 suite "sigterm_exits_with_the_socket_gone":
 
   test "a TERMed daemon exits after its socket file has been unlinked":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # POSIX ONLY, BY DESIGN: there is no SIGTERM on Windows, and no socket
     # file to unlink either -- the Windows endpoint is a named pipe, reached
     # by name rather than through the filesystem, so the hazard has no form
@@ -267,7 +271,9 @@ suite "sigterm_exits_with_the_socket_gone":
     # THE SAME AS HAVING NO STOP" in `runquota_daemon`.
     when defined(posix):
       let root = scratchRoot("sock")
-      let endpointDir = rendezvousDir(root)
+      var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy1)
+      let endpointDir = rendezvousDir(root, endpointPolicy1)
       let socketPath = endpointDir / "d.sock"
       let state = hostStateDir(root)
       require fileExists(daemonPath())
@@ -302,9 +308,13 @@ suite "sigterm_exits_with_the_socket_gone":
       skip()
 
   test "a TERMed daemon exits after its whole scratch tree has been removed":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     when defined(posix):
       let root = scratchRoot("tree")
-      let endpointDir = rendezvousDir(root)
+      var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+      defer: restorePrivateBrokerPolicy(endpointPolicy2)
+      let endpointDir = rendezvousDir(root, endpointPolicy2)
       let socketPath = endpointDir / "d.sock"
       let state = hostStateDir(root)
       require fileExists(daemonPath())

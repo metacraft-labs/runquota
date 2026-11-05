@@ -13,7 +13,10 @@
 ## name, probed with ``WaitNamedPipeW`` so that no pipe instance is consumed
 ## by asking.
 
+import std/[osproc, streams, strutils]
+
 import runquota_ipc
+import runquota_process
 
 when defined(windows):
   import std/[oserrors, winlean]
@@ -41,3 +44,36 @@ else:
     ## symlink planted there is not mistaken for the daemon's socket.
     var info: Stat
     lstat(socketPath.cstring, info) == 0 and S_ISSOCK(info.st_mode)
+
+proc readStartupLines[P](output: Stream; process: var P; count: Positive;
+                         context: string): seq[string] =
+  ## Only real streams and real nonblocking process-status operations enter
+  ## this loop. Each launcher retains its own descriptor/handle ownership.
+  for _ in 0 ..< count:
+    try:
+      result.add(output.readLine())
+    except IOError as error:
+      when P is Process:
+        let status = osproc.peekExitCode(process)
+      elif P is LaunchedProcess:
+        let status =
+          if runquota_process.pollCompletion(process): process.completion.exitCode
+          else: -1
+      else:
+        {.error: "startup reader requires an actual supported process handle".}
+      raise newException(IOError, context & ": startup output ended after " &
+        $result.len & " of " & $count & " required lines; child exit=" &
+        $status & "; original error: " & error.msg &
+        "\nactual startup prefix:\n" & result.join("\n"))
+
+proc readRequiredStartupLines*(process: Process; count: Positive;
+                               context: string): seq[string] =
+  ## Preserve the existing std/osproc startup protocol and exact line count.
+  var actual = process
+  readStartupLines(process.outputStream, actual, count, context)
+
+proc readRequiredStartupLines*(process: var LaunchedProcess; output: Stream;
+                               count: Positive; context: string): seq[string] =
+  ## `output` owns the real pipe detached from this launcher's capture state;
+  ## pollCompletion must not drain or close that same descriptor a second time.
+  readStartupLines(output, process, count, context)

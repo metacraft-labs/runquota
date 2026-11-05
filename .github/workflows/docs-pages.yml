@@ -12,7 +12,8 @@ name: Docs — GitHub Pages
 
 on:
   push:
-    branches: [dev, stable, agents]
+    # Agent integration and promotion branches run their gates locally.
+    branches: [dev, stable]
     paths:
       - "docs/book-isonim/**"
       - ".github/workflows/docs-pages.yml"

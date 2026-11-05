@@ -69,6 +69,12 @@ type
     case kind*: EndpointKind
     of endpointUnixSocket:
       socket*: Socket
+      boundDevice*: uint64
+      boundInode*: uint64
+        ## The socket inode this listener created, taken right after `bind`.
+        ## `close` unlinks the path only while it still names THAT inode, so
+        ## a listener never removes a socket another daemon has since bound
+        ## at the same path. Zero when it could not be read.
     of endpointNamedPipe:
       # Windows: name we listen on; each accept creates a fresh pipe instance.
       # The currently pre-created (but not yet ConnectClient-returned) instance

@@ -1,6 +1,7 @@
 ## Real daemon and supervisor processes; no mocks. A startup handshake keeps
 ## loader scheduling outside the lease-operation/exit deadline. The helper
 ## performs every connection and lease transition after the parent releases it.
+import private_broker_owner
 import std/[envvars, json, os, osproc, strutils, unittest]
 
 when defined(posix):
@@ -243,12 +244,10 @@ template withDaemon(body: untyped) =
   if dirExists(socketDir):
     removeScratchRoot(socketDir)
   createDir(socketDir)
-  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-  # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-  # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-  # where it does not -- so a fixture hardcoding either one is green on one
-  # kind of host and red on the other. Fixture only; the modes themselves
-  # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+  let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+  defer: restorePrivateBrokerPolicy(endpointPolicy)
+  # Use the declared fixture policy for this endpoint. Private broker cases
+  # bind its independently inspected GID before this mode and all participants.
   setFilePermissions(socketDir, endpointDirectoryPermissions())
   check fileExists(daemonPath())
   let process = startProcess(
@@ -271,6 +270,8 @@ template withDaemon(body: untyped) =
 
 suite "e2e_runquota_client_exit_releases_lease":
   test "explicit release still clears the lease before session close":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     withDaemon:
       var client = connectDefault()
       var session = client.registerSession("e2e-crash-explicit", "0.1.0")
@@ -283,6 +284,8 @@ suite "e2e_runquota_client_exit_releases_lease":
       check status.totalGranted == 1'u64
 
   test "normal supervisor exit releases granted-but-not-started lease":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     withDaemon:
       var helper = spawnHelper("granted-normal", socketDir)
       check helper.waitForExit(3000) == 0
@@ -292,6 +295,8 @@ suite "e2e_runquota_client_exit_releases_lease":
       check status.totalGranted == 1'u64
 
   test "abnormal supervisor exit also releases granted-but-not-started lease":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     withDaemon:
       var helper = spawnHelper("granted-abnormal", socketDir)
       check helper.waitForExit(3000) == 31
@@ -301,6 +306,8 @@ suite "e2e_runquota_client_exit_releases_lease":
       check status.totalGranted == 1'u64
 
   test "forced supervisor kill releases granted-but-not-started lease":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     withDaemon:
       let readyPath = socketDir / "granted.ready"
       var helper = spawnHelper("granted-kill", socketDir, [readyPath])
@@ -325,6 +332,8 @@ suite "e2e_runquota_client_exit_releases_lease":
   # killed build. What is asserted instead is the whole lifecycle: granted,
   # lost rather than finished, and released by the reaper.
   test "starting lease is lost, never finished, and released on supervisor exit":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     withDaemon:
       var helper = spawnHelper("starting-abnormal", socketDir)
       check helper.waitForExit(3000) == 32
@@ -335,6 +344,8 @@ suite "e2e_runquota_client_exit_releases_lease":
       check lostLeasesReaped() == 1
 
   test "forced supervisor kill loses a starting lease and releases it":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     withDaemon:
       let readyPath = socketDir / "starting.ready"
       var helper = spawnHelper("starting-kill", socketDir, [readyPath])
@@ -353,6 +364,8 @@ suite "e2e_runquota_client_exit_releases_lease":
         helper.close()
 
   test "running lease becomes supervisor-lost without LeaseFinished inference":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     withDaemon:
       let childPidPath = socketDir / "child.pid"
       var helper = spawnHelper("running-abnormal", socketDir, [childPidPath])
@@ -367,6 +380,8 @@ suite "e2e_runquota_client_exit_releases_lease":
         terminatePidFile(childPidPath)
 
   test "forced supervisor kill marks running lease supervisor-lost without LeaseFinished inference":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     withDaemon:
       let readyPath = socketDir / "running.ready"
       let childPidPath = socketDir / "child-kill.pid"

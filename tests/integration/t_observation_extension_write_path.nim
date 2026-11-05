@@ -25,6 +25,7 @@
 ## disagrees with its column count, a storage class the daemon has no name
 ## for, a row for an extension that was never declared.
 
+import private_broker_owner
 import std/[json, options, os, osproc, streams, strutils, times,
     unittest]
 
@@ -60,9 +61,10 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -83,8 +85,7 @@ proc startDaemon(socketPath, identityFile: string): DaemonHandle =
   for _ in 0 ..< 400:
     if endpointIsBound(socketPath): break
     sleep(25)
-  for _ in 0 ..< 3:
-    discard process.outputStream.readLine()
+  discard readRequiredStartupLines(process, 3, "t_observation_extension_write_path")
   DaemonHandle(process: process)
 
 proc stop(handle: var DaemonHandle) =
@@ -188,9 +189,13 @@ proc waitForProbeRows(path: string; atLeast: int64): int64 =
 suite "observation_extension_write_path":
 
   test "a client declares its extension and attaches a row to its execution":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("ok")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let socketPath = rendezvousDir(root, endpointPolicy1) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     check fileExists(daemonPath())
@@ -228,6 +233,8 @@ suite "observation_extension_write_path":
       daemon.stop()
 
   test "a row naming another session's lease is refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE FIXTURE A WELL-BEHAVED CLIENT CANNOT PRODUCE. One host-wide
     # daemon holds every user's executions; a row accepted here would
     # attach one client's facts to another's execution, and the store
@@ -238,7 +245,9 @@ suite "observation_extension_write_path":
     # session it named" passes every other arm and fails this one.
     let root = scratchRoot("own")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let socketPath = rendezvousDir(root, endpointPolicy2) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -275,6 +284,8 @@ suite "observation_extension_write_path":
       daemon.stop()
 
   test "a row from a connection that never registered the session is refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE STRONGER FORM OF THE OWNERSHIP VIOLATION, and the one the
     # intruder arm below cannot reach. There both sessions live on ONE
     # connection, so "does this connection own the session it named" is
@@ -286,7 +297,9 @@ suite "observation_extension_write_path":
     # one.
     let root = scratchRoot("conn")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socketPath = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -322,6 +335,8 @@ suite "observation_extension_write_path":
       daemon.stop()
 
   test "a row for a lease with no recorded execution is refused, not fatal":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE LATE ROW, AND THE ONE ARM THAT FOUND A LIVE DEFECT. A client
     # sends its rows when the facts are complete, which for a build system
     # is long after the lease finished -- so the daemon remembers a BOUNDED
@@ -338,7 +353,9 @@ suite "observation_extension_write_path":
     # one-way message it is never told was rejected.
     let root = scratchRoot("late")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy4)
+    let socketPath = rendezvousDir(root, endpointPolicy4) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -377,9 +394,13 @@ suite "observation_extension_write_path":
       daemon.stop()
 
   test "a row for an extension nobody declared is refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("undecl")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy5: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy5)
+    let socketPath = rendezvousDir(root, endpointPolicy5) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -415,6 +436,8 @@ suite "observation_extension_write_path":
       daemon.stop()
 
   test "a declaration from a connection that never registered the session is refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE DECLARE-SIDE OWNERSHIP VIOLATION, AND IT WAS THE ONE VACUOUS
     # CLAUSE IN THIS FILE. Removing ``declareClientExtension``'s
     # ``ownsSession`` check left every other arm here green, for exactly
@@ -429,7 +452,9 @@ suite "observation_extension_write_path":
     # running one.
     let root = scratchRoot("declconn")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy6: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy6)
+    let socketPath = rendezvousDir(root, endpointPolicy6) / "d.sock"
     let state = hostStateDir(root)
     putEnv("RUNQUOTA_SOCKET", socketPath)
     var daemon = startDaemon(socketPath, state / "host-id")
@@ -460,9 +485,13 @@ suite "observation_extension_write_path":
       daemon.stop()
 
   test "a declaration naming a version its ladder cannot reach is refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("ver")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy7: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy7)
+    let socketPath = rendezvousDir(root, endpointPolicy7) / "d.sock"
     let state = hostStateDir(root)
     putEnv("RUNQUOTA_SOCKET", socketPath)
     var daemon = startDaemon(socketPath, state / "host-id")

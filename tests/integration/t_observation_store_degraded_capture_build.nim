@@ -12,6 +12,8 @@
 ## really does produce spine rows. That is what makes the corrupt arm's
 ## success a statement about degradation rather than about dead code.
 
+import daemon_endpoint
+import private_broker_owner
 import std/[nativesockets, options, os, osproc, streams, strutils, unittest]
 
 # `readToEnd`, not `streams.readAll`: on Windows `readAll` stops at the
@@ -34,13 +36,9 @@ proc scratchDir(name: string): string =
   result = getTempDir() / ("rq-obs-" & $getCurrentProcessId() & "-" & name)
   removeDir(result)
   createDir(result)
-  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-  # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-  # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-  # where it does not -- so a fixture hardcoding either one is green on one
-  # kind of host and red on the other. Fixture only; the modes themselves
-  # are asserted in tests/unit/t_shared_endpoint_rules.nim.
-  setFilePermissions(result, endpointDirectoryPermissions())
+  # Generic scratch storage starts owner-private. Broker cases inspect this
+  # actual endpoint GID and select the declared rendezvous mode afterward.
+  setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
 
 proc waitForSocket(socketPath: string) =
   for _ in 0 ..< 200:
@@ -89,8 +87,7 @@ proc startDaemon(socketPath, observationDb, identityFile: string):
   # given, and then goes quiet: the endpoint, the observation-store report,
   # and the host-identity/hardware-profile report. Reading precisely those
   # three cannot deadlock against a daemon that never writes again.
-  for _ in 0 ..< 3:
-    lines.add(process.outputStream.readLine())
+  lines = readRequiredStartupLines(process, 3, "t_observation_store_degraded_capture_build")
   DaemonHandle(process: process, startupLines: lines)
 
 proc stop(handle: var DaemonHandle) =
@@ -110,7 +107,12 @@ proc waitForExecutionRows(path: string; atLeast: int): int =
 
 suite "observation_store_degraded_capture_build":
   test "a build over a healthy store succeeds and is recorded":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let dir = scratchDir("h")
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(dir, endpointDirectoryPermissions())
     defer: removeScratchRoot(dir)
     let socketPath = dir / "runquotad.sock"
     let dbPath = dir / "observations.sqlite"
@@ -213,7 +215,12 @@ suite "observation_store_degraded_capture_build":
       restarted.stop()
 
   test "a build over a corrupt store still succeeds, and capture is off":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let dir = scratchDir("c")
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(dir, endpointDirectoryPermissions())
     defer: removeScratchRoot(dir)
     let socketPath = dir / "runquotad.sock"
     let dbPath = dir / "observations.sqlite"

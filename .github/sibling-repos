@@ -8,15 +8,22 @@
 # job compiles `repro.nim`; the nix jobs never do (their `sqlite3` tool is
 # `pkgs.sqlite` in the dev shell).
 #
-# Pinned to an exact revision (published reprobuild-packages 4e2fd1d) rather than
-# `=dev`, which clone-siblings warns makes the build not reproducible. The
+# Pinned to an exact revision (reprobuild-packages 15ceea6, published on its
+# `agents` branch; it declares the version of sqlite3's Windows archives, which
+# `uses: "sqlite3 >=3"` needs) rather than `=dev`, which clone-siblings warns
+# makes the build not reproducible. The
 # catalog is also locked by the flake input used by the owning Nix shell.
 # Keep this non-Nix CI pin aligned with that source constructor.
-reprobuild-packages=4e2fd1dcabf8ae8eac28a2d27c3160233589c1e6
+reprobuild-packages=15ceea674d3e83b8fd1a3032e4f01569c04a8fa5
 
 # RunQuota's published stats table requires this source-library interface.
 # Explicitly override the carried workspace pin until it includes the interface.
-nim-shm-lease!=665e128df7ed841af4c8ca5e07c172de5fdf7ee6
-# Transitive source dependency of shm_lease/obsring. RunQuota has no carried
-# workspace lock yet, so this release uses the exact validated source revision.
-nim-shm-queue=02f442ac12ce2587d9c053c527041097af38609f
+# These two siblings must be the revisions repro.lock records for them
+# (`deps`): the repro engine refuses a checkout whose HEAD differs from the
+# revision the consumer lock expects ("cross-repo producer ... source revision
+# mismatch"). 22e3100 is the nim-shm-lease `agents` merge that contains the
+# earlier 665e128 interface revision (identical tree); flake.lock agrees.
+nim-shm-lease!=22e3100cdb4fbc374689ddac55b4b32c90654140
+# Transitive source dependency of shm_lease/obsring, at the revision repro.lock
+# and flake.lock record (84fd76b descends from the previously pinned 02f442a).
+nim-shm-queue=84fd76b174d4868e703ba3d599668ee340e0b6ea

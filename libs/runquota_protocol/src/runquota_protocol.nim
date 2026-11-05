@@ -7,7 +7,7 @@ export protocolTypes
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 2'u16
-const RqspProtocolMinor* = 1'u16
+const RqspProtocolMinor* = 2'u16
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -42,6 +42,14 @@ const RqspProtocolMinor* = 1'u16
   ## daemon will understand.
 const PoolDeclarationsMinor* = 1'u16
   ## The first daemon minor that understands `DeclarePools`.
+const RetirementMinor* = 2'u16
+  ## The first daemon minor that understands `RetireDaemon`. MINOR 2 ANNOUNCES
+  ## IT, additively and for the same reason minor 1 announced `DeclarePools`:
+  ## an older daemon closes the connection on a message kind it does not know,
+  ## so a client reads the minor from `HelloOk` before it asks. A daemon below
+  ## this minor cannot be asked to make way at all; see
+  ## reprobuild-specs/RunQuota-Host-Configuration.md, "A daemon from another
+  ## build makes way".
 const RqspHeaderLen* = 24'u16
 const MaxCommandStatsIdBytes* = 64
 const FrameFlagRequest* = 0x0001'u16
@@ -1682,3 +1690,54 @@ proc decodeHostConfigReloaded*(payload: string;
   if r.remaining != 0: return false
   msg = decoded
   true
+
+proc encodeRetireDaemon*(msg: RetireDaemonMessage): string =
+  var w = writer()
+  w.writeString(msg.expectedImageDigest)
+  w.writeString(msg.reason)
+  w.data
+
+proc decodeRetireDaemon*(payload: string; msg: var RetireDaemonMessage): bool =
+  var r = reader(payload)
+  var decoded: RetireDaemonMessage
+  if not r.readString(decoded.expectedImageDigest): return false
+  if not r.readString(decoded.reason): return false
+  if r.remaining != 0: return false
+  msg = decoded
+  true
+
+proc encodeDaemonRetirement*(msg: DaemonRetirementMessage): string =
+  var w = writer()
+  w.writeU8(uint8(ord(msg.decision)))
+  w.writeU64(msg.daemonProcessId)
+  w.writeString(msg.daemonImageDigest)
+  w.writeU32(msg.otherConnections)
+  w.writeString(msg.detail)
+  w.data
+
+proc decodeDaemonRetirement*(payload: string;
+                             msg: var DaemonRetirementMessage): bool =
+  ## Refuses a decision ordinal this build does not know rather than reading
+  ## it as one it does: a client that mistook an unknown answer for
+  ## `retirementRetiring` would wait for an exit that is not coming.
+  var r = reader(payload)
+  var decoded: DaemonRetirementMessage
+  var decision: uint8
+  if not r.readU8(decision): return false
+  if decision > uint8(ord(high(RetirementDecision))): return false
+  decoded.decision = RetirementDecision(decision)
+  if not r.readU64(decoded.daemonProcessId): return false
+  if not r.readString(decoded.daemonImageDigest): return false
+  if not r.readU32(decoded.otherConnections): return false
+  if not r.readString(decoded.detail): return false
+  if r.remaining != 0: return false
+  msg = decoded
+  true
+
+proc retirementWord*(decision: RetirementDecision): string =
+  ## The decision as an operator reads it in the daemon's log.
+  case decision
+  of retirementRetiring: "retiring"
+  of retirementCurrent: "current"
+  of retirementRefused: "refused"
+  of retirementManaged: "managed"

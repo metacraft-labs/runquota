@@ -7,6 +7,7 @@ import runquota_exec
 import runquota_process
 import runquota_protocol
 import scratch_root
+import private_broker_owner
 
 const FixtureNull = "--fixture-null"
 const FixtureOutput = "--fixture-output"
@@ -163,12 +164,8 @@ proc prepareDir(path: string) =
   if dirExists(path):
     removeDir(path)
   createDir(path)
-  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-  # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-  # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-  # where it does not -- so a fixture hardcoding either one is green on one
-  # kind of host and red on the other. Fixture only; the modes themselves
-  # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+  # Use the declared fixture policy for this endpoint. Private broker cases
+  # bind its independently inspected GID before this mode and all participants.
   setFilePermissions(path, endpointDirectoryPermissions())
 
 proc checkCwdEnvRecord(path, expectedEnv: string) =
@@ -227,12 +224,10 @@ proc runProcessSuite(quick: bool): seq[BenchMetric] =
   if dirExists(socketDir):
     removeScratchRoot(socketDir)
   createDir(socketDir)
-  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-  # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-  # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-  # where it does not -- so a fixture hardcoding either one is green on one
-  # kind of host and red on the other. Fixture only; the modes themselves
-  # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+  let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+  defer: restorePrivateBrokerPolicy(endpointPolicy)
+  # Use the declared fixture policy for this endpoint. Private broker cases
+  # bind its independently inspected GID before this mode and all participants.
   setFilePermissions(socketDir, endpointDirectoryPermissions())
   var daemon = startDaemon(socketPath)
   try:
@@ -386,12 +381,10 @@ proc runIpcSuite(quick: bool): seq[BenchMetric] =
   if dirExists(socketDir):
     removeScratchRoot(socketDir)
   createDir(socketDir)
-  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-  # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-  # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-  # where it does not -- so a fixture hardcoding either one is green on one
-  # kind of host and red on the other. Fixture only; the modes themselves
-  # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+  let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+  defer: restorePrivateBrokerPolicy(endpointPolicy)
+  # Use the declared fixture policy for this endpoint. Private broker cases
+  # bind its independently inspected GID before this mode and all participants.
   setFilePermissions(socketDir, endpointDirectoryPermissions())
   var daemon = startDaemon(socketPath)
   try:

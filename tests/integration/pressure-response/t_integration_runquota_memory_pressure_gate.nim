@@ -1,6 +1,7 @@
 ## Real daemon and SQLite integration; no mocks. The persistence probe opens
 ## the database read-only so polling cannot create the asynchronous writer's
 ## database before its schema and journal are initialized.
+import private_broker_owner
 import std/[os, osproc, streams, strutils, unittest]
 
 import runquota_client
@@ -187,6 +188,8 @@ suite "integration_runquota_memory_pressure_gate":
     check not fileExists(dbPath)
 
   test "real daemon gates memory-heavy work and persists learned estimates":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let socketDir = getTempDir() / ("runquota-m4-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     let pressurePath = socketDir / "pressure.txt"
@@ -194,12 +197,10 @@ suite "integration_runquota_memory_pressure_gate":
     if dirExists(socketDir):
       removeScratchRoot(socketDir)
     createDir(socketDir)
-    # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-    # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-    # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-    # where it does not -- so a fixture hardcoding either one is green on one
-    # kind of host and red on the other. Fixture only; the modes themselves
-    # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    # Use the declared fixture policy for this endpoint. Private broker cases
+    # bind its independently inspected GID before this mode and all participants.
     setFilePermissions(socketDir, endpointDirectoryPermissions())
     writePressure(pressurePath, "low")
     check fileExists(daemonPath())

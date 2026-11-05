@@ -41,6 +41,8 @@
 ## `trustOk` for a named pipe because "there is no directory to own and no
 ## mode to widen". So on Windows every case is reported skipped.
 
+import private_broker_owner
+
 when not defined(posix):
   import std/unittest
 
@@ -56,6 +58,9 @@ else:
 
   import runquota_ipc
   import daemon_binary
+  # The engine exports RUNQUOTA_ENDPOINT_SCOPE=private to every action it runs;
+  # this file asserts host-scope policy, so it must not inherit that.
+  useHostEndpointScope()
 
   proc scratchDir(name: string): string =
     # Short on purpose. Nim's `Sockaddr_un_path_length` is 92 on macOS and
@@ -120,6 +125,8 @@ else:
 
   suite "rendezvous_degradation":
     test "a resolvable group gives a SHARED, group-gated endpoint and says nothing":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       let root = scratchDir("rdvS")
       defer: removeDir(root)
       let dir = root / "ep"
@@ -146,6 +153,8 @@ else:
         daemon.stop()
 
     test "an UNRESOLVABLE group degrades to owner-only, and SAYS so":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       let root = scratchDir("rdv1")
       defer: removeDir(root)
       let dir = root / "ep"
@@ -176,6 +185,8 @@ else:
         daemon.stop()
 
     test "the two daemons differ in every observable the ruling is about":
+      let privateOwner = bindPrivateBrokerOwnerToCaller()
+      defer: restorePrivateBrokerOwner(privateOwner)
       ## Stated as a comparison rather than as two independent expectations,
       ## so an implementation that produced the same endpoint either way --
       ## which is exactly what "silently disable the group check" does --

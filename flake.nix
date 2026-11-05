@@ -10,7 +10,7 @@
     # Interface catalog consumed by the selected reprobuild SDK. Keep this
     # immutable pin independent of an older workspace catalog checkout.
     runquota-package-catalog = {
-      url = "github:metacraft-labs/reprobuild-packages/4e2fd1dcabf8ae8eac28a2d27c3160233589c1e6";
+      url = "github:metacraft-labs/reprobuild-packages/15ceea674d3e83b8fd1a3032e4f01569c04a8fa5";
       flake = false;
     };
 
@@ -198,6 +198,11 @@
               entry = "just lint";
               language = "system";
               pass_filenames = false;
+              # The pure check runs outside the developer shell.
+              extraPackages = [
+                pkgs.just
+                pkgs.nim2
+              ];
             };
           };
           staticHelperGatePath = pkgs.lib.makeBinPath [
@@ -240,6 +245,11 @@
               "$gate_self"
           '';
           shmLeaseSrc = "${inputs.nim-shm-lease}/src";
+          # All native build and lint entrypoints resolve the same pinned sources.
+          buildSourceEnv = {
+            REPROBUILD_PACKAGES_ROOT = inputs.runquota-package-catalog;
+            SHM_LEASE_SRC = shmLeaseSrc;
+          };
           runquota = pkgs.stdenv.mkDerivation {
             pname = "runquota";
             inherit version;
@@ -252,8 +262,7 @@
             # published aggregate table does not compile, and the point of
             # setting it HERE is that the packaged daemon is built from the
             # same sources as the developer's.
-            REPROBUILD_PACKAGES_ROOT = inputs.runquota-package-catalog;
-            SHM_LEASE_SRC = shmLeaseSrc;
+            inherit (buildSourceEnv) REPROBUILD_PACKAGES_ROOT SHM_LEASE_SRC;
 
             nativeBuildInputs = [
               pkgs.bash
@@ -296,7 +305,8 @@
           packages.runquota = runquota;
 
           checks = {
-            inherit pre-commit-check;
+            # Keep the original complete hook, with its native source inputs.
+            pre-commit-check = pre-commit-check.overrideAttrs (_: buildSourceEnv);
             package-build = runquota;
 
             # Both install steps, put through their real module systems and
@@ -446,8 +456,7 @@
               pkgs.rpm
               pkgs.libarchive
             ];
-            REPROBUILD_PACKAGES_ROOT = inputs.runquota-package-catalog;
-            SHM_LEASE_SRC = shmLeaseSrc;
+            inherit (buildSourceEnv) REPROBUILD_PACKAGES_ROOT SHM_LEASE_SRC;
             RELEASE_PACKAGING_SRC = inputs.release-packaging-src;
             RELEASE_NIMCRYPTO_SRC = inputs.release-nimcrypto-src;
             RELEASE_BEARSSL_SRC = inputs.release-bearssl-src;

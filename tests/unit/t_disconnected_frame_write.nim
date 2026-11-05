@@ -5,11 +5,15 @@ import std/[os, osproc, unittest]
 
 when defined(posix):
   import std/[net, nativesockets, posix, monotimes, times, strutils, tempfiles]
+  import private_broker_owner
   import runquota_ipc
   import runquota_client
   import runquota_core
   import runquota_protocol
   import child_watchdog
+  # The engine exports RUNQUOTA_ENDPOINT_SCOPE=private to every action it runs;
+  # this file asserts host-scope policy, so it must not inherit that.
+  useHostEndpointScope()
 
   var msgDontWait {.importc: "MSG_DONTWAIT", header: "<sys/socket.h>".}: cint
 
@@ -57,9 +61,13 @@ when defined(posix):
     0
 
   proc exerciseSilentPeer(mode: string): int =
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = createTempDir("rq-write-", "")
     defer: removeDir(root)
-    setFilePermissions(root, {fpUserRead, fpUserWrite, fpUserExec})
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(root))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(root, endpointDirectoryPermissions())
     let path = root / "s"
     let listener = newSocket(net.AF_UNIX, net.SOCK_STREAM, IPPROTO_NONE)
     defer: listener.close()

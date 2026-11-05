@@ -47,3 +47,9 @@ tests/unit/t_host_state_directory_rules.nim
 # sqlite3, and its Windows arm is the only place the named-pipe owner rule
 # is exercised on this job.
 tests/unit/t_owner_identity.nim
+# The deadlock-test watchdog (`tests/support/child_watchdog`): a real wedged
+# child and grandchild, the grandchild's pid checked against the kernel's own
+# liveness answer. Needs neither a daemon nor sqlite3, and the Windows arm of
+# that helper -- Job Object, parent-pid walk, native command-line inventory --
+# is exercised nowhere else on this job.
+tests/unit/t_child_watchdog.nim

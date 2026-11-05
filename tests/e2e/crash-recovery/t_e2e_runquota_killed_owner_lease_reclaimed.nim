@@ -22,9 +22,11 @@
 ## granted once it is gone.
 ##
 ## Each case writes its own log (its timeline and the daemon's output)
-## under `test-logs/t_e2e_runquota_killed_owner_lease_reclaimed/`, and names
-## it only when the case fails.
+## under `test-logs/t_e2e_runquota_killed_owner_lease_reclaimed/`, and only
+## when the case fails names it and prints it: a CI job keeps the test's
+## output, not the files it wrote.
 
+import private_broker_owner
 import std/[envvars, json, os, osproc, streams, strtabs, strutils, times,
   unittest]
 
@@ -36,7 +38,7 @@ else:
 import runquota_client
 import runquota_core
 import runquota_protocol
-from runquota_ipc import endpointForPath
+from runquota_ipc import endpointForPath, endpointDirectoryPermissions
 # The daemon's own identity probe, used here only to make CLEANUP safe: a
 # child is killed by pid only while that pid still names the child.
 import runquota_daemon/child_identity
@@ -134,6 +136,8 @@ proc reportOnFailure(log: CaseLog; failed: bool) =
   if failed:
     echo "    case log: " & log.path & " (" & $getFileSize(log.path) &
       " bytes)"
+    for line in readFile(log.path).splitLines():
+      echo "    | " & line
 
 # ---------------------------------------------------------------------------
 # The private daemon
@@ -164,8 +168,10 @@ proc childEnv(socketPath: string): StringTableRef =
     result[key] = value
   result["RUNQUOTA_SOCKET"] = socketPath
 
-proc startPrivateDaemon(tag: string; log: CaseLog): PrivateDaemon =
+proc startPrivateDaemon(fixturePolicy: var PrivateBrokerCallerPolicyBinding; tag: string; log: CaseLog): PrivateDaemon =
   result.root = scratchRoot(tag)
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result.root))
+  setFilePermissions(result.root, endpointDirectoryPermissions())
   result.socketPath = result.root / "d.sock"
   # Every piece of host state in the scratch directory, and an explicit
   # budget: the daemon reads the host budget file at start, and a flag is
@@ -349,10 +355,18 @@ proc leaseRow(daemon: PrivateDaemon; label: string): JsonNode =
 suite "e2e_runquota_killed_owner_lease_reclaimed":
 
   test "a killed owner's lease is held while its child runs, then reclaimed for a waiting client":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let log = openCaseLog("held-then-reclaimed")
-    var daemon = startPrivateDaemon("held", log)
+    var endpointPolicy: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    var daemon = startPrivateDaemon(endpointPolicy, "held", log)
     var holder: Process = nil
     var child = ChildRef()
+    # `must` fails the case by raising from a proc, where `check` cannot
+    # reach the case's status, so a case that did not get to the end of its
+    # body has failed whatever `currentCaseFailed` says.
+    var completed = false
     try:
       let readyPath = daemon.root / "holder.ready"
       let childPidPath = daemon.root / "child.pid"
@@ -409,6 +423,7 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
         check final.totalFinished == 0'u64
       finally:
         waiter.finish()
+      completed = true
     finally:
       child.killChild()
       if holder != nil:
@@ -416,9 +431,11 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
           holder.killAbruptly()
         holder.close()
       daemon.stop(log)
-      log.reportOnFailure(currentCaseFailed())
+      log.reportOnFailure(currentCaseFailed() or not completed)
 
   test "a killed `runquota acquire` releases its reservation to a waiting client":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE HOST SCENARIO END TO END, through the shipped CLI and the shipped
     # launcher. On Windows the launcher binds the child to a kill-on-close
     # job, so killing the CLI kills the child with it and the reservation is
@@ -427,9 +444,12 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
     # seconds later. Either way the waiter must be granted inside the bound,
     # and before the fix it never was.
     let log = openCaseLog("killed-cli")
-    var daemon = startPrivateDaemon("cli", log)
+    var endpointPolicy: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    var daemon = startPrivateDaemon(endpointPolicy, "cli", log)
     var cli: Process = nil
     var child = ChildRef()
+    var completed = false   # as in the case above
     try:
       let childSeconds =
         when defined(windows): "600"   # the job must be what ends it
@@ -440,12 +460,71 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
       log.note("cli: " & cliPath() & " " & args.join(" "))
       # Parent streams for the same reason as the holder above: the CLI's
       # child inherits its standard handles.
+      var cliEnv = childEnv(daemon.socketPath)
+      # A CLI that could not reach this daemon runs the command anyway, and
+      # says nothing; with this set it says why, on the test's stderr.
+      cliEnv["RUNQUOTA_REPORT_STANDALONE"] = "1"
       cli = startProcess(cliPath(), args = args,
-        env = childEnv(daemon.socketPath), options = {poParentStreams})
-      must(waitFor(log, "cli lease running", 10_000, proc (): bool =
-        let row = daemon.leaseRow("killed-cli")
-        row.kind != JNull and row["state"].getStr == "running"),
-        "cli lease running")
+        env = cliEnv, options = {poParentStreams})
+      let cliLeaseRunning = waitFor(log, "cli lease running", 10_000,
+        proc (): bool =
+          let row = daemon.leaseRow("killed-cli")
+          row.kind != JNull and row["state"].getStr == "running")
+      if not cliLeaseRunning:
+        # What the CLI and the daemon were doing instead, for the case log.
+        log.note("cli pid " & $cli.processID & " running: " & $cli.running &
+          (if cli.running: "" else: ", exit code " & $cli.peekExitCode()))
+        for subject in ["sessions", "leases"]:
+          try:
+            log.note(subject & ": " & $daemon.inspect(subject))
+          except CatchableError as error:
+            log.note(subject & " not inspectable: " & error.msg)
+        # Whether the shipped CLI reaches this daemon at all, with the
+        # environment the acquiring CLI was given.
+        var env = childEnv(daemon.socketPath)
+        for key, value in env:
+          if key.startsWith("RUNQUOTA_"):
+            log.note("env " & key & "=" & value)
+        try:
+          let probe = startProcess(cliPath(), args = ["status"], env = env,
+            options = {poStdErrToStdOut})
+          let probeExit = probe.waitForExit(15_000)
+          if probe.running:
+            probe.kill()
+            discard probe.waitForExit(5000)
+            log.note("cli status did not exit within 15 s")
+          else:
+            log.note("cli status exit " & $probeExit & ":\n" &
+              probe.outputStream.readAll())
+          probe.close()
+        except CatchableError as error:
+          log.note("cli status not runnable: " & error.msg)
+        when defined(windows):
+          # Which processes the CLI started: a sleeper whose parent is the CLI
+          # means it got as far as launching the command, which with no
+          # session in the daemon means it ran without one.
+          try:
+            let ps = getEnv("SystemRoot", r"C:\Windows") /
+              r"System32\WindowsPowerShell\v1.0\powershell.exe"
+            let query = startProcess(ps, args = ["-NoProfile",
+              "-NonInteractive", "-Command",
+              "Get-CimInstance Win32_Process | Where-Object { $_.Name -in " &
+              "@('runquota.exe','" & extractFilename(getAppFilename()) &
+              "') } | Format-Table -AutoSize -Wrap ProcessId," &
+              "ParentProcessId,CommandLine | Out-String -Width 400"],
+              options = {poStdErrToStdOut})
+            let queryExit = query.waitForExit(30_000)
+            if query.running:
+              query.kill()
+              discard query.waitForExit(5000)
+              log.note("process listing did not exit within 30 s")
+            else:
+              log.note("process listing exit " & $queryExit & ":\n" &
+                query.outputStream.readAll())
+            query.close()
+          except CatchableError as error:
+            log.note("process listing not runnable: " & error.msg)
+      must(cliLeaseRunning, "cli lease running")
       let row = daemon.leaseRow("killed-cli")
       child = ChildRef(pid: row["child_process_id"].getInt,
         stamp: uint64(row["child_start_stamp"].getBiggestInt))
@@ -467,6 +546,7 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
         check daemon.lostLeasesReaped() == 1
       finally:
         waiter.finish()
+      completed = true
     finally:
       # A no-op whenever the case passed: the child is gone, which is what
       # the grant proved. Here for the case that did not.
@@ -476,4 +556,4 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
           cli.killAbruptly()
         cli.close()
       daemon.stop(log)
-      log.reportOnFailure(currentCaseFailed())
+      log.reportOnFailure(currentCaseFailed() or not completed)

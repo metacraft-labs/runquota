@@ -27,6 +27,8 @@
 ## `defaultHostIdentityFile()` — the thing that actually ships — had never
 ## been resolved by a test at all.
 
+import daemon_endpoint
+import private_broker_owner
 import std/[os, osproc, streams, strutils, unittest]
 
 import runquota_ipc
@@ -53,13 +55,9 @@ proc scratchDir(name: string): string =
   result = getTempDir() / ("rq-hi-" & $getCurrentProcessId() & name)
   removeDir(result)
   createDir(result)
-  # THE MODE THE SHIPPED POLICY REQUIRES, not a literal: some of these
-  # fixtures ARE the rendezvous directory the daemon binds in, and the
-  # rendezvous mode is 0750 where a `runquota` group exists and 0700
-  # (owner-only, single-user mode) where it does not. Nothing in this file
-  # asserts the fixture's own mode; the modes themselves are asserted in
-  # `tests/unit/t_shared_endpoint_rules.nim`.
-  setFilePermissions(result, endpointDirectoryPermissions())
+  # Generic scratch storage starts owner-private. Broker cases inspect the
+  # actual endpoint group before selecting their rendezvous permissions.
+  setFilePermissions(result, {fpUserRead, fpUserWrite, fpUserExec})
 
 proc contents(path: string): string =
   ## Deliberately not `readFile`. A missing artifact must fail its own
@@ -116,8 +114,7 @@ proc startDaemon(socketPath, observationDb, identityFile: string):
   # unfolded message would make this a four-line startup and every reader
   # of the third line would misread or block.
   var lines: seq[string] = @[]
-  for _ in 0 ..< 3:
-    lines.add(process.outputStream.readLine())
+  lines = readRequiredStartupLines(process, 3, "t_host_identity_refusal")
   DaemonHandle(process: process, startupLines: lines)
 
 proc stop(handle: var DaemonHandle) =
@@ -125,6 +122,37 @@ proc stop(handle: var DaemonHandle) =
     handle.process.terminate()
     discard handle.process.waitForExit(5000)
   handle.process.close()
+
+proc checkStableIdentity(first, second: HostIdentity) =
+  ## Read back the actual artifact: directory existence says nothing about
+  ## whether this caller can read or create a daemon-owned identity. Sharing
+  ## this assertion with private fixtures exercises both default-path outcomes
+  ## even when the host itself only provides one of them.
+  check first.path == second.path
+  check first.hostId == second.hostId
+  check first.persisted == second.persisted
+  for identity in [first, second]:
+    check (identity.hostId.len > 0) == identity.persisted
+    check identity.report.splitLines.len == 1
+    check identity.path in identity.report
+
+  var onDisk = ""
+  try:
+    onDisk = readFile(first.path).strip()
+  except IOError, OSError:
+    discard
+
+  if isOpaqueId(onDisk, hostIdPrefix):
+    check first.persisted
+    check first.hostId == onDisk
+  else:
+    check not first.persisted
+    check first.hostId.len == 0
+    check first.report == second.report
+    check "cannot persist" in first.report
+    check "no identity was minted" in first.report
+    check "capture stays off" in first.report
+    check not containsMintedHostId(first.report)
 
 suite "host_identity_refusal":
   test "an unprovisioned directory yields a refusal, and the SAME one twice":
@@ -194,6 +222,7 @@ suite "host_identity_refusal":
     check second.hostId == first.hostId
     check readFile(file).strip() == first.hostId
     check first.report.splitLines.len == 1
+    checkStableIdentity(first, second)
 
   test "the REAL default path resolves to one outcome, not one per call":
     ## M13c's same-`host_id` clause, re-run against what actually ships.
@@ -203,8 +232,8 @@ suite "host_identity_refusal":
     ## Deliberately asserted in a form that holds in BOTH host states, so
     ## it is not a check that only fires on a machine somebody remembered
     ## to prepare:
-    ##   * provisioned   -> the same persisted id twice;
-    ##   * unprovisioned -> the same refusal twice, and no id at all.
+    ##   * readable or successfully created -> the same persisted id twice;
+    ##   * inaccessible or unwritable -> the same refusal, and no id at all.
     ## Either way, TWO DIFFERENT IDS IS A FAILURE. That is the clause.
     ##
     ## It is also uid-independent by construction -- `defaultHostIdentityFile`
@@ -214,32 +243,64 @@ suite "host_identity_refusal":
     let second = resolveHostIdentity()
 
     check first.path == defaultHostIdentityFile()
-    check first.path == second.path
-    check first.hostId == second.hostId
-    check first.persisted == second.persisted
-    check first.report == second.report
-    check (first.hostId.len > 0) == first.persisted
-    check first.report.splitLines.len == 1
-
     echo "  default host identity: path=", first.path,
-      " hostId=[", first.hostId, "] persisted=", first.persisted,
-      " provisioned=", dirExists(first.path.parentDir)
+      " hostId=[", first.hostId, "] persisted=", first.persisted
+    checkStableIdentity(first, second)
 
-    if dirExists(first.path.parentDir):
-      # A provisioned host: this machine has ONE identity and it is on
-      # disk. `hosts` gains no row per daemon start.
-      check first.persisted
-      check isOpaqueId(first.hostId, "host-")
-      check readFile(first.path).strip() == first.hostId
-    else:
-      # An unprovisioned host: refused, and STILL not created.
+  test "the outcome assertion requires the readable provisioned identity":
+    let dir = scratchDir("readable")
+    defer: removeScratchRoot(dir)
+    let file = dir / "host-id"
+    let expected = hostIdPrefix & repeat('a', 32)
+    writeFile(file, expected & "\n")
+    let first = resolveHostIdentity(file)
+    let second = resolveHostIdentity(file)
+    check first.persisted
+    check first.hostId == expected
+    checkStableIdentity(first, second)
+    check readFile(file) == expected & "\n"
+
+  when not defined(windows):
+    test "an existing directory without write authority refuses stably":
+      let dir = scratchDir("readonly")
+      defer:
+        setFilePermissions(dir, {fpUserRead, fpUserWrite, fpUserExec})
+        removeScratchRoot(dir)
+      let file = dir / "host-id"
+      # Only private scratch permissions change. Prove the fixture denies
+      # this caller rather than inferring authority from its mode bits.
+      setFilePermissions(dir, {fpUserRead, fpUserExec})
+      expect IOError:
+        writeFile(dir / "write-probe", "must be refused")
+      let first = resolveHostIdentity(file)
+      let second = resolveHostIdentity(file)
       check not first.persisted
-      check first.hostId.len == 0
-      check "cannot persist" in first.report
-      check hostWideStateDir in first.report
-      check not dirExists(first.path.parentDir)
+      check not fileExists(file)
+      checkStableIdentity(first, second)
+
+    test "an unreadable provisioned identity refuses without replacing it":
+      let dir = scratchDir("unreadable")
+      let file = dir / "host-id"
+      let expected = hostIdPrefix & repeat('b', 32) & "\n"
+      writeFile(file, expected)
+      defer:
+        setFilePermissions(file, {fpUserRead, fpUserWrite})
+        removeScratchRoot(dir)
+      setFilePermissions(file, {})
+      expect IOError:
+        discard readFile(file)
+      let first = resolveHostIdentity(file)
+      let second = resolveHostIdentity(file)
+      check not first.persisted
+      check "unreadable" in first.report
+      checkStableIdentity(first, second)
+      check childCount(dir) == 1
+      setFilePermissions(file, {fpUserRead, fpUserWrite})
+      check readFile(file) == expected
 
   test "the daemon starts, serves leases, and says capture is off":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     ## Refuse-vs-disable, decided and asserted. RunQuota's mission is
     ## ADMISSION: a daemon that cannot record history can still keep a
     ## machine from thrashing itself to death, and refusing to admit
@@ -247,6 +308,9 @@ suite "host_identity_refusal":
     ## advisory subsystem take out the host's build capacity. So the
     ## daemon starts and serves -- and says which path and why.
     let dir = scratchDir("c")
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(dir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    setFilePermissions(dir, endpointDirectoryPermissions())
     defer: removeScratchRoot(dir)
     let socketPath = dir / "d.sock"
     let dbPath = dir / "obs.sqlite"

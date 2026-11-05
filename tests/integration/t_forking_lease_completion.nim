@@ -6,6 +6,7 @@ else:
   import std/winlean
 
 from runquota_ipc import endpointDirectoryPermissions
+import private_broker_owner
 import runquota_client
 import runquota_core
 import runquota_exec
@@ -102,17 +103,17 @@ suite "forking_lease_completion":
       reapLinger(completion.stdout)
 
   test "leased forking action completes and emits LeaseFinished":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let socketDir = getTempDir() / ("runquota-bug2-" & $getCurrentProcessId())
     let socketPath = socketDir / "runquotad.sock"
     if dirExists(socketDir):
       removeScratchRoot(socketDir)
     createDir(socketDir)
-    # THE MODE THE SHIPPED POLICY REQUIRES, not a literal. This directory is
-    # the RENDEZVOUS `runquotad` binds in, and the rendezvous mode is 0750
-    # where a `runquota` group exists and 0700 (owner-only, single-user mode)
-    # where it does not -- so a fixture hardcoding either one is green on one
-    # kind of host and red on the other. Fixture only; the modes themselves
-    # are asserted in tests/unit/t_shared_endpoint_rules.nim.
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    # Use the declared fixture policy for this endpoint. Private broker cases
+    # bind its independently inspected GID before this mode and all participants.
     setFilePermissions(socketDir, endpointDirectoryPermissions())
     check fileExists(daemonPath())
 

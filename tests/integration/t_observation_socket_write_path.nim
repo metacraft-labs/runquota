@@ -24,6 +24,7 @@
 ## are refusals or degradations, and each is reached by doing something a
 ## client library cannot be asked to do.
 
+import private_broker_owner
 import std/[json, options, os, osproc, streams, strutils, tables,
   unittest]
 
@@ -92,13 +93,12 @@ proc scratchRoot(name: string): string =
   removeDir(result)
   createDir(result)
 
-proc rendezvousDir(root: string): string =
+proc rendezvousDir(root: string; fixturePolicy: var PrivateBrokerCallerPolicyBinding): string =
   result = root / "ep"
   createDir(result)
-  # THE MODE THE SHIPPED POLICY REQUIRES, derived rather than written as a
-  # literal: the rendezvous mode is 0750 where a `runquota` group exists
-  # and 0700 where it does not, so a hardcoded fixture is green on one kind
-  # of host and red on the other.
+  fixturePolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(result))
+  # Use the declared fixture policy for this endpoint. Private broker cases
+  # bind its independently inspected GID before this mode and all participants.
   setFilePermissions(result, endpointDirectoryPermissions())
 
 proc hostStateDir(root: string): string =
@@ -128,8 +128,7 @@ proc startDaemon(socketPath: string; extraArgs: openArray[string]):
   # assertion: a daemon that printed a different number would leave this
   # read blocked or misaligned.
   var lines: seq[string] = @[]
-  for _ in 0 ..< 3:
-    lines.add(process.outputStream.readLine())
+  lines = readRequiredStartupLines(process, 3, "t_observation_socket_write_path")
   DaemonHandle(process: process, startupLines: lines)
 
 proc stop(handle: var DaemonHandle) =
@@ -248,9 +247,13 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "with NO capture flag a real run produces complete, correct spine rows":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("on")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy1: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy1)
+    let socketPath = rendezvousDir(root, endpointPolicy1) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     # THE DEFAULT STORE PATH IS DERIVED, NOT PASSED. Nothing below names a
@@ -351,6 +354,8 @@ suite "observation_socket_write_path":
   # the daemon answers as a malformed frame rather than acknowledging.
 
   test "bytes that spell no finish write no row, and say so":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     const
       ExitedKey = "m13-contra-exited"
       OomKey = "m13-contra-oom"
@@ -359,7 +364,9 @@ suite "observation_socket_write_path":
 
     let root = scratchRoot("contra")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy2: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy2)
+    let socketPath = rendezvousDir(root, endpointPolicy2) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let expectedDb = state / "observations.sqlite3"
@@ -479,9 +486,13 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "--no-write-stats writes nothing at all, and the daemon serves anyway":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("off")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socketPath = rendezvousDir(root, endpointPolicy3) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     let defaultDb = state / "observations.sqlite3"
@@ -532,6 +543,8 @@ suite "observation_socket_write_path":
     check status.totalFinished >= 1'u64
 
   test "--no-write-stats wins over a named store, and does not blame it":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE PRECEDENCE CLAUSE, AGAINST A DAEMON RATHER THAN A CONFIG. The
     # unit file asserts `effectiveObservationDbPath` returns "" for
     # `--observation-db X --no-write-stats`, and that is a statement about
@@ -542,7 +555,9 @@ suite "observation_socket_write_path":
     # SAYS and WHETHER IT TOUCHED THE FILE.
     let root = scratchRoot("precedence")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy4: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy4)
+    let socketPath = rendezvousDir(root, endpointPolicy4) / "d.sock"
     let state = hostStateDir(root)
     let identityFile = state / "host-id"
     # A REAL STORE FROM A NEWER BUILD. It opens far enough to read its
@@ -613,6 +628,8 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "an unprovisioned host state directory degrades capture to off":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THIS IS THE SHIPPED DEFAULT, NOT AN EDGE CASE, and that is new with
     # M13. The host-wide state directory is created by the install step and
     # by nothing else, so on every host where that step has not run --
@@ -636,7 +653,9 @@ suite "observation_socket_write_path":
     defer:
       setFilePermissions(locked, {fpUserRead, fpUserWrite, fpUserExec})
       removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy5: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy5)
+    let socketPath = rendezvousDir(root, endpointPolicy5) / "d.sock"
     let identityFile = locked / "nostate" / "host-id"
     let expectedDb = locked / "nostate" / "observations.sqlite3"
 
@@ -687,6 +706,8 @@ suite "observation_socket_write_path":
     check status.totalFinished >= 1'u64
 
   test "an untrusted host state directory refuses the identity, not the daemon":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE OTHER HALF, and the one that only exists because the store path
     # is now DERIVED from the identity file. The store and the host
     # identity live in the same directory, so a directory that opens fine
@@ -695,7 +716,9 @@ suite "observation_socket_write_path":
     # makes the pair reachable without any flag naming a database.
     let root = scratchRoot("untrusted")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy6: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy6)
+    let socketPath = rendezvousDir(root, endpointPolicy6) / "d.sock"
     let state = root / "state"
     createDir(state)
     when defined(windows):
@@ -760,6 +783,8 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "a session reporting figures for a lease it does not own is refused":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # A FIXTURE NO CLIENT LIBRARY CAN PRODUCE. `reportObservation` takes a
     # lease and reads the session out of it, so a well-behaved client can
     # never name a lease belonging to somebody else. The frame is therefore
@@ -772,7 +797,9 @@ suite "observation_socket_write_path":
     # and the clamp absorbs the overshoot.
     let root = scratchRoot("own")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy7: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy7)
+    let socketPath = rendezvousDir(root, endpointPolicy7) / "d.sock"
     let state = hostStateDir(root)
 
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -917,9 +944,13 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "a damaged or oversized report is refused entirely, leaving no half-state":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("bad")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy8: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy8)
+    let socketPath = rendezvousDir(root, endpointPolicy8) / "d.sock"
     let state = hostStateDir(root)
 
     putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -1038,6 +1069,8 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "a client SIGKILLed mid-execution leaves no self figures and no half-row":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # THE FIXTURE IS A REAL KILLED PROCESS. This is M11's deferral (1) in
     # its dangerous form: `SelfReport` had no timestamp, no TTL and no
     # liveness handle, and its only exits were an explicit end or a
@@ -1047,7 +1080,9 @@ suite "observation_socket_write_path":
     # zero. Nothing about that is visible in the data.
     let root = scratchRoot("kill")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy9: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy9)
+    let socketPath = rendezvousDir(root, endpointPolicy9) / "d.sock"
     let state = hostStateDir(root)
     let expectedDb = state / "observations.sqlite3"
     let readyPath = root / "child-ready"
@@ -1130,6 +1165,8 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
 
   test "a store that turns unwritable mid-flight degrades and never fails a client":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
     # A FIXTURE THE HAPPY PATH CANNOT CONSTRUCT. M9 covers a store that is
     # already corrupt when the daemon opens it; this is the other half —
     # a store that was healthy at startup, was written to successfully, and
@@ -1139,7 +1176,9 @@ suite "observation_socket_write_path":
     # normally with nobody telling it anything went wrong.
     let root = scratchRoot("ro")
     defer: removeScratchRoot(root)
-    let socketPath = rendezvousDir(root) / "d.sock"
+    var endpointPolicy10: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy10)
+    let socketPath = rendezvousDir(root, endpointPolicy10) / "d.sock"
     let state = hostStateDir(root)
     let dbPath = state / "observations.sqlite3"
 

@@ -39,6 +39,9 @@ const
   ambientSource =
     repoRoot / "libs" / "runquota_observation_store" / "src" /
     "runquota_observation_store" / "ambient.nim"
+  cpuClockPairSource =
+    repoRoot / "libs" / "runquota_observation_store" / "src" /
+    "runquota_observation_store" / "cpu_clock_pair.nim"
   daemonSource =
     repoRoot / "libs" / "runquota_daemon" / "src" / "runquota_daemon.nim"
   macosTreeSource =
@@ -49,11 +52,9 @@ const
   boundaryFile = repoRoot / "AGENTS.md"
 
   readerStamp = "result.atUnixMillis = unixMillisNow()"
-    ## The ONLY way a reading's instant may be set: a platform reader
-    ## stamping the moment it read the kernel. Pinned as an exact line
-    ## rather than as a pattern, because the check that uses it counts
-    ## occurrences of this spelling against assignments of the field, and
-    ## a looser pattern would let a second spelling in.
+    ## The two direct platform reader stamps. Linux transfers the timestamp
+    ## from its immutable accepted CPU pair; its provenance is checked below.
+  pairReaderStamp = "result.atUnixMillis = pair.atUnixMillis"
 
   perProcessInterfaces = [
     # Every documented way of asking an operating system about a PROCESS
@@ -219,6 +220,31 @@ proc assignmentsTo(text, field: string): int =
     elif text[cursor] == '=' and
         (cursor + 1 >= text.len or text[cursor + 1] != '='):
       result += 1
+
+proc exactCodeLines(text, expected: string): int =
+  ## Count a complete code line, not a prefix that admits a fabricated offset
+  ## or a comment that merely repeats the allowed spelling.
+  for line in text.splitLines():
+    let code = line.strip()
+    if not code.startsWith("#") and code == expected:
+      inc result
+
+proc readerTimestampProvenance(ambientText, pairText: string): bool =
+  ## Preserve the no-retiming boundary through Linux's immutable pair instead
+  ## of allowing an arbitrary third timestamp assignment. No sampler/current
+  ## reassignment, helper offset or replacement clock can satisfy this chain.
+  exactCodeLines(ambientText, readerStamp) == 2 and
+    exactCodeLines(ambientText, pairReaderStamp) == 1 and
+    assignmentsTo(ambientText, "atUnixMillis") == 3 and
+    exactCodeLines(ambientText,
+      "let pair = captureCpuClockPair(proc(): CpuCounters =") == 1 and
+    assignmentsTo(ambientText, "pair") == 1 and
+    assignmentsTo(ambientText, "pair.atUnixMillis") == 0 and
+    exactCodeLines(pairText, "let closedWall = unixMillisNow()") == 1 and
+    assignmentsTo(pairText, "closedWall") == 1 and
+    assignmentsTo(pairText, "atUnixMillis") == 0 and
+    pairText.count("atUnixMillis:") == 1 and
+    exactCodeLines(pairText, "atUnixMillis: closedWall)") == 1
 
 suite "observation_store_ambient_attribution":
 
@@ -601,17 +627,30 @@ suite "observation_store_ambient_attribution":
     # is constructed -- and both checks above stay green while every
     # `sampled_at` in the store becomes a moment at which nothing was read.
     #
-    # It closes with the same shape of statement one level up. There is
-    # exactly one thing in this module allowed to set a reading's instant:
-    # a reader, stamping the moment it read, on the line below. So the
-    # number of assignments to `atUnixMillis` anywhere in the file must be
-    # the number of times that exact line appears, and no other spelling
-    # can be added without the counts diverging.
-    check assignmentsTo(ambientText, "atUnixMillis") ==
-      ambientText.count(readerStamp)
-    # ... and the equality is not satisfied by there being none of either:
-    # the macOS reader carries one and the Linux reader carries one.
-    check ambientText.count(readerStamp) >= 2
+    # Follow the Linux transfer back into the actual accepted pair. The two
+    # direct platform stamps and this one immutable transfer are the complete
+    # allowlist; simply increasing an expected assignment count would also
+    # admit a sampler that invents another timestamp.
+    check fileExists(cpuClockPairSource)
+    let pairText = readFile(cpuClockPairSource)
+    check readerTimestampProvenance(ambientText, pairText)
+
+    # Semantic source mutations are negative controls for this inspection
+    # boundary, not mocks of the kernel. Each changes the meaning of the real
+    # production source while leaving its other allowed stamps present.
+    check not readerTimestampProvenance(ambientText.replace(pairReaderStamp,
+      pairReaderStamp & " + 1"), pairText)
+    check not readerTimestampProvenance(ambientText &
+      "\ncurrent.atUnixMillis = unixMillisNow()\n", pairText)
+    check not readerTimestampProvenance(ambientText.replace(
+      "let pair = captureCpuClockPair", "var pair = captureCpuClockPair"),
+      pairText)
+    check not readerTimestampProvenance(ambientText, pairText.replace(
+      "atUnixMillis: closedWall)", "atUnixMillis: closedWall + 1)"))
+    check not readerTimestampProvenance(ambientText, pairText.replace(
+      "let closedWall = unixMillisNow()", "let closedWall = unixMillisNow() + 1"))
+    check not readerTimestampProvenance(ambientText,
+      pairText & "\nresult.atUnixMillis = unixMillisNow()\n")
     # `atUnixMillis` is not a substring of `sampledAtUnixMillis` -- the
     # capital A sees to that -- so the count above is about readings and
     # the count above that is about rows, and neither absorbs the other.
