@@ -32,7 +32,10 @@ when defined(windows):
     PIPE_READMODE_BYTE_W = 0x00000000'i32
     PIPE_WAIT_W = 0x00000000'i32
     PIPE_REJECT_REMOTE_CLIENTS_W = 0x00000008'i32
-    NMPWAIT_USE_DEFAULT_WAIT = 0x00000000'i32
+    pipeBusyBudgetMillis = 5_000'i64
+      ## How long a client keeps waiting for a free instance of a pipe that
+      ## exists. Generous on purpose: the pipe existing means a daemon is
+      ## serving, and the alternative to waiting is running without it.
     GENERIC_READ_W = 0x80000000'i32
     GENERIC_WRITE_W = 0x40000000'i32
     OPEN_EXISTING_W = 3'i32
@@ -1378,12 +1381,23 @@ proc connectEndpoint*(endpoint: Endpoint;
       LocalConnection(kind: endpointUnixSocket, socket: socket, endpoint: endpoint)
   of endpointNamedPipe:
     when defined(windows):
-      # Windows: open the pipe with read+write access. If the server is
-      # accepting another client right now (all instances busy), the call
-      # would fail with ERROR_PIPE_BUSY; we wait briefly and retry.
+      # Windows: open the pipe with read+write access. ERROR_PIPE_BUSY means
+      # the daemon IS there and another client took the one instance it had
+      # waiting; the next appears once the accept loop has handed that one
+      # off. Wait for it, up to `pipeBusyBudgetMillis`.
+      #
+      # A BUSY PIPE IS NOT AN ABSENT DAEMON. This loop used to give up after
+      # five tries of the pipe's default wait (50 ms), so a client arriving
+      # while others were connecting -- a build's actions starting together,
+      # or a test polling the daemon -- failed to connect to a daemon that
+      # was serving, and `runquota acquire` then ran its command standalone,
+      # with no lease and no word said: reproduced on Windows CI, where the
+      # killed-owner e2e saw the CLI's child running and no session.
       let wide = newWideCString(endpoint.path)
       var handle: WinHandle = INVALID_HANDLE_VALUE
-      for attempt in 0 ..< 5:
+      let deadline = getMonoTime() +
+        initDuration(milliseconds = pipeBusyBudgetMillis)
+      while true:
         handle = createFileW(
           wide,
           GENERIC_READ_W or GENERIC_WRITE_W,
@@ -1396,12 +1410,16 @@ proc connectEndpoint*(endpoint: Endpoint;
         if handle != INVALID_HANDLE_VALUE:
           break
         let err = osLastError().int32
-        if err == 231'i32:  # Windows: ERROR_PIPE_BUSY
-          discard waitNamedPipeW(wide, NMPWAIT_USE_DEFAULT_WAIT)
-          continue
-        raiseLastWinError("CreateFileW failed for " & endpoint.path)
-      if handle == INVALID_HANDLE_VALUE:
-        raise newException(OSError, "could not open named pipe " & endpoint.path)
+        if err != 231'i32:  # Windows: ERROR_PIPE_BUSY
+          raiseLastWinError("CreateFileW failed for " & endpoint.path)
+        let remaining = inMilliseconds(deadline - getMonoTime())
+        if remaining <= 0:
+          raise newException(OSError, "could not open named pipe " &
+            endpoint.path & ": every instance stayed busy for " &
+            $pipeBusyBudgetMillis & " ms")
+        # Returns as soon as an instance is free (or at once if the pipe
+        # has gone, which the next CreateFileW then reports).
+        discard waitNamedPipeW(wide, int32(min(remaining, 250'i64)))
       LocalConnection(kind: endpointNamedPipe, pipeHandle: int(handle), endpoint: endpoint)
     else:
       raise newException(OSError, "named-pipe endpoints are only supported on Windows")

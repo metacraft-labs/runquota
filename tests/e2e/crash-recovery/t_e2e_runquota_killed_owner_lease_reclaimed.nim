@@ -460,21 +460,70 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
       log.note("cli: " & cliPath() & " " & args.join(" "))
       # Parent streams for the same reason as the holder above: the CLI's
       # child inherits its standard handles.
+      var cliEnv = childEnv(daemon.socketPath)
+      # A CLI that could not reach this daemon runs the command anyway, and
+      # says nothing; with this set it says why, on the test's stderr.
+      cliEnv["RUNQUOTA_REPORT_STANDALONE"] = "1"
       cli = startProcess(cliPath(), args = args,
-        env = childEnv(daemon.socketPath), options = {poParentStreams})
+        env = cliEnv, options = {poParentStreams})
       let cliLeaseRunning = waitFor(log, "cli lease running", 10_000,
         proc (): bool =
           let row = daemon.leaseRow("killed-cli")
           row.kind != JNull and row["state"].getStr == "running")
       if not cliLeaseRunning:
         # What the CLI and the daemon were doing instead, for the case log.
-        log.note("cli running: " & $cli.running &
+        log.note("cli pid " & $cli.processID & " running: " & $cli.running &
           (if cli.running: "" else: ", exit code " & $cli.peekExitCode()))
         for subject in ["sessions", "leases"]:
           try:
             log.note(subject & ": " & $daemon.inspect(subject))
           except CatchableError as error:
             log.note(subject & " not inspectable: " & error.msg)
+        # Whether the shipped CLI reaches this daemon at all, with the
+        # environment the acquiring CLI was given.
+        var env = childEnv(daemon.socketPath)
+        for key, value in env:
+          if key.startsWith("RUNQUOTA_"):
+            log.note("env " & key & "=" & value)
+        try:
+          let probe = startProcess(cliPath(), args = ["status"], env = env,
+            options = {poStdErrToStdOut})
+          let probeExit = probe.waitForExit(15_000)
+          if probe.running:
+            probe.kill()
+            discard probe.waitForExit(5000)
+            log.note("cli status did not exit within 15 s")
+          else:
+            log.note("cli status exit " & $probeExit & ":\n" &
+              probe.outputStream.readAll())
+          probe.close()
+        except CatchableError as error:
+          log.note("cli status not runnable: " & error.msg)
+        when defined(windows):
+          # Which processes the CLI started: a sleeper whose parent is the CLI
+          # means it got as far as launching the command, which with no
+          # session in the daemon means it ran without one.
+          try:
+            let ps = getEnv("SystemRoot", r"C:\Windows") /
+              r"System32\WindowsPowerShell\v1.0\powershell.exe"
+            let query = startProcess(ps, args = ["-NoProfile",
+              "-NonInteractive", "-Command",
+              "Get-CimInstance Win32_Process | Where-Object { $_.Name -in " &
+              "@('runquota.exe','" & extractFilename(getAppFilename()) &
+              "') } | Format-Table -AutoSize -Wrap ProcessId," &
+              "ParentProcessId,CommandLine | Out-String -Width 400"],
+              options = {poStdErrToStdOut})
+            let queryExit = query.waitForExit(30_000)
+            if query.running:
+              query.kill()
+              discard query.waitForExit(5000)
+              log.note("process listing did not exit within 30 s")
+            else:
+              log.note("process listing exit " & $queryExit & ":\n" &
+                query.outputStream.readAll())
+            query.close()
+          except CatchableError as error:
+            log.note("process listing not runnable: " & error.msg)
       must(cliLeaseRunning, "cli lease running")
       let row = daemon.leaseRow("killed-cli")
       child = ChildRef(pid: row["child_process_id"].getInt,
