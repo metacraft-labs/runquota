@@ -40,6 +40,23 @@ if paramCount() == 1 and paramStr(1) == InheritedOuter:
   stdout.flushFile()
   quit(completion.exitCode)
 
+proc readToEnd(stream: Stream): string =
+  ## Every byte up to end of file. NOT `streams.readAll`, which stops at the
+  ## first read that returns less than its 1 KiB buffer. On POSIX the
+  ## process streams are C `FILE`s whose `fread` keeps reading until the
+  ## buffer is full, so that never shows; on Windows they are bare pipe
+  ## handles, one `ReadFile` returns whatever one write put there, and
+  ## `readAll` handed back the inner child's line alone -- the outer
+  ## process's line, written after the child exited, was never read.
+  var buffer: array[1024, char]
+  while true:
+    let count = stream.readData(addr buffer[0], buffer.len)
+    if count <= 0:
+      break
+    let start = result.len
+    result.setLen(start + count)
+    copyMem(addr result[start], addr buffer[0], count)
+
 suite "bounded process output":
   test "retains the terminal diagnostic and the true byte count":
     const captureLimit = 64
@@ -64,8 +81,8 @@ suite "bounded process output":
     outer.inputStream.write("real-parent-input\n")
     outer.inputStream.flush()
     outer.inputStream.close()
-    let actualStdout = outer.outputStream.readAll()
-    let actualStderr = outer.errorStream.readAll()
+    let actualStdout = outer.outputStream.readToEnd()
+    let actualStderr = outer.errorStream.readToEnd()
     check outer.waitForExit() == 7
     check actualStdout == "inherited-input=real-parent-input\n" &
       "inherited-completion-empty\n"

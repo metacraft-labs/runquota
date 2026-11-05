@@ -43,6 +43,10 @@ import scratch_root
 import daemon_endpoint
 import owner_uid
 
+# The engine exports RUNQUOTA_ENDPOINT_SCOPE=private to every action it runs;
+# this file asserts host-scope policy, so it must not inherit that.
+useHostEndpointScope()
+
 const EchoFixtureArg = "--echo-fixture"
   ## The leased command in the owner_uid case: this binary, re-executed,
   ## printing its argument. It was `/bin/echo`, which is not a path on

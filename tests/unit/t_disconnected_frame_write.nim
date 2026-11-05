@@ -11,6 +11,9 @@ when defined(posix):
   import runquota_core
   import runquota_protocol
   import child_watchdog
+  # The engine exports RUNQUOTA_ENDPOINT_SCOPE=private to every action it runs;
+  # this file asserts host-scope policy, so it must not inherit that.
+  useHostEndpointScope()
 
   var msgDontWait {.importc: "MSG_DONTWAIT", header: "<sys/socket.h>".}: cint
 

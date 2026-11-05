@@ -76,6 +76,10 @@ else:
   import std/[os, osproc, posix, strutils, tables, times, unittest, sequtils]
 
   import daemon_binary
+  import private_broker_owner
+  # The engine exports RUNQUOTA_ENDPOINT_SCOPE=private to every action it runs;
+  # this file asserts host-scope policy, so it must not inherit that.
+  useHostEndpointScope()
 
   const probeSource = "tests/support/rendezvous_probe.nim"
 

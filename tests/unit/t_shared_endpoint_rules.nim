@@ -37,6 +37,10 @@ when defined(posix):
 
 import runquota_ipc
 
+# The engine exports RUNQUOTA_ENDPOINT_SCOPE=private to every action it runs;
+# this file asserts host-scope policy, so it must not inherit that.
+useHostEndpointScope()
+
 # Real re-executed children exercise the startup reader's OS pipe/EOF boundary.
 # Their small explicit output protocol is the fixture under test, not a mock
 # broker or a replacement for any daemon/kernel integration assertion.

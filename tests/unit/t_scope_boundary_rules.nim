@@ -37,6 +37,10 @@ when defined(posix):
 import runquota_ipc
 import runquota_observation_store
 
+# The engine exports RUNQUOTA_ENDPOINT_SCOPE=private to every action it runs;
+# this file asserts host-scope policy, so it must not inherit that.
+useHostEndpointScope()
+
 # ---------------------------------------------------------------------------
 # WHAT IS POSIX-ONLY HERE, AND WHY
 # ---------------------------------------------------------------------------

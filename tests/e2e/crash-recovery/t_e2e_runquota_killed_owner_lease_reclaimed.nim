@@ -22,8 +22,9 @@
 ## granted once it is gone.
 ##
 ## Each case writes its own log (its timeline and the daemon's output)
-## under `test-logs/t_e2e_runquota_killed_owner_lease_reclaimed/`, and names
-## it only when the case fails.
+## under `test-logs/t_e2e_runquota_killed_owner_lease_reclaimed/`, and only
+## when the case fails names it and prints it: a CI job keeps the test's
+## output, not the files it wrote.
 
 import private_broker_owner
 import std/[envvars, json, os, osproc, streams, strtabs, strutils, times,
@@ -135,6 +136,8 @@ proc reportOnFailure(log: CaseLog; failed: bool) =
   if failed:
     echo "    case log: " & log.path & " (" & $getFileSize(log.path) &
       " bytes)"
+    for line in readFile(log.path).splitLines():
+      echo "    | " & line
 
 # ---------------------------------------------------------------------------
 # The private daemon
@@ -360,6 +363,10 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
     var daemon = startPrivateDaemon(endpointPolicy, "held", log)
     var holder: Process = nil
     var child = ChildRef()
+    # `must` fails the case by raising from a proc, where `check` cannot
+    # reach the case's status, so a case that did not get to the end of its
+    # body has failed whatever `currentCaseFailed` says.
+    var completed = false
     try:
       let readyPath = daemon.root / "holder.ready"
       let childPidPath = daemon.root / "child.pid"
@@ -416,6 +423,7 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
         check final.totalFinished == 0'u64
       finally:
         waiter.finish()
+      completed = true
     finally:
       child.killChild()
       if holder != nil:
@@ -423,7 +431,7 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
           holder.killAbruptly()
         holder.close()
       daemon.stop(log)
-      log.reportOnFailure(currentCaseFailed())
+      log.reportOnFailure(currentCaseFailed() or not completed)
 
   test "a killed `runquota acquire` releases its reservation to a waiting client":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -441,6 +449,7 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
     var daemon = startPrivateDaemon(endpointPolicy, "cli", log)
     var cli: Process = nil
     var child = ChildRef()
+    var completed = false   # as in the case above
     try:
       let childSeconds =
         when defined(windows): "600"   # the job must be what ends it
@@ -453,10 +462,20 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
       # child inherits its standard handles.
       cli = startProcess(cliPath(), args = args,
         env = childEnv(daemon.socketPath), options = {poParentStreams})
-      must(waitFor(log, "cli lease running", 10_000, proc (): bool =
-        let row = daemon.leaseRow("killed-cli")
-        row.kind != JNull and row["state"].getStr == "running"),
-        "cli lease running")
+      let cliLeaseRunning = waitFor(log, "cli lease running", 10_000,
+        proc (): bool =
+          let row = daemon.leaseRow("killed-cli")
+          row.kind != JNull and row["state"].getStr == "running")
+      if not cliLeaseRunning:
+        # What the CLI and the daemon were doing instead, for the case log.
+        log.note("cli running: " & $cli.running &
+          (if cli.running: "" else: ", exit code " & $cli.peekExitCode()))
+        for subject in ["sessions", "leases"]:
+          try:
+            log.note(subject & ": " & $daemon.inspect(subject))
+          except CatchableError as error:
+            log.note(subject & " not inspectable: " & error.msg)
+      must(cliLeaseRunning, "cli lease running")
       let row = daemon.leaseRow("killed-cli")
       child = ChildRef(pid: row["child_process_id"].getInt,
         stamp: uint64(row["child_start_stamp"].getBiggestInt))
@@ -478,6 +497,7 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
         check daemon.lostLeasesReaped() == 1
       finally:
         waiter.finish()
+      completed = true
     finally:
       # A no-op whenever the case passed: the child is gone, which is what
       # the grant proved. Here for the case that did not.
@@ -487,4 +507,4 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
           cli.killAbruptly()
         cli.close()
       daemon.stop(log)
-      log.reportOnFailure(currentCaseFailed())
+      log.reportOnFailure(currentCaseFailed() or not completed)

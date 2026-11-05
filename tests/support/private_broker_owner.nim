@@ -69,3 +69,13 @@ proc privateEndpointGroup*(endpointDir: string): int64 =
     if not S_ISDIR(info.st_mode) or info.st_uid != getuid():
       raise newException(ValueError, "private endpoint must be a caller-owned directory")
     result = int64(info.st_gid)
+
+proc useHostEndpointScope*() =
+  ## Make a test process assert HOST-scope policy regardless of its launcher.
+  ## `repro build`/`repro test` start their own runquotad and export
+  ## RUNQUOTA_ENDPOINT_SCOPE=private to every action, which would silently turn
+  ## the daemons and in-process policy checks of host-scope tests into
+  ## owner-only private ones. Tests that want private scope select it
+  ## themselves (see bindPrivateBrokerPolicyToCaller), so dropping the
+  ## inherited value changes no assertion.
+  delEnv("RUNQUOTA_ENDPOINT_SCOPE")
