@@ -460,8 +460,12 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
       log.note("cli: " & cliPath() & " " & args.join(" "))
       # Parent streams for the same reason as the holder above: the CLI's
       # child inherits its standard handles.
+      var cliEnv = childEnv(daemon.socketPath)
+      # A CLI that could not reach this daemon runs the command anyway, and
+      # says nothing; with this set it says why, on the test's stderr.
+      cliEnv["RUNQUOTA_REPORT_STANDALONE"] = "1"
       cli = startProcess(cliPath(), args = args,
-        env = childEnv(daemon.socketPath), options = {poParentStreams})
+        env = cliEnv, options = {poParentStreams})
       let cliLeaseRunning = waitFor(log, "cli lease running", 10_000,
         proc (): bool =
           let row = daemon.leaseRow("killed-cli")

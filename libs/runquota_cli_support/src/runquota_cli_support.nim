@@ -510,7 +510,13 @@ proc runDebugAcquire(args: seq[string]): int =
   var client: RunQuotaClient
   try:
     client = connectDefault()
-  except CatchableError:
+  except CatchableError as error:
+    # WHY, AND BEFORE THE COMMAND RUNS: the report at exit says that the run
+    # was standalone, but not what the connection attempt hit, and a run
+    # that is killed never reaches its exit. Behind the same opt-in.
+    if getEnv(StandaloneReportEnv).len > 0:
+      stderr.writeLine("runquota acquire: no daemon reached at " &
+        defaultEndpoint().path & ": " & error.msg)
     return runStandaloneAcquire(label, statsKey, command)
   defer: client.close()
   var session = client.registerSession("runquota acquire", versionString())
