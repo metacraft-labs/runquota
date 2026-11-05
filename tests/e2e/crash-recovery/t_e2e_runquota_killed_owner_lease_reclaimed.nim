@@ -475,6 +475,26 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
             log.note(subject & ": " & $daemon.inspect(subject))
           except CatchableError as error:
             log.note(subject & " not inspectable: " & error.msg)
+        # Whether the shipped CLI reaches this daemon at all, with the
+        # environment the acquiring CLI was given.
+        var env = childEnv(daemon.socketPath)
+        for key, value in env:
+          if key.startsWith("RUNQUOTA_"):
+            log.note("env " & key & "=" & value)
+        try:
+          let probe = startProcess(cliPath(), args = ["status"], env = env,
+            options = {poStdErrToStdOut})
+          let probeExit = probe.waitForExit(15_000)
+          if probe.running:
+            probe.kill()
+            discard probe.waitForExit(5000)
+            log.note("cli status did not exit within 15 s")
+          else:
+            log.note("cli status exit " & $probeExit & ":\n" &
+              probe.outputStream.readAll())
+          probe.close()
+        except CatchableError as error:
+          log.note("cli status not runnable: " & error.msg)
       must(cliLeaseRunning, "cli lease running")
       let row = daemon.leaseRow("killed-cli")
       child = ChildRef(pid: row["child_process_id"].getInt,
