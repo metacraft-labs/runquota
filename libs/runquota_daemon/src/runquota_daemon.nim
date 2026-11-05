@@ -3021,6 +3021,9 @@ proc retirementAnswer*(daemon: RunQuotaDaemon; peer: PeerIdentity;
       "exits once its " & $result.otherConnections &
         " other client connection(s) close"
 
+proc awaitImageDigest(): string
+  ## Defined with the digest thread, below `serve`'s other helpers.
+
 proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
                    context: var ConnectionContext; frame: RqspFrame) =
   case frame.header.messageKind
@@ -3442,6 +3445,12 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
           "invalid RetireDaemon payload"))
       return
+    # The one reader of the digest. A request that arrives while it is still
+    # being taken waits for it here, under the daemon lock; that is a
+    # startup window, and answering without it would retire a daemon that
+    # runs the very image the request names.
+    if daemon.imageDigest.len == 0:
+      daemon.imageDigest = awaitImageDigest()
     let answer = daemon.retirementAnswer(context.peer, msg)
     try:
       echo "runquotad: RetireDaemon from pid " & $context.peer.processId &
@@ -4369,6 +4378,79 @@ else:
 # appears has moved.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The daemon's image digest, taken off the accept path.
+#
+# HASHING THE EXECUTABLE TAKES SECONDS WHERE IT IS SLOW, and it used to run
+# on the main thread between the listening line and the accept loop: a
+# client that had connected waited for the hash before its Hello was
+# answered. Measured on the emulated windows-arm64 CI runner, Hello came
+# back 3.7 s after spawn, every time, and
+# `t_endpoint_serves_before_store_verification` failed on it.
+#
+# So a thread of its own takes it, still at startup -- the moment an
+# installer cannot yet have renamed the file aside -- and only a
+# `RetireDaemon` request, the one reader, waits for it. The result crosses
+# threads as bytes in a fixed buffer, not as a string, because under ORC a
+# string allocated here would be freed by another thread after this one
+# exits (see `captureOpenerLock` below).
+# ---------------------------------------------------------------------------
+
+const imageDigestCapacity = 128
+  ## "sha256:" and 64 hex digits fit with room to spare.
+var imageDigestThread: Thread[void]
+var imageDigestRunning = false
+var imageDigestLock: Lock
+var imageDigestCond: Cond
+var imageDigestDone = false
+var imageDigestBytes: array[imageDigestCapacity, char]
+var imageDigestLength = 0
+
+proc imageDigestMain() {.thread, gcsafe.} =
+  let digest = imageDigestOf(getAppFilename())
+  acquire(imageDigestLock)
+  try:
+    # An over-long value cannot be a digest this daemon wrote; recording it
+    # as "" keeps the meaning `imageDigestOf` gives an unreadable image.
+    imageDigestLength =
+      if digest.len <= imageDigestCapacity: digest.len else: 0
+    if imageDigestLength > 0:
+      copyMem(addr imageDigestBytes[0], unsafeAddr digest[0],
+        imageDigestLength)
+    imageDigestDone = true
+    broadcast(imageDigestCond)
+  finally:
+    release(imageDigestLock)
+
+proc startImageDigest() =
+  initLock(imageDigestLock)
+  initCond(imageDigestCond)
+  imageDigestDone = false
+  imageDigestLength = 0
+  createThread(imageDigestThread, imageDigestMain)
+  imageDigestRunning = true
+
+proc awaitImageDigest(): string =
+  ## The digest `startImageDigest` is taking, once it is taken.
+  if not imageDigestRunning:
+    return ""
+  acquire(imageDigestLock)
+  try:
+    while not imageDigestDone:
+      wait(imageDigestCond, imageDigestLock)
+    result = newString(imageDigestLength)
+    if imageDigestLength > 0:
+      copyMem(addr result[0], addr imageDigestBytes[0], imageDigestLength)
+  finally:
+    release(imageDigestLock)
+
+proc stopImageDigest() =
+  if imageDigestRunning:
+    joinThread(imageDigestThread)
+    imageDigestRunning = false
+    deinitCond(imageDigestCond)
+    deinitLock(imageDigestLock)
+
 var captureOpenerThread: Thread[void]
 var captureOpenerRunning = false
 var captureCreateParent = false
@@ -4536,10 +4618,10 @@ proc serve*(config: DaemonConfig): int =
   # The listening line goes out now, on its own, so a reader that waits for
   # it is not made to wait for the store.
   flushFile(stdout)
-  # WHICH BUILD THIS IS, taken now -- after the listening line, so a client
-  # waiting for it is not made to wait for a hash, and long before an
-  # installer could rename the file aside. See `RunQuotaDaemon.imageDigest`.
-  sharedDaemon.daemon.imageDigest = imageDigestOf(getAppFilename())
+  # WHICH BUILD THIS IS, taken from now on -- long before an installer could
+  # rename the file aside -- by a thread of its own, so no client waits for
+  # the hash. See `startImageDigest` and `RunQuotaDaemon.imageDigest`.
+  startImageDigest()
   resetRetirementState()
   retirementEndpointPath = config.endpoint.path
   # AFTER the endpoint is bound, because the waker has a socket to dial, and
@@ -4740,6 +4822,7 @@ proc serve*(config: DaemonConfig): int =
         captureOpenerRunning = false
         deinitCond(captureOpenerCond)
         deinitLock(captureOpenerLock)
+      stopImageDigest()
       if not listenerClosed:
         listener.close()
       deinitLock(sharedDaemon.lock)
