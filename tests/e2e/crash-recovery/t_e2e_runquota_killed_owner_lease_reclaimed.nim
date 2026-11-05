@@ -468,7 +468,7 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
           row.kind != JNull and row["state"].getStr == "running")
       if not cliLeaseRunning:
         # What the CLI and the daemon were doing instead, for the case log.
-        log.note("cli running: " & $cli.running &
+        log.note("cli pid " & $cli.processID & " running: " & $cli.running &
           (if cli.running: "" else: ", exit code " & $cli.peekExitCode()))
         for subject in ["sessions", "leases"]:
           try:
@@ -495,6 +495,31 @@ suite "e2e_runquota_killed_owner_lease_reclaimed":
           probe.close()
         except CatchableError as error:
           log.note("cli status not runnable: " & error.msg)
+        when defined(windows):
+          # Which processes the CLI started: a sleeper whose parent is the CLI
+          # means it got as far as launching the command, which with no
+          # session in the daemon means it ran without one.
+          try:
+            let ps = getEnv("SystemRoot", r"C:\Windows") /
+              r"System32\WindowsPowerShell\v1.0\powershell.exe"
+            let query = startProcess(ps, args = ["-NoProfile",
+              "-NonInteractive", "-Command",
+              "Get-CimInstance Win32_Process | Where-Object { $_.Name -in " &
+              "@('runquota.exe','" & extractFilename(getAppFilename()) &
+              "') } | Format-Table -AutoSize -Wrap ProcessId," &
+              "ParentProcessId,CommandLine | Out-String -Width 400"],
+              options = {poStdErrToStdOut})
+            let queryExit = query.waitForExit(30_000)
+            if query.running:
+              query.kill()
+              discard query.waitForExit(5000)
+              log.note("process listing did not exit within 30 s")
+            else:
+              log.note("process listing exit " & $queryExit & ":\n" &
+                query.outputStream.readAll())
+            query.close()
+          except CatchableError as error:
+            log.note("process listing not runnable: " & error.msg)
       must(cliLeaseRunning, "cli lease running")
       let row = daemon.leaseRow("killed-cli")
       child = ChildRef(pid: row["child_process_id"].getInt,
