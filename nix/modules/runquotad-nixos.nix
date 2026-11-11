@@ -27,6 +27,7 @@ let
   # `RuntimeDirectory=` names a path RELATIVE to /run, so the two have to
   # agree. Derived rather than written twice.
   endpointDirName = lib.removePrefix "/run/" endpointDir;
+  endpointPath = "${endpointDir}/${hostState.endpointSocketName}";
 in
 {
   options.services.runquotad = {
@@ -82,6 +83,33 @@ in
       description = "Additional arguments passed to `runquotad`.";
     };
 
+    socketActivation = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Start `runquotad` through a `runquotad.socket` unit instead of at
+        boot. systemd binds the host endpoint (`${endpointPath}`, owned by
+        the module's user and group, mode `0660`) and starts the service on
+        the first connection, holding that connection queued meanwhile; the
+        service is then started ONLY through the socket. `false` (the
+        default) keeps the always-running unit.
+      '';
+    };
+
+    idleExitAfter = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
+      example = 600;
+      description = ''
+        Seconds with no client connection after which `runquotad` exits by
+        itself (`--idle-exit-after`), counted from start-up or from the
+        moment the last connection closed. systemd starts it again on the
+        next connection. Requires `socketActivation`: without the socket
+        unit nothing would start it again. `null` (the default) never idles
+        out.
+      '';
+    };
+
     hostConfig = lib.mkOption {
       type = lib.types.nullOr (hostConfigLib.optionType);
       default = null;
@@ -108,6 +136,13 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = cfg.idleExitAfter == null || cfg.socketActivation;
+        message = "services.runquotad.idleExitAfter requires services.runquotad.socketActivation: a daemon that exits when idle must have a socket unit to start it again.";
+      }
+    ];
+
     users.users.${cfg.user} = lib.mkIf (cfg.user == hostState.user) {
       isSystemUser = true;
       group = cfg.group;
@@ -152,10 +187,35 @@ in
       ${hostConfigLib.etcName}.text = hostConfigLib.render cfg.hostConfig;
     };
 
+    # SOCKET ACTIVATION. systemd binds the host endpoint and hands it to the
+    # daemon on descriptor 3 (`sd_listen_fds(3)`); the daemon serves it,
+    # never unlinks it, and with `--idle-exit-after` exits when idle and is
+    # started again on the next connection (reprobuild-pm
+    # `spec/RunQuota-Host-Configuration.md`, "Socket activation (systemd)").
+    # The rendezvous directory is still the tmpfiles rule's, so its owner
+    # and group stay the ones written down above rather than the socket
+    # unit's default `DirectoryMode`.
+    systemd.sockets.runquotad = lib.mkIf cfg.socketActivation {
+      description = "RunQuota host-wide lease authority endpoint";
+      wantedBy = [ "sockets.target" ];
+      listenStreams = [ endpointPath ];
+      socketConfig = {
+        SocketUser = cfg.user;
+        SocketGroup = cfg.group;
+        # The group is the admission list, exactly as for a socket the
+        # daemon binds itself (`endpointSocketMode`).
+        SocketMode = hostState.endpointSocketMode;
+        DirectoryMode = hostState.endpointDirectoryMode;
+      };
+    };
+
     systemd.services.runquotad = {
       description = "RunQuota host-wide lease authority";
-      wantedBy = [ "multi-user.target" ];
-      after = [ "local-fs.target" ];
+      # STARTED ONLY THROUGH THE SOCKET when it is activated: a boot-time
+      # start beside it would race the socket unit for the endpoint.
+      wantedBy = lib.optionals (!cfg.socketActivation) [ "multi-user.target" ];
+      requires = lib.optionals cfg.socketActivation [ "runquotad.socket" ];
+      after = [ "local-fs.target" ] ++ lib.optionals cfg.socketActivation [ "runquotad.socket" ];
       serviceConfig = {
         Type = "simple";
         User = cfg.user;
@@ -177,6 +237,10 @@ in
             "--observation-db"
             cfg.observationDb
           ]
+          ++ lib.optionals (cfg.idleExitAfter != null) [
+            "--idle-exit-after"
+            (toString cfg.idleExitAfter)
+          ]
           ++ cfg.extraArgs
         );
         Restart = "on-failure";
@@ -186,7 +250,9 @@ in
         # spec). A restart would drop every build on the host.
         ExecReload = "${cfg.package}/bin/runquota config reload";
       };
-      environment.RUNQUOTA_SOCKET = "${endpointDir}/${hostState.endpointSocketName}";
+      # Also the endpoint a socket-activated daemon compares the handed
+      # socket's bound path with; it refuses one bound anywhere else.
+      environment.RUNQUOTA_SOCKET = endpointPath;
       reloadTriggers = lib.optional (cfg.hostConfig != null) (hostConfigLib.render cfg.hostConfig);
     };
   };

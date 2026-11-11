@@ -187,6 +187,7 @@ and that daemon admits only the pools its file and flags size.
 | `--pool NAME=UNITS` | none | An arbitrary named counter. Pins the value against a reload, and over what sessions declare. |
 | `--socket PATH` | the rendezvous socket | Where to listen. A path you name here is created on demand; the host-wide one never is. |
 | `--host-config PATH` | the host file above | The budget file read at start and on every reload. |
+| `--idle-exit-after SECONDS` | never | Exit (0, through the orderly shutdown) once no client connection has been open for `SECONDS`, counted from start-up or from the moment the last connection closed. A positive whole number; anything else is a usage error (exit 2). See [Exiting when idle](#exiting-when-idle). |
 
 Memory pressure:
 
@@ -285,10 +286,87 @@ variables are removed from the daemon's environment at entry.
 An explicitly supplied PID 1 is valid, allowing the caller to be a container
 entrypoint; the daemon stays alive while its observed parent is still 1.
 
-This is what `repro` does with the private daemon it starts on an
-unprovisioned host, and it is the only way such a daemon stops when its caller
-is `SIGKILL`ed or OOM-killed, since no handler in the caller runs then. The
-installed host-wide service is never started with it.
+It is the only way such a daemon stops when its caller is `SIGKILL`ed or
+OOM-killed, since no handler in the caller runs then. Neither the installed
+host-wide service nor the per-user daemon `repro` starts (next section) is
+started with it: both are meant to outlive whoever started them.
+
+### Exiting when idle
+
+`runquotad --idle-exit-after SECONDS` makes a daemon end itself once no client
+connection has been open for `SECONDS`, counted from start-up or from the
+moment the last connection closed. Leases live in sessions and sessions on
+connections, so "no connection" includes "no lease"; a client that merely
+holds a connection open, saying nothing, keeps the daemon alive. When the
+period passes the daemon prints
+
+```text
+runquotad: idle exit: no client connection for SECONDS s
+```
+
+stops admitting connections, frees its endpoint first and exits 0 through the
+shutdown above. The decision and the admission of connections are one step,
+so no connection is admitted after it and none admitted before it is cut off;
+a client whose connection lands in that instant is closed unserved, exactly as
+during a `SIGTERM` shutdown, and should start or find the next daemon.
+
+Without the flag a daemon never idles out.
+
+### One daemon per user on an unprovisioned host
+
+On a host with no RunQuota service installed, `repro` starts one daemon per
+user, which every later invocation of that user adopts and which exits by
+itself after a period with no client (`--idle-exit-after`). Its endpoint is
+computed the same way by every process of the user, from the filesystem and
+the effective uid:
+
+1. `RUNQUOTA_USER_ENDPOINT_DIR`, when set;
+2. on Linux, `/run/user/<uid>/runquota` when `/run/user/<uid>` is a real
+   directory owned by the user with no group or other write permission;
+3. otherwise `/tmp/runquota-<uid>`.
+
+The socket is `runquotad.sock` in that directory, which is created `0700`
+and must be owned by the user. One owned by anyone else is refused, never
+replaced: remove it, or set `RUNQUOTA_USER_ENDPOINT_DIR`. The daemon and its
+clients use the owner-only private policy (`RUNQUOTA_ENDPOINT_SCOPE=private`).
+
+Two lock files sit beside the socket:
+
+- `runquotad.sock.lock`, the **lifetime lock**. A daemon that binds a
+  private endpoint takes an exclusive `flock` on it before it binds and holds
+  it until it exits. A second daemon on the same endpoint is refused (exit 3,
+  naming the lock). The lock, not the socket file, says whether a daemon is
+  alive there: a daemon killed with `SIGKILL` leaves its socket behind, and
+  the kernel releases its lock, so a launcher that finds the socket but a
+  free lock knows the socket is stale.
+- `runquotad.sock.start`, the **start lock**, held by a launcher while it
+  adopts or starts a daemon, so that concurrent invocations never start two.
+  The daemon never takes it.
+
+One daemon per *user* is still not one per *host*: two users of an
+unprovisioned host each get their own. Installing the service is what gives a
+host a single authority.
+
+### Socket activation (systemd)
+
+A `runquotad` started by a systemd `.socket` unit serves the listening socket
+systemd hands it on descriptor 3 instead of binding one: with `LISTEN_PID`
+equal to its pid and `LISTEN_FDS=1`
+([`sd_listen_fds(3)`](https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html)).
+It removes the three `LISTEN_*` variables from its environment first, and
+refuses (exit 3) any `LISTEN_FDS` other than 1, a descriptor that is not a
+listening Unix stream socket, and one bound at a path other than its
+configured endpoint (`--socket`, else the default) -- its clients would be
+looking somewhere else. It never removes the socket (systemd owns it), takes no
+lifetime lock, and never dials its own socket to wake its accept loop, so it
+leaves no queued connection behind that would make systemd start it again at
+once. With `--idle-exit-after` it exits when idle and systemd starts it again
+on the next connection, which systemd holds queued meanwhile.
+
+The NixOS module turns this on with `services.runquotad.socketActivation =
+true`, and `services.runquotad.idleExitAfter = SECONDS` adds the idle period
+(it requires socket activation). The nix-darwin service keeps running
+unconditionally.
 
 ## When things go wrong at runtime
 

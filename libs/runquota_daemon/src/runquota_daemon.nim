@@ -1,5 +1,5 @@
-import std/[algorithm, atomics, cpuinfo, locks, options, os, sets, strutils,
-  tables, times]
+import std/[algorithm, atomics, cpuinfo, locks, monotimes, options, os, sets,
+  strutils, tables, times]
 
 when defined(posix):
   # `getuid` for the host-state-directory ownership check below.
@@ -16,6 +16,7 @@ import runquota_daemon/host_memory
 import runquota_daemon/reload_report
 import runquota_daemon/child_identity
 import runquota_daemon/parent_watch
+import runquota_daemon/socket_activation
 import runquota_codec
 import runquota_core
 import runquota_core/process_owned
@@ -47,6 +48,8 @@ export windows_service
 export reload_report
 # `runquotad` reads `RUNQUOTA_EXIT_WITH_PARENT` through this, at start.
 export parent_watch
+# And systemd's `LISTEN_*` hand-over through this one.
+export socket_activation
 
 const libraryName* = "runquota_daemon"
 
@@ -2906,6 +2909,15 @@ var
     ## Connections the accept loop has handed to a worker and the worker has
     ## not finished with. The accept loop's own wake-up dials are never
     ## counted: they are closed before they are admitted.
+  idleExitAfterMillis = 0'i64
+    ## `--idle-exit-after`, in milliseconds; 0 never idles out. Guarded by
+    ## `retirementLock` with the fields above, because the idle decision IS
+    ## the retirement decision and has to be taken in the same step as the
+    ## admission it excludes.
+  idleSince: MonoTime
+    ## When `openClientConnections` last became 0: start-up, or the moment
+    ## the last admitted connection was counted out. Meaningful only while
+    ## that count is 0.
 initLock(retirementLock)
 
 proc wakeAcceptLoopForRetirement(endpointPath: string) {.gcsafe.}
@@ -2938,6 +2950,10 @@ proc connectionEnded() {.gcsafe.} =
     try:
       if openClientConnections > 0:
         dec openClientConnections
+      if openClientConnections == 0:
+        # THE IDLE PERIOD STARTS NOW, not at the last request: a connection
+        # held open without a word -- the launcher's hold -- is use.
+        idleSince = getMonoTime()
       if retirementRequested and not retirementDecided and
           openClientConnections == 0:
         retirementDecided = true
@@ -2967,6 +2983,8 @@ proc resetRetirementState() =
     retirementRequested = false
     retirementDecided = false
     openClientConnections = 0
+    idleExitAfterMillis = 0
+    idleSince = getMonoTime()
   finally:
     release(retirementLock)
 
@@ -3020,6 +3038,106 @@ proc retirementAnswer*(daemon: RunQuotaDaemon; peer: PeerIdentity;
     else:
       "exits once its " & $result.otherConnections &
         " other client connection(s) close"
+
+# ---------------------------------------------------------------------------
+# Idle exit: `--idle-exit-after N`.
+#
+# Normative specification: reprobuild-pm
+# ``spec/RunQuota-Host-Configuration.md`` §"The shared per-user daemon
+# (POSIX)", "The idle period", and "Socket activation (systemd)".
+#
+# WHO ASKS FOR THIS. On a host with no provisioned service, `repro` starts one
+# daemon per user that every later invocation adopts and nobody ever stops;
+# and a socket-activated service may exit when idle, because systemd starts it
+# again on the next connection. Both need the daemon to end ITSELF once nobody
+# has used it for a while.
+#
+# IT IS THE RETIREMENT DECISION, MADE BY THE DAEMON ITSELF, and it reuses that
+# machinery rather than growing a second shutdown: the decision is taken under
+# `retirementLock`, the same lock `admitConnection` takes, so no connection is
+# admitted after it and none admitted before it is cut off; the accept loop is
+# woken the way a retirement wakes it; and `serve`'s shutdown then frees the
+# endpoint FIRST, exactly as for a retirement, and returns 0. "No connection"
+# includes "no lease": leases live in sessions and sessions on connections.
+#
+# A SLEEPING THREAD, NOT A TIMER IN THE ACCEPT LOOP. The accept loop parks in
+# `poll` with no timeout on purpose (see `waitForAcceptOrShutdown`), and
+# Windows parks in `ConnectNamedPipe`, which has none to give. So a thread of
+# its own sleeps until the earliest moment the period could end -- in slices
+# of at most `idleWatchSliceMillis`, so that `serve`'s shutdown, which joins
+# it on every path, never waits longer than one slice -- and decides then.
+# It runs only when the flag was given: without it there is nothing to watch
+# and no thread exists, which keeps the provisioned service exactly as it was.
+# ---------------------------------------------------------------------------
+
+const idleWatchSliceMillis = 200
+  ## The longest single sleep of the idle watcher. Bounds how long the join in
+  ## `serve`'s shutdown waits for it, and how late after the period the
+  ## decision can come; the parent watch uses the same interval.
+
+var
+  idleWatchThread: Thread[void]
+  idleWatchRunning = false
+  idleWatchStop: Atomic[bool]
+  idleExitAfterSecondsForLog = 0
+    ## The configured period, for the log line. Written by `serve` before the
+    ## watcher exists, read only by it.
+
+proc idleWatchMain() {.thread.} =
+  {.cast(gcsafe).}:
+    while not idleWatchStop.load(moAcquire):
+      var decideNow = false
+      var sleepMillis = int64(idleWatchSliceMillis)
+      acquire(retirementLock)
+      try:
+        if retirementDecided:
+          # A retirement or a shutdown got there first; nothing to watch.
+          return
+        if openClientConnections == 0:
+          let idleFor = inMilliseconds(getMonoTime() - idleSince)
+          if idleFor >= idleExitAfterMillis:
+            retirementDecided = true
+            decideNow = true
+          else:
+            sleepMillis = min(sleepMillis, idleExitAfterMillis - idleFor)
+      finally:
+        release(retirementLock)
+      if decideNow:
+        try:
+          echo "runquotad: idle exit: no client connection for " &
+            $idleExitAfterSecondsForLog & " s"
+          flushFile(stdout)
+        except CatchableError:
+          discard
+        wakeAcceptLoopForRetirement(retirementEndpointPath)
+        return
+      sleep(int(max(sleepMillis, 1'i64)))
+
+proc startIdleWatch(seconds: int) =
+  ## Arms the idle exit; a no-op for 0. Call after `resetRetirementState` and
+  ## after the accept loop's wake is armed (`installShutdownHandler`), because
+  ## the decision is delivered through it.
+  if seconds <= 0 or idleWatchRunning:
+    return
+  acquire(retirementLock)
+  try:
+    idleExitAfterMillis = int64(seconds) * 1000
+    idleSince = getMonoTime()
+  finally:
+    release(retirementLock)
+  idleExitAfterSecondsForLog = seconds
+  idleWatchStop.store(false, moRelease)
+  createThread(idleWatchThread, idleWatchMain)
+  idleWatchRunning = true
+
+proc stopIdleWatch() =
+  ## Stops and joins the watcher, on every path out of `serve`; costs at most
+  ## one slice. A no-op without a watch.
+  if not idleWatchRunning:
+    return
+  idleWatchStop.store(true, moRelease)
+  joinThread(idleWatchThread)
+  idleWatchRunning = false
 
 proc awaitImageDigest(): string
   ## Defined with the digest thread, below `serve`'s other helpers.
@@ -4540,7 +4658,48 @@ const endpointRefusedExitCode* = 3
   ## something impossible" from "the path you asked for belongs to someone
   ## else".
 
+proc takeLifetimeLock(endpoint: Endpoint): cint =
+  ## THE LIFETIME LOCK, for a daemon that binds a PRIVATE-scope endpoint
+  ## itself: `flock(LOCK_EX | LOCK_NB)` on `<socket>.lock`, taken BEFORE the
+  ## bind and held until the process exits (reprobuild-pm
+  ## `spec/RunQuota-Host-Configuration.md`, "The shared per-user daemon
+  ## (POSIX)"). Returns the descriptor, or -1 where no lock applies.
+  ##
+  ## WHY THE LOCK AND NOT THE SOCKET. A daemon killed by `SIGKILL` leaves its
+  ## socket behind, and the kernel releases its lock; so the lock, not the
+  ## socket file, is what tells the next launcher whether a daemon is alive
+  ## on this endpoint. Before the bind, so that a daemon that holds the lock
+  ## and has not yet bound reads as "starting" rather than "gone".
+  ##
+  ## ONLY THE PRIVATE SCOPE. The host endpoint is provisioned and supervised
+  ## -- a service manager, not a lock, decides who serves it -- and the
+  ## provisioned service's behaviour does not change. The rendezvous
+  ## directory is created and verified first, because the lock lives in it.
+  ##
+  ## Raises `OSError` (an `EndpointTrustError` when the lock is held or the
+  ## lock file is not ours); `serve` turns either into a refusal.
+  when defined(posix):
+    if endpoint.kind != endpointUnixSocket:
+      return -1
+    let policy = rendezvousPolicy()
+    if policy.scope != rendezvousPrivate:
+      return -1
+    ensureEndpointDir(endpoint, policy)
+    acquireLifetimeLock(endpoint.path)
+  else:
+    discard endpoint
+    -1
+
 proc serve*(config: DaemonConfig): int =
+  # A SOCKET-ACTIVATION HAND-OVER THAT CANNOT BE SERVED IS REFUSED FIRST.
+  # The descriptors were addressed to this process, so binding a socket of
+  # its own instead would leave systemd's listener unserved while the unit
+  # reads as running.
+  let activated = config.socketActivation.requested
+  if activated and config.socketActivation.refusal.len > 0:
+    echo config.socketActivation.refusal
+    flushFile(stdout)
+    return endpointRefusedExitCode
   # THE RENDEZVOUS PATH IS CHECKED BEFORE ANYTHING ELSE STARTS. A daemon
   # that has already opened its observation store, minted a boot id and
   # spawned its writer thread has done work on behalf of a directory it is
@@ -4557,14 +4716,33 @@ proc serve*(config: DaemonConfig): int =
     echo refusal
     flushFile(stdout)
     return endpointRefusedExitCode
+  # THE LISTENER SYSTEMD HANDED OVER, or THE LIFETIME LOCK, before any thread
+  # starts: either can refuse, and a refusal should not have to stop
+  # background work it started on behalf of an endpoint it will not serve.
+  var listener: LocalListener
+  var lifetimeLock = cint(-1)
+  try:
+    if activated:
+      when defined(posix):
+        listener = adoptListeningSocket(cint(config.socketActivation.fd),
+          config.endpoint)
+      else:
+        # Unreachable: `takeSocketActivation` never requests it here.
+        raise newException(OSError, "socket activation requires POSIX")
+    else:
+      lifetimeLock = takeLifetimeLock(config.endpoint)
+  except OSError as error:
+    echo error.msg
+    flushFile(stdout)
+    return endpointRefusedExitCode
   initLock(sharedDaemon.lock)
   initConnectionQueue()
   # THE STORE IS NOT OPENED HERE. See `captureOpenerMain`.
   sharedDaemon.daemon = initDaemon(config, deferCapture = true)
   captureCreateParent = config.observationDbPath.len > 0
-  var listener: LocalListener
   try:
-    listener = bindEndpoint(config.endpoint)
+    if not activated:
+      listener = bindEndpoint(config.endpoint)
   except EndpointTrustError as error:
     # Only reachable if the directory changed underneath the pre-check
     # above. Still a refusal rather than a fallback, and the background
@@ -4577,6 +4755,8 @@ proc serve*(config: DaemonConfig): int =
     stopObservationWriter()
     deinitLock(sharedDaemon.lock)
     deinitConnectionQueue()
+    when defined(posix):
+      releaseEndpointLock(lifetimeLock)
     return endpointRefusedExitCode
   sharedDaemon.daemon.state = dsServing
   # AFTER the rendezvous directory exists and has been verified, because the
@@ -4600,7 +4780,9 @@ proc serve*(config: DaemonConfig): int =
   # defect (M13's unfolded `OSError.msg`), so a new subsystem appends rather
   # than announces.
   echo "runquotad listening " & config.endpoint.path &
-    rendezvousDegradationReport() & "; " &
+    rendezvousDegradationReport() &
+    (if activated: " (socket activation: descriptor " &
+       $config.socketActivation.fd & ")" else: "") & "; " &
     statsPublisherReport(sharedDaemon.daemon.statsPublisher)
   # The report is the "clear report" half of OS-4: a store that will not
   # open says so on stdout and the daemon carries on serving leases.
@@ -4623,11 +4805,18 @@ proc serve*(config: DaemonConfig): int =
   # the hash. See `startImageDigest` and `RunQuotaDaemon.imageDigest`.
   startImageDigest()
   resetRetirementState()
-  retirementEndpointPath = config.endpoint.path
+  # A SOCKET-ACTIVATED DAEMON NEVER DIALS ITS OWN ENDPOINT. The dial is only
+  # the faster of two wakes (the accept-wake pipe is the other, and the one
+  # that always arrives); under systemd it is also a hazard: a dialled
+  # connection still queued on systemd's listener when this process exits
+  # makes systemd start the daemon again at once. An empty path is what
+  # `dialOwnEndpoint` reads as "do not dial".
+  let wakeDialPath = if activated: "" else: config.endpoint.path
+  retirementEndpointPath = wakeDialPath
   # AFTER the endpoint is bound, because the waker has a socket to dial, and
   # before any worker exists, because the shutdown this arms is the one that
   # joins them.
-  installShutdownHandler(config.endpoint.path)
+  installShutdownHandler(wakeDialPath)
   # `RUNQUOTA_EXIT_WITH_PARENT`: AFTER the handler is armed, because the watch
   # stops the daemon by sending it SIGTERM, and a SIGTERM that arrived before
   # the arming would take the default disposition instead of the orderly
@@ -4664,6 +4853,10 @@ proc serve*(config: DaemonConfig): int =
   captureOpenerRelease = false
   createThread(captureOpenerThread, captureOpenerMain)
   captureOpenerRunning = true
+  # `--idle-exit-after`: after the accept loop's wake is armed, because the
+  # decision is delivered through it, and immediately before the `try` whose
+  # `finally` joins it, so no path out of `serve` leaves it running.
+  startIdleWatch(config.idleExitAfterSeconds)
   try:
     # A FAILED ACCEPT IS USUALLY THE HOST TALKING, NOT THE LISTENER DYING.
     # `accept` reports the peer's problems as well as its own: ECONNABORTED
@@ -4761,6 +4954,9 @@ proc serve*(config: DaemonConfig): int =
     # only possible signal is one the armed handler still turns into a flag
     # this shutdown is already acting on. A no-op without a watch.
     stopParentWatch()
+    # And the idle watch, for the same reason: whatever it would decide, this
+    # shutdown is already doing, and it must not outlive `serve`.
+    stopIdleWatch()
     # FIRST OF THE SHUTDOWN PROPER, so the handler is disarmed and the waker
     # joined before the shutdown does anything else. A second SIGTERM arriving mid-shutdown
     # then takes the default disposition, which is the right answer: an
@@ -4827,4 +5023,12 @@ proc serve*(config: DaemonConfig): int =
         listener.close()
       deinitLock(sharedDaemon.lock)
       deinitConnectionQueue()
+      # THE LIFETIME LOCK GOES LAST: until here this process still holds the
+      # endpoint's directory files, and a launcher that saw the lock free
+      # would treat whatever is left as stale. `runquotad` exits right after
+      # `serve` returns, so this is the process's lifetime in practice; it is
+      # released explicitly so an in-process caller that serves twice does
+      # not refuse itself.
+      when defined(posix):
+        releaseEndpointLock(lifetimeLock)
   0

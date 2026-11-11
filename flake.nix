@@ -134,6 +134,44 @@
               }
             ];
           };
+          # Socket activation (`services.runquotad.socketActivation`): the
+          # `.socket` unit, and a service started only through it with the
+          # idle period on its command line.
+          nixosSocketEval = inputs.nixos-modules.inputs.nixpkgs.lib.nixosSystem {
+            modules = [
+              self.nixosModules.runquotad
+              {
+                nixpkgs.hostPlatform = "x86_64-linux";
+                boot.loader.grub.devices = [ "/dev/sda" ];
+                fileSystems."/" = {
+                  device = "/dev/sda1";
+                  fsType = "ext4";
+                };
+                system.stateVersion = "24.05";
+                services.runquotad.enable = true;
+                services.runquotad.socketActivation = true;
+                services.runquotad.idleExitAfter = 600;
+              }
+            ];
+          };
+          # The idle period without socket activation must be refused: nothing
+          # would start the daemon again after it idled out.
+          nixosIdleWithoutSocketEval = inputs.nixos-modules.inputs.nixpkgs.lib.nixosSystem {
+            modules = [
+              self.nixosModules.runquotad
+              {
+                nixpkgs.hostPlatform = "x86_64-linux";
+                boot.loader.grub.devices = [ "/dev/sda" ];
+                fileSystems."/" = {
+                  device = "/dev/sda1";
+                  fsType = "ext4";
+                };
+                system.stateVersion = "24.05";
+                services.runquotad.enable = true;
+                services.runquotad.idleExitAfter = 600;
+              }
+            ];
+          };
           version =
             let
               versionMatches = builtins.filter (match: match != null) (
@@ -349,6 +387,39 @@
                       "ExecReload"
                     ]
                   );
+                  # The default module keeps the always-running unit and
+                  # passes no idle period.
+                  nixosDefaultWantedBy = builtins.toJSON nixosEval.config.systemd.services.runquotad.wantedBy;
+                  nixosDefaultSocketEnabled = builtins.toJSON (
+                    nixosEval.config.systemd.sockets ? runquotad
+                  );
+                  nixosDefaultExecStart = builtins.unsafeDiscardStringContext nixosEval.config.systemd.services.runquotad.serviceConfig.ExecStart;
+                  # Socket activation: the socket unit's values, and the
+                  # service's wiring and arguments. `ExecStart` with its
+                  # context discarded, for the reason given above.
+                  nixosSocket = builtins.toJSON {
+                    inherit (nixosSocketEval.config.systemd.sockets.runquotad) listenStreams wantedBy;
+                    inherit (nixosSocketEval.config.systemd.sockets.runquotad.socketConfig)
+                      SocketUser
+                      SocketGroup
+                      SocketMode
+                      ;
+                  };
+                  nixosSocketService = builtins.toJSON {
+                    inherit (nixosSocketEval.config.systemd.services.runquotad) wantedBy requires after;
+                    inherit (nixosSocketEval.config.systemd.services.runquotad.environment) RUNQUOTA_SOCKET;
+                  };
+                  nixosSocketExecStart = builtins.unsafeDiscardStringContext nixosSocketEval.config.systemd.services.runquotad.serviceConfig.ExecStart;
+                  nixosIdleWithoutSocketFailures = builtins.toJSON (
+                    map (assertion: assertion.message) (
+                      builtins.filter (assertion: !assertion.assertion) nixosIdleWithoutSocketEval.config.assertions
+                    )
+                  );
+                  nixosSocketFailures = builtins.toJSON (
+                    map (assertion: assertion.message) (
+                      builtins.filter (assertion: !assertion.assertion) nixosSocketEval.config.assertions
+                    )
+                  );
                 }
                 ''
                   printf '%s' "$darwinActivation" > darwin-activation
@@ -381,6 +452,34 @@
                   printf '%s' "$nixosService" > nixos-service
                   grep -F 'RuntimeDirectory' nixos-service
                   grep -F 'StateDirectory' nixos-service
+
+                  # Default: always running, no socket unit, no idle exit.
+                  test "$nixosDefaultWantedBy" = '["multi-user.target"]'
+                  test "$nixosDefaultSocketEnabled" = 'false'
+                  if printf '%s' "$nixosDefaultExecStart" | grep -F -- '--idle-exit-after'; then
+                    echo "the default service must not idle out" >&2
+                    exit 1
+                  fi
+
+                  # Socket activation: the host endpoint, the module's user
+                  # and group, 0660, wanted by sockets.target.
+                  printf '%s' "$nixosSocket" > nixos-socket
+                  grep -F '"listenStreams":["${hostState.endpointDirectories.linux}/${hostState.endpointSocketName}"]' nixos-socket
+                  grep -F '"SocketUser":"${hostState.user}"' nixos-socket
+                  grep -F '"SocketGroup":"${hostState.group}"' nixos-socket
+                  grep -F '"SocketMode":"0660"' nixos-socket
+                  grep -F '"wantedBy":["sockets.target"]' nixos-socket
+                  # The service is started only through the socket, serves
+                  # the same endpoint, and carries the idle period.
+                  printf '%s' "$nixosSocketService" > nixos-socket-service
+                  grep -F '"wantedBy":[]' nixos-socket-service
+                  grep -F '"requires":["runquotad.socket"]' nixos-socket-service
+                  grep -F 'runquotad.socket' nixos-socket-service
+                  grep -F '"RUNQUOTA_SOCKET":"${hostState.endpointDirectories.linux}/${hostState.endpointSocketName}"' nixos-socket-service
+                  printf '%s' "$nixosSocketExecStart" | grep -F -- "--idle-exit-after 600"
+                  test "$nixosSocketFailures" = '[]'
+                  # The idle period without the socket unit is refused.
+                  printf '%s' "$nixosIdleWithoutSocketFailures" | grep -F 'idleExitAfter requires services.runquotad.socketActivation'
 
                   mkdir -p $out
                 '';

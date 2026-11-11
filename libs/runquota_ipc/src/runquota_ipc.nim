@@ -1198,6 +1198,314 @@ proc defaultEndpoint*(): Endpoint =
   else:
     Endpoint(kind: endpointUnsupported, path: "")
 
+# ---------------------------------------------------------------------------
+# The per-user endpoint, and the two lock files beside it.
+#
+# Normative specification: reprobuild-pm
+# ``spec/RunQuota-Host-Configuration.md`` §"The shared per-user daemon
+# (POSIX)".
+#
+# WHY A PER-USER ENDPOINT EXISTS AT ALL, given everything the section above
+# says against one. The section above is about the HOST endpoint, and it still
+# holds: a provisioned host has one daemon, at a fixed path, for everybody.
+# This is the UNPROVISIONED case. There, `repro` used to start a private
+# daemon per invocation on a per-build socket, so two concurrent builds of one
+# user each admitted against the whole budget. One daemon per USER, at a path
+# every process of that user computes identically, is the most global view an
+# unprovisioned host can have without an operator: two users still get two
+# daemons, and provisioning the service is still what gives a host one
+# authority.
+#
+# THE PATH IS COMPUTED FROM THE FILESYSTEM AND THE EFFECTIVE UID, never from a
+# per-process environment variable such as ``XDG_RUNTIME_DIR``: two processes
+# of one user that saw different environments would compute two paths -- the
+# defect ``defaultEndpoint`` above records, one level down. The one variable
+# that IS read, ``RUNQUOTA_USER_ENDPOINT_DIR``, is an isolation knob for tests
+# and for an operator who wants a second, separate per-user daemon; it is not
+# discovery.
+#
+# The launcher protocol that uses these -- adopt or start under the start
+# lock, the lifetime lock as the liveness test -- lives in reprobuild. What
+# lives here is every NAME and every CHECK, so the launcher and the daemon
+# cannot disagree about either.
+# ---------------------------------------------------------------------------
+
+when defined(posix):
+  const
+    userEndpointDirEnvVar* = "RUNQUOTA_USER_ENDPOINT_DIR"
+      ## Names the per-user endpoint directory outright. Absolute, no NUL;
+      ## a malformed value is an error. Empty means unset.
+    userEndpointDirectoryMode* = 0o700
+    endpointLockFileMode* = 0o600
+      ## Both lock files: the lifetime lock and the start lock.
+    lifetimeLockSuffix* = ".lock"
+    startLockSuffix* = ".start"
+    userEndpointLogName* = "runquotad.log"
+      ## Where the launcher appends a daemon's standard output and error, in
+      ## the endpoint directory.
+
+  var
+    oNoFollow {.importc: "O_NOFOLLOW", header: "<fcntl.h>".}: cint
+    oDirectory {.importc: "O_DIRECTORY", header: "<fcntl.h>".}: cint
+      ## Neither is exported by ``std/posix``.
+
+  const
+    lockShared = cint(1)
+    lockExclusive = cint(2)
+    lockNonBlocking = cint(4)
+    lockUnlock = cint(8)
+      ## The ``flock(2)`` operations; the same values on Linux, macOS and
+      ## the BSDs (``<sys/file.h>``).
+
+  proc flockCall(fd: cint; operation: cint): cint {.
+    importc: "flock", header: "<sys/file.h>".}
+
+  proc requireUsableDirectoryName(directory, origin: string) =
+    if directory.len == 0 or not isAbsolute(directory) or '\0' in directory:
+      raise newException(EndpointTrustError,
+        origin & " must be an absolute directory path without NUL bytes, got: " &
+          directory.escape)
+
+  proc resolveUserEndpointDir*(euid: int64; overrideDir: string;
+                               runUserRoot, tmpRoot: string): string =
+    ## The three-step rule, with every input explicit so it can be tested
+    ## without root and without the environment:
+    ##
+    ## 1. ``overrideDir`` (``RUNQUOTA_USER_ENDPOINT_DIR``), when non-empty.
+    ## 2. ``<runUserRoot>/<euid>/runquota`` when ``<runUserRoot>/<euid>`` is
+    ##    a REAL directory (``lstat``: a symbolic link does not count) owned
+    ##    by ``euid`` with no group or other write permission. Only root can
+    ##    create ``/run/user/<uid>``, so no other local user can have
+    ##    occupied the path first. ``runUserRoot`` is empty where the step
+    ##    does not exist (everywhere but Linux).
+    ## 3. ``<tmpRoot>/runquota-<euid>``. Squatting on it is possible, and is
+    ##    refused rather than tolerated by ``ensureUserEndpointDir``.
+    if overrideDir.len > 0:
+      requireUsableDirectoryName(overrideDir, userEndpointDirEnvVar)
+      return overrideDir
+    if runUserRoot.len > 0:
+      let runtime = runUserRoot & "/" & $euid
+      var info: Stat
+      if lstat(runtime.cstring, info) == 0 and S_ISDIR(info.st_mode) and
+          int64(info.st_uid) == euid and (int(info.st_mode) and 0o022) == 0:
+        return runtime & "/runquota"
+    tmpRoot & "/runquota-" & $euid
+
+  proc userEndpointDir*(): string =
+    ## The directory of this user's per-user daemon. Raises
+    ## ``EndpointTrustError`` for a malformed ``RUNQUOTA_USER_ENDPOINT_DIR``.
+    ## Computes; creates nothing (``ensureUserEndpointDir`` does).
+    let runUserRoot = when defined(linux): "/run/user" else: ""
+    # macOS: `/tmp` is a link to `/private/tmp`. Spelled `/tmp` on purpose:
+    # the kernel resolves it identically for every process, and the
+    # directory itself, the one that is verified, is the link's target's
+    # child.
+    resolveUserEndpointDir(int64(geteuid()), getEnv(userEndpointDirEnvVar),
+      runUserRoot, "/tmp")
+
+  proc userEndpoint*(): Endpoint =
+    ## ``<userEndpointDir()>/runquotad.sock``. Always used with the PRIVATE
+    ## policy (``RUNQUOTA_ENDPOINT_SCOPE=private``): owner-only directory and
+    ## socket, owned by the effective uid.
+    unixEndpoint(userEndpointDir() / endpointSocketName)
+
+  proc lifetimeLockPath*(socketPath: string): string =
+    ## ``<socket>.lock``: held exclusively by a daemon that bound a private
+    ## endpoint itself, for its whole life. A daemon killed by ``SIGKILL``
+    ## leaves its socket behind and the kernel releases this lock, which is
+    ## what makes it -- and not the socket -- the liveness test.
+    socketPath & lifetimeLockSuffix
+
+  proc startLockPath*(socketPath: string): string =
+    ## ``<socket>.start``: held by a launcher while it adopts or starts, so
+    ## that concurrent invocations never start two daemons. The daemon never
+    ## takes it.
+    socketPath & startLockSuffix
+
+  proc userEndpointDirRefusal(directory, problem: string): string =
+    ## Names the directory and BOTH remedies, as the specification requires:
+    ## a directory another user created first is a denial of service that
+    ## must stay loud, and its victim needs to know the way out.
+    "runquota per-user endpoint directory " & directory & ": " & problem &
+      ". It must be a directory owned by this user (uid " & $geteuid() &
+      ") with mode " & modeText(userEndpointDirectoryMode) &
+      "; remove it (whoever owns it can), or set " & userEndpointDirEnvVar &
+      " to a directory of your own"
+
+  proc ensureUserEndpointDir*(directory: string) =
+    ## Creates, repairs and VERIFIES a per-user endpoint directory under the
+    ## private policy (owner = effective uid, exact ``0700``, not a symbolic
+    ## link). Raises ``EndpointTrustError`` for a refusal and ``OSError`` for
+    ## a directory that cannot be created at all.
+    ##
+    ## * missing: ``mkdir`` with ``0700`` (only the last component -- the
+    ##   parents are ``/run/user/<uid>``, ``/tmp`` or the operator's own);
+    ## * owned by this user with another mode: set to ``0700`` through a
+    ##   descriptor opened with ``O_NOFOLLOW | O_DIRECTORY``, whose identity
+    ##   is checked against the one ``lstat`` saw, so a directory swapped for
+    ##   a link in between is not what gets changed;
+    ## * a symbolic link, a non-directory, or owned by anyone else: REFUSED,
+    ##   never silently replaced. A ``/tmp`` path another user can create
+    ##   first must stay a loud denial of service, not become a trust hole.
+    requireUsableDirectoryName(directory, "the per-user endpoint directory")
+    if mkdir(directory.cstring, Mode(userEndpointDirectoryMode)) != 0:
+      let code = errno
+      if code != EEXIST:
+        raise newException(OSError,
+          "runquota per-user endpoint directory " & directory &
+            ": cannot create it (" & $strerror(code) & ")")
+    var seen: Stat
+    if lstat(directory.cstring, seen) != 0:
+      raise newException(OSError,
+        "runquota per-user endpoint directory " & directory &
+          ": cannot be inspected (" & $strerror(errno) & ")")
+    if S_ISLNK(seen.st_mode):
+      raise newException(EndpointTrustError, userEndpointDirRefusal(directory,
+        "is a symbolic link; refusing to follow it"))
+    if not S_ISDIR(seen.st_mode):
+      raise newException(EndpointTrustError, userEndpointDirRefusal(directory,
+        "is not a directory"))
+    # OWNERSHIP BEFORE MODE, as in `inspectPath`: a foreign directory is
+    # refused for its owner and its mode is never touched.
+    if int64(seen.st_uid) != int64(geteuid()):
+      raise newException(EndpointTrustError, userEndpointDirRefusal(directory,
+        "is owned by uid " & $seen.st_uid & " with mode " &
+          modeText(int(seen.st_mode) and 0o7777)))
+    if (int(seen.st_mode) and 0o7777) != userEndpointDirectoryMode:
+      let fd = posix.open(directory.cstring,
+        O_RDONLY or O_CLOEXEC or oNoFollow or oDirectory)
+      if fd < 0:
+        raise newException(EndpointTrustError, userEndpointDirRefusal(directory,
+          "cannot be opened to repair its mode (" & $strerror(errno) & ")"))
+      try:
+        var opened: Stat
+        if fstat(fd, opened) != 0 or opened.st_dev != seen.st_dev or
+            opened.st_ino != seen.st_ino or opened.st_uid != seen.st_uid:
+          raise newException(EndpointTrustError, userEndpointDirRefusal(
+            directory, "changed while it was being checked"))
+        if fchmod(fd, Mode(userEndpointDirectoryMode)) != 0:
+          raise newException(EndpointTrustError, userEndpointDirRefusal(
+            directory, "mode " & modeText(int(seen.st_mode) and 0o7777) &
+              " cannot be set to " & modeText(userEndpointDirectoryMode) &
+              " (" & $strerror(errno) & ")"))
+      finally:
+        discard posix.close(fd)
+    # VERIFIED, whatever happened above: creating or repairing it correctly
+    # says nothing about what is there now.
+    let trust = inspectPath(directory, wantDirectory = true,
+      requiredMode = userEndpointDirectoryMode,
+      expectedOwnerUid = int64(geteuid()),
+      label = "per-user endpoint directory")
+    if trust.reason != trustOk:
+      raise newException(EndpointTrustError,
+        userEndpointDirRefusal(directory, trust.message))
+
+  proc openEndpointLockFile*(path: string; create: bool): cint =
+    ## Opens a lock file beside an endpoint: ``O_CLOEXEC | O_NOFOLLOW``, mode
+    ## ``0600`` when created, refused unless it is a regular file owned by
+    ## the effective uid. A file of ours with a wider mode is narrowed to
+    ## ``0600``. Returns -1 only when ``create`` is false and the file does
+    ## not exist; every other failure raises (``EndpointTrustError`` for a
+    ## refusal, ``OSError`` otherwise).
+    ##
+    ## CLOSE-ON-EXEC IS THE POINT, not hygiene: a lock descriptor inherited by
+    ## a child keeps the lock held after this process is gone, which is
+    ## exactly the false "a daemon is alive here" the lock exists to rule out.
+    var flags = O_CLOEXEC or oNoFollow
+    flags = flags or (if create: O_RDWR or O_CREAT else: O_RDONLY)
+    result = posix.open(path.cstring, flags, Mode(endpointLockFileMode))
+    if result < 0:
+      let code = errno
+      if code == ENOENT and not create:
+        return -1
+      if code == ELOOP:
+        raise newException(EndpointTrustError, "runquota lock file " & path &
+          ": is a symbolic link; refusing to follow it")
+      raise newException(OSError, "runquota lock file " & path &
+        ": cannot be opened (" & $strerror(code) & ")")
+    var info: Stat
+    var refusal = ""
+    if fstat(result, info) != 0:
+      refusal = "cannot be inspected (" & $strerror(errno) & ")"
+    elif not S_ISREG(info.st_mode):
+      refusal = "is not a regular file"
+    elif int64(info.st_uid) != int64(geteuid()):
+      refusal = "is owned by uid " & $info.st_uid & ", not by this user (uid " &
+        $geteuid() & ")"
+    elif (int(info.st_mode) and 0o7777) != endpointLockFileMode and
+        fchmod(result, Mode(endpointLockFileMode)) != 0:
+      refusal = "mode " & modeText(int(info.st_mode) and 0o7777) &
+        " cannot be set to " & modeText(endpointLockFileMode)
+    if refusal.len > 0:
+      discard posix.close(result)
+      raise newException(EndpointTrustError,
+        "runquota lock file " & path & ": " & refusal)
+
+  proc releaseEndpointLock*(fd: cint) =
+    ## Releases a lock taken by ``acquireLifetimeLock`` or
+    ## ``acquireStartLock`` by closing its descriptor. A negative value is
+    ## ignored.
+    if fd >= 0:
+      discard posix.close(fd)
+
+  proc lifetimeLockHeld*(socketPath: string): bool =
+    ## Whether a daemon holds the lifetime lock of ``socketPath`` right now:
+    ## a SHARED non-blocking lock is taken and released at once. It succeeds
+    ## against nobody and fails against an exclusive holder. A missing lock
+    ## file means no daemon ever took it, so nobody holds it.
+    let path = lifetimeLockPath(socketPath)
+    let fd = openEndpointLockFile(path, create = false)
+    if fd < 0:
+      return false
+    defer: discard posix.close(fd)
+    while true:
+      if flockCall(fd, lockShared or lockNonBlocking) == 0:
+        discard flockCall(fd, lockUnlock)
+        return false
+      let code = errno
+      if code == EINTR:
+        continue
+      if code == EWOULDBLOCK or code == EAGAIN:
+        return true
+      raise newException(OSError, "runquota lock file " & path &
+        ": cannot be probed (" & $strerror(code) & ")")
+
+  proc acquireLifetimeLock*(socketPath: string): cint =
+    ## Takes the lifetime lock of ``socketPath`` (``flock(LOCK_EX |
+    ## LOCK_NB)``) and returns its descriptor, which the caller holds until
+    ## it exits. Raises ``EndpointTrustError`` naming the lock when another
+    ## process holds it: a daemon is alive on this endpoint.
+    let path = lifetimeLockPath(socketPath)
+    result = openEndpointLockFile(path, create = true)
+    while true:
+      if flockCall(result, lockExclusive or lockNonBlocking) == 0:
+        return
+      let code = errno
+      if code == EINTR:
+        continue
+      discard posix.close(result)
+      if code == EWOULDBLOCK or code == EAGAIN:
+        raise newException(EndpointTrustError,
+          "runquota endpoint " & socketPath & ": another runquotad holds its " &
+            "lifetime lock " & path & "; refusing to start a second daemon " &
+            "on it")
+      raise newException(OSError, "runquota lock file " & path &
+        ": cannot be locked (" & $strerror(code) & ")")
+
+  proc acquireStartLock*(socketPath: string): cint =
+    ## Takes the start lock of ``socketPath`` (``flock(LOCK_EX)``, BLOCKING:
+    ## a launcher waits for another launcher to finish adopting or starting)
+    ## and returns its descriptor. Release it with ``releaseEndpointLock``.
+    let path = startLockPath(socketPath)
+    result = openEndpointLockFile(path, create = true)
+    while flockCall(result, lockExclusive) != 0:
+      let code = errno
+      if code == EINTR:
+        continue
+      discard posix.close(result)
+      raise newException(OSError, "runquota lock file " & path &
+        ": cannot be locked (" & $strerror(code) & ")")
+
 proc provisionEndpointDirCommand*(directory: string;
                                   policy = rendezvousPolicy()): string =
   ## The exact command an operator runs on a host the install step has not
@@ -1484,6 +1792,67 @@ proc bindEndpoint*(endpoint: Endpoint;
 proc bindEndpoint*(endpoint: Endpoint): LocalListener =
   ## Preserve the one-argument procedure type for callback consumers.
   bindEndpoint(endpoint, rendezvousPolicy())
+
+when defined(posix):
+  proc adoptListeningSocket*(fd: cint; endpoint: Endpoint): LocalListener =
+    ## A listener over a socket SOMEBODY ELSE BOUND -- systemd socket
+    ## activation hands one over on descriptor 3
+    ## ([`sd_listen_fds(3)`](https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html)).
+    ## Raises ``EndpointTrustError`` unless ``fd`` is a LISTENING ``AF_UNIX``
+    ## STREAM socket bound at exactly ``endpoint.path``: a daemon serving a
+    ## socket its clients do not look for is serving nobody, silently.
+    ##
+    ## The descriptor is marked close-on-exec, so nothing the daemon starts
+    ## inherits the listener. ``boundInode`` is left 0, so ``close`` never
+    ## unlinks the path: the socket belongs to whoever bound it (systemd),
+    ## and removing it would leave the unit listening on a name nobody can
+    ## reach.
+    if endpoint.kind != endpointUnixSocket or endpoint.path.len == 0:
+      raise newException(EndpointTrustError,
+        "a handed-over listening socket needs a Unix-socket endpoint to " &
+          "compare it with")
+    let label = "the listening socket handed over on descriptor " & $fd
+    var info: Stat
+    if fstat(fd, info) != 0:
+      raise newException(EndpointTrustError, label & " cannot be inspected (" &
+        $strerror(errno) & ")")
+    if not S_ISSOCK(info.st_mode):
+      raise newException(EndpointTrustError, label & " is not a socket")
+    var value: cint = 0
+    var size = SockLen(sizeof(value))
+    if getsockopt(SocketHandle(fd), SOL_SOCKET, SO_TYPE, addr value,
+        addr size) != 0 or value != SOCK_STREAM:
+      raise newException(EndpointTrustError, label & " is not a stream socket")
+    value = 0
+    size = SockLen(sizeof(value))
+    if getsockopt(SocketHandle(fd), SOL_SOCKET, SO_ACCEPTCONN, addr value,
+        addr size) != 0 or value == 0:
+      raise newException(EndpointTrustError, label & " is not listening")
+    var address: Sockaddr_un
+    var addressSize = SockLen(sizeof(address))
+    zeroMem(addr address, sizeof(address))
+    if getsockname(SocketHandle(fd), cast[ptr SockAddr](addr address),
+        addr addressSize) != 0:
+      raise newException(EndpointTrustError, label &
+        " has no readable address (" & $strerror(errno) & ")")
+    if cint(address.sun_family) != AF_UNIX:
+      raise newException(EndpointTrustError, label & " is not an AF_UNIX socket")
+    # `sun_path` is NUL-terminated for a pathname socket, and an abstract
+    # socket (Linux) starts with a NUL byte and so reads as "", which never
+    # equals a configured path.
+    var bound = ""
+    for ch in address.sun_path:
+      if ch == '\0': break
+      bound.add(ch)
+    if bound != endpoint.path:
+      raise newException(EndpointTrustError, label & " is bound at " &
+        (if bound.len > 0: bound else: "no filesystem path") &
+        ", not at the configured endpoint " & endpoint.path &
+        "; its clients would be looking somewhere else")
+    setCloseOnExec(fd)
+    LocalListener(kind: endpointUnixSocket,
+      socket: newSocket(SocketHandle(fd), AF_UNIX, SOCK_STREAM, IPPROTO_NONE),
+      endpoint: endpoint, boundDevice: 0, boundInode: 0)
 
 proc acceptWaitHandle*(listener: LocalListener): int =
   ## THE DESCRIPTOR A CALLER MAY WAIT ON for "there is a connection to
