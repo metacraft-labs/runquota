@@ -498,13 +498,16 @@ const windowsCancelledExitCode* = 1'u32
 proc commandSpec*(argv: openArray[string]; cwd = ""; env: openArray[string] = [];
                   stdoutLimit = DefaultOutputLimit; stderrLimit = DefaultOutputLimit;
                   createProcessGroup = true; inheritEnv = true;
-                  stdio = captureStdio): CommandSpec =
+                  stdio = captureStdio;
+                  unsetEnv: openArray[string] = []): CommandSpec =
   for item in argv:
     result.argv.add(item)
   result.cwd = cwd
   for item in env:
     result.env.add(item)
   result.inheritEnv = inheritEnv
+  for name in unsetEnv:
+    result.unsetEnv.add(name)
   result.stdoutLimit = stdoutLimit
   result.stderrLimit = stderrLimit
   result.createProcessGroup = createProcessGroup
@@ -621,20 +624,32 @@ when defined(posix):
     ## place so no slice is materialised per comparison.
     entry.len > key.len and entry[key.len] == '=' and entry.startsWith(key)
 
+  proc envEntryNamedIn(entry: string; names: openArray[string]): bool =
+    ## Is `entry` (`NAME=VALUE`) one of the `names` a launch removes?
+    for name in names:
+      if entry.envEntryHasKey(name):
+        return true
+    false
+
   proc childEnvEntries(overrides: openArray[string];
-                       inherit = true): seq[string] =
+                       inherit = true;
+                       unset: openArray[string] = []): seq[string] =
     ## The environment the child should exec with: the launcher's own
     ## environment with `overrides` layered on top. This reproduces what the
     ## in-child `putEnv` loop produced -- including that an entry with no name
     ## (`=value`) or no separator at all is not an assignment and is ignored --
     ## except that it is computed before the fork. With `inherit = false` the
     ## launcher's own environment is not the base: the child gets `overrides`
-    ## alone (`CommandSpec.inheritEnv`).
+    ## alone (`CommandSpec.inheritEnv`). `unset` names are dropped from the
+    ## inherited base before the overrides go on, so an override still sets
+    ## its name (`CommandSpec.unsetEnv`).
     let inherited = if inherit: currentEnviron() else: nil
     if inherited != nil:
       var index = 0
       while inherited[index] != nil:
-        result.add($inherited[index])
+        let entry = $inherited[index]
+        if not envEntryNamedIn(entry, unset):
+          result.add(entry)
         inc index
     for item in overrides:
       let split = item.find('=')
@@ -738,7 +753,13 @@ when defined(windows):
     result = newStringTable(modeCaseInsensitive)
     if spec.inheritEnv:
       for k, v in envPairs():
-        result[k] = v
+        var removed = false
+        for name in spec.unsetEnv:
+          if cmpIgnoreCase(name, k) == 0:
+            removed = true
+            break
+        if not removed:
+          result[k] = v
     for entry in spec.env:
       let eq = entry.find('=')
       if eq <= 0:
@@ -975,7 +996,7 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     # Everything the child needs between fork and exec is composed here, while
     # there is still a whole process to compose it in. After the fork the child
     # may only read what is already built.
-    let childEnv = childEnvEntries(spec.env, spec.inheritEnv)
+    let childEnv = childEnvEntries(spec.env, spec.inheritEnv, spec.unsetEnv)
     let program = resolveProgram(spec.argv[0], execSearchPath(childEnv))
     let shellArgv = shellFallbackArgv(program, spec.argv)
 
