@@ -124,7 +124,7 @@ jobs:
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@58bb699b79984abdcafac1f9fa1cda3e6289180f
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@8ee1026a5d427a7aa5cf8c036fab12cb3d009503
         with:
           env-flavor: reprobuild
           # Reprobuild v0.2.23. The engine reads the committed v3 lock on
