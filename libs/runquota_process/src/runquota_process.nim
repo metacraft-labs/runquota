@@ -740,18 +740,20 @@ when defined(posix):
     ## Runs in the forked child after `execve` failed. Allocation-free: the
     ## errno name is a literal and the decimal is formatted into a stack buffer.
     writeAllToStderr(prefix)
+    # An `if` chain, not a `case`: on a non-Linux target the POSIX errno values
+    # are C-header variables (`var E2BIG {.importc.}`), and `case` demands
+    # compile-time constants, so a `case` here breaks the cross-OS compile.
     let name: cstring =
-      case failure
-      of E2BIG: "E2BIG"
-      of ENOENT: "ENOENT"
-      of EACCES: "EACCES"
-      of ENOEXEC: "ENOEXEC"
-      of ENOMEM: "ENOMEM"
-      of ENOTDIR: "ENOTDIR"
-      of ELOOP: "ELOOP"
-      of ENAMETOOLONG: "ENAMETOOLONG"
-      of ETXTBSY: "ETXTBSY"
-      of EISDIR: "EISDIR"
+      if failure == E2BIG: "E2BIG"
+      elif failure == ENOENT: "ENOENT"
+      elif failure == EACCES: "EACCES"
+      elif failure == ENOEXEC: "ENOEXEC"
+      elif failure == ENOMEM: "ENOMEM"
+      elif failure == ENOTDIR: "ENOTDIR"
+      elif failure == ELOOP: "ELOOP"
+      elif failure == ENAMETOOLONG: "ENAMETOOLONG"
+      elif failure == ETXTBSY: "ETXTBSY"
+      elif failure == EISDIR: "EISDIR"
       else: "errno"
     writeAllToStderr(name)
     writeAllToStderr(" (errno ")
