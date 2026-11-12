@@ -712,6 +712,63 @@ when defined(posix):
     for index in 1 ..< argv.len:
       result.add(argv[index])
 
+  proc execFailurePrefix(program: string; argv: openArray[string];
+                         envp: openArray[string]): string =
+    ## The part of the "could not exec" message that is known before the fork:
+    ## what was being run and how big the argument and environment blocks were.
+    ## The sizes are the reason this message exists: `execve` answers E2BIG
+    ## for an argument over `MAX_ARG_STRLEN` (131072 bytes on Linux) and for an
+    ## argument-plus-environment block over the stack-derived limit, and
+    ## neither is diagnosable from an exit code alone. Each string counts its
+    ## terminating NUL, as the kernel does.
+    var argvBytes = 0
+    for item in argv:
+      argvBytes += item.len + 1
+    var envBytes = 0
+    for item in envp:
+      envBytes += item.len + 1
+    "runquota: cannot execute " & program & " (argv bytes " & $argvBytes &
+      ", env bytes " & $envBytes & "): "
+
+  proc writeAllToStderr(text: cstring) =
+    ## Async-signal-safe: `write` on a buffer the parent built. A short write
+    ## is not retried -- this is a diagnostic on the way to `_exit`.
+    if text != nil:
+      discard posix.write(STDERR_FILENO, pointer(text), len(text))
+
+  proc childReportExecFailure(prefix: cstring; failure: cint) =
+    ## Runs in the forked child after `execve` failed. Allocation-free: the
+    ## errno name is a literal and the decimal is formatted into a stack buffer.
+    writeAllToStderr(prefix)
+    let name: cstring =
+      case failure
+      of E2BIG: "E2BIG"
+      of ENOENT: "ENOENT"
+      of EACCES: "EACCES"
+      of ENOEXEC: "ENOEXEC"
+      of ENOMEM: "ENOMEM"
+      of ENOTDIR: "ENOTDIR"
+      of ELOOP: "ELOOP"
+      of ENAMETOOLONG: "ENAMETOOLONG"
+      of ETXTBSY: "ETXTBSY"
+      of EISDIR: "EISDIR"
+      else: "errno"
+    writeAllToStderr(name)
+    writeAllToStderr(" (errno ")
+    var digits: array[12, char]
+    var position = digits.high
+    digits[position] = '\0'
+    var remaining = int(failure)
+    if remaining <= 0:
+      dec position
+      digits[position] = '0'
+    while remaining > 0:
+      dec position
+      digits[position] = char(ord('0') + remaining mod 10)
+      remaining = remaining div 10
+    writeAllToStderr(cast[cstring](addr digits[position]))
+    writeAllToStderr(")\n")
+
   proc buildCompletion(child: LaunchedProcess; status: cint; elapsedMillis: uint64;
                        stdoutText, stderrText: string; stdoutBytes, stderrBytes: uint64;
                        timedOut: bool; peakResidentMemoryBytes: uint64;
@@ -999,6 +1056,7 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     let childEnv = childEnvEntries(spec.env, spec.inheritEnv, spec.unsetEnv)
     let program = resolveProgram(spec.argv[0], execSearchPath(childEnv))
     let shellArgv = shellFallbackArgv(program, spec.argv)
+    let execFailureText = execFailurePrefix(program, spec.argv, childEnv)
 
     var stdoutPipe = [cint(-1), cint(-1)]
     var stderrPipe = [cint(-1), cint(-1)]
@@ -1044,6 +1102,9 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       discard execve(cstring(program), argv, envp)
       if errno == ENOEXEC:
         discard execve(cstring(ExecShellPath), shellArgvC, envp)
+      # Still here, so the program was never started. Say why on the child's
+      # own stderr -- the stream the caller already captures -- before the 127.
+      childReportExecFailure(cstring(execFailureText), errno)
       childExit(127)
     if pid < 0:
       if spec.stdio == captureStdio:
