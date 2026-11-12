@@ -1,16 +1,20 @@
 ## `RUNQUOTA_EXIT_WITH_PARENT`: a daemon that stops when the process that
 ## started it is gone.
 ##
-## WHO ASKS FOR THIS. `runquotad` is normally the host's one long-lived lease
-## authority and outlives every client by design. But on an unprovisioned
-## POSIX host `repro` starts a PRIVATE daemon for one invocation, on a per-PID
-## socket, and that daemon is owned by the invocation: it must not outlive it,
-## however the invocation ends (reprobuild-pm
-## `spec/RunQuota-Host-Configuration.md`, "\"Terminated when the top-level
-## build ends\" means however it ends"). `repro` forwards a terminating signal
-## to the daemon itself, but no handler in `repro` can see SIGKILL or the OOM
-## killer. Watching the parent from this side is the only half that covers
-## those, which is why it lives here and not in the client.
+## WHO ASKS FOR THIS. `runquotad` is normally a long-lived lease authority
+## that outlives every client by design. This is an OPT-IN for a caller that
+## OWNS its daemon -- one started for a single job, on a socket nobody else
+## will look for -- and wants it to end however that job ends. `repro` asked
+## for it until 2026-11-11, for the private daemon it then started per
+## invocation (the specification section that required it, "\"Terminated
+## when the top-level build ends\" means however it ends", was withdrawn
+## then). `repro` now starts ONE daemon per user that outlives every
+## invocation and ends itself with `--idle-exit-after`, and it removes this
+## variable from that daemon's environment (reprobuild-pm
+## `spec/RunQuota-Host-Configuration.md`, "The shared per-user daemon
+## (POSIX)"). The feature stays for other callers; no handler in a client can
+## see SIGKILL or the OOM killer, so watching the parent from this side is the
+## only half that covers those.
 ##
 ## THE MECHANISM IS A RE-PARENTING CHECK, NOT `PR_SET_PDEATHSIG`. When a
 ## process's parent dies, the kernel re-parents it -- to init, or to the

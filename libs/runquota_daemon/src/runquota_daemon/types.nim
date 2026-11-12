@@ -43,6 +43,21 @@ type
     id*: string
     cpuSlots*: MilliCpu
 
+  SocketActivation* = object
+    ## What `takeSocketActivation` read from systemd's `LISTEN_*` variables
+    ## ([`sd_listen_fds(3)`](https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html)).
+    ## The default value -- `requested` false -- is an ordinary start, which
+    ## binds its own endpoint.
+    requested*: bool
+      ## `LISTEN_PID` named this process: the descriptors are addressed to
+      ## it, so it must serve them or refuse, never bind a second socket.
+    fd*: int
+      ## The descriptor to serve (`SD_LISTEN_FDS_START`, 3) when `refusal`
+      ## is empty.
+    refusal*: string
+      ## Non-empty when the hand-over is unusable (`LISTEN_FDS` other than
+      ## 1); `serve` prints it and exits `endpointRefusedExitCode`.
+
   BudgetFlags* = object
     ## The budget the COMMAND LINE pinned. A reload re-reads the host file and
     ## changes everything else, but never these: a flag is the operator's
@@ -155,6 +170,17 @@ type
       ## default, and always on Windows) means no watch. `serve` starts the
       ## watch once SIGTERM is armed, and the watch stops the daemon through
       ## that same orderly SIGTERM path. See `runquota_daemon/parent_watch`.
+    idleExitAfterSeconds*: int
+      ## `runquotad --idle-exit-after N`: begin the orderly shutdown once no
+      ## client connection has been open for N seconds, counted from start-up
+      ## or from the moment the last connection closed. 0, the default, never
+      ## idles out -- the provisioned service's behaviour, unchanged. The
+      ## decision is the retirement decision, made by the daemon itself
+      ## (reprobuild-pm `spec/RunQuota-Host-Configuration.md`, "The shared
+      ## per-user daemon (POSIX)", "The idle period").
+    socketActivation*: SocketActivation
+      ## Set by `runquotad` from `takeSocketActivation` at start. See
+      ## `runquota_daemon/socket_activation`.
 
   SessionRow* = object
     id*: SessionId

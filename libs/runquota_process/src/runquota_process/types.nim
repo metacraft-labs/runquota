@@ -28,12 +28,22 @@ type
       ## child's environment is EXACTLY `env`: nothing is inherited, so a
       ## caller that must control what a process can observe (a build that
       ## keys an action on the variables it reads) can do so. There is no
-      ## other removal channel — layering can replace a variable, never
-      ## unset one.
+      ## other removal channel for an inherited variable: see `unsetEnv`.
       ##
       ## The OS loader may normalize reserved platform variables: Windows x64
       ## emulation sets `PROCESSOR_ARCHITECTURE=AMD64` even for an explicit
       ## block. Declare the target architecture when composing such a block.
+    unsetEnv*: seq[string]
+      ## The names removed from the INHERITED environment before `env` is
+      ## layered over it, so an inheriting child does not see a variable its
+      ## launcher has. Layering can replace a variable but never remove one,
+      ## which is why this exists: a caller that must keep one variable away
+      ## from a child (a build whose compiler choice comes from the ambient
+      ## shell, say) names it here. The removal happens first, so a name also
+      ## set in `env` takes the `env` value. Names match exactly, and
+      ## case-insensitively on Windows where environment names do. The list
+      ## is ignored when `inheritEnv` is false: an isolated child inherits
+      ## nothing to remove.
     stdoutLimit*: int
     stderrLimit*: int
     createProcessGroup*: bool

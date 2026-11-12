@@ -97,6 +97,11 @@ when isMainModule:
   # POSIX only; Windows ignores the variable. See
   # `runquota_daemon/parent_watch`.
   let exitWithParentPid = takeExitWithParentRequest()
+  # systemd's `LISTEN_*` hand-over, read and removed just as early and for the
+  # same reason: nothing this daemon starts may inherit a hand-over addressed
+  # to this process. `serve` acts on it. See
+  # `runquota_daemon/socket_activation`.
+  let socketActivation = takeSocketActivation()
 
   # THE SCM CONNECTION IS MADE BEFORE ANYTHING IS PRINTED, and the order
   # is load-bearing rather than tidy.
@@ -147,7 +152,8 @@ when isMainModule:
 
   var config = defaultDaemonConfig(defaultEndpoint())
   config.exitWithParentPid = exitWithParentPid
-  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--log-file PATH]"
+  config.socketActivation = socketActivation
+  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--log-file PATH]"
   var i = 0
   while i < args.len:
     case args[i]
@@ -309,6 +315,26 @@ when isMainModule:
       config.retentionPolicy.maxAmbientSamples =
         optionalRetentionBound(args[i + 1])
       i += 2
+    of "--idle-exit-after":
+      # A POSITIVE WHOLE NUMBER OF SECONDS, and nothing else. Zero would read
+      # as "exit at once" to one person and "never" to another, so neither
+      # is accepted; leaving the flag off is how a daemon never idles out.
+      if i + 1 >= args.len:
+        echo "runquotad: --idle-exit-after needs a value\n" & usage
+        quit 2
+      var seconds = 0
+      try:
+        seconds = parseInt(args[i + 1])
+      except ValueError:
+        seconds = 0
+      # The upper bound only keeps the period in milliseconds inside an
+      # int64; it is about 292 million years.
+      if seconds <= 0 or seconds > int(high(int64) div 1000):
+        echo "runquotad: --idle-exit-after needs a positive whole number " &
+          "of seconds, got: " & args[i + 1] & "\n" & usage
+        quit 2
+      config.idleExitAfterSeconds = seconds
+      i += 2
     of "--host-identity-file":
       # Where this machine's opaque `host_id` is kept. Overridable so a
       # test can run against a scratch identity instead of reading, or
@@ -323,10 +349,19 @@ when isMainModule:
       # the daemon and a reader of `--help` is that person. The full list
       # is the book's reference/environment_variables page.
       echo "runquotad " & versionString() & "\n" & usage & "\n\n" &
+        "  --idle-exit-after SECONDS  begin the orderly shutdown (exit 0) once " &
+        "no client connection has been open for SECONDS, counted from start-up " &
+        "or from the moment the last connection closed; without it the daemon " &
+        "never idles out\n\n" &
         "environment:\n" &
         "  " & exitWithParentEnvVar & "=1  stop (as on SIGTERM) when the " &
         "process that started runquotad exits; POSIX only, ignored on Windows\n" &
-        "  " & exitWithParentPidEnvVar & "=PID  expected owner recorded before spawning"
+        "  " & exitWithParentPidEnvVar & "=PID  expected owner recorded before spawning\n" &
+        "  " & listenPidEnvVar & ", " & listenFdsEnvVar & "  systemd socket " &
+        "activation (sd_listen_fds(3)): with " & listenPidEnvVar & " equal to " &
+        "this pid and " & listenFdsEnvVar & "=1, serve the listening socket on " &
+        "descriptor 3 instead of binding one; it must be bound at the " &
+        "configured endpoint (--socket); POSIX only"
       quit 0
     else:
       echo "unknown runquotad argument: " & args[i]

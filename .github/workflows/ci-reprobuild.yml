@@ -124,20 +124,22 @@ jobs:
         # setup-dev-env clones the siblings listed in .github/sibling-repos
         # (codetracer-trace-format, codetracer-trace-format-nim) at the
         # workspace-lock-pinned revisions before materialising the env.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@e2b9947768dccce6de2687a495c8286df4d6de96
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@8ee1026a5d427a7aa5cf8c036fab12cb3d009503
         with:
           env-flavor: reprobuild
-          # Reprobuild v0.2.18. The engine reads the committed v3 lock on
+          # Reprobuild v0.2.23. The engine reads the committed v3 lock on
           # every host and builds on Windows. Keep the bootstrap libraries at
           # that engine's own flake-lock revisions. Older engines reject the
           # committed lock ("unsupported lock schema ...v3").
           # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
           repro-from-source: true
-          repro-build-pin: 413830138a7a73293dfc551d623f7bf2cb0ab62c
-          repro-runquota-pin: 35b9dfe4af6e18f3f2a2242ece7cff330eb581e2
-          repro-io-mon-pin: 6fccd929cb09da0bfc0844b93ced9ffb1ac0f74f
-          repro-stackable-hooks-pin: 059c549306621e2f769adf75630b0b7f29018dca
+          repro-build-pin: 9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0
+          repro-runquota-pin: 9818dc0c90be8ba7993424a7bbfbb6e009ffa965
+          repro-io-mon-pin: 7a9b2f331024f4bc0b952bcab89b1dc48525d804
+          repro-stackable-hooks-pin: c1d55ce33fb2a29e4cf8d8bdbe1713f355370d0a
           gh-token: ${{ steps.ci_token.outputs.token }}
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          app-private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
 
       - name: Verify CI engine reads the committed lock
         if: matrix.os == 'linux'
