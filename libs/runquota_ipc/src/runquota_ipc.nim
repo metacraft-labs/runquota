@@ -1826,7 +1826,28 @@ when defined(posix):
     value = 0
     size = SockLen(sizeof(value))
     if getsockopt(SocketHandle(fd), SOL_SOCKET, SO_ACCEPTCONN, addr value,
-        addr size) != 0 or value == 0:
+        addr size) != 0:
+      # Darwin has the SO_ACCEPTCONN flag but does not implement it as a
+      # readable option: getsockopt answers ENOPROTOOPT ("Protocol not
+      # available") for every AF_UNIX socket, listening or not (measured
+      # on Darwin 25.5.0, m4). Without a way to ask that leaves the state
+      # unchanged, listen(2) is the test, and it is deliberately more
+      # lenient than the Linux path:
+      #   * already listening: listen(2) succeeds and only resets the
+      #     backlog to SOMAXCONN (the kernel clamps a larger value the
+      #     manager configured to kern.ipc.somaxconn anyway);
+      #   * bound but NOT yet listening: listen(2) succeeds, so the
+      #     daemon starts listening where Linux would refuse the
+      #     descriptor. sd_listen_fds(3) only ever hands over listening
+      #     sockets, so this arises from a misconfigured manager, not
+      #     from a conforming one;
+      #   * unbound, connected or datagram: listen(2) fails (EINVAL or
+      #     EOPNOTSUPP) and the descriptor is refused as before.
+      # The address check below still rejects an unbound or misplaced one.
+      if errno != ENOPROTOOPT or
+          posix.listen(SocketHandle(fd), cint(SOMAXCONN)) != 0:
+        raise newException(EndpointTrustError, label & " is not listening")
+    elif value == 0:
       raise newException(EndpointTrustError, label & " is not listening")
     var address: Sockaddr_un
     var addressSize = SockLen(sizeof(address))
