@@ -67,23 +67,31 @@ proc releaseSlice(slice: var OwnedSlice) =
     slice.bytes = nil
   slice.length = 0
 
+proc adoptBytes(slice: var OwnedSlice; bytes: pointer; length: int): bool =
+  ## Replaces ``slice`` with a C-heap copy of ``length`` bytes at ``bytes``.
+  ## Returns false, and leaves ``slice`` exactly as it was, when the
+  ## allocator has nothing to give -- THE ONE CONDITION A QUEUE CANNOT
+  ## RECORD ITS WAY OUT OF is the machine having no memory to record in, and
+  ## every caller here already has a "dropped and counted" arm for a full
+  ## queue to fold this into.
+  if length <= 0:
+    releaseSlice(slice)
+    return true
+  let fresh = cast[ptr UncheckedArray[char]](cMalloc(csize_t(length)))
+  if fresh == nil:
+    return false
+  copyMem(fresh, bytes, length)
+  releaseSlice(slice)
+  slice.bytes = fresh
+  slice.length = length
+  true
+
 proc adopt(slice: var OwnedSlice; value: string): bool =
-  ## Replaces ``slice`` with a C-heap copy of ``value``. Returns false, and
-  ## leaves ``slice`` exactly as it was, when the allocator has nothing to
-  ## give -- THE ONE CONDITION A QUEUE CANNOT RECORD ITS WAY OUT OF is the
-  ## machine having no memory to record in, and every caller here already
-  ## has a "dropped and counted" arm for a full queue to fold this into.
+  ## ``adoptBytes`` for a Nim string.
   if value.len == 0:
     releaseSlice(slice)
     return true
-  let fresh = cast[ptr UncheckedArray[char]](cMalloc(csize_t(value.len)))
-  if fresh == nil:
-    return false
-  copyMem(fresh, unsafeAddr value[0], value.len)
-  releaseSlice(slice)
-  slice.bytes = fresh
-  slice.length = value.len
-  true
+  adoptBytes(slice, unsafeAddr value[0], value.len)
 
 proc reserve(store: var OwnedStrings; needed: int): bool =
   if needed <= store.capacity:
@@ -105,6 +113,21 @@ proc add*(store: var OwnedStrings; value: string): bool {.discardable.} =
     return false
   store.items[store.count] = OwnedSlice(bytes: nil, length: 0)
   if not adopt(store.items[store.count], value):
+    return false
+  store.count += 1
+  true
+
+proc addBytes*(store: var OwnedStrings; bytes: pointer; length: int): bool
+    {.discardable.} =
+  ## Appends a copy of ``length`` bytes at ``bytes``. The same as ``add``,
+  ## for a caller that must not create a Nim ``string`` to hold them: a
+  ## short-lived thread, whose allocator region's pages are never returned
+  ## to the OS once it exits (see ``runquota_core/child_process``). False
+  ## means the allocator refused and nothing was appended.
+  if not store.reserve(store.count + 1):
+    return false
+  store.items[store.count] = OwnedSlice(bytes: nil, length: 0)
+  if not adoptBytes(store.items[store.count], bytes, length):
     return false
   store.count += 1
   true
