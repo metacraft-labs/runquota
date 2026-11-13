@@ -5,7 +5,9 @@
   description = "RunQuota book — self-contained dev shell for the isonim-docs documentation site";
 
   inputs = {
-    isonim.url = "github:metacraft-labs/isonim/dev";
+    # `agents` carries `isonim/content/*`, which isonim-docs `dev` imports and
+    # isonim `dev` lacks. Return this to `dev` once isonim promotes `agents`.
+    isonim.url = "github:metacraft-labs/isonim/agents";
 
     isonim-docs.url = "github:metacraft-labs/isonim-docs/dev";
     isonim-docs.inputs.isonim.follows = "isonim";
@@ -19,7 +21,11 @@
       flake = false;
     };
     nim-stew = {
-      url = "github:status-im/nim-stew";
+      # Upstream stew removed `readPragma` in
+      # https://github.com/status-im/nim-stew/commit/eeff9f5 ("Drop deprecated
+      # APIs"), which the vendored serialization and chronicles still call. The
+      # Metacraft fork's `codetracer` branch keeps it.
+      url = "github:metacraft-labs/nim-stew/codetracer";
       flake = false;
     };
 
