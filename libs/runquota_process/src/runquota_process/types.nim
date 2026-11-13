@@ -99,6 +99,12 @@ type
     processCount*: uint32
     telemetrySource*: string
     lastTelemetrySampleSeconds*: float
+    treeSampling*: bool
+      ## Whether this launch samples its tree's resident memory and process
+      ## count while it waits: the `tree-sampling` measurement switch
+      ## (`runquota_core/measurement`), read once at launch. Off, the
+      ## completion carries no peak memory (0, which every reader already
+      ## treats as "not measured") and `telemetrySource` says why.
     info*: LaunchResult
     completion*: ProcessCompletion
     # Windows: extra slots store the osproc Process ref and the Job Object

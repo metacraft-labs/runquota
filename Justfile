@@ -82,6 +82,17 @@ bench-runquota-process-execution *args:
     mkdir -p bench-results test-logs
     bash scripts/run-m5-benchmark.sh process {{args}} 2> >(tee test-logs/bench-runquota-process-execution.log >&2)
 
+# THE MEASUREMENT OVERHEAD GATE: wall and CPU time of a real build with every
+# RunQuota measurement off versus on, repeated until the 95% interval of the
+# difference is within +-0.5%; fails above a 1% overhead. The default case is
+# the 64-action Reprobuild build and needs a reprobuild engine built against
+# this checkout (see scripts/run-overhead-gate.sh). Takes tens of minutes on
+# a shared host; `just bench-overhead-gate synthetic` checks the instrument in
+# about a minute.
+bench-overhead-gate *args:
+    mkdir -p bench-results test-logs
+    bash scripts/run-overhead-gate.sh {{args}} 2> >(tee test-logs/bench-overhead-gate.log >&2)
+
 bench-runquota-ipc *args:
     mkdir -p bench-results test-logs
     bash scripts/run-m5-benchmark.sh ipc {{args}} 2> >(tee test-logs/bench-runquota-ipc.log >&2)

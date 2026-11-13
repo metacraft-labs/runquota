@@ -235,6 +235,7 @@ Recording (see [the observation store](/usage_guide/observations)):
 | `--no-write-stats` | off | **The off switch, and the only one.** Wins over `--observation-db` regardless of order. |
 | `--estimate-db PATH` | — | The learned-estimate database. |
 | `--ambient-sample-interval-millis N` | `1000` | Host-wide sampling cadence; `0` turns sampling off. |
+| `--measurement NAME=on\|off[,...]` | the defaults | Turns daemon-side measurements on or off by name, repeatable, applied after every other flag. `capture=off` is `--no-write-stats`; `ambient-sampling=off` is an interval of `0`. An explicit `=on` against one of those older flags, an unknown name, or a value other than `on`/`off` is a refusal (exit 2). See [Measurement switches](/usage_guide/observations#measurement-switches). |
 | `--host-identity-file PATH` | `/var/lib/runquota/host-id` (`/var/db/...` on macOS) | Relocates the host state, and the store with it. |
 
 Retention — four bounds, each with the **same unusual rule**:

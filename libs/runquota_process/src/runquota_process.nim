@@ -11,6 +11,7 @@ when defined(windows):
   import std/winlean
 
 import runquota_core
+import runquota_core/measurement
 when defined(linux):
   import runquota_host_linux
 import runquota_host_macos
@@ -513,6 +514,13 @@ proc commandSpec*(argv: openArray[string]; cwd = ""; env: openArray[string] = []
   result.createProcessGroup = createProcessGroup
   result.stdio = stdio
 
+proc launchTelemetrySource(treeSampling: bool): string =
+  ## The telemetry source a launch starts with. With `tree-sampling` off the
+  ## completion says so, so a reader of a zero peak can tell "nobody
+  ## measured" from "the backend could not read it".
+  if treeSampling: backendProfile().telemetry
+  else: "off (RUNQUOTA_MEASUREMENT tree-sampling=off)"
+
 proc launchResult*(processId: uint64; running: bool): LaunchResult =
   LaunchResult(
     processId: processId,
@@ -892,6 +900,8 @@ when defined(windows):
     # Windows host backend, throttled to ~10Hz like the POSIX path. Peak RSS
     # cannot be read after the tree exits, so callers must sample while it is
     # still alive.
+    if not child.treeSampling:
+      return
     let now = epochTime()
     if not force and child.lastTelemetrySampleSeconds != 0.0 and
         now - child.lastTelemetrySampleSeconds < 0.1:
@@ -968,6 +978,7 @@ when defined(windows):
   proc launchWindowsProcess(spec: CommandSpec): LaunchedProcess =
     if spec.argv.len == 0:
       raise newException(ValueError, "empty argv")
+    let treeSampling = measureTreeSampling in clientMeasurements()
     let cwd = if spec.cwd.len > 0: spec.cwd else: getCurrentDir()
     let prepared = prepareWindowsArgv(spec.argv)
     let args =
@@ -1032,8 +1043,9 @@ when defined(windows):
       stderrBytes: 0'u64,
       peakResidentMemoryBytes: 0'u64,
       processCount: 0'u32,
-      telemetrySource: backendProfile().telemetry,
+      telemetrySource: launchTelemetrySource(treeSampling),
       lastTelemetrySampleSeconds: 0.0,
+      treeSampling: treeSampling,
       info: LaunchResult(
         processId: processId,
         processGroupId: processId,
@@ -1051,6 +1063,10 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
   when defined(posix):
     if spec.argv.len == 0:
       raise newException(ValueError, "empty argv")
+    # THE LAUNCHER'S OWN SWITCH, read from this process's environment and
+    # never from `spec.env`: the measurement is taken here, by the client,
+    # and the child's environment is the child's business.
+    let treeSampling = measureTreeSampling in clientMeasurements()
 
     # Everything the child needs between fork and exec is composed here, while
     # there is still a whole process to compose it in. After the fork the child
@@ -1140,8 +1156,9 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       stderrBytes: 0'u64,
       peakResidentMemoryBytes: 0'u64,
       processCount: 0'u32,
-      telemetrySource: backendProfile().telemetry,
+      telemetrySource: launchTelemetrySource(treeSampling),
       lastTelemetrySampleSeconds: 0.0,
+      treeSampling: treeSampling,
       info: LaunchResult(
         processId: uint64(pid),
         processGroupId: uint64(max(pgid, 0)),
@@ -1240,8 +1257,8 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
 
     if not child.doneFlag:
       let now = epochTime()
-      if child.lastTelemetrySampleSeconds == 0.0 or
-          now - child.lastTelemetrySampleSeconds >= 0.1:
+      if child.treeSampling and (child.lastTelemetrySampleSeconds == 0.0 or
+          now - child.lastTelemetrySampleSeconds >= 0.1):
         let sample =
           when defined(linux):
             sampleLinuxProcessTreeTelemetry(uint64(child.pid))

@@ -22,6 +22,7 @@ import runquota_codec
 import runquota_core
 import runquota_core/process_owned
 import runquota_core/image_digest
+import runquota_core/measurement
 import runquota_host
 import runquota_host_macos
 when defined(windows):
@@ -129,6 +130,53 @@ proc shareBetweenUsersOf(host: HostConfig): ShareBetweenUsers =
     raise newException(HostConfigError, host.sourcePath &
       ": unknown share-between-users `" & host.shareBetweenUsers.get & "`")
 
+
+proc daemonMeasurements*(config: DaemonConfig): MeasurementSet =
+  ## The daemon-side measurements this configuration takes, derived from the
+  ## fields that actually govern them rather than kept beside them, so the
+  ## reported state cannot drift from the behaviour.
+  if not config.writeStatsDisabled:
+    result.incl(measureCapture)
+  if config.ambientSampleIntervalMillis > 0:
+    result.incl(measureAmbientSampling)
+
+proc applyDaemonMeasurementSwitches*(config: var DaemonConfig;
+                                     switches: openArray[string]): string =
+  ## Apply every `runquotad --measurement` value, in order, onto `config`.
+  ## Returns "" on success or why the switches were refused; on refusal
+  ## `config` is unchanged.
+  ##
+  ## THE OLDER SPELLINGS STAY, AND OFF IS NEVER A MATTER OF ORDER.
+  ## `--no-write-stats` and `--ambient-sample-interval-millis 0` already turn
+  ## two of these off. A switch that turns one off agrees with them; a switch
+  ## that explicitly turns one ON while the older flag turned it off is a
+  ## contradiction, and is refused rather than resolved by whichever came
+  ## last on the command line.
+  ##
+  ## Client-side measurements are accepted and ignored here, so one value can
+  ## be handed to the daemon and to the client alike. Measurements that are
+  ## not implemented yet are accepted and do nothing.
+  if switches.len == 0:
+    return ""
+  var measurements = daemonMeasurements(config)
+  var namedOn, namedOff: MeasurementSet
+  for text in switches:
+    let problem = applyMeasurementSwitches(text, measurements, namedOn,
+      namedOff)
+    if problem.len > 0:
+      return problem
+  if measureCapture in namedOn and config.writeStatsDisabled:
+    return "--measurement capture=on contradicts --no-write-stats"
+  if measureAmbientSampling in namedOn and
+      config.ambientSampleIntervalMillis <= 0:
+    return "--measurement ambient-sampling=on contradicts " &
+      "--ambient-sample-interval-millis " &
+      $config.ambientSampleIntervalMillis
+  if measureCapture notin measurements:
+    config.writeStatsDisabled = true
+  if measureAmbientSampling notin measurements:
+    config.ambientSampleIntervalMillis = 0
+  ""
 
 proc applyHostConfig*(config: var DaemonConfig; host: HostConfig) =
   ## Overlay the host budget file (`runquota_daemon/host_config`) onto
@@ -1729,6 +1777,23 @@ proc ambientSamplingJson(intervalMillis: int): string =
     "\"failures\":" & $ambientSampleFailures() &
   "}"
 
+proc daemonMeasurementsJson(config: DaemonConfig): string =
+  let taken = daemonMeasurements(config)
+  result = "{"
+  var first = true
+  for m in Measurement:
+    if not first:
+      result.add(',')
+    first = false
+    let info = measurementRegistry[m]
+    let state =
+      if not info.implemented: "not-implemented"
+      elif info.side == measuredByClient: "client"
+      elif m in taken: "on"
+      else: "off"
+    result.add("\"" & $m & "\":\"" & state & "\"")
+  result.add('}')
+
 proc observationsJson(daemon: RunQuotaDaemon): string =
   ## The write path's own honesty, readable from outside the daemon.
   ##
@@ -1823,7 +1888,13 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
     "\"estimate_write_failed_rows\":" & $estimateWriteFailedRows() & "," &
     aggregatePublicationJson() & "," &
     retentionJson(daemon.config.retentionSweepIntervalMillis) & "," &
-    ambientSamplingJson(daemon.config.ambientSampleIntervalMillis) &
+    ambientSamplingJson(daemon.config.ambientSampleIntervalMillis) & "," &
+    # THE MEASUREMENT SWITCHES IN FORCE, every registered name, so a caller
+    # that turned one off (the overhead gate, first of all) can confirm the
+    # daemon it is measuring is the one it configured rather than assume it.
+    # Client-side measurements are switched in the client and reported
+    # here as `client`.
+    "\"measurements\":" & daemonMeasurementsJson(daemon.config) &
   "}}"
 
 # ---------------------------------------------------------------------------

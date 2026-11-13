@@ -153,7 +153,8 @@ when isMainModule:
   var config = defaultDaemonConfig(defaultEndpoint())
   config.exitWithParentPid = exitWithParentPid
   config.socketActivation = socketActivation
-  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--admission-max-wait-millis N] [--log-file PATH]"
+  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--measurement NAME=on|off[,...]] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--admission-max-wait-millis N] [--log-file PATH]"
+  var measurementSwitches: seq[string]
   var i = 0
   while i < args.len:
     case args[i]
@@ -263,6 +264,17 @@ when isMainModule:
       # so "disabled" is never a matter of argument order.
       config.writeStatsDisabled = true
       i += 1
+    of "--measurement":
+      # A MEASUREMENT SWITCH, `NAME=on|off[,NAME=on|off...]`, repeatable and
+      # applied in order after every other flag (see
+      # `applyDaemonMeasurementSwitches`). The names are
+      # `runquota_core/measurement`'s, shared with the client-side
+      # `RUNQUOTA_MEASUREMENT`, so one value can be handed to both.
+      if i + 1 >= args.len:
+        echo "runquotad: --measurement needs NAME=on|off\n" & usage
+        quit 2
+      measurementSwitches.add(args[i + 1])
+      i += 2
     of "--ambient-sample-interval-millis":
       # The FIXED cadence of ambient load sampling, independent of
       # execution boundaries. Overridable so a test can watch a load it
@@ -393,6 +405,12 @@ when isMainModule:
     else:
       echo "unknown runquotad argument: " & args[i]
       quit 2
+
+  let measurementProblem =
+    config.applyDaemonMeasurementSwitches(measurementSwitches)
+  if measurementProblem.len > 0:
+    echo "runquotad: " & measurementProblem & "\n" & usage
+    quit 2
 
   # The host's budget, between the built-in defaults and the flags, so that
   # a flag still overrides it for one launch

@@ -52,6 +52,7 @@ group does not reset them.
 | `RUNQUOTA_HANDSHAKE_TIMEOUT_MS` | `30000` | Milliseconds a client waits on a **control handshake** before giving up so it can fall back to standalone. `0` restores unbounded blocking. It never bounds the long-running grant stream — that one is supposed to wait. |
 | `RUNQUOTA_REPORT_STANDALONE` | unset | Any non-empty value makes a daemonless `runquota acquire` print its degradation to **stderr**. Off by default on purpose: a missing daemon is not an error, and a wrapper that complained about one on every host without it would be a wrapper nobody could adopt incrementally. |
 | `RUNQUOTA_REPORT_ESTIMATE_SOURCE` | unset | Any non-empty value makes `acquire --stats-key` print which of the three [estimate](/getting_started/concepts#estimate) paths answered, and with what. |
+| `RUNQUOTA_MEASUREMENT` | the defaults | Measurement switches for the measurements the **launching client** takes, read from the launcher's own environment at every launch (never the child's): `NAME=on\|off[,NAME=on\|off...]`, applied left to right, `all=on\|off` for every name. The same syntax and names as `runquotad --measurement`; see [Measurement switches](/usage_guide/observations#measurement-switches). A value that does not parse is reported once on stderr and the defaults are used: a measurement switch never stops a build. |
 
 ## Platform
 

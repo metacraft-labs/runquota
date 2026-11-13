@@ -35,6 +35,34 @@ On a host where the state directory was never provisioned, capture degrades to
 The daemon keeps admitting leases: an advisory subsystem may not take out a
 machine's build capacity.
 
+## Measurement switches
+
+Everything RunQuota records about a build costs the build something, and the
+total is budgeted: with every measurement on, a build may take at most 1% more
+wall time and 1% more CPU time than with every measurement off. To check that
+(`just bench-overhead-gate`, see the repository's `benchmarks/README.md`) each
+measurement has a name and a switch:
+
+| Name | Taken by | Status |
+|---|---|---|
+| `capture` | the daemon: execution rows, extension rows and self-reports into this store | on by default |
+| `ambient-sampling` | the daemon: the host-wide load sampler | on by default |
+| `tree-sampling` | the launching client: samples of the child tree's resident memory and process count while it waits, which become the finish's peak memory | on by default |
+| `profiles`, `pressure-reports`, `sizing-data`, `metrics-export` | — | registered, not implemented yet: the switches are accepted and do nothing |
+
+A switch is `NAME=on|off`, comma-separated and applied left to right;
+`all=on|off` covers every name. The daemon takes it as `runquotad
+--measurement VALUE`; the launching client (`runquota acquire`, Reprobuild)
+takes it from `RUNQUOTA_MEASUREMENT`. Both accept every name, so one value can
+be given to both; a name taken by the other side is ignored. With
+`tree-sampling=off` a finish carries no peak memory (`0`, which the learned
+estimate already treats as "not measured").
+
+`runquota observations --json` reports the switches in force under
+`measurements`: `on` or `off` for the daemon's own measurements, `client` for
+one the launching client takes, `not-implemented` for one that does not exist
+yet.
+
 ## Only the daemon reads it
 
 `runquotad` is the **only sanctioned reader**. No client opens the database
