@@ -164,6 +164,40 @@ proc estimate*(rounds: openArray[RoundSample]; metric: GateMetric):
   result.upper = exp(mean + margin) - 1
   result.halfWidth = (result.upper - result.lower) / 2
 
+proc logRatioSpread*(rounds: openArray[RoundSample]; metric: GateMetric):
+    float =
+  ## The sample standard deviation of the per-round log-ratios of `metric`:
+  ## the one number that decides how many rounds a given precision takes
+  ## (the interval half-width is about t * spread / sqrt(rounds)). Infinite
+  ## with fewer than two rounds, so a caller cannot take it for a quiet host.
+  if rounds.len < 2:
+    return Inf
+  var total = 0.0
+  for r in rounds:
+    total += logRatio(r, metric)
+  let mean = total / float(rounds.len)
+  var squares = 0.0
+  for r in rounds:
+    let d = logRatio(r, metric) - mean
+    squares += d * d
+  sqrt(squares / float(rounds.len - 1))
+
+proc roundsForHalfWidth*(spread, halfWidth: float; limit = 100_000): int =
+  ## The fewest rounds at which a 95% interval over log-ratios with standard
+  ## deviation `spread` is no wider than +-`halfWidth` (both as fractions;
+  ## for the small values the gate uses a log-ratio and a percentage agree
+  ## to well within the slack callers allow). `limit + 1` when even `limit`
+  ## rounds do not reach it, or when `spread` is not a finite number.
+  if not (spread < Inf) or spread != spread or halfWidth <= 0:
+    return limit + 1
+  var n = 2
+  while n <= limit:
+    if studentT975(n - 1) * spread / sqrt(float(n)) <= halfWidth:
+      return n
+    # Geometric growth keeps the search short for a very noisy host.
+    n = max(n + 1, n + n div 64)
+  limit + 1
+
 proc pct(x: float): string =
   formatFloat(x * 100, ffDecimal, 3) & "%"
 

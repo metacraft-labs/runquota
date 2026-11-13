@@ -40,10 +40,17 @@
 ##   Reprobuild case, with a 2% overhead injected. The gate must reach a
 ##   FAIL verdict. It can do so on CPU time alone, which stays precise under
 ##   foreign load (see the spreads above), so this case does not depend on
-##   the host being quiet; a host so loaded that even CPU time cannot
-##   establish the overhead within the time limit ends inconclusive, which
-##   fails this test visibly rather than passing it. Real processes are not
-##   used for the no-overhead pass, for the reason given above.
+##   the host being quiet; a host so loaded that even CPU time
+##   cannot establish the overhead within the time limit ends inconclusive,
+##   and that is the scheduler's verdict on the host, not the gate's. The
+##   case therefore first measures, on real children with no overhead
+##   injected, how widely the host spreads CPU time, works out with
+##   `roundsForHalfWidth` how many rounds a 2% overhead needs at that
+##   spread, and SKIPS with the measured figures when the time limit cannot
+##   fit them, instead of failing on the host's noise (measured on a 32-CPU
+##   host at load 16-37: the same commit passed and failed). When it does
+##   run, the verdict must be FAIL. Real processes are not used for the
+##   no-overhead pass, for the reason given above.
 ##
 ## THE INJECTED OVERHEAD. In the ON arm each run does 2% more work. That is
 ## twice the 1% budget, so the gate must FAIL it.
@@ -75,7 +82,8 @@
 ## The model is deterministic, so the count is fixed; the threshold states
 ## what the design promises, with room for the expected few.
 ##
-## TIME. The seeded cases take well under a second. The real-process case
+## TIME. The seeded cases take well under a second. The real-process case,
+## after a ten-round probe of about half a minute,
 ## stops as soon as its CPU lower bound clears 1%, about 15-30 rounds of
 ## two one-second children, so a minute or two on a loaded host.
 
@@ -101,6 +109,16 @@ when defined(posix):
     roundLevelSigma = 0.05
       ## A round's common level, shared by both arms: the gate's ratio must
       ## remove it, and does.
+    probeRounds = 10
+      ## Real-child rounds, with no overhead injected, that size the host's
+      ## CPU-time spread before the real-process case commits four minutes.
+    spreadSlack = 1.25
+      ## The probe's spread comes from ten rounds and the host's load moves;
+      ## the case plans for a quarter more spread than it saw.
+    requiredHalfWidth = 0.007
+      ## Detecting 2% against a 1% budget needs the CPU interval's lower bound
+      ## above 1%, i.e. a half-width under 1% around a mean near 2%; 0.7%
+      ## leaves room for the mean landing a little low.
     runSigma = 0.01
       ## Per-run CPU noise; wall carries it plus as much again of its own.
 
@@ -139,7 +157,13 @@ when defined(posix):
     defer: gateCase.stop()
     runGate(cfg, gateCase, progress = false)
 
-  proc runReal(cfg: GateConfig): GateResult =
+  proc runReal(cfg: GateConfig; maxRounds = 0): GateResult =
+    ## `maxRounds` > 0 caps the run below the config's own limit (the host
+    ## probe wants a fixed, small number of rounds).
+    var cfg = cfg
+    if maxRounds > 0:
+      cfg.policy.minRounds = maxRounds
+      cfg.policy.maxRounds = maxRounds
     let scratch = createTempDir("rqgate-test", "")
     defer: removeDir(scratch)
     let gateCase = makeCase(cfg, scratch)
@@ -210,12 +234,56 @@ when defined(posix):
         check outcome.decision.verdict == verdictInconclusive
         check exitStatusFor(outcome.decision.verdict) == exitInconclusive
 
+    test "the round count a spread needs is the t-interval's":
+      # The arithmetic the real-process case's host check rests on, pinned
+      # to values worked by hand: half-width = t * spread / sqrt(n), so a
+      # 1.6% spread needs about (2.0 * 1.6 / 0.5)^2 = 41 rounds for +-0.5%.
+      let n = roundsForHalfWidth(0.016, 0.005)
+      check n in 38 .. 46
+      let e = estimate(
+        block:
+          var rs: seq[RoundSample]
+          for i in 0 ..< n:
+            # Alternate +-spread-ish log-ratios around zero.
+            let d = if i mod 2 == 0: 0.016 else: -0.016
+            rs.add RoundSample(offWall: 1, onWall: exp(d), offCpu: 1,
+              onCpu: exp(d))
+          rs, metricCpu)
+      check e.halfWidth > 0
+      # A noisier host needs more rounds, never fewer.
+      check roundsForHalfWidth(0.05, 0.005) > n
+      # A spread nothing can average away, and one that is not a number.
+      check roundsForHalfWidth(10.0, 0.005, limit = 1000) == 1001
+      check roundsForHalfWidth(Inf, 0.005, limit = 1000) == 1001
+      check roundsForHalfWidth(NaN, 0.005, limit = 1000) == 1001
+      check logRatioSpread([RoundSample(offWall: 1, onWall: 1, offCpu: 1,
+        onCpu: 1)], metricCpu) == Inf
+
     test "real child processes: a 2% injected overhead fails the gate":
       let cfg = syntheticConfig(2, 500, maxMinutes = 4)
-      let outcome = runReal(cfg)
-      echo "    ", describe(outcome), " in ", outcome.elapsedSeconds, " s"
-      check outcome.decision.verdict == verdictFail
-      check outcome.rounds.len >= cfg.policy.minRounds
-      for r in outcome.rounds:
-        check r.offWall > 0 and r.onWall > 0
-        check r.offCpu > 0 and r.onCpu > 0
+      # The host check (header, "REAL CHILD PROCESSES"): can this host,
+      # right now, establish a 2% overhead within the time limit? Measure
+      # the spread of CPU time on real children with no overhead injected.
+      let probeCfg = syntheticConfig(0, probeRounds)
+      let probe = runReal(probeCfg, probeRounds)
+      let spread = logRatioSpread(probe.rounds, metricCpu)
+      let secondsPerRound = probe.elapsedSeconds / float(probe.rounds.len)
+      let affordable = int(cfg.maxSeconds / secondsPerRound)
+      let needed = roundsForHalfWidth(spread * spreadSlack, requiredHalfWidth)
+      echo "    host check: cpu spread ", spread * 100, "% over ",
+        probe.rounds.len, " probe rounds, ", secondsPerRound,
+        " s/round; ", needed, " rounds needed, ", affordable, " affordable"
+      if needed > affordable:
+        echo "    SKIPPED: the host is too loaded to establish a 2% overhead ",
+          "within ", cfg.maxSeconds, " s (needs ", needed, " rounds, fits ",
+          affordable, "); the seeded cases above still judge the decision ",
+          "logic"
+        skip()
+      else:
+        let outcome = runReal(cfg)
+        echo "    ", describe(outcome), " in ", outcome.elapsedSeconds, " s"
+        check outcome.decision.verdict == verdictFail
+        check outcome.rounds.len >= cfg.policy.minRounds
+        for r in outcome.rounds:
+          check r.offWall > 0 and r.onWall > 0
+          check r.offCpu > 0 and r.onCpu > 0
