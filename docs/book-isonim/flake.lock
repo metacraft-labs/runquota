@@ -2907,17 +2907,19 @@
       },
       "locked": {
         "lastModified": 1794488637,
-        "narHash": "sha256-Z2gpwsX6w2Ckt/22Lw5cwYa8sSihYANrA6HQ2Nn5v10=",
-        "owner": "metacraft-labs",
-        "repo": "isonim",
+        "narHash": "sha256-oOJ7RTZ5q18ejY/6hVJhoSs49OPomQBUeu97FOCLNSw=",
+        "ref": "agents",
         "rev": "b9a4c05eeb79e12faaec11ca828ce4f9c59c4c42",
-        "type": "github"
+        "revCount": 1010,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/metacraft-labs/isonim"
       },
       "original": {
-        "owner": "metacraft-labs",
         "ref": "agents",
-        "repo": "isonim",
-        "type": "github"
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/metacraft-labs/isonim"
       }
     },
     "isonim-docs": {
