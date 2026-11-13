@@ -962,6 +962,13 @@ when defined(windows):
       return
 
 when defined(posix):
+  type DirectoryUnreadableError* = object of OSError
+    ## A component could not be inspected because the caller may not search
+    ## the directory above it (EACCES). ``resolvedParent`` is the fully
+    ## resolved directory that was readable up to that point; everything
+    ## the path names lies below it, whatever the unreadable part holds.
+    resolvedParent*: string
+
   proc resolveDirectoryPath*(path: string): string =
     ## Resolve existing symlinks in filesystem order, retaining an absent
     ## suffix. Unlike lexical normalization followed by realpath, this keeps
@@ -998,6 +1005,12 @@ when defined(posix):
           continue
         if not S_ISDIR(info.st_mode):
           raiseOSError(OSErrorCode(ENOTDIR), "resolving directory " & candidate)
+      elif errno == EACCES:
+        var denied = newException(DirectoryUnreadableError,
+          "resolving directory " & candidate & ": " &
+          osErrorMsg(OSErrorCode(EACCES)))
+        denied.resolvedParent = result
+        raise denied
       elif errno != ENOENT:
         raiseOSError(osLastError(), "resolving directory " & candidate)
       result = candidate
@@ -1005,10 +1018,22 @@ when defined(posix):
   proc directoryResolvesWithin*(path, directory: string): bool =
     ## Compare directory identities including absent suffixes; separators
     ## distinguish a descendant from an unrelated name sharing its prefix.
-    let candidate = resolveDirectoryPath(path)
     let boundary = resolveDirectoryPath(directory)
-    boundary == "/" or candidate == boundary or
-      candidate.startsWith(boundary & "/")
+    proc within(candidate: string): bool =
+      boundary == "/" or candidate == boundary or
+        candidate.startsWith(boundary & "/")
+    try:
+      within(resolveDirectoryPath(path))
+    except DirectoryUnreadableError as denied:
+      # The answer must not depend on the host's permissions: a boundary
+      # provisioned 0750 for a group the caller is not in is still the
+      # boundary. Resolution reached `resolvedParent` through readable
+      # directories only, so when that is inside the boundary the whole
+      # path is, however the unreadable remainder (symlinks, `..`) goes;
+      # nothing below it is inspected. Outside the boundary, an unreadable
+      # ancestor leaves the question open, so the error propagates.
+      if within(denied.resolvedParent): true
+      else: raise
 
 proc endpointDirectoryTrust*(endpoint: Endpoint;
                              policy = rendezvousPolicy()): PathTrust =

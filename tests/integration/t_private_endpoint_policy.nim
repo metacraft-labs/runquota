@@ -307,6 +307,28 @@ when defined(posix):
           "/" & absent & "/child/d.sock"), policy).reason == trustWrongType
       check not dirExists(hostWideEndpointDir & "/" & absent)
 
+    test "containment inside an unreadable boundary is decided without inspecting below it":
+      # Models a host whose rendezvous directory is provisioned for a group
+      # the caller is not in (e.g. /run/runquota 0750 runquota:runquota),
+      # using a real directory whose mode removes the caller's search right.
+      let root = scratchDir("rqu")
+      defer:
+        setFilePermissions(root / "boundary", {fpUserRead, fpUserWrite, fpUserExec})
+        removeDir(root)
+      createDir(root / "boundary")
+      createDir(root / "elsewhere")
+      createSymlink(root / "boundary", root / "alias")
+      setFilePermissions(root / "boundary", {})
+      prerequisite modeOf(root / "boundary") == 0, "boundary was not made unreadable"
+      for spelling in [root / "boundary" / "absent" / "child",
+                       root / "alias" / "absent" / "child" / ".." / ".."]:
+        check directoryResolvesWithin(spelling, root / "boundary")
+      # An unreadable ancestor that is NOT inside the boundary stays unknown.
+      expect OSError:
+        discard directoryResolvesWithin(root / "boundary" / "absent",
+                                        root / "elsewhere")
+      check not directoryResolvesWithin(root / "elsewhere" / "x", root / "boundary")
+
     test "an ordinary ancestor alias and symlink dotdot serve a real private client":
       let root = scratchDir("rqo")
       defer: removeDir(root)
