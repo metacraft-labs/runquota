@@ -11,7 +11,7 @@ const libraryName* = "runquota_exec"
 proc libraryInfo*(): execTypes.LibraryInfo =
   execTypes.LibraryInfo(name: libraryName)
 
-proc finishOutcome(completion: ProcessCompletion): LeaseFinish =
+proc finishOutcome*(completion: ProcessCompletion): LeaseFinish =
   ## What this supervisor saw, said in the vocabulary the spine records.
   ##
   ## THE SIGNAL IS TESTED BEFORE THE CANCEL, WHICH REVERSES THE OLD ORDER

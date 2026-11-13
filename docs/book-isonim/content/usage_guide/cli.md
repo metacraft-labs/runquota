@@ -24,6 +24,7 @@ usage:
   runquota stats capture [--json]
   runquota stats top [KEY] [--limit N] [--all-users] [--all-profiles] [--json]
   runquota stats export [KEY] [--limit N] [--all-users] [--all-profiles] [--json]
+  runquota run [--width N|MIN:PREF] [--stats-key KEY] [--adapter NAME|none|list] [--verbose] -- COMMAND [ARG...]
   runquota acquire --cpu N --mem BYTES [--label TEXT] [--machine ID] [--stats-key KEY] [--benchmark] [-- COMMAND [ARG...]]
 ```
 
@@ -164,3 +165,70 @@ estimate — see [standalone mode](/getting_started/concepts#standalone-mode).
 Set `RUNQUOTA_REPORT_STANDALONE` to any non-empty value to have that printed to
 stderr, and `RUNQUOTA_REPORT_ESTIMATE_SOURCE` to see which of the three
 estimate paths answered.
+
+## `runquota run`
+
+Run a command under a CPU lease, and tell the command how wide it may be.
+Build and test tools that have no RunQuota client of their own (`nim`, `go`,
+`cargo nextest`, `nix`, Playwright, the JavaScript package managers) keep doing
+their own parallelism; `run` takes a lease of N slots and passes N to the tool
+in the form it understands, so the tool's fan-out stays inside what the host
+granted.
+
+```sh
+runquota run --width 3 -- nim c --parallelBuild:8 app.nim   # runs with --parallelBuild:3
+runquota run --width 2:8 -- go test ./...                   # go test -p N, N from 2 to 8
+runquota run -- nix build .#package                         # --max-jobs 1 --cores N
+runquota run --adapter list
+```
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--width N` / `--width MIN:PREF` | `1:` host CPUs, at most 8 | `N` alone is a fixed width. With a range, `run` asks for `PREF` slots and, if the daemon refuses that many, retries at half, down to `MIN`; the grant is whole or not at all. `MIN:` keeps the default `PREF`, `:PREF` keeps `MIN` at 1. A fixed width the budget cannot grant fails with exit 1 and the command does not run. |
+| `--stats-key KEY` | `run/<program>@<project>` | Keys the recorded row and the [estimate](/getting_started/concepts#estimate) lookup. The default is the program's base name plus the name of the nearest enclosing git checkout of the working directory (or of the directory itself). |
+| `--adapter NAME` | detected | `nim`, `go`, `nextest`, `nix`, `pnpm`, `yarn`, `playwright`, `npm`; `none` leaves the command line alone and only holds the lease; `list` prints the table and exits. |
+| `--verbose`, `-v` | off | Print the chosen width, what the adapter did and the final command line to stderr. |
+| `--cap` | | Not available yet: exits 2 without running the command. |
+| `-- COMMAND [ARG...]` | required | Everything after `--` is the command. Its own flags are never read by `run`. |
+
+The command also gets two environment variables whatever the adapter:
+`RUNQUOTA_RUN_WIDTH` (the grant in slots, for scripts and tools no adapter
+covers) and `RUNQUOTA_RUN_STATS_KEY`. A `RUNQUOTA_SESSION` group exported by a
+launcher is joined, as for every other client.
+
+### Adapters
+
+Each adapter recognises a command from the program's base name and its first
+positional word, and inserts its flag right after that word, so the flag lands
+before any `--` that passes the rest of the line on.
+
+| Adapter | Recognises | Passes the grant as |
+|---|---|---|
+| `nim` | `nim c`, `cc`, `cpp`, `objc`, `js`, `r`, `compile*` | `--parallelBuild:N` |
+| `go` | `go build`, `install`, `test`, `vet` | `-p N` |
+| `nextest` | `cargo [+toolchain] nextest run` | `-j N` |
+| `playwright` | `playwright test`, also behind `npx`, `pnpm`, `yarn`, `npm`, `bunx`, `bun` | `--workers=N` |
+| `nix` | `nix [flags] build`, `nix-build` | `--max-jobs 1 --cores N` |
+| `pnpm` | `pnpm` with `-r`, `--recursive`, `--filter`, or a script-running or install command | `--workspace-concurrency=N` |
+| `yarn` | `yarn workspaces foreach` (Yarn 2 and later) | `--jobs N` |
+| `npm` | any `npm` command | nothing: npm has no workspace concurrency setting, so the command is passed through |
+
+**A width flag you already wrote is kept, and capped.** A value from 1 up to the
+grant stays exactly as written. A larger value, `0`, a negative number, or
+anything that is not a plain integer (`50%`, `auto`, `num-cpus`) becomes the
+grant, because none of those can be shown to fit. For `nix`, `--max-jobs` and
+`--cores` share the grant so that jobs times cores never exceeds it: with
+`--max-jobs M` the cores per build are the grant divided by M. A command that
+no adapter recognises is run unchanged; the lease is still held for its
+duration.
+
+**Exit codes.** The command's exit code, or `128 + signal` if it was killed.
+**2** for bad arguments and for `--cap`; **1** when the daemon refused or lost
+the lease so the command never ran; **127** when the command could not be
+started. The lease is released when the command ends, whatever its status.
+
+**With no daemon, it still runs your command**, unchanged and unbounded, as
+`acquire` does.
+
+The command's standard streams are the terminal's: its output is not captured
+and replayed, unlike `acquire`.

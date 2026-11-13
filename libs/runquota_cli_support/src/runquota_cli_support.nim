@@ -12,6 +12,7 @@ import runquota_protocol
 import runquota_stats_table
 import runquota_cli_support/stats
 import runquota_cli_support/config
+import runquota_cli_support/run_command
 
 proc wantsVersion*(args: openArray[string]): bool =
   args.len == 1 and args[0] in ["--version", "-V"]
@@ -50,6 +51,11 @@ proc renderUsage*(programName: string): string =
     "    column is on the row, so jq does the ranking, percentiles and diffing.\n" &
     "    stats exit codes: 0 rows returned, 3 no answer (no-data/unknown-key/\n" &
     "    no-rows-in-scope), 4 no instrument (capture-off/daemon-unreachable/denied)\n" &
+    "  " & programName & " run [--width N|MIN:PREF] [--stats-key KEY] [--adapter NAME|none|list] [--verbose] -- COMMAND [ARG...]\n" &
+    "    runs COMMAND under a CPU lease and passes the grant to it through an\n" &
+    "    adapter (nim, go, nextest, nix, pnpm, yarn, playwright; --adapter list);\n" &
+    "    exits with the command's status, 2 on bad arguments or --cap (not yet\n" &
+    "    available), 1 when no lease was granted, 127 when it cannot start\n" &
     "  " & programName & " acquire --cpu N --mem BYTES [--label TEXT] [--machine ID] [--stats-key KEY] [--benchmark] [-- COMMAND [ARG...]]"
 
 proc parseMemory(value: string): uint64 =
@@ -1069,6 +1075,12 @@ proc runThinApp*(programName: string): int =
         return runStats(programName, args[1 .. ^1])
       of "acquire":
         return runDebugAcquire(args[1 .. ^1])
+      of "run":
+        # A lease for the duration of a command, with the
+        # grant handed to the tool through an adapter. Kept in its own
+        # module (`runquota_cli_support/run_command`) so this dispatcher
+        # carries one line of it.
+        return runRun(args[1 .. ^1], clientFailureText, versionString())
       of "session":
         if args.len >= 2 and args[1] == "set":
           return runSessionSet(args[2 .. ^1])
