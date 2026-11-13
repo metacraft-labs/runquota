@@ -747,15 +747,39 @@ proc runStatsCapture(asJson: bool): int =
   echo renderCapture(answer.captureEnabled, detail, asJson)
   exitCode(if answer.captureEnabled: asOk else: asCaptureOff)
 
-proc parseStatsOptions(args: seq[string]; options: var StatsOptions): bool =
-  ## Returns false on anything unrecognised. A misspelt flag must not be
-  ## absorbed into a query that then answers about something else.
-  if args.len == 0:
+proc parseLimit(text: string; limit: var uint32): bool =
+  ## A whole number that fits the wire's `uint32`. `parseUInt` alone is not
+  ## enough: it accepts values past `high(uint32)`, and the plain conversion
+  ## that followed it WRAPPED them -- `--limit 99999999999` became a limit of
+  ## 1215752191 that nobody asked for.
+  var parsed: uint
+  try:
+    parsed = parseUInt(text)
+  except ValueError:
     return false
+  if parsed > uint(high(uint32)):
+    return false
+  limit = uint32(parsed)
+  true
+
+proc parseStatsOptions(args: seq[string]; options: var StatsOptions): string =
+  ## Returns "" on success and otherwise the reason the invocation is
+  ## refused. A misspelt flag must not be absorbed into a query that then
+  ## answers about something else -- but the REASON is part of the refusal.
+  ## Every refusal used to read "unrecognised 'stats' invocation", including
+  ## `stats export --limit 700`: a valid verb with a valid flag, refused only
+  ## because the value crossed `MaxExportLimit`. The reader learnt nothing
+  ## about the ceiling and concluded the command was broken (reprobuild-pm
+  ## issue 2026-11-12). So "unrecognised" is reserved for a verb or a flag
+  ## that really does not exist, and a refused VALUE names the flag, the
+  ## value and the bound it broke.
+  if args.len == 0:
+    return "'stats' needs a verb: capture, top or export"
   try:
     options.verb = parseEnum[StatsVerb](args[0])
   except ValueError:
-    return false
+    return "unrecognised 'stats' verb '" & args[0] &
+      "'; expected capture, top or export"
   options.limit =
     if options.verb == svExport: DefaultExportLimit else: DefaultTopLimit
   var index = 1
@@ -774,31 +798,42 @@ proc parseStatsOptions(args: seq[string]; options: var StatsOptions): bool =
       options.allProfiles = true
       index += 1
     of "--limit":
-      if index + 1 >= args.len: return false
-      options.limit = uint32(parseUInt(args[index + 1]))
+      if index + 1 >= args.len:
+        return "--limit needs a value: a whole number of rows"
+      if not parseLimit(args[index + 1], options.limit):
+        return "--limit " & args[index + 1] & " is not a whole number of " &
+          "rows no larger than " & $high(uint32)
       index += 2
     else:
-      return false
-  if options.verb == svExport:
+      return "unrecognised 'stats " & $options.verb & "' argument '" &
+        args[index] & "'"
+  if options.verb == svExport and
+      (options.limit == 0'u32 or options.limit > MaxExportLimit):
     # REFUSED, NOT CLAMPED. A caller who asked for 5000 rows and silently
     # got 1200 would draw conclusions from a window they did not choose;
-    # a caller told the bound can decide whether it matters.
-    if options.limit == 0'u32 or options.limit > MaxExportLimit:
-      return false
-  true
+    # a caller told the bound can decide whether it matters. Zero is
+    # refused with the rest: on the wire it means "no limit", which is the
+    # largest export of all. (`top` keeps zero: a ranking row is small.)
+    return "--limit " & $options.limit & " is outside the 'stats export' " &
+      "range of 1 to " & $MaxExportLimit & " rows: a response must fit " &
+      "one 1 MiB protocol frame and a full row is about 1.4 KB. The rows " &
+      "are the newest ones; export one KEY at a time to reach further " &
+      "back, or retry with --limit " & $MaxExportLimit & " or less."
+  ""
 
 proc runStats(programName: string; args: seq[string]): int =
   var options = StatsOptions()
-  if not parseStatsOptions(args, options):
-    # A REFUSAL WITH THE SHAPE IN IT. A misspelt verb or flag that exited
-    # silently would be indistinguishable, at a glance, from a query that
-    # found nothing -- which is the one confusion this whole surface
-    # exists to remove.
+  let refusal = parseStatsOptions(args, options)
+  if refusal.len > 0:
+    # A REFUSAL WITH THE REASON AND THE SHAPE IN IT. A misspelt verb or flag
+    # that exited silently would be indistinguishable, at a glance, from a
+    # query that found nothing -- which is the one confusion this whole
+    # surface exists to remove.
     #
     # ON STDERR, because `stats export` writes NDJSON to stdout and the
     # rule that nothing else ever does has to hold on the error paths too
     # -- those are exactly the paths a caller has not looked at yet.
-    stderr.writeLine("unrecognised 'stats' invocation")
+    stderr.writeLine(refusal)
     stderr.writeLine(renderUsage(programName))
     return 2
   case options.verb

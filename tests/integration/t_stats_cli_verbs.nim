@@ -367,6 +367,84 @@ suite "stats_cli_verbs":
       daemon.stop()
 
   # -------------------------------------------------------------------------
+  # A refused argument names itself; a valid verb is never "unrecognised".
+  # -------------------------------------------------------------------------
+
+  test "a refused --limit names the bound and never calls the verb unrecognised":
+    # REGRESSION (reprobuild-pm issue 2026-11-12, `stats export --limit 700`).
+    # Every refusal used to print "unrecognised 'stats' invocation" -- for a
+    # verb that exists, with a flag that exists, refused only because its
+    # VALUE crossed the export ceiling. The reader learnt nothing about the
+    # ceiling and concluded the command was broken. A DISCRIMINATION, not
+    # one assertion: the ceiling itself is accepted and answered by a live
+    # daemon, the value one above it is refused naming the ceiling, and
+    # only a genuinely unknown verb or flag is called unrecognised.
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
+    let root = scratchRoot("limit")
+    defer: removeScratchRoot(root)
+    var endpointPolicyLimit: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicyLimit)
+    let socketPath = rendezvousDir(root, endpointPolicyLimit) / "d.sock"
+    let state = hostStateDir(root)
+    let dbPath = state / "observations.sqlite3"
+    putEnv("RUNQUOTA_SOCKET", socketPath)
+    var daemon = startDaemon(socketPath,
+      ["--host-identity-file", state / "host-id",
+       "--ambient-sample-interval-millis", "0"])
+    try:
+      var client = connectDefault()
+      client.completeOneExecution(SeedKey, 10)
+      check waitForExecutions(dbPath, 1).len >= 1
+      client.close()
+
+      # The ceiling is a valid value: a real answer, rows on stdout.
+      let atCeiling = runCli("stats", "export", "--limit", "600")
+      check atCeiling.code == 0
+      check atCeiling.ndjson.len >= 1
+
+      # `top` has no frame-derived ceiling; the same value is not refused.
+      let topWide = runCli("stats", "top", "--limit", "700")
+      check topWide.code == 0
+      check "unrecognised" notin topWide.errText
+
+      proc checkRefusal(answer: CliResult; mustName: openArray[string]) =
+        check answer.code == 2
+        check answer.outText.len == 0
+        check "unrecognised" notin answer.errText
+        for fragment in mustName:
+          check fragment in answer.errText
+
+      # One past the ceiling, and the value from the issue's report.
+      checkRefusal(runCli("stats", "export", "--limit", "601"),
+        ["--limit", "601", "600"])
+      checkRefusal(runCli("stats", "export", "--limit", "700"),
+        ["--limit", "700", "600"])
+      checkRefusal(runCli("stats", "export", "--limit", "0"),
+        ["--limit", "0", "600"])
+      # Not a number, and a number past uint32: refused by name rather than
+      # escaping as a raw parse exception or wrapping to some other limit.
+      checkRefusal(runCli("stats", "export", "--limit", "many"),
+        ["--limit", "many"])
+      checkRefusal(runCli("stats", "top", "--limit", "99999999999"),
+        ["--limit", "99999999999"])
+      checkRefusal(runCli("stats", "top", "--limit"), ["--limit"])
+
+      # The word "unrecognised" is reserved for what really is.
+      let badVerb = runCli("stats", "exprot")
+      check badVerb.code == 2
+      check badVerb.outText.len == 0
+      check "unrecognised" in badVerb.errText
+      check "exprot" in badVerb.errText
+      let badFlag = runCli("stats", "export", "--limt", "5")
+      check badFlag.code == 2
+      check badFlag.outText.len == 0
+      check "unrecognised" in badFlag.errText
+      check "--limt" in badFlag.errText
+    finally:
+      daemon.stop()
+
+  # -------------------------------------------------------------------------
   # Scope, hardware and the facts a row carries.
   # -------------------------------------------------------------------------
 

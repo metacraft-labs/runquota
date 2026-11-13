@@ -110,7 +110,10 @@ metadata together, on stdout.
 
 `--limit` defaults to **250** and is capped at **600** — a full row is about
 1.4 KB on the current schema, so 600 rows is roughly 855 KB against a 1 MiB
-frame limit. A larger value is refused (exit 2) rather than silently truncated.
+frame limit. A larger value (or `0`, which on the wire means "no limit") is
+refused with exit 2 and a message naming the 1–600 range, rather than silently
+truncated. To reach further back than the newest 600 rows, export one `KEY` at
+a time.
 
 > The rows you get are the **newest** `--limit` rows and **there is no older
 > page**: the protocol carries a row limit but no time cursor, so a deeper
