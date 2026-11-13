@@ -87,14 +87,21 @@ suite "measurement switch parser":
   test "the registry says which measurements exist and where they are taken":
     check measurementRegistry[measureCapture].side == measuredByDaemon
     check measurementRegistry[measureTreeSampling].side == measuredByClient
-    for m in [measureProfiles, measurePressureReports, measureSizingData,
+    for m in [measurePressureReports, measureSizingData,
               measureMetricsExport]:
       check not measurementRegistry[m].implemented
       # Not implemented, so not on by default: a measurement is on by
       # default only once it has passed the overhead gate.
       check not measurementRegistry[m].defaultOn
+    # CPU profiles exist, are taken by the launching client, and stay off by
+    # default until the overhead gate passes with them on.
+    check measurementRegistry[measureProfiles].implemented
+    check measurementRegistry[measureProfiles].side == measuredByClient
+    check not measurementRegistry[measureProfiles].defaultOn
+    check measureProfiles notin defaultMeasurements()
     check implementedMeasurements() ==
-      {measureCapture, measureAmbientSampling, measureTreeSampling}
+      {measureCapture, measureAmbientSampling, measureTreeSampling,
+       measureProfiles}
 
   test "a malformed client value falls back to the defaults and says why":
     var problem: string

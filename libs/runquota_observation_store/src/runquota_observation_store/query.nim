@@ -447,12 +447,13 @@ proc exportColumns*(): seq[ExportColumn] =
   ## commit and the hardware therefore travel WITH each execution rather
   ## than being left in a table the caller cannot reach.
   ##
-  ## WHY THE UNWRITTEN COLUMNS ARE HERE ANYWAY. `cpu_user_millis`,
-  ## `cpu_sys_millis`, `io_read_bytes` and `io_write_bytes` are NULL on
-  ## every row ever written, because nothing in the lease-finish path
-  ## measures them. Omitting them would make their absence a mystery a
+  ## WHY THE UNWRITTEN COLUMNS ARE HERE ANYWAY. `io_read_bytes` and
+  ## `io_write_bytes` are NULL on every row ever written, because nothing in
+  ## the lease-finish path measures them, and `cpu_user_millis` and
+  ## `cpu_sys_millis` are NULL on a row whose finish carried no totals (an
+  ## older client). Omitting them would make their absence a mystery a
   ## reader has to go and discover; emitting them as `null` makes it a
-  ## fact they can see. They cost four nulls a row.
+  ## fact they can see.
   ##
   ## THE LIST IS EXPLICIT AND NEVER `select *`. Column ORDER and column
   ## NAMES are what a caller's `jq` is written against, and `select *`

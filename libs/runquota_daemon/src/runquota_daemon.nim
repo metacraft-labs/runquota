@@ -105,6 +105,7 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     observationQueueCapacity: 1024,
     hostIdentityFilePath: "",
     ambientSampleIntervalMillis: defaultAmbientCadenceMillis,
+    profileUncontendedPct: DefaultUncontendedOtherCpuPct,
     retentionPolicy: defaultRetentionPolicy(),
     retentionSweepIntervalMillis: defaultRetentionSweepIntervalMillis,
     retentionMaxDeferredSweeps: defaultMaxDeferredSweeps,
@@ -670,6 +671,7 @@ proc initDaemon*(config: DaemonConfig; deferCapture = false): RunQuotaDaemon =
     sessions: initTable[uint64, SessionRow](),
     leases: initTable[uint64, LeaseRow](),
     estimates: initTable[string, LearnedEstimateRow](),
+    cpuEstimates: initTable[string, CpuShapeEstimate](),
     estimateStore: startEstimateStore(effectiveConfig.estimateDbPath,
         effectiveConfig.estimateQueueCapacity),
     activeLeaseCount: 0'u32,
@@ -1534,6 +1536,38 @@ proc estimatesJson(daemon: RunQuotaDaemon): string =
       "\"recent_peak_memory_bytes\":" & $row.recentPeakMemoryBytes & "," &
       "\"sample_count\":" & $row.sampleCount &
     "}")
+  result.add("],\"cpu_estimates\":[")
+  var cpuKeys: seq[string] = @[]
+  for key in daemon.cpuEstimates.keys:
+    cpuKeys.add(key)
+  cpuKeys.sort()
+  for i, key in cpuKeys:
+    if i > 0:
+      result.add(",")
+    let estimate = daemon.cpuEstimates[key]
+    var shapeText = ""
+    if estimate.hasShape:
+      let points = estimate.shape()
+      for k, value in points:
+        if k > 0:
+          shapeText.add(",")
+        shapeText.add($value)
+    var widthsText = ""
+    for j, width in estimate.widths():
+      if j > 0:
+        widthsText.add(",")
+      widthsText.add("{\"cpu_milli\":" & $width &
+        ",\"expected_duration_millis\":" &
+        $estimate.expectedDurationMillis(width) & "}")
+    result.add("{\"key\":" & jsonEscape(key) & "," &
+      "\"totals_seen\":" & $estimate.totalsSeen & "," &
+      "\"conservative_cpu_millis\":" & $estimate.conservativeCpuMillis() & "," &
+      "\"profiles_folded\":" & $estimate.profilesFolded & "," &
+      "\"contended_skipped\":" & $estimate.contendedSkipped & "," &
+      "\"unjudged_skipped\":" & $estimate.unjudgedSkipped & "," &
+      "\"shape_milli_cpu\":" & (if estimate.hasShape: "[" & shapeText & "]"
+                                 else: "null") & "," &
+      "\"expected_duration_by_width\":[" & widthsText & "]}")
   result.add("]}")
 
 proc pressureJson(daemon: var RunQuotaDaemon): string =
@@ -2370,15 +2404,31 @@ proc aggregatePayload(storePath, statsKey: string;
       result.sampleCount = uint64(max(0'i64, entry.sampleCount))
       break
 
+proc clientInt64(value: uint64): int64 =
+  ## A client-sent unsigned figure as a store integer, SATURATING at
+  ## ``int64.high``. A plain ``int64(value)`` raises ``RangeDefect`` above
+  ## that, and the value comes off the wire from any local peer: one
+  ## malformed finish must not take down the host-wide daemon.
+  if value > uint64(high(int64)): high(int64) else: int64(value)
+
+proc finishPeakMemoryBytes(finish: LeaseFinishedMessage): uint64 =
+  ## The finish's peak memory: the larger of the launcher's sampled tree
+  ## peak (a sum over processes alive at once, `tree-sampling`) and the
+  ## largest single resident set from its wait (`ru_maxrss`). Each is a
+  ## lower bound on the true peak and neither contains the other: samples
+  ## can miss a short spike, and `ru_maxrss` never sums processes.
+  max(finish.peakMemoryBytes, finish.totals.maxRssBytes)
+
 proc updateEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
                               finish: LeaseFinishedMessage) =
-  if lease.commandStatsId.len == 0 or finish.peakMemoryBytes == 0:
+  let peakMemoryBytes = finishPeakMemoryBytes(finish)
+  if lease.commandStatsId.len == 0 or peakMemoryBytes == 0:
     return
   if not daemon.sessions.hasKey(lease.sessionId.value):
     return
   let scope = daemon.sessions[lease.sessionId.value].sessionScope()
   let key = estimateTableKey(scope, lease.commandStatsId)
-  let observed = finish.peakMemoryBytes
+  let observed = peakMemoryBytes
   var conservative =
     if finish.finish.kind == lfOomKilled:
       max(observed, lease.resources.memory.value) * 2'u64
@@ -2401,6 +2451,30 @@ proc updateEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
   )
   daemon.estimates[key] = row
   discard enqueueEstimateWrite(daemon.estimateStore, row)
+
+proc foldCpuEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
+                               finish: LeaseFinishedMessage) =
+  ## Fold a finish's totals and CPU profile into its key's learned CPU
+  ## estimate (``cpu_shape``). Judged against the ambient samples the
+  ## sampler holds in memory for the run's window; the store is not read.
+  if lease.commandStatsId.len == 0 or not finish.totals.known:
+    return
+  if not daemon.sessions.hasKey(lease.sessionId.value):
+    return
+  let scope = daemon.sessions[lease.sessionId.value].sessionScope()
+  let key = estimateTableKey(scope, lease.commandStatsId)
+  let finishedAt = unixMillisNow()
+  var busyPct = 0.0
+  let samples = meanHostCpuBusyPct(
+    finishedAt - min(finishedAt, clientInt64(finish.totals.durationMillis)),
+    finishedAt, busyPct)
+  let verdict = contention(busyPct, samples, finish.totals.totalCpuMicros,
+    finish.totals.durationMillis, countProcessors(),
+    daemon.config.profileUncontendedPct)
+  var estimate = daemon.cpuEstimates.getOrDefault(key)
+  estimate.fold(finish.totals, finish.cpuProfile,
+    lease.resources.cpu.value, verdict)
+  daemon.cpuEstimates[key] = estimate
 
 proc openObservationRun(daemon: var RunQuotaDaemon; session: SessionRow) =
   ## One ``runs`` row per registered session. The row is written once, at
@@ -2597,16 +2671,28 @@ proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
     leaseId: some(int64(lease.id.value)),
     startedAtUnixMillis: startedAt,
     finishedAtUnixMillis: finishedAt,
-    durationMillis: max(0'i64, finishedAt - startedAt),
+    # THE LAUNCHER'S DURATION WHEN IT SENT ONE: launch to reap on its own
+    # clock, which is the run itself. The daemon's two stamps also contain
+    # the round trips on either side of it.
+    durationMillis:
+      if finish.totals.known: clientInt64(finish.totals.durationMillis)
+      else: max(0'i64, finishedAt - startedAt),
     exitStatus: int64(finish.finish.exitStatus),
     termination: observationTermination(finish.finish),
     attempt: 1,
     retryOf: none(string),
-    peakRssBytes: int64(finish.peakMemoryBytes),
-    cpuUserMillis: none(int64),
-    cpuSysMillis: none(int64),
+    peakRssBytes: clientInt64(finishPeakMemoryBytes(finish)),
+    # NULL, NOT ZERO, WHEN THE CLIENT SENT NO TOTALS: an older client, or a
+    # launcher that never reaped the root. Zero would be a measurement.
+    cpuUserMillis:
+      if finish.totals.known: some(clientInt64(finish.totals.cpuUserMicros div 1000))
+      else: none(int64),
+    cpuSysMillis:
+      if finish.totals.known: some(clientInt64(finish.totals.cpuSysMicros div 1000))
+      else: none(int64),
     maxProcesses: int64(finish.processCount),
-    majorPageFaults: int64(finish.majorPageFaults),
+    majorPageFaults: clientInt64(max(finish.majorPageFaults,
+      finish.totals.majorPageFaults)),
     ioReadBytes: none(int64),
     ioWriteBytes: none(int64),
     captureCompleteness: ccComplete,
@@ -2620,7 +2706,11 @@ proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
     # exists to prevent.
     #
     # NULL, not 0, when the transport cannot report credentials: 0 is root.
-    ownerUid: ownerIdOf(lease.peer)
+    ownerUid: ownerIdOf(lease.peer),
+    cpuProfileIntervalMillis:
+      if finish.cpuProfile.present: int64(finish.cpuProfile.intervalMillis)
+      else: 0'i64,
+    cpuProfileSamples: finish.cpuProfile.samples
   ))
 
 proc declareClientExtension(daemon: var RunQuotaDaemon;
@@ -3867,6 +3957,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     lease.majorPageFaults = msg.majorPageFaults
     lease.pressureEvents = msg.pressureEvents
     daemon.updateEstimateFromFinish(lease, msg)
+    daemon.foldCpuEstimateFromFinish(lease, msg)
     daemon.captureObservation(lease, msg)
     # M13b: THE KEY IS MARKED DIRTY, NOT PUBLISHED. Ordered after
     # `captureObservation` because the aggregate must include the run that

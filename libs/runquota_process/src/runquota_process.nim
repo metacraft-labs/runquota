@@ -1,4 +1,4 @@
-import std/[os, strutils, times]
+import std/[monotimes, os, strutils, times]
 
 when defined(posix):
   import std/posix
@@ -11,6 +11,7 @@ when defined(windows):
   import std/winlean
 
 import runquota_core
+import runquota_core/cpu_profile
 import runquota_core/measurement
 when defined(linux):
   import runquota_host_linux
@@ -779,6 +780,36 @@ when defined(posix):
     writeAllToStderr(cast[cstring](addr digits[position]))
     writeAllToStderr(")\n")
 
+  proc timevalMicros(value: Timeval): uint64 =
+    uint64(max(0'i64, int64(value.tv_sec))) * 1_000_000'u64 +
+      uint64(max(0'i64, int64(value.tv_usec)))
+
+  proc reapChild(child: var LaunchedProcess; status: var cint;
+                 options: cint): Pid =
+    ## `waitpid` that also keeps what the kernel says the reaped tree used.
+    ##
+    ## `wait4` returns, with the status, the rusage of the child INCLUDING
+    ## every descendant it waited for, directly or through descendants that
+    ## were themselves waited for -- which is the tree's CPU time, read at
+    ## the one moment the launcher has it for free. Not `getrusage(
+    ## RUSAGE_CHILDREN)`: that is process-wide, and a launcher with many
+    ## children at once (a build engine) cannot attribute it to one of them.
+    ## What neither can see is a descendant re-parented away before it was
+    ## waited for; see `runquota_core/cpu_profile`.
+    var usage: Rusage
+    result = wait4(Pid(child.pid), addr status, options, addr usage)
+    if result == Pid(child.pid):
+      child.rusageKnown = true
+      child.rusageUserMicros = timevalMicros(usage.ru_utime)
+      child.rusageSysMicros = timevalMicros(usage.ru_stime)
+      # `ru_maxrss` is in KiB on Linux and in bytes on macOS (getrusage(2)
+      # on each).
+      let maxRss = uint64(max(0'i64, int64(usage.ru_maxrss)))
+      child.rusageMaxRssBytes =
+        when defined(macosx): maxRss else: maxRss * 1024'u64
+      child.rusageMajorFaults = uint64(max(0'i64, int64(usage.ru_majflt)))
+      child.reapMonoMillis = getMonoTime().ticks div 1_000_000
+
   proc buildCompletion(child: LaunchedProcess; status: cint; elapsedMillis: uint64;
                        stdoutText, stderrText: string; stdoutBytes, stderrBytes: uint64;
                        timedOut: bool; peakResidentMemoryBytes: uint64;
@@ -801,6 +832,20 @@ when defined(posix):
       processCount: processCount,
       telemetrySource: telemetrySource
     )
+    if child.rusageKnown:
+      result.totals = FinishTotals(known: true,
+        cpuUserMicros: child.rusageUserMicros,
+        cpuSysMicros: child.rusageSysMicros,
+        maxRssBytes: child.rusageMaxRssBytes,
+        majorPageFaults: child.rusageMajorFaults,
+        durationMillis: uint64(max(0'i64,
+          child.reapMonoMillis - child.launchMonoMillis)))
+      if child.profiles:
+        var sampler = child.profileSampler
+        sampler.finish(child.reapMonoMillis - child.launchMonoMillis,
+          result.totals.totalCpuMicros)
+        result.cpuProfile = sampler.profile()
+        result.memoryProfileMiB = sampler.memoryProfileMiB()
     if not timedOut:
       if WIFEXITED(status):
         result.exited = true
@@ -1066,7 +1111,12 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     # THE LAUNCHER'S OWN SWITCH, read from this process's environment and
     # never from `spec.env`: the measurement is taken here, by the client,
     # and the child's environment is the child's business.
-    let treeSampling = measureTreeSampling in clientMeasurements()
+    let measurements = clientMeasurements()
+    let treeSampling = measureTreeSampling in measurements
+    # PROFILES ONLY WHERE THE TREE CAN BE READ. On Linux the launcher reads
+    # its own descendants from `/proc`; elsewhere nothing here can, so the
+    # switch is inert rather than producing a profile of the root alone.
+    let profiles = measureProfiles in measurements and defined(linux)
 
     # Everything the child needs between fork and exec is composed here, while
     # there is still a whole process to compose it in. After the fork the child
@@ -1140,6 +1190,10 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     if spec.createProcessGroup:
       discard setpgid(pid, pid)
     let pgid = if spec.createProcessGroup: int(pid) else: int(getpgid(pid))
+    var sampler = initCpuProfileSampler()
+    if profiles:
+      # The profile's clock starts at 0, the launch.
+      sampler.start(0'i64)
     LaunchedProcess(
       pid: int(pid),
       processGroupId: pgid,
@@ -1159,6 +1213,9 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       telemetrySource: launchTelemetrySource(treeSampling),
       lastTelemetrySampleSeconds: 0.0,
       treeSampling: treeSampling,
+      profiles: profiles,
+      profileSampler: sampler,
+      launchMonoMillis: getMonoTime().ticks div 1_000_000,
       info: LaunchResult(
         processId: uint64(pid),
         processGroupId: uint64(max(pgid, 0)),
@@ -1257,22 +1314,36 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
 
     if not child.doneFlag:
       let now = epochTime()
-      if child.treeSampling and (child.lastTelemetrySampleSeconds == 0.0 or
-          now - child.lastTelemetrySampleSeconds >= 0.1):
+      let treeDue = child.treeSampling and
+        (child.lastTelemetrySampleSeconds == 0.0 or
+          now - child.lastTelemetrySampleSeconds >= 0.1)
+      # ONE READING OF THE TREE SERVES BOTH MEASUREMENTS when both are due;
+      # the profile's own reading comes once per profile interval (1 s,
+      # doubling as the run lengthens), so with tree sampling off a profile
+      # costs one walk of the tree per interval and nothing in between.
+      let sinceLaunch = getMonoTime().ticks div 1_000_000 -
+        child.launchMonoMillis
+      let profileDue = child.profiles and child.profileSampler.due(sinceLaunch)
+      if treeDue or profileDue:
         let sample =
           when defined(linux):
             sampleLinuxProcessTreeTelemetry(uint64(child.pid))
           else:
             sampleMacosProcessTreeTelemetry(uint64(child.pid))
-        child.lastTelemetrySampleSeconds = now
-        child.telemetrySource = sample.source
-        if sample.diagnostic.code == diagOk:
-          if sample.residentMemoryBytes > child.peakResidentMemoryBytes:
-            child.peakResidentMemoryBytes = sample.residentMemoryBytes
-          if sample.processCount > child.processCount:
-            child.processCount = sample.processCount
+        if treeDue:
+          child.lastTelemetrySampleSeconds = now
+          child.telemetrySource = sample.source
+          if sample.diagnostic.code == diagOk:
+            if sample.residentMemoryBytes > child.peakResidentMemoryBytes:
+              child.peakResidentMemoryBytes = sample.residentMemoryBytes
+            if sample.processCount > child.processCount:
+              child.processCount = sample.processCount
+        if child.profiles and sample.diagnostic.code == diagOk and
+            sample.cumulativeCpuKnown:
+          child.profileSampler.observe(sinceLaunch,
+            sample.cumulativeCpuTimeMicros, sample.residentMemoryBytes)
       var status: cint = 0
-      let waited = waitpid(Pid(child.pid), status, WNOHANG)
+      let waited = child.reapChild(status, WNOHANG)
       if waited == Pid(child.pid):
         child.doneFlag = true
         child.runningFlag = false
@@ -1443,7 +1514,7 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
           child.stderrFd.drainFd(child.stderrText, child.stderrBytes,
                                  child.stderrLimit)
           var status: cint = 0
-          let waited = waitpid(Pid(child.pid), status, WNOHANG)
+          let waited = child.reapChild(status, WNOHANG)
           if waited == Pid(child.pid):
             child.doneFlag = true
             child.runningFlag = false
@@ -1453,7 +1524,12 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
         if not child.doneFlag:
           child.killNow()
           var status: cint = 0
-          discard waitpid(Pid(child.pid), status, 0)
+          # A blocking wait can be interrupted by a signal before the
+          # killed root is reaped; retry, or the root is left a zombie and
+          # the totals are lost. Any other failure (ECHILD: already reaped
+          # elsewhere) leaves the totals unknown, never zero.
+          while child.reapChild(status, 0) < 0 and errno == EINTR:
+            discard
           child.waitStatus = int(status)
           child.doneFlag = true
           child.runningFlag = false

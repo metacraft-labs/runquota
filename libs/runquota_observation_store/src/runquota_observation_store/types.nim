@@ -143,6 +143,19 @@ type
       ## NEVER from anything the client declares. ``none`` means the
       ## transport could not report them; it does not mean root. A value
       ## must have a ``users`` row: the schema refuses the insert otherwise.
+    cpuProfileIntervalMillis*: int64
+      ## The execution's CPU profile (``execution_cpu_profiles``): the
+      ## sample interval, 0 when the execution has no profile.
+    cpuProfileSamples*: seq[uint16]
+      ## Milli-CPUs per interval, at most 256.
+
+  CpuProfileRow* = object
+    ## One row of ``execution_cpu_profiles``, as read back.
+    hostId*: string
+    executionId*: string
+    intervalMillis*: int64
+    samples*: seq[uint16]
+    source*: string
 
   AmbientSampleRow* = object
     hostId*: string

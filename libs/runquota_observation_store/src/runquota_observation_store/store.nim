@@ -25,7 +25,8 @@ import ./hardware, ./ids, ./schema, ./sqlite_cli, ./types
 export types
 export ids
 export hardware
-export schema.spineSchemaVersion, schema.spineTableNames
+export schema.spineSchemaVersion, schema.spineTableNames,
+  schema.cpuProfileTable
 
 const libraryName* = "runquota_observation_store"
 
@@ -427,9 +428,31 @@ proc runInsertStatement*(row: RunRow): string =
   "insert or ignore into runs (" & runColumns.join(", ") & ") values (" &
     runValues(row).join(", ") & ");"
 
+proc cpuProfileBlob*(samples: openArray[uint16]): string =
+  ## The ``samples`` column: little-endian u16, as a SQL blob literal.
+  const hexDigits = "0123456789ABCDEF"
+  result = "X'"
+  for value in samples:
+    for b in [uint8(value and 0xff'u16), uint8(value shr 8)]:
+      result.add(hexDigits[int(b shr 4)])
+      result.add(hexDigits[int(b and 0x0f'u8)])
+  result.add("'")
+
 proc executionInsertStatement*(row: ExecutionRow): string =
-  ## One execution's insert. Same reason as ``runInsertStatement``.
-  insertStatement("executions", executionColumns, executionValues(row))
+  ## One execution's insert, and its CPU profile's when it has one. Same
+  ## reason as ``runInsertStatement``.
+  ##
+  ## THE PROFILE TRAVELS IN THE SAME STATEMENT TEXT, so the writer queues,
+  ## counts and commits the pair as one observation: a profile can never
+  ## reach the store without its execution, and its foreign key is
+  ## satisfied by the line above it.
+  result = insertStatement("executions", executionColumns, executionValues(row))
+  if row.cpuProfileIntervalMillis > 0 and row.cpuProfileSamples.len > 0:
+    result.add("\n" & insertStatement(cpuProfileTable,
+      ["host_id", "execution_id", "interval_ms", "samples", "source"],
+      [encodeText(row.hostId), encodeText(row.executionId),
+       encodeInt(row.cpuProfileIntervalMillis),
+       cpuProfileBlob(row.cpuProfileSamples), encodeText("client-tree")]))
 
 proc batchStatement*(runs: openArray[RunRow];
                      executions: openArray[ExecutionRow];
@@ -633,6 +656,27 @@ proc readExecutions*(store: ObservationStore): seq[ExecutionRow] =
       captureCompleteness: parseEnum[CaptureCompleteness](decodeText(row[20])),
       droppedObservations: parseBiggestInt(row[21]),
       ownerUid: decodeOptInt(row[22])))
+
+proc readCpuProfiles*(store: ObservationStore): seq[CpuProfileRow] =
+  ## Every stored CPU profile, decoded. For tests and inspection; admission
+  ## never reads this table.
+  let sql = "select " & [
+    selectText("host_id"), selectText("execution_id"),
+    selectInt("interval_ms"), "hex(samples)", selectText("source")
+  ].join(" || '|' || ") & " from " & cpuProfileTable &
+    " order by host_id, execution_id;"
+  for row in store.query(sql):
+    var samples: seq[uint16] = @[]
+    let hex = row[3]
+    var i = 0
+    while i + 3 < hex.len:
+      let lo = uint16(parseHexInt(hex[i .. i + 1]))
+      let hi = uint16(parseHexInt(hex[i + 2 .. i + 3]))
+      samples.add(lo or (hi shl 8))
+      i += 4
+    result.add(CpuProfileRow(hostId: decodeText(row[0]),
+      executionId: decodeText(row[1]), intervalMillis: parseBiggestInt(row[2]),
+      samples: samples, source: decodeText(row[4])))
 
 proc readAmbientSamples*(store: ObservationStore): seq[AmbientSampleRow] =
   let sql = "select " & [

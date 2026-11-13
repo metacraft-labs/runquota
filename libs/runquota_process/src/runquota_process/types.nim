@@ -1,5 +1,9 @@
 import std/osproc
 
+import runquota_core/cpu_profile
+
+export cpu_profile
+
 type
   LibraryInfo* = object
     name*: string
@@ -70,8 +74,22 @@ type
     stderrBytes*: uint64
     elapsedMillis*: uint64
     peakResidentMemoryBytes*: uint64
+      ## The largest SUMMED resident set the tree samples saw while it ran
+      ## (`tree-sampling`). 0 when nothing sampled it. See `totals` for the
+      ## largest single process, which needs no sampling.
     processCount*: uint32
     telemetrySource*: string
+    totals*: FinishTotals
+      ## The tree's CPU time, largest single resident set and duration, from
+      ## the wait that reaped its root. `totals.known` is false where the
+      ## platform gave none.
+    cpuProfile*: CpuProfile
+      ## The tree's CPU use over time, when the `profiles` measurement is on
+      ## and the platform can read the tree (Linux). Otherwise absent.
+    memoryProfileMiB*: seq[uint16]
+      ## The largest summed resident set per profile interval, in MiB, on
+      ## `cpuProfile`'s intervals. Taken by the same tree readings, so it
+      ## costs nothing extra; not yet sent anywhere.
 
   LaunchedProcess* = object
     pid*: int
@@ -105,6 +123,20 @@ type
       ## (`runquota_core/measurement`), read once at launch. Off, the
       ## completion carries no peak memory (0, which every reader already
       ## treats as "not measured") and `telemetrySource` says why.
+    profiles*: bool
+      ## Whether this launch takes a CPU profile of its tree: the `profiles`
+      ## measurement switch, read once at launch, and only where the tree
+      ## can be read (Linux `/proc`).
+    profileSampler*: CpuProfileSampler
+    launchMonoMillis*: int64
+      ## The launch on the monotonic clock: the origin of the profile's
+      ## intervals and of the totals' duration.
+    rusageKnown*: bool
+    rusageUserMicros*: uint64
+    rusageSysMicros*: uint64
+    rusageMaxRssBytes*: uint64
+    rusageMajorFaults*: uint64
+    reapMonoMillis*: int64
     info*: LaunchResult
     completion*: ProcessCompletion
     # Windows: extra slots store the osproc Process ref and the Job Object

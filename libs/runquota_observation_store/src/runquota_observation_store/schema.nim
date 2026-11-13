@@ -11,10 +11,14 @@
 ## registered in ``extension_registry`` (M12).
 
 const
-  spineSchemaVersion* = 6'i64
+  spineSchemaVersion* = 7'i64
     ## The schema version this build understands. A database whose
     ## ``user_version`` exceeds it is REFUSED, never degraded (see
     ## ``openObservationStore``).
+
+  cpuProfileTable* = "execution_cpu_profiles"
+    ## One optional CPU profile per execution (schema version 7), keyed and
+    ## pruned with it. A spine table, not an extension: RunQuota reads it.
 
   carriedExtensionTable* = "carried_extension_rows"
     ## Quarantine for extension rows a merge could not place, named here
@@ -29,7 +33,8 @@ const
     "ambient_samples",
     "extension_registry",
     carriedExtensionTable,
-    "users"
+    "users",
+    cpuProfileTable
   ]
 
   migrationV1 = """
@@ -331,8 +336,37 @@ begin
 end;
 """
 
+  # VERSION 7: CPU PROFILES. One optional row per execution, written in the
+  # same statement batch as its execution and immutable like it. `samples`
+  # is at most 256 little-endian u16 (CPU used per interval, milli-CPUs,
+  # saturating), so the length check bounds the row whatever a client sends;
+  # an execution without a profile has NO row, never a row of zeros.
+  # Retention deletes these rows in the same transaction as their
+  # executions (`pruneExecutions`), before the parents, so the foreign key
+  # holds throughout.
+  migrationV7 = """
+create table execution_cpu_profiles (
+  host_id text not null,
+  execution_id text not null,
+  interval_ms integer not null check (interval_ms > 0),
+  samples blob not null
+    check (length(samples) between 2 and 512 and length(samples) % 2 = 0),
+  source text not null check (source in ('client-tree', 'client-self')),
+  primary key (host_id, execution_id),
+  foreign key (host_id, execution_id)
+    references executions(host_id, execution_id)
+);
+
+create trigger execution_cpu_profiles_immutable
+before update on execution_cpu_profiles
+begin
+  select raise(abort,
+    'runquota: execution_cpu_profiles rows are immutable after write (OS-3)');
+end;
+"""
+
   migrations* = [migrationV1, migrationV2, migrationV3, migrationV4,
-                 migrationV5, migrationV6]
+                 migrationV5, migrationV6, migrationV7]
     ## Index ``i`` migrates ``user_version`` ``i`` to ``i + 1``.
 
 static:

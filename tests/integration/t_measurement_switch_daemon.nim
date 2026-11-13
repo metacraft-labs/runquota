@@ -63,7 +63,8 @@ when defined(posix):
       check measurements["capture"].getStr == "on"
       check measurements["ambient-sampling"].getStr == "off"
       check measurements["tree-sampling"].getStr == "client"
-      for name in ["profiles", "pressure-reports", "sizing-data",
+      check measurements["profiles"].getStr == "client"
+      for name in ["pressure-reports", "sizing-data",
                    "metrics-export"]:
         check measurements[name].getStr == "not-implemented"
       check observations["ambient_sampling"]["interval_millis"].getInt == 0

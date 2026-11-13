@@ -20,6 +20,9 @@ when defined(linux):
       ppid: uint64
       residentMemoryBytes: uint64
       cpuTimeMicros: uint64
+      cumulativeCpuTimeMicros: uint64
+        ## utime + stime + cutime + cstime: this process and every
+        ## descendant it has reaped (proc(5), fields 14-17).
 
   proc procRoot(): string =
     getEnv("RUNQUOTA_PROC_ROOT", "/proc")
@@ -48,7 +51,13 @@ when defined(linux):
       ppid: parseUInt(fields[1]),
       residentMemoryBytes:
         if rssPages > 0: uint64(rssPages) * uint64(sysconf(SC_PAGESIZE)) else: 0'u64,
-      cpuTimeMicros: ticksToMicros(parseUInt(fields[11]) + parseUInt(fields[12]))
+      cpuTimeMicros: ticksToMicros(parseUInt(fields[11]) + parseUInt(fields[12])),
+      # cutime and cstime are signed in proc(5) (`%ld`); a negative value
+      # never occurs for a reaped child's time, but is read as zero rather
+      # than wrapping.
+      cumulativeCpuTimeMicros: ticksToMicros(parseUInt(fields[11]) +
+        parseUInt(fields[12]) + uint64(max(0'i64, parseBiggestInt(fields[13]))) +
+        uint64(max(0'i64, parseBiggestInt(fields[14]))))
     )
     true
 
@@ -162,15 +171,19 @@ when defined(linux):
         )
       var residentBytes = 0'u64
       var cpuMicros = 0'u64
+      var cumulativeMicros = 0'u64
       for row in rows:
         residentBytes += row.residentMemoryBytes
         cpuMicros += row.cpuTimeMicros
+        cumulativeMicros += row.cumulativeCpuTimeMicros
       HostProcessTreeTelemetrySample(
         rootProcessId: rootProcessId,
         rootAlive: true,
         processCount: uint32(rows.len),
         residentMemoryBytes: residentBytes,
         cpuTimeMicros: cpuMicros,
+        cumulativeCpuTimeMicros: cumulativeMicros,
+        cumulativeCpuKnown: true,
         source: "linux-procfs",
         diagnostic: okDiagnostic()
       )

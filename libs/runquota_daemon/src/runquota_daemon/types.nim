@@ -8,6 +8,9 @@ import runquota_persistence
 import runquota_protocol
 import runquota_stats_table/publisher
 import ./owners
+import ./cpu_shape
+
+export cpu_shape
 
 export owners
 
@@ -118,6 +121,11 @@ type
       ## Where this machine's ``host_id`` is kept. Empty means the
       ## per-user default; tests point it at a scratch directory so they
       ## neither read nor write the operator's real machine identity.
+    profileUncontendedPct*: float64
+      ## The most of the host's CPU that everything other than an execution
+      ## may have used over its run for the run to count as uncontended and
+      ## be folded into its command's learned duration and CPU shape
+      ## (``cpu_shape``). `runquotad --profile-uncontended-pct`.
     ambientSampleIntervalMillis*: int
       ## The FIXED cadence of ambient load sampling (M11), independent of
       ## execution boundaries. Zero or negative turns ambient sampling off
@@ -353,6 +361,10 @@ type
       ## Open session groups by `sessionGroupKey`.
     leases*: Table[uint64, LeaseRow]
     estimates*: Table[string, LearnedEstimateRow]
+    cpuEstimates*: Table[string, CpuShapeEstimate]
+      ## The learned CPU estimate per estimate key: totals, uncontended
+      ## durations per width and the CPU shape (``cpu_shape``). In memory
+      ## only, like the hot-path half of ``estimates``.
     estimateStore*: EstimateStore
     observationStore*: ObservationStore
     owners*: OwnerLedger

@@ -103,6 +103,16 @@ type
     processCount*: uint32
     residentMemoryBytes*: uint64
     cpuTimeMicros*: uint64
+      ## CPU time of the processes alive in the tree now, each counting
+      ## only itself.
+    cumulativeCpuTimeMicros*: uint64
+      ## CPU time the tree has used so far: every live process's own time
+      ## PLUS what it has collected from the descendants it reaped. Unlike
+      ## ``cpuTimeMicros`` this does not fall when a process exits and is
+      ## reaped inside the tree, so differences of it are the tree's CPU
+      ## use between two readings. Meaningful only when
+      ## ``cumulativeCpuKnown``.
+    cumulativeCpuKnown*: bool
     source*: string
     diagnostic*: Diagnostic
 

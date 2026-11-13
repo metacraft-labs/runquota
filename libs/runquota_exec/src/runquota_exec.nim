@@ -74,7 +74,9 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
     lease.finish(
       outcome = finishOutcome(completion),
       peakMemoryBytes = completion.peakResidentMemoryBytes,
-      processCount = completion.processCount
+      processCount = completion.processCount,
+      totals = completion.totals,
+      cpuProfile = completion.cpuProfile
     )
     result.process = completion
     result.stdoutBytes = completion.stdoutBytes

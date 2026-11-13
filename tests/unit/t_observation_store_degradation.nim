@@ -131,10 +131,21 @@ suite "observation_store_degradation":
     # of the schema, not of the store's corruption handling, so the damage
     # now always starts at a page boundary: every b-tree page has a header
     # there, and a damaged one is what `quick_check` reports.
+    #
+    # A NAMED PAGE, NOT THE MIDDLE ONE. Schema version 7 added a table and
+    # an index, and the midpoint moved onto `extension_registry`, which the
+    # store reads while it opens: the damage was then caught by that read
+    # before `quick_check` ran, which is still a refusal but not the one
+    # this case is about. The page is now the root of an index that nothing
+    # reads at open (`executions_by_command_stats_id`), found by name, so
+    # the next table a migration adds cannot move it.
     let pageSize = (int(byte(data[16])) shl 8) or int(byte(data[17]))
     check pageSize >= 1024
     check data.len mod pageSize == 0
-    let start = ((data.len div 2) div pageSize) * pageSize
+    let root = runSqlite(path, "select rootpage from sqlite_master where " &
+      "name = 'executions_by_command_stats_id';")
+    check root.ok
+    let start = (parseInt(root.output.strip()) - 1) * pageSize
     check start >= 4 * pageSize
     for i in start ..< min(start + 512, data.len):
       data[i] = 'Z'

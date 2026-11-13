@@ -89,8 +89,10 @@ const
       implemented: true, defaultOn: true),
     measureTreeSampling: MeasurementInfo(side: measuredByClient,
       implemented: true, defaultOn: true),
+    # IMPLEMENTED, AND OFF BY DEFAULT until the overhead gate passes with
+    # it on (see the specification's measurement switches section).
     measureProfiles: MeasurementInfo(side: measuredByClient,
-      implemented: false, defaultOn: false),
+      implemented: true, defaultOn: false),
     measurePressureReports: MeasurementInfo(side: measuredByClient,
       implemented: false, defaultOn: false),
     measureSizingData: MeasurementInfo(side: measuredByClient,

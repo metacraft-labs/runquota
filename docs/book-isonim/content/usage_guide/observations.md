@@ -47,16 +47,46 @@ measurement has a name and a switch:
 |---|---|---|
 | `capture` | the daemon: execution rows, extension rows and self-reports into this store | on by default |
 | `ambient-sampling` | the daemon: the host-wide load sampler | on by default |
-| `tree-sampling` | the launching client: samples of the child tree's resident memory and process count while it waits, which become the finish's peak memory | on by default |
-| `profiles`, `pressure-reports`, `sizing-data`, `metrics-export` | — | registered, not implemented yet: the switches are accepted and do nothing |
+| `tree-sampling` | the launching client: samples of the child tree's resident memory and process count while it waits, which become the finish's summed peak memory | on by default |
+| `profiles` | the launching client: a CPU profile of the child tree (Linux), see "CPU totals and profiles" below | off by default |
+| `pressure-reports`, `sizing-data`, `metrics-export` | — | registered, not implemented yet: the switches are accepted and do nothing |
 
 A switch is `NAME=on|off`, comma-separated and applied left to right;
 `all=on|off` covers every name. The daemon takes it as `runquotad
 --measurement VALUE`; the launching client (`runquota acquire`, Reprobuild)
 takes it from `RUNQUOTA_MEASUREMENT`. Both accept every name, so one value can
 be given to both; a name taken by the other side is ignored. With
-`tree-sampling=off` a finish carries no peak memory (`0`, which the learned
-estimate already treats as "not measured").
+`tree-sampling=off` a finish carries no sampled peak; its peak memory is then
+the largest single process from the launcher's wait (`ru_maxrss`), which
+needs no sampling.
+
+## CPU totals and profiles
+
+Every finish from a launching client (`runquota acquire -- CMD`, Reprobuild)
+carries the tree's CPU time (user and system), its largest single resident
+set and its duration, read from the rusage of the launcher's `wait4` for the
+tree's root. They cover every process of the tree that was waited for. A
+process that leaves the tree before it is waited for, such as a daemonising
+grandchild or a background job its shell never waited for, is re-parented to
+init and reaped there, and its CPU is missing from the totals. A daemon older
+than protocol minor 4 is sent the finish without them, and the row's CPU
+columns stay NULL.
+
+With `RUNQUOTA_MEASUREMENT=profiles=on` the launcher also records when the
+CPU was used. It reads its own descendants from `/proc` once per interval
+and sends CPU used per interval in milli-CPUs. The interval starts at one
+second. When a run outgrows 256 samples, adjacent pairs merge and the
+interval doubles, so a profile never holds more than 256 samples and the
+reads get rarer as the run lengthens. The profile is stored in
+`execution_cpu_profiles` (schema version 7), one row per execution, removed
+with it by retention. The daemon folds the profiles of uncontended runs, and
+the totals of every run, into the command's learned CPU estimate: a 20-point
+curve of CPUs against the fraction of the run elapsed, and an expected
+duration per granted width. These are reported under `cpu_estimates` in the
+`estimates` inspection subject. A run counts as uncontended when everything
+else on the host used at most `--profile-uncontended-pct` of its CPU over the
+run, judged from the ambient samples.
+
 
 `runquota observations --json` reports the switches in force under
 `measurements`: `on` or `off` for the daemon's own measurements, `client` for

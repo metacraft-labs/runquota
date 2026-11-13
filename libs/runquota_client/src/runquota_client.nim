@@ -826,10 +826,17 @@ proc reportObservation*(lease: var RunQuotaLease; cpuMilliPct: uint32;
   except CatchableError:
     discard
 
+proc supportsFinishTotals*(client: RunQuotaClient): bool =
+  ## Whether the daemon reads the totals block of `LeaseFinished`: its
+  ## `HelloOk` reported protocol minor `FinishTotalsMinor` or later.
+  client.capabilities.protocolMinor >= FinishTotalsMinor
+
 proc finish*(lease: var RunQuotaLease; outcome = succeeded();
              finishDiagnostic = okDiagnostic();
              peakMemoryBytes = 0'u64; processCount = 0'u32;
-             majorPageFaults = 0'u64; pressureEvents = 0'u32) =
+             majorPageFaults = 0'u64; pressureEvents = 0'u32;
+             totals = FinishTotals(known: false);
+             cpuProfile = noCpuProfile()) =
   ## Report how this execution ended, and free what it held.
   ##
   ## ONE PARAMETER SAYS WHY IT ENDED, and it is a ``LeaseFinish``. It used
@@ -840,8 +847,15 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
   ## caller write it by accident. It no longer can: the conclusion and the
   ## evidence for it arrive together or not at all, and the constructors
   ## in ``runquota_protocol`` are the only way to pair them.
+  ##
+  ## ``totals`` and ``cpuProfile`` are what the launcher measured of the
+  ## tree (``runquota_process``'s ``ProcessCompletion``). They are dropped,
+  ## not sent, to a daemon older than ``FinishTotalsMinor``, which would
+  ## refuse the whole finish as malformed: losing a measurement is always
+  ## preferable to losing the record of the execution.
   if not lease.active:
     return
+  let carriesTotals = lease.session[].client[].supportsFinishTotals()
   let msg = LeaseFinishedMessage(
     sessionId: lease.session[].id,
     leaseId: lease.id,
@@ -850,7 +864,9 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
     processCount: processCount,
     majorPageFaults: majorPageFaults,
     pressureEvents: pressureEvents,
-    diagnostic: finishDiagnostic
+    diagnostic: finishDiagnostic,
+    totals: (if carriesTotals: totals else: FinishTotals(known: false)),
+    cpuProfile: (if carriesTotals: cpuProfile else: noCpuProfile())
   )
   let requestId = lease.session[].client[].requestFrame(rqLeaseFinished,
       encodeLeaseFinished(msg))

@@ -102,6 +102,7 @@ type
     hostProfilesAdded*: int64
     runsAdded*: int64
     executionsAdded*: int64
+    cpuProfilesAdded*: int64
     ambientSamplesAdded*: int64
     extensionRowsAdded*: int64
     carriedRowsAdded*: int64
@@ -114,7 +115,8 @@ type
 
 const
   mergedSpineTables* = [
-    "hosts", "host_profiles", "runs", "executions", "ambient_samples"]
+    "hosts", "host_profiles", "runs", "executions", "execution_cpu_profiles",
+    "ambient_samples"]
     ## In foreign-key order, parents first. ``extension_registry`` is
     ## absent by decision, not by omission — see the module comment.
 
@@ -513,6 +515,7 @@ proc mergeObservationStore*(destination: ObservationStore;
     of "host_profiles": result.hostProfilesAdded = added
     of "runs": result.runsAdded = added
     of "executions": result.executionsAdded = added
+    of "execution_cpu_profiles": result.cpuProfilesAdded = added
     of "ambient_samples": result.ambientSamplesAdded = added
     else: discard
   result.carriedRowsAdded = after[^1] - before[^1]

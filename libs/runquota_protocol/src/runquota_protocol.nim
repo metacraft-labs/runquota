@@ -7,7 +7,7 @@ export protocolTypes
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 2'u16
-const RqspProtocolMinor* = 3'u16
+const RqspProtocolMinor* = 4'u16
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -58,6 +58,14 @@ const SessionGroupsMinor* = 3'u16
   ## on an unknown message kind, so a client sends neither below this minor
   ## -- and its session then lands in the interactive group, which is
   ## exactly where the older daemon's admission would have treated it.
+const FinishTotalsMinor* = 4'u16
+  ## The first daemon minor that reads the optional trailing totals block
+  ## of `LeaseFinished` (CPU time, largest resident set, page faults and
+  ## duration from the launcher's wait, and an optional CPU profile). MINOR
+  ## 4 ANNOUNCES IT, additively: an older daemon refuses a `LeaseFinished`
+  ## with trailing bytes as malformed, so a client sends the block only to a
+  ## daemon at this minor or above, and an older client's finish, which has
+  ## no block, still decodes here with the totals not known.
 const RqspHeaderLen* = 24'u16
 const MaxCommandStatsIdBytes* = 64
 const FrameFlagRequest* = 0x0001'u16
@@ -871,6 +879,71 @@ proc leaseFinishFromWire*(kindRaw, exitCode, signal: uint32;
     finish = if kind == lfCancelled: cancelled() else: launchFailed()
   ""
 
+const
+  finishBlockTotals = 1'u32
+  finishBlockProfile = 2'u32
+  finishBlockKnownBits = finishBlockTotals or finishBlockProfile
+
+proc writeFinishTotalsBlock(w: var BinaryWriter; totals: FinishTotals;
+                            profile: CpuProfile) =
+  ## The optional trailing block of `LeaseFinished` (`FinishTotalsMinor`):
+  ## a u32 of presence bits, then the totals (bit 0) and the profile
+  ## (bit 1). Written only when there is something in it, so a finish with
+  ## neither is byte-identical to one from before the block existed -- and
+  ## a client talking to an older daemon passes neither (see
+  ## `runquota_client.finish`).
+  var bits = 0'u32
+  if totals.known: bits = bits or finishBlockTotals
+  if profile.present: bits = bits or finishBlockProfile
+  if bits == 0'u32:
+    return
+  w.writeU32(bits)
+  if totals.known:
+    w.writeU64(totals.cpuUserMicros)
+    w.writeU64(totals.cpuSysMicros)
+    w.writeU64(totals.maxRssBytes)
+    w.writeU64(totals.majorPageFaults)
+    w.writeU64(totals.durationMillis)
+  if profile.present:
+    let count = min(profile.samples.len, MaxCpuProfileSamples)
+    w.writeU32(profile.intervalMillis)
+    w.writeU16(uint16(count))
+    for i in 0 ..< count:
+      w.writeU16(profile.samples[i])
+
+proc readFinishTotalsBlock(r: var BinaryReader; totals: var FinishTotals;
+                           profile: var CpuProfile): bool =
+  ## Reads the block `writeFinishTotalsBlock` wrote. Refuses unknown
+  ## presence bits, a profile with a zero interval, and a profile longer
+  ## than `MaxCpuProfileSamples`: a bound the sender is required to keep is
+  ## a bound the receiver checks, or a peer could make the store hold an
+  ## unbounded row.
+  var bits: uint32
+  if not r.readU32(bits): return false
+  if bits == 0'u32 or (bits and not finishBlockKnownBits) != 0'u32:
+    return false
+  if (bits and finishBlockTotals) != 0'u32:
+    totals.known = true
+    if not r.readU64(totals.cpuUserMicros): return false
+    if not r.readU64(totals.cpuSysMicros): return false
+    if not r.readU64(totals.maxRssBytes): return false
+    if not r.readU64(totals.majorPageFaults): return false
+    if not r.readU64(totals.durationMillis): return false
+  if (bits and finishBlockProfile) != 0'u32:
+    var interval: uint32
+    var count: uint16
+    if not r.readU32(interval): return false
+    if not r.readU16(count): return false
+    if interval == 0'u32 or count == 0'u16 or
+        int(count) > MaxCpuProfileSamples:
+      return false
+    profile = CpuProfile(intervalMillis: interval, samples: @[])
+    for i in 0 ..< int(count):
+      var value: uint16
+      if not r.readU16(value): return false
+      profile.samples.add(value)
+  true
+
 type LeaseFinishedDecode* = enum
   ## What came of reading a ``LeaseFinished`` payload.
   ##
@@ -899,6 +972,7 @@ proc encodeLeaseFinished*(msg: LeaseFinishedMessage): string =
   w.writeU64(msg.majorPageFaults)
   w.writeU32(msg.pressureEvents)
   w.writeDiagnostic(msg.diagnostic)
+  w.writeFinishTotalsBlock(msg.totals, msg.cpuProfile)
   w.data
 
 proc decodeLeaseFinished*(payload: string;
@@ -924,6 +998,12 @@ proc decodeLeaseFinished*(payload: string;
   if not r.readU64(majorPageFaults): return lfdMalformedPayload
   if not r.readU32(pressureEvents): return lfdMalformedPayload
   if not r.readDiagnostic(diagnostic): return lfdMalformedPayload
+  # THE TOTALS BLOCK IS OPTIONAL (`FinishTotalsMinor`): an older client
+  # sends none, and its finish decodes with the totals not known.
+  var totals = FinishTotals(known: false)
+  var profile = noCpuProfile()
+  if r.remaining != 0:
+    if not r.readFinishTotalsBlock(totals, profile): return lfdMalformedPayload
   if r.remaining != 0: return lfdMalformedPayload
   var finish: LeaseFinish
   if leaseFinishFromWire(kindRaw, exitCode, signal, finish).len > 0:
@@ -936,7 +1016,9 @@ proc decodeLeaseFinished*(payload: string;
     processCount: processCount,
     majorPageFaults: majorPageFaults,
     pressureEvents: pressureEvents,
-    diagnostic: diagnostic
+    diagnostic: diagnostic,
+    totals: totals,
+    cpuProfile: profile
   )
   lfdOk
 

@@ -149,10 +149,14 @@ it did. Only macOS/arm64 has ever run the detector; the Linux branch is written
 from `/proc` and `/sys` and has never executed, and there is no Windows branch
 beyond what the Nim runtime already knows.
 
-Columns the RQSP protocol does not yet carry — CPU user and system time, IO
-byte counts, and a run's finish status — are stored as SQL `NULL`, which reads
-as "not declared". They are deliberately not stored as zero: a zero is a
-measurement, and nobody made it. M13 supplies the client-reported figures.
+Columns the RQSP protocol does not carry — IO byte counts, and a run's
+finish status — are stored as SQL `NULL`, which reads as "not declared". They
+are deliberately not stored as zero: a zero is a measurement, and nobody made
+it. CPU user and system time come from the launcher's wait for the tree's root
+(the `LeaseFinished` totals block, protocol minor 4) and are `NULL` only for a
+finish without it, such as one from an older client. Schema version 7 adds
+`execution_cpu_profiles`: an optional CPU profile per execution (see the
+book's observation store chapter, "CPU totals and profiles").
 
 `executions.owner_uid` (schema version 4) says whose lease a row records. One
 host-wide daemon means one store holding every user's executions, so a query

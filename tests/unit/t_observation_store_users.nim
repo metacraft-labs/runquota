@@ -123,7 +123,7 @@ suite "observation_store_users":
     let path = dir / "observations.sqlite3"
     let store = openObservationStore(path)
     check store.captureEnabled
-    check store.schemaVersion == 6
+    check store.schemaVersion == spineSchemaVersion
     store.hostFixture("host-a", "windows")
     let alice = ownerIdFromSid(AliceSid)
 
@@ -294,7 +294,7 @@ suite "observation_store_users":
 
     let store = openObservationStore(path)
     check store.captureEnabled
-    check store.schemaVersion == 6
+    check store.schemaVersion == spineSchemaVersion
 
     var owners: seq[(string, Option[int64])] = @[]
     for row in store.readExecutions():

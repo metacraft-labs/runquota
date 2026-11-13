@@ -678,6 +678,11 @@ proc pruneExecutions*(store: ObservationStore; hostId: string;
     result.extensionRowsRemoved += count
   result.extensionsCascaded = extensionIds
   sql.add(carriedCascadeStatement(hostId, doomed) & "\n")
+  # CPU profiles are spine rows keyed by their execution: removed in the
+  # same transaction, before their parents, so the foreign key holds.
+  sql.add("delete from " & cpuProfileTable & " where (host_id, " &
+    "execution_id) in (select host_id, execution_id from executions where " &
+    clause & ");\n")
 
   sql.add("delete from executions where " & clause & ";\n")
   sql.add("commit;\n")

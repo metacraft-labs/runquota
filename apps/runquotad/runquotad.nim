@@ -153,7 +153,7 @@ when isMainModule:
   var config = defaultDaemonConfig(defaultEndpoint())
   config.exitWithParentPid = exitWithParentPid
   config.socketActivation = socketActivation
-  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--measurement NAME=on|off[,...]] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--admission-max-wait-millis N] [--log-file PATH]"
+  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--measurement NAME=on|off[,...]] [--ambient-sample-interval-millis N] [--profile-uncontended-pct N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--admission-max-wait-millis N] [--log-file PATH]"
   var measurementSwitches: seq[string]
   var i = 0
   while i < args.len:
@@ -283,6 +283,25 @@ when isMainModule:
       if i + 1 >= args.len:
         quit 2
       config.ambientSampleIntervalMillis = parseInt(args[i + 1])
+      i += 2
+    of "--profile-uncontended-pct":
+      # The most of the host's CPU that everything other than a finished
+      # execution may have used for its run to be folded into its command's
+      # learned duration and CPU shape. 0..100; refused otherwise, because a
+      # silently clamped value would change what the estimate learns from.
+      if i + 1 >= args.len:
+        echo "runquotad: --profile-uncontended-pct needs a percentage\n" & usage
+        quit 2
+      var pct = -1.0
+      try:
+        pct = parseFloat(args[i + 1])
+      except ValueError:
+        discard
+      if pct < 0.0 or pct > 100.0:
+        echo "runquotad: --profile-uncontended-pct " & args[i + 1] &
+          " is not a percentage between 0 and 100"
+        quit 2
+      config.profileUncontendedPct = pct
       i += 2
     of "--retention-sweep-interval-millis":
       # THE CADENCE OF THE SCHEDULED PRUNE, and the off switch with it.

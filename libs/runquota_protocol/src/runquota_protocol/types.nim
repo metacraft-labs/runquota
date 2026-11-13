@@ -1,5 +1,8 @@
 import runquota_core
+import runquota_core/cpu_profile
 import runquota_codec
+
+export cpu_profile
 
 type
   LibraryInfo* = object
@@ -347,6 +350,12 @@ type
     majorPageFaults*: uint64
     pressureEvents*: uint32
     diagnostic*: Diagnostic
+    totals*: FinishTotals
+      ## The tree's totals from the launcher's wait for its root. Optional
+      ## on the wire (protocol minor `FinishTotalsMinor`): absent, they read
+      ## as not known and the spine stores NULL CPU, never zero.
+    cpuProfile*: CpuProfile
+      ## Optional CPU profile of the tree (`profiles` measurement).
 
   LeaseFinishedAckMessage* = object
     sessionId*: SessionId

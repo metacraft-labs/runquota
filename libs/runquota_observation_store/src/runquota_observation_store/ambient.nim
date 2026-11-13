@@ -544,6 +544,11 @@ const
     ## of kernel calls; writing is a process spawn, so they run at
     ## different rates on purpose.
 
+const
+  RecentBusyCapacity = 4096
+    ## About an hour at the default 1 s cadence. An execution longer than
+    ## that is judged on its last hour.
+
 var
   samplerLock: Lock
   samplerThread: Thread[void]
@@ -576,6 +581,13 @@ var
   samplerLeaseCovered = false
   samplerStop = false
   samplerActive = false
+  recentBusyAt: array[RecentBusyCapacity, int64]
+  recentBusyPct: array[RecentBusyCapacity, float64]
+  recentBusyNext = 0
+  recentBusyCount = 0
+    ## The host's CPU busy share of the most recent samples taken, kept in
+    ## memory so the daemon can tell whether a finished execution ran on a
+    ## contended host without reading the store (admission never reads it).
 
 # ARMED AT MODULE INITIALISATION, for the reason set out at length over the
 # same line in ``writer.nim``. The lazy `ensure` proc that stood here was a
@@ -1037,6 +1049,10 @@ proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
       else:
         samplerLastSampledAt = row.sampledAtUnixMillis
         samplerTaken += 1
+        recentBusyAt[recentBusyNext] = row.sampledAtUnixMillis
+        recentBusyPct[recentBusyNext] = row.cpuBusyPct
+        recentBusyNext = (recentBusyNext + 1) mod RecentBusyCapacity
+        recentBusyCount = min(recentBusyCount + 1, RecentBusyCapacity)
         if samplerQueue.len >= samplerCapacity:
           samplerDropped += 1
         else:
@@ -1270,6 +1286,27 @@ proc ambientReadingsUnavailable*(): int64 =
     samplerUnavailable
   finally:
     release(samplerLock)
+
+proc meanHostCpuBusyPct*(fromUnixMillis, toUnixMillis: int64;
+                         meanPct: var float64): int =
+  ## The mean host CPU busy share (percent of the whole host) over the
+  ## samples taken in ``(fromUnixMillis, toUnixMillis]``, and how many there
+  ## were. 0 samples means the window cannot be judged (sampling off, or
+  ## the window shorter than one cadence) and ``meanPct`` is untouched.
+  ## In memory and under the sampler's lock only: no store read.
+  var total = 0.0
+  {.cast(gcsafe).}:
+    acquire(samplerLock)
+    try:
+      for i in 0 ..< recentBusyCount:
+        let at = recentBusyAt[i]
+        if at > fromUnixMillis and at <= toUnixMillis:
+          total += recentBusyPct[i]
+          inc result
+    finally:
+      release(samplerLock)
+  if result > 0:
+    meanPct = total / float64(result)
 
 proc stopAmbientSampler*() =
   ## Join the sampler, then settle its final batch before joining the writer.
