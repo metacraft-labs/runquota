@@ -7,7 +7,15 @@
   inputs = {
     # `agents` carries `isonim/content/*`, which isonim-docs `dev` imports and
     # isonim `dev` lacks. Return this to `dev` once isonim promotes `agents`.
-    isonim.url = "github:metacraft-labs/isonim/agents";
+    #
+    # Fetched with the git fetcher and `submodules=1` on purpose. The isonim
+    # tree holds a submodule gitlink (`src/isonim/layout/yoga`), and a
+    # `github:` input hashes a tree with an unfetched gitlink differently
+    # across Nix versions (2.28 vs current), so a lock written by one version
+    # failed with a NAR hash mismatch on the other. That broke the GitHub-hosted
+    # docs build on 2026-11-13. Fetching the submodules makes the hash the same
+    # in every Nix version.
+    isonim.url = "git+https://github.com/metacraft-labs/isonim?ref=agents&submodules=1";
 
     isonim-docs.url = "github:metacraft-labs/isonim-docs/dev";
     isonim-docs.inputs.isonim.follows = "isonim";
