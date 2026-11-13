@@ -4014,11 +4014,11 @@
         "vscode-server": "vscode-server_2"
       },
       "locked": {
-        "lastModified": 1793705460,
-        "narHash": "sha256-HQdRg4q/xALPZsuy6JEP9erCtRK2IbzZ6nshBTFeZlc=",
+        "lastModified": 1794517054,
+        "narHash": "sha256-04Xh8PjloogRYsVwyWVdUKPy4Uqc/VuKrK4g/aFti+4=",
         "owner": "metacraft-labs",
         "repo": "devops-modules",
-        "rev": "f975046990ef695ba6037420de404eddd6514682",
+        "rev": "9b5d46176410fd26aaf5b6469077aca543e9154a",
         "type": "github"
       },
       "original": {
