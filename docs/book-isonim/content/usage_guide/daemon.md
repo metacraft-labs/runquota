@@ -66,8 +66,29 @@ Every key is optional; an absent one keeps the built-in default: **75% of
 physical memory** and one core (`1000` milli-CPU) per logical processor. A
 flag given on the command line overrides the file for that launch.
 
+The admission order has a table of its own (see
+[Admission control](/getting_started/concepts#admission-control)):
+
+```toml
+[admission]
+order               = ["starvation", "fair-share", "arrival"]   # default: starvation, priority, cache-deadline, arrival
+max-wait            = "90s"    # also "1500ms", "2m"; "0s" turns the bound off; default "120s"
+share-between-users = "drf"    # or "none"; default "drf"
+```
+
+`order` takes the keys `starvation`, `priority`, `cache-deadline`,
+`fair-share` and `arrival`. A key outside them, a key listed twice and an
+empty list are refused like any other malformed line. `--admission-max-wait-millis`
+overrides `max-wait` for that launch.
+
+A `runquotad` older than this table refuses a file that has it: it does not
+start, and a reload is refused with the budget in force unchanged. Upgrade
+the daemon before adding the table.
+
 The reader accepts exactly this shape: a `schema` string, positive integers in
-`[machine]` and `[pools]`, `_` between digits, and `#` comments. Anything else
+`[machine]` and `[pools]`, `_` between digits, the `[admission]` keys above
+(plain double-quoted strings without escapes, and `order` as a one-line
+array of them), and `#` comments. Anything else
 is refused with the file and line, and the daemon exits **2** without starting,
 because a budget file that was half-read would look configured when it is not.
 A missing file is not an error, and the daemon never creates the file or its
@@ -98,6 +119,9 @@ runquota config show                              # the file, the defaults, and 
 runquota config set machine.memory_bytes 96GiB    # also 512MiB, 64GB, or a byte count
 runquota config set machine.cpu_milli 16000
 runquota config set pools.compile 8
+runquota config set admission.order starvation,fair-share,arrival
+runquota config set admission.max-wait 90s
+runquota config set admission.share-between-users none
 runquota config unset pools.compile               # back to the default
 runquota config reload                            # after editing the file by hand
 runquota config path
@@ -129,6 +153,10 @@ What a new budget does to leases already in flight:
 | Shrink | **never revoked** — they keep running, and the granted total may exceed the new budget | admitted against the new budget, so nothing new starts until the total falls below it |
 | Shrink below a queued lease's size | untouched | **denied** on its session's next poll, with the reason a fresh request of that size gets (`lease request exceeds machine memory budget: local (requested 12 GiB, budget 8 GiB)`) — waiting could never end |
 | A pool removed from the file | untouched | denied, as above |
+
+A reload also puts the file's `[admission]` keys in force: the reload's own
+admission pass already orders the queue by them, queued requests keep the time
+they have waited, and nothing granted is revoked.
 
 A file that does not parse changes **nothing**: the reload is refused with the
 file and line, the budget in force stays the last one that parsed, and
@@ -187,7 +215,7 @@ and that daemon admits only the pools its file and flags size.
 | `--pool NAME=UNITS` | none | An arbitrary named counter. Pins the value against a reload, and over what sessions declare. |
 | `--socket PATH` | the rendezvous socket | Where to listen. A path you name here is created on demand; the host-wide one never is. |
 | `--host-config PATH` | the host file above | The budget file read at start and on every reload. |
-| `--admission-max-wait-millis N` | `120000` | The starvation bound: a request queued this long is served before its user's other requests, and capacity is held for it. `0` turns the bound off. See [Admission control](/getting_started/concepts#admission-control). |
+| `--admission-max-wait-millis N` | the host file's `admission.max-wait`, else `120000` | The starvation bound: a request queued this long is served before its user's other requests, and capacity is held for it. `0` turns the bound off. Pins the value against a reload. See [Admission control](/getting_started/concepts#admission-control). |
 | `--idle-exit-after SECONDS` | never | Exit (0, through the orderly shutdown) once no client connection has been open for `SECONDS`, counted from start-up or from the moment the last connection closed. A positive whole number; anything else is a usage error (exit 2). See [Exiting when idle](#exiting-when-idle). |
 
 Memory pressure:

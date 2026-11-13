@@ -34,7 +34,9 @@ const configUsage* =
   "  runquota config unset KEY [--file PATH] [--no-reload]\n" &
   "  runquota config reload\n" &
   "    KEY is machine.memory_bytes (VALUE may be 96GiB, 512MiB, 64GB, ...),\n" &
-  "    machine.cpu_milli or pools.NAME. set/unset check the edit with the\n" &
+  "    machine.cpu_milli, pools.NAME, admission.order (e.g.\n" &
+  "    starvation,fair-share,arrival), admission.max-wait (e.g. 90s) or\n" &
+  "    admission.share-between-users (drf or none). set/unset check the edit with the\n" &
   "    daemon's own reader, write the file atomically, and ask the running\n" &
   "    daemon to reload it; reload asks it to re-read a file edited by hand.\n"
 
@@ -112,6 +114,16 @@ proc showFile(path: string): int =
       $max(1, countProcessors()) & " logical processors)")
   for name, units in host.pools:
     echo "  pools." & name & " = " & $units
+  echo "  admission.order = " & (
+    if host.admissionOrder.isSome: host.admissionOrder.get.join(",")
+    else: "unset -> default starvation,priority,cache-deadline,arrival")
+  echo "  admission.max-wait = " & (
+    if host.admissionMaxWaitMillis.isSome:
+      $host.admissionMaxWaitMillis.get & "ms"
+    else: "unset -> default 120s")
+  echo "  admission.share-between-users = " & (
+    if host.shareBetweenUsers.isSome: host.shareBetweenUsers.get
+    else: "unset -> default drf")
   0
 
 proc showDaemon(): int =

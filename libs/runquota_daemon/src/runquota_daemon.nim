@@ -107,8 +107,28 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     retentionPolicy: defaultRetentionPolicy(),
     retentionSweepIntervalMillis: defaultRetentionSweepIntervalMillis,
     retentionMaxDeferredSweeps: defaultMaxDeferredSweeps,
-    admissionMaxWaitMillis: DefaultMaxWaitMillis
+    admissionMaxWaitMillis: DefaultMaxWaitMillis,
+    admissionOrder: @DefaultAdmissionOrder,
+    shareBetweenUsers: sbuDrf
   )
+
+proc admissionOrderOf(host: HostConfig): seq[AdmissionKey] =
+  ## The file's `admission.order`, or the default. The reader has already
+  ## refused an empty, unknown or repeated key, so a refusal here would mean
+  ## the two key lists drifted apart; it is reported, never ignored.
+  if host.admissionOrder.isNone:
+    return @DefaultAdmissionOrder
+  var error = ""
+  if not parseAdmissionOrder(host.admissionOrder.get, result, error):
+    raise newException(HostConfigError, host.sourcePath & ": " & error)
+
+proc shareBetweenUsersOf(host: HostConfig): ShareBetweenUsers =
+  result = sbuDrf
+  if host.shareBetweenUsers.isSome and
+      not parseShareBetweenUsers(host.shareBetweenUsers.get, result):
+    raise newException(HostConfigError, host.sourcePath &
+      ": unknown share-between-users `" & host.shareBetweenUsers.get & "`")
+
 
 proc applyHostConfig*(config: var DaemonConfig; host: HostConfig) =
   ## Overlay the host budget file (`runquota_daemon/host_config`) onto
@@ -120,6 +140,10 @@ proc applyHostConfig*(config: var DaemonConfig; host: HostConfig) =
     config.cpuSlots = milliCpu(host.cpuMilli.get)
   for name, units in host.pools:
     config.namedPoolCaps[name] = units
+  if host.admissionMaxWaitMillis.isSome:
+    config.admissionMaxWaitMillis = host.admissionMaxWaitMillis.get
+  config.admissionOrder = admissionOrderOf(host)
+  config.shareBetweenUsers = shareBetweenUsersOf(host)
 
 proc recomputePoolCaps*(config: var DaemonConfig) =
   ## The pool caps from the bottom up: what open sessions declared
@@ -164,6 +188,14 @@ proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
   ## then the `--pool` flags (`recomputePoolCaps`). A pool none of the three
   ## names any more is gone (its cap is 0, so new demands for it are refused
   ## and leases already granted in it keep running).
+  ##
+  ## The admission policy follows the same rule: `admission.order` and
+  ## `admission.share-between-users` from the file or the default, and
+  ## `admission.max-wait` from the flag, the file or the default.
+  # Read before anything is assigned, so a file whose order cannot be used
+  # raises with `config` untouched.
+  let order = admissionOrderOf(host)
+  let share = shareBetweenUsersOf(host)
   if config.builtinMemoryBytes.value == 0:
     config.builtinMemoryBytes = config.memoryBytes
   if config.builtinCpuSlots.value == 0:
@@ -181,6 +213,14 @@ proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
   for name, units in host.pools:
     config.hostFilePools[name] = units
   config.recomputePoolCaps()
+  # THE ADMISSION POLICY, from the bottom like the budget: the defaults, the
+  # file's `[admission]`, then the one flag that names a key of it.
+  config.admissionMaxWaitMillis =
+    if flags.admissionMaxWaitMillis.isSome: flags.admissionMaxWaitMillis.get
+    elif host.admissionMaxWaitMillis.isSome: host.admissionMaxWaitMillis.get
+    else: DefaultMaxWaitMillis
+  config.admissionOrder = order
+  config.shareBetweenUsers = share
 
 proc machineCapacity*(id: string; cpuSlots: MilliCpu; memoryBytes: Bytes;
                       ioSlots: uint32; cpuShareGroup = ""): MachineCapacity =
@@ -782,6 +822,25 @@ proc groupIsBusy(daemon: RunQuotaDaemon; key: string; excluding: uint64): bool =
       return true
   false
 
+proc recentCpuNow(group: SessionGroupRow; now: int64): float64 =
+  ## The group's decayed past CPU brought forward to `now`.
+  decayedCpu(group.recentCpu, group.heldCpuMilli,
+    max(0'i64, now - group.recentCpuAtMillis))
+
+proc changeHeldCpu(group: var SessionGroupRow; delta: int64) =
+  ## Record that the group's granted leases now reserve `delta` milli-CPU
+  ## more (or less). The decayed figure is brought forward FIRST, so the
+  ## interval it integrates was held at the old figure throughout.
+  let now = monoMillis()
+  group.recentCpu = group.recentCpuNow(now)
+  group.recentCpuAtMillis = now
+  if delta >= 0:
+    group.heldCpuMilli += uint64(delta)
+  else:
+    let less = uint64(-delta)
+    group.heldCpuMilli =
+      if group.heldCpuMilli >= less: group.heldCpuMilli - less else: 0'u64
+
 proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
                              add: bool) =
   # Maintains live aggregates so fitsNow/countActiveLeases/hasActiveBenchmark
@@ -810,6 +869,8 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
     inc daemon.activeLeaseCount
     if lease.purpose == leasePurposeBenchmark:
       inc daemon.activeBenchmarkCount
+    if lease.groupKey.len > 0 and daemon.sessionGroups.hasKey(lease.groupKey):
+      daemon.sessionGroups[lease.groupKey].changeHeldCpu(int64(cpuDelta))
   else:
     usage.cpu = (if usage.cpu >= cpuDelta: usage.cpu - cpuDelta else: 0'u32)
     usage.memory = (if usage.memory >= memDelta: usage.memory -
@@ -830,6 +891,7 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
     if lease.groupKey.len > 0 and daemon.sessionGroups.hasKey(lease.groupKey):
       daemon.sessionGroups[lease.groupKey].grantedCpuMilliMillis +=
         uint64(cpuDelta) * elapsedSince(lease.grantedAtMillis)
+      daemon.sessionGroups[lease.groupKey].changeHeldCpu(-int64(cpuDelta))
     if lease.purpose == leasePurposeBenchmark and daemon.activeBenchmarkCount > 0'u32:
       dec daemon.activeBenchmarkCount
   # AMBIENT SAMPLING IS GATED ON THIS. The sampler writes no row over an
@@ -1272,6 +1334,10 @@ proc sessionGroupsJson(daemon: RunQuotaDaemon): string =
       "\"grants_total\":" & $group.grantsTotal & "," &
       "\"granted_cpu_milli_seconds\":" &
         $(group.grantedCpuMilliMillis div 1000'u64) & "," &
+      # The decayed figure `fair-share` orders by, without the committed
+      # term for what the group holds now (that is `held_cpu_milli`).
+      "\"recent_cpu_milli_seconds\":" &
+        $int64(group.recentCpuNow(now)) & "," &
       "\"wait_total_millis\":" & $group.waitsTotalMillis & "," &
       "\"wait_max_millis\":" & $group.waitMaxMillis & "," &
       "\"oldest_queued_wait_millis\":" & $max(0'i64, oldestWait) &
@@ -1283,8 +1349,14 @@ proc statusJson(daemon: RunQuotaDaemon): string =
   ## session groups beside it.
   var base = inspectionStatusJson(daemon.status())
   base.setLen(base.len - 1)
+  var order: seq[string] = @[]
+  for key in daemon.config.admissionOrder:
+    order.add(jsonEscape($key))
   base & ",\"admission_max_wait_millis\":" &
     $daemon.config.admissionMaxWaitMillis &
+    ",\"admission_order\":[" & order.join(",") & "]" &
+    ",\"admission_share_between_users\":" &
+      jsonEscape($daemon.config.shareBetweenUsers) &
     ",\"session_groups\":" & daemon.sessionGroupsJson() & "}"
 
 proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
@@ -1332,6 +1404,8 @@ proc pinnedKeys*(flags: BudgetFlags): seq[string] =
       result.add("machine.memory_bytes")
     if flags.cpuSlots.isSome:
       result.add("machine.cpu_milli")
+  if flags.admissionMaxWaitMillis.isSome:
+    result.add("admission.max-wait")
   var names: seq[string] = @[]
   for name in flags.pools.keys:
     names.add(name)
@@ -2707,7 +2781,9 @@ proc pendingRequest(daemon: RunQuotaDaemon; lease: LeaseRow;
     groupArrival: group.busySince,
     localRank: priorityRank(lease.priority),
     queueOrder: lease.queueOrder,
-    waitedMillis: max(0'i64, now - lease.queuedAtMillis))
+    waitedMillis: max(0'i64, now - lease.queuedAtMillis),
+    groupKey: lease.groupKey,
+    fairShareCpu: fairShareFigure(group.recentCpuNow(now), group.heldCpuMilli))
 
 proc ownerLoads(daemon: RunQuotaDaemon): Table[string, OwnerLoad] =
   ## What each owner's granted leases hold now, for dominant-resource
@@ -2771,19 +2847,24 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
     uint32)): seq[uint64] =
   # Before deciding what fits, stop counting what is no longer there.
   discard daemon.reapLostLeases()
-  # THE ORDER IS `runquota_admission`'s: fairness between owners, then
-  # within an owner's share the starvation bound, the session group's
-  # priority, its cache deadline and its arrival. Each request is tried once, in that
-  # order; one that does not fit is passed over for the next (backfill),
-  # unless it is held under the starvation bound -- then nothing behind it
-  # is granted in this pass, so the capacity that frees up is kept for it.
-  # Nothing already granted is ever revoked.
+  # THE ORDER IS `runquota_admission`'s: fairness between owners (unless the
+  # host configured `share-between-users = none`, which drops only the
+  # division by usage: group attributes still rank only their owner's
+  # requests), then within each owner's requests the configured order (`admission.order`; by default the starvation
+  # bound, the session group's priority, its cache deadline and its
+  # arrival). Each request is tried once, in that order; one that does not
+  # fit is passed over for the next (backfill), unless it is held under the
+  # starvation bound -- then nothing behind it is granted in this pass, so
+  # the capacity that frees up is kept for it. Nothing already granted is
+  # ever revoked.
   let now = monoMillis()
   var pending: seq[PendingRequest] = @[]
   for lease in daemon.leases.values:
     if lease.state == leaseStateQueued:
       pending.add(daemon.pendingRequest(lease, now))
   var plan = planAdmission(pending, daemon.ownerLoads(), AdmissionPolicy(
+    order: daemon.config.admissionOrder,
+    shareBetweenUsers: daemon.config.shareBetweenUsers,
     maxWaitMillis: daemon.config.admissionMaxWaitMillis,
     capacityCpuMilli: uint64(daemon.config.cpuSlots.value),
     capacityMemoryBytes: daemon.config.memoryBytes.value))
@@ -2804,7 +2885,7 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
     if daemon.fitsNow(lease.resources):
       daemon.grantQueuedLease(candidate.id, false)
       plan.noteGranted(candidate.owner, uint64(lease.resources.cpu.value),
-        lease.resources.memory.value)
+        lease.resources.memory.value, candidate.groupKey)
       result.add(candidate.id)
       inc promoted
     elif candidate.starved:

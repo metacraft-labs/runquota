@@ -354,7 +354,9 @@ when isMainModule:
         echo "runquotad: --admission-max-wait-millis needs a non-negative " &
           "whole number of milliseconds, got: " & args[i + 1] & "\n" & usage
         quit 2
-      config.admissionMaxWaitMillis = millis
+      # A FLAG, over the host file's `admission.max-wait`, for this launch and
+      # across reloads (`BudgetFlags`).
+      config.budgetFlags.admissionMaxWaitMillis = some(millis)
       i += 2
     of "--host-identity-file":
       # Where this machine's opaque `host_id` is kept. Overridable so a
@@ -376,7 +378,8 @@ when isMainModule:
         "never idles out\n" &
         "  --admission-max-wait-millis N  the starvation bound: a request " &
         "queued this long is served before its user's others (default " &
-        "120000; 0 turns the bound off)\n\n" &
+        "120000; 0 turns the bound off); overrides the host file's " &
+        "admission.max-wait\n\n" &
         "environment:\n" &
         "  " & exitWithParentEnvVar & "=1  stop (as on SIGTERM) when the " &
         "process that started runquotad exits; POSIX only, ignored on Windows\n" &

@@ -1,5 +1,6 @@
 import std/[options, sets, tables]
 
+import runquota_admission
 import runquota_core
 import runquota_ipc
 import runquota_observation_store
@@ -72,6 +73,8 @@ type
       ## `--machine` was given: the topology is the command line's, so the
       ## file's `[machine]` keys have nothing to size.
     cpuShareGroups*: HashSet[string] ## `--cpu-share-group ID=...`
+    admissionMaxWaitMillis*: Option[int64]
+      ## `--admission-max-wait-millis`, over the file's `admission.max-wait`.
 
   DaemonConfig* = object
     endpoint*: Endpoint
@@ -182,10 +185,19 @@ type
       ## Set by `runquotad` from `takeSocketActivation` at start. See
       ## `runquota_daemon/socket_activation`.
     admissionMaxWaitMillis*: int64
-      ## The starvation bound (`runquotad --admission-max-wait-millis`): a
-      ## queued request that has waited this long without being granted goes
-      ## before its owner's other requests, and capacity is held for it. Zero
-      ## or negative turns the bound off. Default `DefaultMaxWaitMillis` (120 s).
+      ## The starvation bound in force (`runquotad
+      ## --admission-max-wait-millis`, else the host file's
+      ## `admission.max-wait`, else `DefaultMaxWaitMillis`, 120 s;
+      ## `resolveBudget` decides): a queued request that has waited this long
+      ## without being granted goes before the requests the keys after
+      ## `starvation` would rank, and capacity is held for it. Zero or
+      ## negative turns the bound off, and so does an order without
+      ## `starvation`.
+    admissionOrder*: seq[AdmissionKey]
+      ## The admission order in force: the host file's `admission.order`, or
+      ## `DefaultAdmissionOrder`. Never empty once `resolveBudget` ran.
+    shareBetweenUsers*: ShareBetweenUsers
+      ## The host file's `admission.share-between-users`, default `drf`.
 
   SessionRow* = object
     id*: SessionId
@@ -238,6 +250,16 @@ type
     waitMaxMillis*: uint64
       ## How long the group's granted leases had been queued: the total and
       ## the longest single wait.
+    heldCpuMilli*: uint64
+      ## What the group's granted leases reserve now, kept current by every
+      ## grant and release (`applyLeaseResourceUsage`).
+    recentCpu*: float64
+    recentCpuAtMillis*: int64
+      ## The group's decayed past CPU (`runquota_admission.decayedCpu`,
+      ## milli-CPU x seconds) as of the monotonic time `recentCpuAtMillis`.
+      ## Brought forward whenever `heldCpuMilli` changes, and on reading, so
+      ## the held CPU is constant over every interval it integrates. What
+      ## `fair-share` orders by, with what the group holds now.
 
   LeaseRow* = object
     id*: LeaseId

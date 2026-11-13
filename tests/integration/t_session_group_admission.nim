@@ -31,6 +31,23 @@
 ## * `missing_session_group_is_interactive` -- giving the
 ##   interactive group `normal` priority serves the named group that queued
 ##   first.
+## * `fair_share_order` -- with the host file's order `[starvation,
+##   fair-share, arrival]`, three busy groups each wanting the whole host
+##   hold equal shares; hard-coding the default order (ignoring the file)
+##   hands the first group everything, and ignoring the reload that puts the
+##   default back hands freed slots back to the group that released them.
+## * `max_wait_flag_over_host_file` -- letting the host file's
+##   `admission.max-wait` override `--admission-max-wait-millis` (on start or
+##   on reload) reports the file's bound.
+## * `fair_share_unequal_sizes` -- a group asking two slots at a time and
+##   one asking one: after a reload to fair-share they converge on equal
+##   CPU; hard-coding the default order (ignoring the reload) leaves the
+##   wide group with three quarters of the host. (That a fixed charge per grant, not
+##   one by width, favours the wide group is shown over an hour of
+##   simulated turnover in `libs/runquota_admission/tests/t_admission_order`.)
+## * `invalid_order_refused` -- accepting an order with a repeated or
+##   unknown key starts the daemon, or changes the policy in force on reload
+##   (status and the order admission actually uses both show it).
 ##
 ## NO MOCKS. Every case runs the built `runquotad` on a private socket in a
 ## scratch `0700` directory (`RUNQUOTA_ENDPOINT_SCOPE=private`, through
@@ -189,16 +206,29 @@ when defined(posix):
     for key in GroupEnvKeys:
       if env.hasKey(key): env.del(key)
 
+  const HostConfigHead = "schema = \"runquota.host-config.v1\"\n"
+
+  proc writeHostConfig(root, admission: string) =
+    ## The private daemon's host file (`--host-config root/host.toml`, from
+    ## `daemonArgs`): the schema line and, when given, an `[admission]` table.
+    writeFile(root / "host.toml", HostConfigHead &
+      (if admission.len > 0: "[admission]\n" & admission else: ""))
+
   proc startFixture(tag: string; extra: openArray[string] = [];
-                    launcher: seq[string] = @[]): Fixture =
-    ## A private daemon with a 4-slot CPU budget. `launcher`, when given, is
-    ## the command the daemon is started under (`unshare ...`).
+                    launcher: seq[string] = @[]; slots = HostSlots;
+                    admission = ""): Fixture =
+    ## A private daemon with a `slots`-slot CPU budget (4 by default).
+    ## `launcher`, when given, is the command the daemon is started under
+    ## (`unshare ...`); `admission`, when given, is the body of the host
+    ## file's `[admission]` table, read at start.
     result.root = scratchDir(tag)
     result.socket = result.root / "rq.sock"
     result.env = privateEnv(result.socket)
     cleanGroupEnv(result.env)
+    if admission.len > 0:
+      writeHostConfig(result.root, admission)
     var args = daemonArgs(result.root, result.socket,
-      @["--cpu-milli", $(HostSlots * SlotMilli),
+      @["--cpu-milli", $(slots * SlotMilli),
         "--memory-bytes", $(4096'u64 * MiB)] & @extra)
     if launcher.len == 0:
       result.daemon = startProcess(daemonPath(), env = result.env, args = args,
@@ -714,3 +744,249 @@ when defined(posix):
       blocker.releaseAll()
       check old.collect() == HostSlots
       check agent.collect() == 0
+
+    test "fair_share_order":
+      # The host file asks for equal shares: order = [starvation, fair-share,
+      # arrival]. Three groups of equal priority each want the whole host
+      # (six slots) and keep wanting it. They hold equal shares, within 10%,
+      # while their leases turn over. Then the file goes back to the default
+      # order and the daemon is only asked to reload: from the next freed
+      # slot on, the group that became busy first is served first again.
+      const
+        Slots = 6
+        Rounds = 12
+        FairOrder = "order = [\"starvation\", \"fair-share\", \"arrival\"]\n"
+      var fixture = startFixture("sgafair", slots = Slots,
+        admission = FairOrder)
+      defer: stopFixture(fixture)
+      let configured = fixture.statusJson()
+      check configured["admission_order"] == %["starvation", "fair-share",
+        "arrival"]
+      let blocker = fixture.party("blocker", group("sga-blocker"))
+      let parties = [fixture.party("a", group("sga-fair-a")),
+        fixture.party("b", group("sga-fair-b")),
+        fixture.party("c", group("sga-fair-c"))]
+      let names = ["sga-fair-a", "sga-fair-b", "sga-fair-c"]
+      defer:
+        blocker.close()
+        for p in parties:
+          p.close()
+      for _ in 0 ..< Slots:
+        check blocker.offer()
+      for p in parties:
+        for _ in 0 ..< Slots:
+          check not p.offer()
+      # The whole host frees at once: ONE admission pass spreads it.
+      blocker.releaseAll()
+      var held: array[3, int]
+      for i, p in parties:
+        held[i] = p.collect()
+      echo "  after the blocker: held " & $held
+      check held == [2, 2, 2]
+
+      # Turnover: in each round every group releases its oldest lease and
+      # offers another, so each keeps wanting the whole host. The held CPU
+      # each group's status row reports is sampled after every release, and
+      # summed: the share each group held over the run.
+      var heldSum: array[3, int]
+      var grants: array[3, int]
+      for i in 0 ..< 3:
+        grants[i] = held[i]
+      for round in 0 ..< Rounds:
+        for turn in 0 ..< 3:
+          # Rotate who releases first, so no group is always first to ask.
+          let i = (round + turn) mod 3
+          parties[i].releaseOne()
+          discard parties[i].offer()
+          for j, p in parties:
+            grants[j] += p.collect()
+          let status = fixture.statusJson()
+          for j, name in names:
+            let row = status.groupNamed(name)
+            check row != nil
+            if row != nil:
+              heldSum[j] += row["held_cpu_milli"].getInt()
+      echo "  fair-share turnover: grants " & $grants & ", held-cpu samples " &
+        $heldSum
+      let meanHeld = (heldSum[0] + heldSum[1] + heldSum[2]) / 3
+      let meanGrants = (grants[0] + grants[1] + grants[2]) / 3
+      check meanHeld > 0
+      for j in 0 ..< 3:
+        check abs(float(heldSum[j]) - meanHeld) <= 0.10 * meanHeld
+        check abs(float(grants[j]) - meanGrants) <= 0.10 * meanGrants
+      let busy = fixture.statusJson()
+      for name in names:
+        let row = busy.groupNamed(name)
+        check row != nil and row["held_cpu_milli"].getInt() == 2 * SlotMilli
+        # The decayed figure the order uses is reported, and grows with use.
+        check row != nil and row["recent_cpu_milli_seconds"].getInt() >= 0
+
+      # Back to the default order: the file loses its [admission] table, and
+      # the running daemon is asked to reload it. Nothing else changes.
+      writeHostConfig(fixture.root, "")
+      let (reloadCode, reloadOutput) = cli(fixture.env, ["config", "reload"])
+      check reloadCode == 0
+      check "runquotad reloaded its host configuration" in reloadOutput
+      let reloaded = fixture.statusJson()
+      check reloaded["admission_order"] == %["starvation", "priority",
+        "cache-deadline", "arrival"]
+      # Default order: group a became busy first and still wants the whole
+      # host, so every slot b and c free goes to a. (Under fair-share each
+      # freed slot went back to the group that freed it.)
+      for _ in 0 ..< 2:
+        for i in 1 .. 2:
+          parties[i].releaseOne()
+          discard parties[i].offer()
+          check parties[i].collect() == 0
+          check parties[0].collect() == 1
+      let after = fixture.statusJson()
+      check after.groupNamed("sga-fair-a")["held_cpu_milli"].getInt() ==
+        Slots * SlotMilli
+      check after.groupNamed("sga-fair-b")["held_cpu_milli"].getInt() == 0
+      check after.groupNamed("sga-fair-c")["held_cpu_milli"].getInt() == 0
+
+    test "max_wait_flag_over_host_file":
+      # The host file says 45 s; the flag says 1.5 s. The flag wins, on start
+      # and after a reload that changes the file, and the reload says it
+      # pinned the key. Without the flag the file's bound is in force.
+      var pinned = startFixture("sgawaitflag",
+        ["--admission-max-wait-millis", "1500"],
+        admission = "max-wait = \"45s\"\n")
+      defer: stopFixture(pinned)
+      check pinned.statusJson()["admission_max_wait_millis"].getInt() == 1500
+      writeHostConfig(pinned.root, "max-wait = \"10s\"\n")
+      let (code, output) = cli(pinned.env, ["config", "reload"])
+      check code == 0
+      check "admission.max-wait" in output
+      check pinned.statusJson()["admission_max_wait_millis"].getInt() == 1500
+      let (topoCode, topoOutput) = cli(pinned.env, ["topology", "--json"])
+      check topoCode == 0
+      check "\"admission.max-wait\"" in topoOutput
+
+      var fromFile = startFixture("sgawaitfile",
+        admission = "max-wait = \"45s\"\n")
+      defer: stopFixture(fromFile)
+      check fromFile.statusJson()["admission_max_wait_millis"].getInt() ==
+        45_000
+      writeHostConfig(fromFile.root, "max-wait = \"10s\"\n")
+      check cli(fromFile.env, ["config", "reload"]).code == 0
+      check fromFile.statusJson()["admission_max_wait_millis"].getInt() ==
+        10_000
+
+    test "invalid_order_refused":
+      # A repeated key stops the daemon at start, with the file and line.
+      let root = scratchDir("sgabadorder")
+      let socket = root / "rq.sock"
+      writeHostConfig(root, "order = [\"priority\", \"priority\"]\n")
+      var env = privateEnv(socket)
+      cleanGroupEnv(env)
+      let refused = launch(root, socket, env)
+      let code = refused.exitWithin(30_000)
+      let said = refused.output
+      refused.close()
+      check code == 2
+      check "host.toml:3: admission order lists `priority` twice" in said
+
+      # Under a running daemon, an unknown key is refused by the reload and
+      # the order in force is unchanged.
+      var fixture = startFixture("sgabadreload",
+        admission = "order = [\"fair-share\", \"arrival\"]\n")
+      defer: stopFixture(fixture)
+      # The refused file also changes the bound and the division; neither
+      # may take effect, because the file as a whole did not parse.
+      writeHostConfig(fixture.root, "order = [\"fairshare\"]\n" &
+        "max-wait = \"10s\"\nshare-between-users = \"none\"\n")
+      let (reloadCode, reloadOutput) = cli(fixture.env, ["config", "reload"])
+      check reloadCode == 1
+      check "unknown admission order key `fairshare`" in reloadOutput
+      let kept = fixture.statusJson()
+      check kept["admission_order"] == %["fair-share", "arrival"]
+      check kept["admission_max_wait_millis"].getInt() == 120_000
+      check kept["admission_share_between_users"].getStr() == "drf"
+      # An empty order is refused the same way.
+      writeHostConfig(fixture.root, "order = []\n")
+      let (emptyCode, emptyOutput) = cli(fixture.env, ["config", "reload"])
+      check emptyCode == 1
+      check "admission order is empty" in emptyOutput
+      check fixture.statusJson()["admission_order"] == %["fair-share",
+        "arrival"]
+      # And the order still in force is the one ADMISSION uses, not only the
+      # one status prints: two busy groups wanting the whole host split it
+      # (fair-share). Had the refused reload put the default in force, the
+      # group that queued first would take all of it.
+      let blocker = fixture.party("blocker", group("sga-blocker"))
+      let first = fixture.party("first", group("sga-kept-a"))
+      let second = fixture.party("second", group("sga-kept-b"))
+      defer:
+        blocker.close()
+        first.close()
+        second.close()
+      for _ in 0 ..< HostSlots:
+        check blocker.offer()
+      for _ in 0 ..< HostSlots:
+        check not first.offer()
+      for _ in 0 ..< HostSlots:
+        check not second.offer()
+      blocker.releaseAll()
+      check first.collect() == HostSlots div 2
+      check second.collect() == HostSlots div 2
+
+    test "fair_share_unequal_sizes":
+      # Two busy groups whose requests differ in width: "wide" asks for two
+      # slots at a time, "narrow" for one. Under the default order wide,
+      # which became busy first, takes the whole host. A reload to
+      # [starvation, fair-share, arrival] -- nothing else -- moves the host
+      # to equal CPU as wide's leases end, and keeps it there while both
+      # turn their leases over. Ignoring the reload leaves wide with three
+      # quarters (six slots to narrow's two).
+      const Slots = 8
+      var fixture = startFixture("sgafairsize", slots = Slots)
+      defer: stopFixture(fixture)
+      let wide = fixture.party("wide", group("sga-size-wide"))
+      let narrow = fixture.party("narrow", group("sga-size-narrow"))
+      defer:
+        wide.close()
+        narrow.close()
+      for _ in 0 ..< Slots div 2:
+        check wide.offer(2)
+      for _ in 0 ..< Slots:
+        check not narrow.offer()
+      check narrow.collect() == 0
+      writeHostConfig(fixture.root,
+        "order = [\"starvation\", \"fair-share\", \"arrival\"]\n")
+      let (reloadCode, reloadOutput) = cli(fixture.env, ["config", "reload"])
+      if reloadCode != 0: echo reloadOutput
+      check reloadCode == 0
+      proc heldBy(name: string): int =
+        let row = fixture.statusJson().groupNamed(name)
+        if row == nil: -1 else: row["held_cpu_milli"].getInt()
+      # Wide keeps wanting the host: every lease it ends is offered again.
+      var wideGrants = 0
+      var narrowGrants = 0
+      var wideSum = 0
+      var narrowSum = 0
+      for round in 0 ..< 12:
+        if round mod 2 == 0:
+          wide.releaseOne()
+          if not wide.offer(2):
+            discard
+          else:
+            inc wideGrants
+        else:
+          narrow.releaseOne()
+          if narrow.offer():
+            inc narrowGrants
+        wideGrants += wide.collect()
+        narrowGrants += narrow.collect()
+        if round >= 4:
+          wideSum += heldBy("sga-size-wide")
+          narrowSum += heldBy("sga-size-narrow")
+      echo "  unequal sizes: held-cpu samples wide " & $wideSum & ", narrow " &
+        $narrowSum & "; grants wide " & $wideGrants & ", narrow " &
+        $narrowGrants
+      check heldBy("sga-size-wide") == (Slots div 2) * SlotMilli
+      check heldBy("sga-size-narrow") == (Slots div 2) * SlotMilli
+      let mean = (wideSum + narrowSum) / 2
+      check mean > 0
+      check abs(float(wideSum) - mean) <= 0.10 * mean
+      check abs(float(narrowSum) - mean) <= 0.10 * mean

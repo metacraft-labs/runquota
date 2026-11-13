@@ -16,10 +16,12 @@
 ##
 ## THE READER ACCEPTS A DOCUMENTED SUBSET OF TOML AND REFUSES EVERYTHING ELSE.
 ## runquota carries no TOML library, and the file has one small, fixed shape:
-## a `schema` string, a `[machine]` table of integers and a `[pools]` table of
-## integers. Rather than guess at syntax it does not model -- an array, an
-## inline table, a float -- the reader rejects it with the file and line, and
-## the daemon does not start. A budget file that is silently half-read is worse
+## a `schema` string, a `[machine]` table of integers, a `[pools]` table of
+## integers, and an `[admission]` table of plain strings and one one-line
+## array of strings (the admission order). Rather than guess at syntax it does
+## not model -- an inline table, a float, a string with escapes, a multi-line
+## array -- the reader rejects it with the file and line, and the daemon does
+## not start. A budget file that is silently half-read is worse
 ## than none, because it looks configured.
 ##
 ## A MISSING FILE IS NOT AN ERROR and is never created here. The directory it
@@ -68,6 +70,16 @@ const
     ## The budget when physical memory cannot be read at all. The old flat
     ## default, kept only for that case.
 
+  AdmissionOrderKeys* = ["starvation", "priority", "cache-deadline",
+    "fair-share", "arrival"]
+    ## The keys `[admission] order` may list, spelled as the file spells
+    ## them. They are `runquota_admission.AdmissionKey`'s spellings, repeated
+    ## here because this module stays standard-library only (see above);
+    ## `libs/runquota_daemon/tests/t_host_config_admission` refuses a drift.
+
+  ShareBetweenUsersValues* = ["drf", "none"]
+    ## `[admission] share-between-users`; `runquota_admission.ShareBetweenUsers`.
+
   HostConfigTemplate* = """# RunQuota host budget. One file per host: every workspace and every user on
 # this machine shares the one runquotad that reads it.
 #
@@ -96,6 +108,13 @@ type
     memoryBytes*: Option[uint64]
     cpuMilli*: Option[uint64]
     pools*: OrderedTable[string, uint32]
+    admissionOrder*: Option[seq[string]]
+      ## `[admission] order`, validated: each key one of
+      ## `AdmissionOrderKeys`, none twice, at least one.
+    admissionMaxWaitMillis*: Option[int64]
+      ## `[admission] max-wait`; 0 turns the starvation bound off.
+    shareBetweenUsers*: Option[string]
+      ## `[admission] share-between-users`, one of `ShareBetweenUsersValues`.
     sourcePath*: string
       ## Where it was read from; empty when no file existed. Kept so a denial
       ## can say whose budget it enforced.
@@ -132,6 +151,79 @@ proc parseInteger(raw, path: string; lineNo: int): uint64 =
   except ValueError:
     fail(path, lineNo, "integer out of range: `" & text & "`")
 
+proc parseQuoted(raw, path: string; lineNo: int): string =
+  ## A double-quoted TOML basic string WITHOUT escapes: the subset has no use
+  ## for them, and a reader that half-modelled them would misread one.
+  let text = raw.strip()
+  if text.len < 2 or text[0] != '"' or text[^1] != '"':
+    fail(path, lineNo, "expected a double-quoted string, got `" & text & "`")
+  result = text[1 .. ^2]
+  if '"' in result or '\\' in result:
+    fail(path, lineNo, "unsupported string `" & text & "`: quotes and " &
+      "escapes inside a string are outside the supported subset")
+
+proc parseStringArray(raw, path: string; lineNo: int): seq[string] =
+  ## A one-line array of `parseQuoted` strings: `["a", "b"]`. A trailing
+  ## comma is allowed, as TOML allows it.
+  let text = raw.strip()
+  if text.len < 2 or text[0] != '[' or text[^1] != ']':
+    fail(path, lineNo, "expected a one-line array of strings, got `" & text &
+      "`")
+  let inner = text[1 .. ^2].strip()
+  if inner.len == 0:
+    return @[]
+  var items = inner.split(',')
+  if items[^1].strip().len == 0:
+    items.setLen(items.len - 1)
+  for item in items:
+    result.add(parseQuoted(item, path, lineNo))
+
+proc parseDurationMillis*(raw: string; millis: var int64): bool =
+  ## `1500ms`, `120s` or `2m` (a non-negative whole number and a unit) as
+  ## milliseconds. Used by the file reader and by `runquota config set`.
+  let text = raw.strip()
+  var digits = ""
+  var factor = 0'i64
+  if text.endsWith("ms"):
+    digits = text[0 ..< text.len - 2]
+    factor = 1
+  elif text.endsWith("s"):
+    digits = text[0 ..< text.len - 1]
+    factor = 1000
+  elif text.endsWith("m"):
+    digits = text[0 ..< text.len - 1]
+    factor = 60_000
+  else:
+    return false
+  if digits.len == 0:
+    return false
+  for ch in digits:
+    if ch notin {'0' .. '9'}:
+      return false
+  try:
+    let value = parseBiggestInt(digits)
+    if value > high(int64) div factor:
+      return false
+    millis = value * factor
+    true
+  except ValueError:
+    false
+
+proc validateAdmissionOrder(keys: seq[string]; path: string; lineNo: int) =
+  ## Refuse an empty order, an unknown key and a key listed twice (reprobuild-
+  ## specs Build-Engine-And-Scheduler.md, "Configuring the order").
+  if keys.len == 0:
+    fail(path, lineNo, "admission order is empty; list at least one key " &
+      "(arrival order alone is [\"arrival\"])")
+  var seen: seq[string] = @[]
+  for key in keys:
+    if key notin AdmissionOrderKeys:
+      fail(path, lineNo, "unknown admission order key `" & key &
+        "`; expected " & AdmissionOrderKeys.join(", "))
+    if key in seen:
+      fail(path, lineNo, "admission order lists `" & key & "` twice")
+    seen.add(key)
+
 proc parseHostConfig*(text, path: string): HostConfig =
   result.pools = initOrderedTable[string, uint32]()
   result.sourcePath = path
@@ -146,9 +238,9 @@ proc parseHostConfig*(text, path: string): HostConfig =
       if not line.endsWith("]") or line.startsWith("[["):
         fail(path, lineNo, "unsupported table header `" & line & "`")
       section = line[1 .. ^2].strip()
-      if section notin ["machine", "pools"]:
+      if section notin ["machine", "pools", "admission"]:
         fail(path, lineNo, "unknown table `[" & section & "]`; expected " &
-          "[machine] or [pools]")
+          "[machine], [pools] or [admission]")
       continue
     let eq = line.find('=')
     if eq <= 0:
@@ -188,6 +280,27 @@ proc parseHostConfig*(text, path: string): HostConfig =
       if v > uint64(high(uint32)):
         fail(path, lineNo, "pool size out of range: " & $v)
       result.pools[key] = uint32(v)
+    of "admission":
+      case key
+      of "order":
+        let keys = parseStringArray(value, path, lineNo)
+        validateAdmissionOrder(keys, path, lineNo)
+        result.admissionOrder = some(keys)
+      of "max-wait":
+        var millis = 0'i64
+        if not parseDurationMillis(parseQuoted(value, path, lineNo), millis):
+          fail(path, lineNo, "max-wait must be a duration such as \"120s\", " &
+            "\"1500ms\" or \"2m\", got " & value)
+        result.admissionMaxWaitMillis = some(millis)
+      of "share-between-users":
+        let share = parseQuoted(value, path, lineNo)
+        if share notin ShareBetweenUsersValues:
+          fail(path, lineNo, "share-between-users must be " &
+            ShareBetweenUsersValues.join(" or ") & ", got " & value)
+        result.shareBetweenUsers = some(share)
+      else:
+        fail(path, lineNo, "unknown key `" & key & "` in [admission]; " &
+          "expected order, max-wait or share-between-users")
     else:
       discard
 
@@ -236,7 +349,7 @@ proc humanBytes*(value: uint64): string =
 
 type
   HostConfigKey* = object
-    section*: string ## `machine` or `pools`
+    section*: string ## `machine`, `pools` or `admission`
     name*: string
 
 proc isBareKey(name: string): bool =
@@ -248,11 +361,14 @@ proc isBareKey(name: string): bool =
   true
 
 proc parseHostConfigKey*(key: string): HostConfigKey =
-  ## `machine.memory_bytes`, `machine.cpu_milli` or `pools.NAME`.
+  ## `machine.memory_bytes`, `machine.cpu_milli`, `pools.NAME`,
+  ## `admission.order`, `admission.max-wait` or
+  ## `admission.share-between-users`.
   let dot = key.find('.')
   if dot <= 0 or dot == key.len - 1:
     raise newException(HostConfigError, "unknown key `" & key &
-      "`; expected machine.memory_bytes, machine.cpu_milli or pools.NAME")
+      "`; expected machine.memory_bytes, machine.cpu_milli, pools.NAME or " &
+      "admission.order, admission.max-wait, admission.share-between-users")
   result = HostConfigKey(section: key[0 ..< dot], name: key[dot + 1 .. ^1])
   case result.section
   of "machine":
@@ -265,9 +381,13 @@ proc parseHostConfigKey*(key: string): HostConfigKey =
     if not result.name.isBareKey:
       raise newException(HostConfigError, "pool name `" & result.name &
         "` must be letters, digits, `_` or `-`")
+  of "admission":
+    if result.name notin ["order", "max-wait", "share-between-users"]:
+      raise newException(HostConfigError, "unknown key `" & key &
+        "`; [admission] has order, max-wait and share-between-users")
   else:
     raise newException(HostConfigError, "unknown table `" & result.section &
-      "` in `" & key & "`; expected machine or pools")
+      "` in `" & key & "`; expected machine, pools or admission")
 
 proc `$`*(key: HostConfigKey): string = key.section & "." & key.name
 
@@ -338,15 +458,41 @@ proc linesOf(text: string): seq[string] =
 proc joinLines(lines: seq[string]): string =
   lines.join("\n") & "\n"
 
-proc setHostConfigValue*(text: string; key: HostConfigKey;
-                         value: uint64): string =
-  ## `text` with `key` set to `value`: the key's line replaced when it has one
-  ## (its old trailing comment goes with it, because it described the old
-  ## value), otherwise a line added at the end of the key's table, and the
+proc renderAdmissionEntry(key: HostConfigKey; raw: string): string =
+  ## The `[admission]` line a `config set` VALUE stands for. VALUES ARE
+  ## SPELLED AS THE DAEMON PRINTS THEM, not as TOML: `starvation,fair-share`
+  ## for the order, `90s` for the bound, `none` for the division. The quoting
+  ## is added here; whether the result is acceptable is `parseHostConfig`'s
+  ## decision, over the edited file as a whole.
+  let text = raw.strip()
+  if '"' in text or '\\' in text:
+    raise newException(HostConfigError, "`" & $key &
+      "` takes a plain value without quotes, got `" & raw & "`")
+  case key.name
+  of "order":
+    var quoted: seq[string] = @[]
+    for part in text.split(','):
+      if part.strip().len > 0:
+        quoted.add("\"" & part.strip() & "\"")
+    key.name & " = [" & quoted.join(", ") & "]"
+  else:
+    key.name & " = \"" & text & "\""
+
+proc hostConfigEntry*(key: HostConfigKey; raw: string): string =
+  ## The `key = value` line `runquota config set KEY VALUE` writes.
+  if key.section == "admission":
+    renderAdmissionEntry(key, raw)
+  else:
+    renderEntry(key, parseHostConfigValue(key, raw))
+
+proc setHostConfigEntry(text: string; key: HostConfigKey;
+                        entry: string): string =
+  ## `text` with `key` set by `entry` (its `key = value` line): the key's
+  ## line replaced when it has one (its old trailing comment goes with it,
+  ## because it described the old value), otherwise a line added at the end of the key's table, and the
   ## table appended when the file has none. Not validated here; see
   ## `editHostConfig`.
   var lines = linesOf(text)
-  let entry = renderEntry(key, value)
   var section = ""
   var sectionEnd = -1 # index after the last non-blank line of `key.section`
   for i, raw in lines:
@@ -371,6 +517,11 @@ proc setHostConfigValue*(text: string; key: HostConfigKey;
     lines.add("[" & key.section & "]")
     lines.add(entry)
   joinLines(lines)
+
+proc setHostConfigValue*(text: string; key: HostConfigKey;
+                         value: uint64): string =
+  ## `setHostConfigEntry` for an integer key (`[machine]`, `[pools]`).
+  setHostConfigEntry(text, key, renderEntry(key, value))
 
 proc unsetHostConfigValue*(text: string; key: HostConfigKey;
                            removed: var bool): string =
@@ -404,8 +555,8 @@ proc editHostConfig*(path, key, value: string; unset: bool;
     var removed = false
     result = unsetHostConfigValue(before, parsedKey, removed)
   else:
-    result = setHostConfigValue(before, parsedKey,
-      parseHostConfigValue(parsedKey, value))
+    result = setHostConfigEntry(before, parsedKey,
+      hostConfigEntry(parsedKey, value))
   discard parseHostConfig(result, path)
   changed = result != before or (not exists and not unset)
 

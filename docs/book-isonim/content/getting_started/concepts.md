@@ -118,7 +118,8 @@ requests in this order:
    with equal shares, the one whose group became busy first goes first: a
    user's group attributes rank only that user's own requests.
 2. **Within one user, the starvation bound.** A request that has waited longer
-   than `--admission-max-wait-millis` (default two minutes, below the shortest
+   than the bound (`admission.max-wait` in the host file, or
+   `--admission-max-wait-millis`; default two minutes, below the shortest
    prompt-cache lifetime) goes before that user's other requests, oldest
    first, and the capacity that frees up is held for it rather than handed to
    a request behind it.
@@ -132,6 +133,36 @@ first may take the whole machine, and the next one waits for the slots it
 frees. A request that does not fit is passed over for one behind it that does
 (backfill), unless it is held under the starvation bound. No lease is ever
 revoked.
+
+Steps 2 and 3 are the default **order**, `[starvation, priority,
+cache-deadline, arrival]`, and the host file can change it
+(`admission.order`, see [the host file](/usage_guide/daemon#the-host-file)).
+The keys are applied in turn, each only where the ones before it tie:
+
+| Key | Goes first |
+|---|---|
+| `starvation` | a request that has waited past the bound; freed capacity is held for it |
+| `priority` | the group with the higher priority |
+| `cache-deadline` | the group with the earliest cache deadline; none goes last |
+| `fair-share` | the group that has used the least CPU recently |
+| `arrival` | the group that became busy first |
+
+Every order ends with `arrival`, listed or not. Leaving `starvation` out
+removes the bound. `fair-share` divides the host equally between busy groups:
+a group's recent CPU is what its granted leases held, with each moment
+counting half as much a minute later, plus what the leases it holds now will
+add if they keep running, so the slots one release frees are spread between
+groups rather than handed to one. `order = ["starvation", "fair-share",
+"arrival"]` asks for equal shares between sessions.
+
+`admission.share-between-users = "none"` drops the division by usage in
+step 1. Group priorities and cache deadlines still rank only their own
+user's requests: each user's requests are ordered by the whole list, and the
+next user served is the one whose next request goes first by `starvation`,
+`fair-share` and `arrival` alone. With `fair-share` listed, busy groups then
+converge on equal shares across users, so a user with more busy groups takes
+more of the host. Use it only where users trust each other's load, such as a
+CI host.
 
 ## Estimate
 

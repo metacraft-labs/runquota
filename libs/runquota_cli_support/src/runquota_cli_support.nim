@@ -76,6 +76,15 @@ proc printSessionGroups(statusJson: string) =
     return
   echo "admission_max_wait_millis: " &
     $parsed{"admission_max_wait_millis"}.getBiggestInt()
+  let orderNode = parsed{"admission_order"}
+  if not orderNode.isNil and orderNode.kind == JArray:
+    var keys: seq[string] = @[]
+    for key in orderNode:
+      keys.add(key.getStr())
+    echo "admission_order: " & keys.join(",")
+  if parsed.hasKey("admission_share_between_users"):
+    echo "admission_share_between_users: " &
+      parsed{"admission_share_between_users"}.getStr()
   for group in parsed["session_groups"]:
     if group.isNil or group.kind != JObject:
       continue
@@ -104,6 +113,8 @@ proc printSessionGroups(statusJson: string) =
       " grants=" & $group{"grants_total"}.getBiggestInt() &
       " granted_cpu_milli_seconds=" &
         $group{"granted_cpu_milli_seconds"}.getBiggestInt() &
+      " recent_cpu_milli_seconds=" &
+        $group{"recent_cpu_milli_seconds"}.getBiggestInt() &
       " wait_total_millis=" & $group{"wait_total_millis"}.getBiggestInt() &
       " wait_max_millis=" & $group{"wait_max_millis"}.getBiggestInt() &
       " oldest_queued_wait_millis=" &
