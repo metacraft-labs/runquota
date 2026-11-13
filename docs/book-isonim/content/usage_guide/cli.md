@@ -14,6 +14,7 @@ usage:
   runquota observations --json
   runquota explain SESSION_ID
   runquota daemon start|status
+  runquota session set GROUP [--priority LEVEL] [--cache-deadline TIME|none | --cache-ttl SECONDS]
   runquota config path
   runquota config show [--file PATH]
   runquota config set KEY VALUE [--file PATH] [--no-reload]
@@ -37,7 +38,7 @@ The `stats` verbs have a page of their own:
 
 | Command | What it tells you |
 |---|---|
-| `runquota status [--json]` | Live counters: sessions, leases, `supervisor_lost_leases`, finished and granted totals, and the memory-pressure reading. |
+| `runquota status [--json]` | Live counters: sessions, leases, `supervisor_lost_leases`, finished and granted totals, the memory-pressure reading, the starvation bound, and one row per [session group](/getting_started/concepts#session-group) with its counters (below). |
 | `runquota sessions --json` | The registered sessions. |
 | `runquota leases --json` | Every lease the daemon is tracking. |
 | `runquota topology --json` | The configured machines and CPU share groups — the budget, as the daemon sees it. |
@@ -49,6 +50,48 @@ The `stats` verbs have a page of their own:
 > `observations`. Without it you fall through to the usage text and a zero exit
 > — which is easy to mistake for "there is nothing to report". These four have
 > no text renderer; the JSON *is* the answer.
+
+### Session group counters
+
+`runquota status` prints one `session_group:` line per open group, and
+`status --json` carries the same as `session_groups`. These are inspection
+output: read them, do not parse them into anything that persists.
+
+| Field | Meaning |
+|---|---|
+| `name`, `owner_uid` | The group, and the user it belongs to. |
+| `priority`, `cache_deadline_unix_millis` | Its attributes now (`null`: no deadline). |
+| `sessions` | Open sessions in it. |
+| `queued_leases`, `active_leases` | Its requests waiting, and its leases holding capacity. |
+| `held_cpu_milli`, `held_memory_bytes` | What its granted leases reserve now. |
+| `grants_total` | Leases granted to it since it was created. |
+| `granted_cpu_milli_seconds` | The CPU its released leases reserved, times how long they held it. |
+| `wait_total_millis`, `wait_max_millis` | How long its granted requests had waited: in total, and the longest. |
+| `oldest_queued_wait_millis` | How long its oldest waiting request has waited so far. |
+
+The figures are reservations, not measurements: the daemon does not watch
+process trees.
+
+## `runquota session set`
+
+Changes a session group's attributes while it runs — how a launcher keeps
+them current.
+
+```sh
+runquota session set myhost:3 --priority urgent --cache-ttl 240
+runquota session set myhost:3 --cache-deadline none
+```
+
+| Flag | Meaning |
+|---|---|
+| `--priority LEVEL` | `urgent`, `high`, `normal` or `low`. |
+| `--cache-deadline TIME` | A UTC time, `YYYY-MM-DDTHH:MM:SSZ`; `none` clears the deadline. |
+| `--cache-ttl SECONDS` | The deadline as seconds from now. Give this or `--cache-deadline`, not both. |
+
+Only the group's owner may change it, and only while one of its sessions is
+open. Exit **0** when changed (it prints the attributes now in force), **1**
+when the daemon refuses — another user's group, or no open session names it —
+or cannot be reached, **2** on bad arguments.
 
 ## `runquota config`
 

@@ -153,7 +153,7 @@ when isMainModule:
   var config = defaultDaemonConfig(defaultEndpoint())
   config.exitWithParentPid = exitWithParentPid
   config.socketActivation = socketActivation
-  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--log-file PATH]"
+  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--ambient-sample-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--admission-max-wait-millis N] [--log-file PATH]"
   var i = 0
   while i < args.len:
     case args[i]
@@ -335,6 +335,27 @@ when isMainModule:
         quit 2
       config.idleExitAfterSeconds = seconds
       i += 2
+    of "--admission-max-wait-millis":
+      # THE STARVATION BOUND: a queued request that has waited this long goes
+      # before its owner's other requests, and capacity is held for it. A
+      # whole number of milliseconds, so a test can bound a wait in seconds
+      # rather than minutes; zero turns the bound off, which an operator says
+      # on purpose and a typo cannot (a value that does not parse is
+      # refused).
+      if i + 1 >= args.len:
+        echo "runquotad: --admission-max-wait-millis needs a value\n" & usage
+        quit 2
+      var millis = -1'i64
+      try:
+        millis = parseBiggestInt(args[i + 1])
+      except ValueError:
+        millis = -1'i64
+      if millis < 0:
+        echo "runquotad: --admission-max-wait-millis needs a non-negative " &
+          "whole number of milliseconds, got: " & args[i + 1] & "\n" & usage
+        quit 2
+      config.admissionMaxWaitMillis = millis
+      i += 2
     of "--host-identity-file":
       # Where this machine's opaque `host_id` is kept. Overridable so a
       # test can run against a scratch identity instead of reading, or
@@ -352,7 +373,10 @@ when isMainModule:
         "  --idle-exit-after SECONDS  begin the orderly shutdown (exit 0) once " &
         "no client connection has been open for SECONDS, counted from start-up " &
         "or from the moment the last connection closed; without it the daemon " &
-        "never idles out\n\n" &
+        "never idles out\n" &
+        "  --admission-max-wait-millis N  the starvation bound: a request " &
+        "queued this long is served before its user's others (default " &
+        "120000; 0 turns the bound off)\n\n" &
         "environment:\n" &
         "  " & exitWithParentEnvVar & "=1  stop (as on SIGTERM) when the " &
         "process that started runquotad exits; POSIX only, ignored on Windows\n" &

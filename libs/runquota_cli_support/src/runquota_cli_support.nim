@@ -1,4 +1,4 @@
-import std/[os, osproc, strutils, times]
+import std/[json, os, osproc, strutils, times]
 
 import runquota_client
 import runquota_core
@@ -36,6 +36,10 @@ proc renderUsage*(programName: string): string =
     "    the daemon exits once no client is connected to it; it cuts off no\n" &
     "    build in flight. --wait waits for the exit (exit 3 on timeout)\n" &
     "  " & programName & " daemon status\n" &
+    "  " & programName & " session set GROUP [--priority urgent|high|normal|low]\n" &
+    "      [--cache-deadline YYYY-MM-DDTHH:MM:SSZ|none | --cache-ttl SECONDS]\n" &
+    "    change a session group's priority or prompt-cache deadline; only the\n" &
+    "    group's owner may (exit 1 when the daemon refuses, 2 on bad arguments)\n" &
     configUsage.replace("  runquota ", "  " & programName & " ") &
     "  " & programName & " stats-table [KEY]\n" &
     "  " & programName & " stats capture [--json]\n" &
@@ -64,12 +68,58 @@ proc parseMemory(value: string): uint64 =
     return parseUInt(lower[0 ..< lower.len - 2]) * 1000'u64
   parseUInt(lower)
 
+proc printSessionGroups(statusJson: string) =
+  ## One line per session group, from the `status` inspection JSON.
+  let parsed = parseJson(statusJson)
+  if parsed.kind != JObject or not parsed.hasKey("session_groups") or
+      parsed["session_groups"].kind != JArray:
+    return
+  echo "admission_max_wait_millis: " &
+    $parsed{"admission_max_wait_millis"}.getBiggestInt()
+  for group in parsed["session_groups"]:
+    if group.isNil or group.kind != JObject:
+      continue
+    # `{}` answers nil for a missing key; `getBiggestInt` and `getStr` read
+    # nil as 0 and "", but `.kind` does not, so test those two explicitly.
+    let ownerNode = group{"owner_uid"}
+    let deadlineNode = group{"cache_deadline_unix_millis"}
+    let owner =
+      if not ownerNode.isNil and ownerNode.kind == JInt:
+        $ownerNode.getBiggestInt()
+      else: "unknown"
+    let deadline =
+      if not deadlineNode.isNil and deadlineNode.kind == JInt:
+        format(fromUnix(deadlineNode.getBiggestInt() div 1000).utc,
+          "yyyy-MM-dd'T'HH:mm:ss'Z'")
+      else: "none"
+    echo "session_group: " & group{"name"}.getStr() &
+      " owner_uid=" & owner &
+      " priority=" & group{"priority"}.getStr() &
+      " cache_deadline=" & deadline &
+      " sessions=" & $group{"sessions"}.getBiggestInt() &
+      " queued=" & $group{"queued_leases"}.getBiggestInt() &
+      " active=" & $group{"active_leases"}.getBiggestInt() &
+      " held_cpu_milli=" & $group{"held_cpu_milli"}.getBiggestInt() &
+      " held_memory_bytes=" & $group{"held_memory_bytes"}.getBiggestInt() &
+      " grants=" & $group{"grants_total"}.getBiggestInt() &
+      " granted_cpu_milli_seconds=" &
+        $group{"granted_cpu_milli_seconds"}.getBiggestInt() &
+      " wait_total_millis=" & $group{"wait_total_millis"}.getBiggestInt() &
+      " wait_max_millis=" & $group{"wait_max_millis"}.getBiggestInt() &
+      " oldest_queued_wait_millis=" &
+        $group{"oldest_queued_wait_millis"}.getBiggestInt()
+
 proc printStatus(json: bool): int =
   var client = connectDefault()
   defer: client.close()
   let status = client.daemonStatus()
+  # THE SESSION GROUPS ARE INSPECTION OUTPUT, asked for separately and only of
+  # a daemon that has them; an older daemon still answers the status above.
+  let statusJson =
+    if client.supportsSessionGroups(): client.inspectionJson("status")
+    else: ""
   if json:
-    echo inspectionStatusJson(status)
+    echo(if statusJson.len > 0: statusJson else: inspectionStatusJson(status))
   else:
     echo "sessions: " & $status.activeSessions
     echo "leases: " & $status.activeLeases
@@ -77,6 +127,14 @@ proc printStatus(json: bool): int =
     echo "finished_leases: " & $status.finishedLeases
     echo "total_granted: " & $status.totalGranted
     echo "total_finished: " & $status.totalFinished
+    if statusJson.len > 0:
+      try:
+        printSessionGroups(statusJson)
+      except JsonParsingError, KeyError, ValueError:
+        # The counts above are already printed; a group table the daemon
+        # sent in a shape this CLI does not read is reported, not fatal.
+        stderr.writeLine("runquota status: could not read the session " &
+          "groups: " & getCurrentExceptionMsg())
     # Windows: surface memory-pressure capability + current sample so operators
     # can see whether the host backend is wired in. Identical text on every
     # platform; the value differs based on which backend signed off on it.
@@ -88,6 +146,112 @@ proc printStatus(json: bool): int =
     except CatchableError:
       discard
   0
+
+proc parseCacheDeadline(text: string; unixMillis: var uint64): bool =
+  ## `YYYY-MM-DDTHH:MM:SSZ`, in UTC. One spelling, the RFC 3339 one, so a
+  ## launcher in any time zone writes the same instant the same way.
+  try:
+    let instant = parse(text, "yyyy-MM-dd'T'HH:mm:ss'Z'", utc())
+    let seconds = instant.toTime().toUnix()
+    if seconds <= 0:
+      return false
+    unixMillis = uint64(seconds) * 1000'u64
+    true
+  except TimeParseError, ValueError:
+    false
+
+proc runSessionSet(args: seq[string]): int =
+  ## `runquota session set GROUP [--priority LEVEL] [--cache-deadline TIME |
+  ## --cache-ttl SECONDS]`: how a launcher keeps its session group's
+  ## attributes current. Exit 0 on success, 1 when the daemon refuses or
+  ## cannot be reached, 2 on bad arguments.
+  if args.len < 1 or args[0].startsWith("-"):
+    stderr.writeLine("runquota session set: name the session group first")
+    return 2
+  var update = UpdateSessionGroupMessage(group: args[0],
+    priority: sessionPriorityNormal, cacheDeadlineChange: cacheDeadlineKeep)
+  let problem = sessionGroupNameProblem(update.group)
+  if problem.len > 0:
+    stderr.writeLine("runquota session set: " & problem)
+    return 2
+  var i = 1
+  while i < args.len:
+    if i + 1 >= args.len:
+      stderr.writeLine("runquota session set: " & args[i] & " needs a value")
+      return 2
+    let value = args[i + 1]
+    case args[i]
+    of "--priority":
+      var priority: SessionPriority
+      if not parseSessionPriority(value, priority):
+        stderr.writeLine("runquota session set: --priority is one of " &
+          "urgent, high, normal, low; got: " & value)
+        return 2
+      update.priorityPresent = true
+      update.priority = priority
+    of "--cache-deadline":
+      if update.cacheDeadlineChange != cacheDeadlineKeep:
+        stderr.writeLine("runquota session set: give --cache-deadline or " &
+          "--cache-ttl once")
+        return 2
+      if value == "none":
+        update.cacheDeadlineChange = cacheDeadlineClear
+      else:
+        var millis: uint64
+        if not parseCacheDeadline(value, millis):
+          stderr.writeLine("runquota session set: --cache-deadline is a UTC " &
+            "time YYYY-MM-DDTHH:MM:SSZ, or none; got: " & value)
+          return 2
+        update.cacheDeadlineChange = cacheDeadlineSet
+        update.cacheDeadlineUnixMillis = millis
+    of "--cache-ttl":
+      if update.cacheDeadlineChange != cacheDeadlineKeep:
+        stderr.writeLine("runquota session set: give --cache-deadline or " &
+          "--cache-ttl once")
+        return 2
+      var seconds: uint64
+      try:
+        seconds = parseBiggestUInt(value)
+      except ValueError:
+        stderr.writeLine("runquota session set: --cache-ttl is a whole " &
+          "number of seconds; got: " & value)
+        return 2
+      if seconds > 1_000_000_000'u64:
+        stderr.writeLine("runquota session set: --cache-ttl is too large: " &
+          value)
+        return 2
+      update.cacheDeadlineChange = cacheDeadlineSet
+      update.cacheDeadlineUnixMillis =
+        uint64(epochTime() * 1000.0) + seconds * 1000'u64
+    else:
+      stderr.writeLine("runquota session set: unknown option " & args[i])
+      return 2
+    i += 2
+  if not update.priorityPresent and update.cacheDeadlineChange == cacheDeadlineKeep:
+    stderr.writeLine("runquota session set: nothing to change; give " &
+      "--priority, --cache-deadline or --cache-ttl")
+    return 2
+  var client: RunQuotaClient
+  try:
+    client = connectDefault()
+  except CatchableError as error:
+    stderr.writeLine("runquota session set: no daemon answered: " & error.msg)
+    return 1
+  defer: client.close()
+  try:
+    let answer = client.updateSessionGroup(update)
+    echo "session_group: " & answer.group & " priority=" &
+      sessionPriorityName(answer.priority) & " cache_deadline=" &
+      (if answer.cacheDeadlinePresent:
+        format(fromUnix(int64(answer.cacheDeadlineUnixMillis div 1000'u64)).utc,
+          "yyyy-MM-dd'T'HH:mm:ss'Z'")
+       else: "none") & " sessions=" & $answer.sessions
+    0
+  except RunQuotaClientError as error:
+    let detail = client.lastDiagnostic.detail
+    stderr.writeLine("runquota session set: refused: " & error.msg &
+      (if detail.len > 0: " (" & detail & ")" else: ""))
+    1
 
 proc printInspection(subject: string; sessionId = sessionId(0)): int =
   var client = connectDefault()
@@ -894,6 +1058,9 @@ proc runThinApp*(programName: string): int =
         return runStats(programName, args[1 .. ^1])
       of "acquire":
         return runDebugAcquire(args[1 .. ^1])
+      of "session":
+        if args.len >= 2 and args[1] == "set":
+          return runSessionSet(args[2 .. ^1])
       of "config":
         # THE HOST BUDGET FILE: who writes it, and how a running daemon
         # learns it changed (reprobuild-specs/RunQuota-Host-Configuration.md).

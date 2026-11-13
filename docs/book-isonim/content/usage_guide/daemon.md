@@ -187,6 +187,7 @@ and that daemon admits only the pools its file and flags size.
 | `--pool NAME=UNITS` | none | An arbitrary named counter. Pins the value against a reload, and over what sessions declare. |
 | `--socket PATH` | the rendezvous socket | Where to listen. A path you name here is created on demand; the host-wide one never is. |
 | `--host-config PATH` | the host file above | The budget file read at start and on every reload. |
+| `--admission-max-wait-millis N` | `120000` | The starvation bound: a request queued this long is served before its user's other requests, and capacity is held for it. `0` turns the bound off. See [Admission control](/getting_started/concepts#admission-control). |
 | `--idle-exit-after SECONDS` | never | Exit (0, through the orderly shutdown) once no client connection has been open for `SECONDS`, counted from start-up or from the moment the last connection closed. A positive whole number; anything else is a usage error (exit 2). See [Exiting when idle](#exiting-when-idle). |
 
 Memory pressure:

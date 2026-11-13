@@ -7,7 +7,7 @@ export protocolTypes
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 2'u16
-const RqspProtocolMinor* = 2'u16
+const RqspProtocolMinor* = 3'u16
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -50,6 +50,14 @@ const RetirementMinor* = 2'u16
   ## this minor cannot be asked to make way at all; see
   ## reprobuild-specs/RunQuota-Host-Configuration.md, "A daemon from another
   ## build makes way".
+const SessionGroupsMinor* = 3'u16
+  ## The first daemon minor that understands session groups: the optional
+  ## trailing group block of `RegisterSession` and the `UpdateSessionGroup`
+  ## request. MINOR 3 ANNOUNCES BOTH, additively. An older daemon refuses a
+  ## `RegisterSession` that carries trailing bytes and closes the connection
+  ## on an unknown message kind, so a client sends neither below this minor
+  ## -- and its session then lands in the interactive group, which is
+  ## exactly where the older daemon's admission would have treated it.
 const RqspHeaderLen* = 24'u16
 const MaxCommandStatsIdBytes* = 64
 const FrameFlagRequest* = 0x0001'u16
@@ -260,11 +268,31 @@ proc decodeHelloOk*(payload: string; msg: var HelloOkMessage): bool =
   )
   true
 
+proc readSessionPriority(r: var BinaryReader;
+    priority: var SessionPriority): bool =
+  ## Bounded by THIS build's `high()`: a level a newer peer added is refused
+  ## rather than read as some other level.
+  var raw: uint32
+  if not r.readU32(raw): return false
+  if raw > uint32(ord(high(SessionPriority))): return false
+  priority = SessionPriority(int(raw))
+  true
+
 proc encodeRegisterSession*(msg: RegisterSessionMessage): string =
   var w = writer()
   w.writeString(msg.name)
   w.writeString(msg.version)
   w.writeMetadata(msg.metadata)
+  # THE GROUP BLOCK IS OMITTED, NOT EMPTY, WHEN THERE IS NO GROUP. The bytes
+  # are then exactly what a client from before session groups sends, which is
+  # what lets one sentence -- "no group means the interactive group" -- cover
+  # both, and what lets this encoder talk to an older daemon at all.
+  if msg.group.name.len > 0:
+    w.writeString(msg.group.name)
+    w.writeBool(msg.group.priorityPresent)
+    w.writeU32(uint32(ord(msg.group.priority)))
+    w.writeBool(msg.group.cacheDeadlinePresent)
+    w.writeU64(msg.group.cacheDeadlineUnixMillis)
   w.data
 
 proc decodeRegisterSession*(payload: string;
@@ -276,8 +304,68 @@ proc decodeRegisterSession*(payload: string;
   if not r.readString(name): return false
   if not r.readString(version): return false
   if not r.readMetadata(metadata): return false
+  var group = SessionGroupDeclaration(priority: sessionPriorityNormal)
+  if r.remaining != 0:
+    if not r.readString(group.name): return false
+    # A block that names no group is not something the encoder writes, so it
+    # is a malformed frame rather than a roundabout "no group".
+    if group.name.len == 0: return false
+    if not r.readBool(group.priorityPresent): return false
+    if not r.readSessionPriority(group.priority): return false
+    if not r.readBool(group.cacheDeadlinePresent): return false
+    if not r.readU64(group.cacheDeadlineUnixMillis): return false
   if r.remaining != 0: return false
-  msg = RegisterSessionMessage(name: name, version: version, metadata: metadata)
+  msg = RegisterSessionMessage(name: name, version: version, metadata: metadata,
+    group: group)
+  true
+
+proc encodeUpdateSessionGroup*(msg: UpdateSessionGroupMessage): string =
+  var w = writer()
+  w.writeString(msg.group)
+  w.writeBool(msg.priorityPresent)
+  w.writeU32(uint32(ord(msg.priority)))
+  w.writeU32(uint32(ord(msg.cacheDeadlineChange)))
+  w.writeU64(msg.cacheDeadlineUnixMillis)
+  w.data
+
+proc decodeUpdateSessionGroup*(payload: string;
+    msg: var UpdateSessionGroupMessage): bool =
+  var r = reader(payload)
+  var decoded: UpdateSessionGroupMessage
+  if not r.readString(decoded.group): return false
+  if not r.readBool(decoded.priorityPresent): return false
+  if not r.readSessionPriority(decoded.priority): return false
+  var change: uint32
+  if not r.readU32(change): return false
+  if change > uint32(ord(high(CacheDeadlineChange))): return false
+  decoded.cacheDeadlineChange = CacheDeadlineChange(int(change))
+  if not r.readU64(decoded.cacheDeadlineUnixMillis): return false
+  if r.remaining != 0: return false
+  msg = decoded
+  true
+
+proc encodeSessionGroupUpdated*(msg: SessionGroupUpdatedMessage): string =
+  var w = writer()
+  w.writeString(msg.group)
+  w.writeU64(msg.ownerUid)
+  w.writeU32(uint32(ord(msg.priority)))
+  w.writeBool(msg.cacheDeadlinePresent)
+  w.writeU64(msg.cacheDeadlineUnixMillis)
+  w.writeU32(msg.sessions)
+  w.data
+
+proc decodeSessionGroupUpdated*(payload: string;
+    msg: var SessionGroupUpdatedMessage): bool =
+  var r = reader(payload)
+  var decoded: SessionGroupUpdatedMessage
+  if not r.readString(decoded.group): return false
+  if not r.readU64(decoded.ownerUid): return false
+  if not r.readSessionPriority(decoded.priority): return false
+  if not r.readBool(decoded.cacheDeadlinePresent): return false
+  if not r.readU64(decoded.cacheDeadlineUnixMillis): return false
+  if not r.readU32(decoded.sessions): return false
+  if r.remaining != 0: return false
+  msg = decoded
   true
 
 proc encodeSessionRegistered*(msg: SessionRegisteredMessage): string =

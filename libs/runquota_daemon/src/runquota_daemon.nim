@@ -17,6 +17,7 @@ import runquota_daemon/reload_report
 import runquota_daemon/child_identity
 import runquota_daemon/parent_watch
 import runquota_daemon/socket_activation
+import runquota_admission
 import runquota_codec
 import runquota_core
 import runquota_core/process_owned
@@ -105,7 +106,8 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     ambientSampleIntervalMillis: defaultAmbientCadenceMillis,
     retentionPolicy: defaultRetentionPolicy(),
     retentionSweepIntervalMillis: defaultRetentionSweepIntervalMillis,
-    retentionMaxDeferredSweeps: defaultMaxDeferredSweeps
+    retentionMaxDeferredSweeps: defaultMaxDeferredSweeps,
+    admissionMaxWaitMillis: DefaultMaxWaitMillis
   )
 
 proc applyHostConfig*(config: var DaemonConfig; host: HostConfig) =
@@ -575,7 +577,6 @@ proc initDaemon*(config: DaemonConfig; deferCapture = false): RunQuotaDaemon =
     nextSessionId: 1'u64,
     nextLeaseId: 1'u64,
     nextQueueOrder: 1'u64,
-    lastGrantedSessionId: 0'u64,
     totalGranted: 0'u64,
     totalFinished: 0'u64,
     sessions: initTable[uint64, SessionRow](),
@@ -699,6 +700,88 @@ proc cpuShareGroupFor(daemon: RunQuotaDaemon;
   else:
     cpuShareGroup(groupId, machine.cpuSlots)
 
+proc monoMillis(): int64 =
+  ## Monotonic milliseconds: what queue waits are measured in. Never the wall
+  ## clock, which an NTP step can move backwards under a waiting request.
+  getMonoTime().ticks div 1_000_000
+
+proc elapsedSince(start: int64): uint64 =
+  let now = monoMillis()
+  if now > start: uint64(now - start) else: 0'u64
+
+proc ownerKeyOf(peer: PeerIdentity): string =
+  ## The owner as admission keys it: the owner id from peer credentials, or
+  ## `?` for a transport that reported none. Never the uid a client declared.
+  let owner = ownerIdOf(peer)
+  if owner.isSome: $owner.get else: "?"
+
+proc sessionGroupKey(peer: PeerIdentity; name: string): string =
+  ## A group is the pair (owner, name). The owner key holds no `/`, so the
+  ## first `/` separates the two whatever the name contains.
+  ownerKeyOf(peer) & "/" & name
+
+proc groupFor(daemon: RunQuotaDaemon; key: string): SessionGroupRow =
+  ## The group `key` names, or -- for a lease whose group has gone, or a
+  ## session row built without one -- the attributes of an interactive group,
+  ## which is what such work would have been placed in.
+  if key.len > 0 and daemon.sessionGroups.hasKey(key):
+    return daemon.sessionGroups[key]
+  SessionGroupRow(key: key, name: InteractiveSessionGroup,
+    priority: sessionPriorityHigh)
+
+proc joinSessionGroup(daemon: var RunQuotaDaemon; peer: PeerIdentity;
+                      declaration: SessionGroupDeclaration): string =
+  ## Place a new session in its group and return the group's key. The first
+  ## session of a group creates it with the attributes it declared; a session
+  ## joining an existing group leaves the attributes alone, because the
+  ## launcher may have changed them since the environment it inherited was
+  ## written (see `SessionGroupDeclaration`).
+  let name =
+    if declaration.name.len == 0: InteractiveSessionGroup
+    else: declaration.name
+  result = sessionGroupKey(peer, name)
+  if daemon.sessionGroups.hasKey(result):
+    inc daemon.sessionGroups[result].sessions
+    return
+  let owner = ownerIdOf(peer)
+  var group = SessionGroupRow(
+    key: result,
+    name: name,
+    ownerKnown: owner.isSome,
+    ownerUid: (if owner.isSome: owner.get else: 0'i64),
+    priority: sessionPriorityNormal,
+    sessions: 1)
+  if name == InteractiveSessionGroup:
+    # The group of a user at a terminal: high, and no cache to lose.
+    group.priority = sessionPriorityHigh
+  if declaration.name.len > 0:
+    if declaration.priorityPresent:
+      group.priority = declaration.priority
+    if declaration.cacheDeadlinePresent:
+      group.cacheDeadlinePresent = true
+      group.cacheDeadlineUnixMillis = declaration.cacheDeadlineUnixMillis
+  daemon.sessionGroups[result] = group
+
+proc leaveSessionGroup(daemon: var RunQuotaDaemon; key: string) =
+  ## A session closed, orderly or not. The group and everything it counted
+  ## go with its last session.
+  if key.len == 0 or not daemon.sessionGroups.hasKey(key):
+    return
+  dec daemon.sessionGroups[key].sessions
+  if daemon.sessionGroups[key].sessions <= 0:
+    daemon.sessionGroups.del(key)
+
+proc groupIsBusy(daemon: RunQuotaDaemon; key: string; excluding: uint64): bool =
+  ## Whether a lease of group `key` other than `excluding` is queued or holds
+  ## capacity.
+  for id, lease in daemon.leases.pairs:
+    if id != excluding and lease.groupKey == key and
+        (lease.state == leaseStateQueued or lease.state in
+          {leaseStateGranted, leaseStateStarting, leaseStateRunning,
+           leaseStateSupervisorLost}):
+      return true
+  false
+
 proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
                              add: bool) =
   # Maintains live aggregates so fitsNow/countActiveLeases/hasActiveBenchmark
@@ -743,6 +826,10 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
         if prevPool >= demand.units: prevPool - demand.units else: 0'u32
     if daemon.activeLeaseCount > 0'u32:
       dec daemon.activeLeaseCount
+    # What the group held, for how long, counted when it stops holding it.
+    if lease.groupKey.len > 0 and daemon.sessionGroups.hasKey(lease.groupKey):
+      daemon.sessionGroups[lease.groupKey].grantedCpuMilliMillis +=
+        uint64(cpuDelta) * elapsedSince(lease.grantedAtMillis)
     if lease.purpose == leasePurposeBenchmark and daemon.activeBenchmarkCount > 0'u32:
       dec daemon.activeBenchmarkCount
   # AMBIENT SAMPLING IS GATED ON THIS. The sampler writes no row over an
@@ -1129,9 +1216,76 @@ proc sessionsJson(daemon: RunQuotaDaemon): string =
     result.add("{" &
       "\"id\":" & $session.id.value & "," &
       "\"name\":" & jsonEscape(session.name) & "," &
-      "\"version\":" & jsonEscape(session.version) &
+      "\"version\":" & jsonEscape(session.version) & "," &
+      "\"session_group\":" &
+        jsonEscape(daemon.groupFor(session.groupKey).name) &
     "}")
   result.add("]}")
+
+proc sessionGroupsJson(daemon: RunQuotaDaemon): string =
+  ## Per-group grant, usage and wait counters, for `runquota status`.
+  ## INSPECTION OUTPUT ONLY: nothing reads it back, and it is not wire or
+  ## persistent state.
+  ##
+  ## "held" is what the group's granted leases reserve now; "granted
+  ## cpu-milli-seconds" integrates the reservations of leases that have
+  ## released theirs. Both are reservations: the daemon does not measure
+  ## process trees.
+  var keys: seq[string] = @[]
+  for key in daemon.sessionGroups.keys:
+    keys.add(key)
+  keys.sort()
+  let now = monoMillis()
+  result = "["
+  for i, key in keys:
+    let group = daemon.sessionGroups[key]
+    var queued = 0
+    var active = 0
+    var heldCpu = 0'u64
+    var heldMemory = 0'u64
+    var oldestWait = 0'i64
+    for lease in daemon.leases.values:
+      if lease.groupKey != key:
+        continue
+      if lease.state == leaseStateQueued:
+        inc queued
+        oldestWait = max(oldestWait, now - lease.queuedAtMillis)
+      elif lease.state.isResourceActive:
+        inc active
+        heldCpu += uint64(lease.resources.cpu.value)
+        heldMemory += lease.resources.memory.value
+    if i > 0:
+      result.add(",")
+    result.add("{" &
+      "\"name\":" & jsonEscape(group.name) & "," &
+      "\"owner_uid\":" &
+        (if group.ownerKnown: $group.ownerUid else: "null") & "," &
+      "\"priority\":" & jsonEscape(sessionPriorityName(group.priority)) & "," &
+      "\"cache_deadline_unix_millis\":" &
+        (if group.cacheDeadlinePresent: $group.cacheDeadlineUnixMillis
+         else: "null") & "," &
+      "\"sessions\":" & $max(0, group.sessions) & "," &
+      "\"queued_leases\":" & $queued & "," &
+      "\"active_leases\":" & $active & "," &
+      "\"held_cpu_milli\":" & $heldCpu & "," &
+      "\"held_memory_bytes\":" & $heldMemory & "," &
+      "\"grants_total\":" & $group.grantsTotal & "," &
+      "\"granted_cpu_milli_seconds\":" &
+        $(group.grantedCpuMilliMillis div 1000'u64) & "," &
+      "\"wait_total_millis\":" & $group.waitsTotalMillis & "," &
+      "\"wait_max_millis\":" & $group.waitMaxMillis & "," &
+      "\"oldest_queued_wait_millis\":" & $max(0'i64, oldestWait) &
+    "}")
+  result.add("]")
+
+proc statusJson(daemon: RunQuotaDaemon): string =
+  ## The `status` inspection subject: the wire status, as JSON, with the
+  ## session groups beside it.
+  var base = inspectionStatusJson(daemon.status())
+  base.setLen(base.len - 1)
+  base & ",\"admission_max_wait_millis\":" &
+    $daemon.config.admissionMaxWaitMillis &
+    ",\"session_groups\":" & daemon.sessionGroupsJson() & "}"
 
 proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
   var ids: seq[uint64] = @[]
@@ -1830,7 +1984,7 @@ proc inspectionJson(daemon: var RunQuotaDaemon;
   of "explain":
     daemon.leasesJson(request.sessionId)
   of "status":
-    inspectionStatusJson(daemon.status())
+    daemon.statusJson()
   of "estimates":
     daemon.estimatesJson()
   of "pressure":
@@ -1950,6 +2104,17 @@ proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
   inc daemon.nextLeaseId
   let queueOrder = daemon.nextQueueOrder
   inc daemon.nextQueueOrder
+  # THE GROUP'S PLACE IN ARRIVAL ORDER is taken by the first request it makes
+  # after having nothing queued or running, and kept while it stays busy.
+  # Every caller runs an admission pass before the daemon reads its next
+  # message, and one message comes from one session, so no two groups ever
+  # become busy within one admission pass: the order between groups is
+  # exactly the order in which they became busy, with no ties to break.
+  if session.groupKey.len > 0 and
+      daemon.sessionGroups.hasKey(session.groupKey) and
+      (daemon.sessionGroups[session.groupKey].busySince == 0'u64 or
+        not daemon.groupIsBusy(session.groupKey, high(uint64))):
+    daemon.sessionGroups[session.groupKey].busySince = queueOrder + 1'u64
   result = LeaseRow(
     id: id,
     sessionId: sessionId,
@@ -1974,7 +2139,9 @@ proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
     processCount: 0'u32,
     majorPageFaults: 0'u64,
     pressureEvents: 0'u32,
-    queueDiagnostic: okDiagnostic()
+    queueDiagnostic: okDiagnostic(),
+    groupKey: session.groupKey,
+    queuedAtMillis: monoMillis()
   )
   daemon.leases[id.value] = result
 
@@ -2513,25 +2680,45 @@ proc captureDeferredBatch(daemon: var RunQuotaDaemon;
 
 proc grantQueuedLease(daemon: var RunQuotaDaemon; id: uint64; delivered: bool) =
   var lease = daemon.leases[id]
+  lease.grantedAtMillis = monoMillis()
   daemon.transitionLeaseState(lease, leaseStateGranted)
   lease.delivered = delivered
   daemon.leases[id] = lease
-  daemon.lastGrantedSessionId = lease.sessionId.value
   inc daemon.totalGranted
+  if lease.groupKey.len > 0 and daemon.sessionGroups.hasKey(lease.groupKey):
+    let waited = elapsedSince(lease.queuedAtMillis)
+    inc daemon.sessionGroups[lease.groupKey].grantsTotal
+    daemon.sessionGroups[lease.groupKey].waitsTotalMillis += waited
+    if waited > daemon.sessionGroups[lease.groupKey].waitMaxMillis:
+      daemon.sessionGroups[lease.groupKey].waitMaxMillis = waited
 
-proc queuedSessionOrder(daemon: RunQuotaDaemon): seq[uint64] =
+proc pendingRequest(daemon: RunQuotaDaemon; lease: LeaseRow;
+                    now: int64): PendingRequest =
+  ## What the admission order needs to know about one queued lease.
+  let group = daemon.groupFor(lease.groupKey)
+  PendingRequest(
+    id: lease.id.value,
+    owner: ownerKeyOf(lease.peer),
+    groupPriority: group.priority,
+    cacheDeadlinePresent: group.cacheDeadlinePresent,
+    cacheDeadlineUnixMillis: group.cacheDeadlineUnixMillis,
+    # Zero for a lease whose group has gone or never existed: such leases
+    # then order among themselves by class and arrival, as one group would.
+    groupArrival: group.busySince,
+    localRank: priorityRank(lease.priority),
+    queueOrder: lease.queueOrder,
+    waitedMillis: max(0'i64, now - lease.queuedAtMillis))
+
+proc ownerLoads(daemon: RunQuotaDaemon): Table[string, OwnerLoad] =
+  ## What each owner's granted leases hold now, for dominant-resource
+  ## fairness between owners.
   for lease in daemon.leases.values:
-    if lease.state == leaseStateQueued and not result.contains(
-        lease.sessionId.value):
-      result.add(lease.sessionId.value)
-  result.sort()
-  if result.len <= 1 or daemon.lastGrantedSessionId == 0:
-    return
-  var cut = 0
-  while cut < result.len and result[cut] <= daemon.lastGrantedSessionId:
-    inc cut
-  if cut > 0 and cut < result.len:
-    result = result[cut .. ^1] & result[0 ..< cut]
+    if lease.state.isResourceActive:
+      let owner = ownerKeyOf(lease.peer)
+      var held = result.getOrDefault(owner, OwnerLoad())
+      held.cpuMilli += uint64(lease.resources.cpu.value)
+      held.memoryBytes += lease.resources.memory.value
+      result[owner] = held
 
 proc lostChildVerdict(lease: LeaseRow): ChildVerdict =
   ## Is anything the lost lease launched still consuming its reservation?
@@ -2584,33 +2771,47 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
     uint32)): seq[uint64] =
   # Before deciding what fits, stop counting what is no longer there.
   discard daemon.reapLostLeases()
+  # THE ORDER IS `runquota_admission`'s: fairness between owners, then
+  # within an owner's share the starvation bound, the session group's
+  # priority, its cache deadline and its arrival. Each request is tried once, in that
+  # order; one that does not fit is passed over for the next (backfill),
+  # unless it is held under the starvation bound -- then nothing behind it
+  # is granted in this pass, so the capacity that frees up is kept for it.
+  # Nothing already granted is ever revoked.
+  let now = monoMillis()
+  var pending: seq[PendingRequest] = @[]
+  for lease in daemon.leases.values:
+    if lease.state == leaseStateQueued:
+      pending.add(daemon.pendingRequest(lease, now))
+  var plan = planAdmission(pending, daemon.ownerLoads(), AdmissionPolicy(
+    maxWaitMillis: daemon.config.admissionMaxWaitMillis,
+    capacityCpuMilli: uint64(daemon.config.cpuSlots.value),
+    capacityMemoryBytes: daemon.config.memoryBytes.value))
   var promoted = 0'u32
-  var madeProgress = true
-  while madeProgress and promoted < maxDecisions:
-    madeProgress = false
-    let sessions = daemon.queuedSessionOrder()
-    for sessionIdValue in sessions:
-      if promoted >= maxDecisions:
-        break
-      var bestId = 0'u64
-      var bestPriority = high(int)
-      var bestOrder = high(uint64)
-      for id, lease in daemon.leases.pairs:
-        if lease.state == leaseStateQueued and lease.sessionId.value == sessionIdValue:
-          let rank = priorityRank(lease.priority)
-          if rank < bestPriority or (rank == bestPriority and lease.queueOrder < bestOrder):
-            var pressureDiagnostic: Diagnostic
-            if daemon.benchmarkGateAllows(lease) and
-                daemon.pressureAllows(lease.resources, pressureDiagnostic) and
-                daemon.fitsNow(lease.resources):
-              bestId = id
-              bestPriority = rank
-              bestOrder = lease.queueOrder
-      if bestId != 0'u64:
-        daemon.grantQueuedLease(bestId, false)
-        result.add(bestId)
-        inc promoted
-        madeProgress = true
+  var candidate: PendingRequest
+  while promoted < maxDecisions and plan.next(candidate):
+    let lease = daemon.leases[candidate.id]
+    var pressureDiagnostic: Diagnostic
+    if not daemon.benchmarkGateAllows(lease) or
+        not daemon.pressureAllows(lease.resources, pressureDiagnostic):
+      # Not held for. The benchmark gate stops every non-benchmark request
+      # alike, and the queued benchmark it waits for may be behind this one
+      # in the order and needs this pass to reach it. Memory pressure (or a
+      # required pressure signal that is missing) is not cured by capacity
+      # freeing up, so holding capacity for it would stall the whole queue
+      # on a condition no grant can change.
+      continue
+    if daemon.fitsNow(lease.resources):
+      daemon.grantQueuedLease(candidate.id, false)
+      plan.noteGranted(candidate.owner, uint64(lease.resources.cpu.value),
+        lease.resources.memory.value)
+      result.add(candidate.id)
+      inc promoted
+    elif candidate.starved:
+      # HELD FOR: it waits only for capacity, so nothing behind it is granted
+      # in this pass, and the slots that free up accumulate until it fits
+      # instead of going to a request that arrived later.
+      break
   for id, lease in daemon.leases.pairs:
     if lease.state == leaseStateQueued:
       var updated = lease
@@ -2773,6 +2974,72 @@ proc reloadHostConfig*(daemon: var RunQuotaDaemon): HostConfigReloadedMessage =
     memoryInUse: usage.memory,
     cpuInUse: usage.cpu)
 
+proc updateSessionGroup*(daemon: var RunQuotaDaemon; peer: PeerIdentity;
+                         msg: UpdateSessionGroupMessage;
+                         answer: var SessionGroupUpdatedMessage;
+                         refusal: var Diagnostic): bool =
+  ## `UpdateSessionGroup`: change the priority or cache deadline of a group the
+  ## CALLER owns. The caller is `peer`, from the connection's credentials; the
+  ## message names only the group, so it cannot claim somebody else's.
+  ##
+  ## A REFUSAL CHANGES NOTHING. Every check runs before any field is written.
+  ## A connection with no credentials owns nothing; a name that only another
+  ## owner's group carries is refused as that owner's, and the group keeps its
+  ## attributes.
+  if ownerIdOf(peer).isNone:
+    refusal = diagnostic(diagDenied,
+      "session group " & msg.group & " cannot be updated: this connection " &
+        "carries no peer credentials",
+      "a group's attributes are changed only by its owner, read from peer " &
+        "credentials")
+    return false
+  let key = sessionGroupKey(peer, msg.group)
+  if not daemon.sessionGroups.hasKey(key):
+    var ownedElsewhere = false
+    for group in daemon.sessionGroups.values:
+      if group.name == msg.group:
+        ownedElsewhere = true
+    if ownedElsewhere:
+      refusal = diagnostic(diagDenied,
+        "session group " & msg.group & " belongs to another user",
+        "a group's attributes are changed only by its owner (uid from peer " &
+          "credentials); this connection's owner is " & ownerKeyOf(peer))
+    else:
+      refusal = diagnostic(diagInvalidArgument,
+        "no open session names session group " & msg.group,
+        "a group exists while a session of its owner names it")
+    return false
+  if msg.cacheDeadlineChange == cacheDeadlineSet and
+      msg.cacheDeadlineUnixMillis == 0'u64:
+    refusal = diagnostic(diagInvalidArgument,
+      "a cache deadline must be a time after the Unix epoch",
+      "clear the deadline instead of setting it to 0")
+    return false
+  var group = daemon.sessionGroups[key]
+  if msg.priorityPresent:
+    group.priority = msg.priority
+  case msg.cacheDeadlineChange
+  of cacheDeadlineKeep:
+    discard
+  of cacheDeadlineSet:
+    group.cacheDeadlinePresent = true
+    group.cacheDeadlineUnixMillis = msg.cacheDeadlineUnixMillis
+  of cacheDeadlineClear:
+    group.cacheDeadlinePresent = false
+    group.cacheDeadlineUnixMillis = 0'u64
+  daemon.sessionGroups[key] = group
+  # A new order can change which queued request is tried first; nothing new
+  # fits because of it, but whatever does fit is granted in the new order.
+  discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
+  answer = SessionGroupUpdatedMessage(
+    group: group.name,
+    ownerUid: uint64(group.ownerUid),
+    priority: group.priority,
+    cacheDeadlinePresent: group.cacheDeadlinePresent,
+    cacheDeadlineUnixMillis: group.cacheDeadlineUnixMillis,
+    sessions: uint32(max(0, group.sessions)))
+  true
+
 proc grantNextDecisions*(daemon: var RunQuotaDaemon;
                          sessionId: SessionId): seq[LeaseDecision] =
   ## What a `GrantNext` from `sessionId` is answered with. Denials a reload
@@ -2851,6 +3118,7 @@ proc cleanupLostSession(daemon: var RunQuotaDaemon; sessionId: SessionId) =
   # why it is reaped here rather than bounded by a timeout somewhere.
   daemon.reapSessionSelfReports(sessionId)
   daemon.pendingDenials.del(sessionId.value)
+  daemon.leaveSessionGroup(daemon.sessions[sessionId.value].groupKey)
   daemon.sessions.del(sessionId.value)
   daemon.forgetSessionPools(sessionId)
   discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
@@ -3151,15 +3419,24 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
           "invalid RegisterSession payload"))
       return
+    if msg.group.name.len > 0:
+      let problem = sessionGroupNameProblem(msg.group.name)
+      if problem.len > 0:
+        connection.sendError(frame.header.requestId, diagnostic(
+          diagInvalidArgument, "invalid session group: " & problem,
+          "the group comes from RUNQUOTA_SESSION"))
+        return
     let id = sessionId(daemon.nextSessionId)
     inc daemon.nextSessionId
+    let groupKey = daemon.joinSessionGroup(context.peer, msg.group)
     daemon.sessions[id.value] = SessionRow(
       id: id,
       name: msg.name,
       version: msg.version,
       supervisorProcessId: context.supervisorProcessId,
       supervisorUserId: context.supervisorUserId,
-      peer: context.peer
+      peer: context.peer,
+      groupKey: groupKey
     )
     context.sessionIds.add(id)
     daemon.openObservationRun(daemon.sessions[id.value])
@@ -3187,6 +3464,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     # did not end goes with it, by the same key the crash path uses.
     daemon.reapSessionSelfReports(msg.sessionId)
     daemon.pendingDenials.del(msg.sessionId.value)
+    daemon.leaveSessionGroup(daemon.sessions[msg.sessionId.value].groupKey)
     daemon.sessions.del(msg.sessionId.value)
     daemon.forgetSessionPools(msg.sessionId)
     connection.sendResponse(
@@ -3606,6 +3884,19 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
         return
     connection.sendResponse(rqPoolsDeclared, frame.header.requestId,
         encodePoolsDeclared(daemon.declarePools(msg.sessionId, msg.pools)))
+  of rqUpdateSessionGroup:
+    var msg: UpdateSessionGroupMessage
+    if not decodeUpdateSessionGroup(frame.payload, msg):
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "invalid UpdateSessionGroup payload"))
+      return
+    var answer: SessionGroupUpdatedMessage
+    var refusal: Diagnostic
+    if daemon.updateSessionGroup(context.peer, msg, answer, refusal):
+      connection.sendResponse(rqSessionGroupUpdated, frame.header.requestId,
+          encodeSessionGroupUpdated(answer))
+    else:
+      connection.sendError(frame.header.requestId, refusal)
   of rqStatsQuery:
     # THE READ PATH, OVER THE SOCKET. Request/response with a variable-size
     # result, which is why it is here and not on the observation ring: the

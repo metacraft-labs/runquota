@@ -63,6 +63,15 @@ type
       ## `HelloOk` reports protocol minor >= `RetirementMinor`, for the reason
       ## `rqDeclarePools` gives.
     rqDaemonRetirement = 38
+    rqUpdateSessionGroup = 39
+      ## Change a session group's priority or cache deadline while it runs.
+      ## Accepted from any connection whose peer credentials name the group's
+      ## owner, with or without a session of its own, so a launcher that holds
+      ## no lease can keep its group's attributes current; refused for a group
+      ## another owner holds. Sent only to a daemon whose `HelloOk` reports
+      ## protocol minor >= `SessionGroupsMinor`, for the reason
+      ## `rqDeclarePools` gives.
+    rqSessionGroupUpdated = 40
 
   MessageKind* = RqspMessageKind
 
@@ -101,10 +110,36 @@ type
     capabilities*: CapabilityRecord
     flow*: FlowControlLimits
 
+  SessionGroupDeclaration* = object
+    ## The session group a session joins, and the attributes the group
+    ## starts with if this session is the one that creates it.
+    ##
+    ## AN EMPTY ``name`` MEANS "NO GROUP": the daemon places the session in
+    ## its owner's ``interactive`` group and ignores the attributes. It is
+    ## also what an older client says by sending nothing, so the two cannot
+    ## mean different things.
+    ##
+    ## THE ATTRIBUTES ARE INITIAL VALUES ONLY. A group outlives any one of its
+    ## sessions, and a launcher changes its attributes with
+    ## ``UpdateSessionGroup``; every process below the launcher still carries
+    ## the launcher's START-UP environment, so a session that joins an
+    ## existing group must not reset what the launcher has since set.
+    name*: string
+    priorityPresent*: bool
+    priority*: SessionPriority
+    cacheDeadlinePresent*: bool
+    cacheDeadlineUnixMillis*: uint64
+      ## Absolute UTC time, milliseconds since the Unix epoch, at which the
+      ## group's provider prompt cache expires if it keeps waiting.
+
   RegisterSessionMessage* = object
     name*: string
     version*: string
     metadata*: DynamicMetadata
+    group*: SessionGroupDeclaration
+      ## Travels as an OPTIONAL TRAILING BLOCK, written only when ``name`` is
+      ## not empty and only to a daemon at ``SessionGroupsMinor`` or above:
+      ## an older daemon refuses a RegisterSession with trailing bytes.
 
   SessionRegisteredMessage* = object
     sessionId*: SessionId
@@ -388,6 +423,36 @@ type
       ## Client connections open besides the requester's own. The daemon
       ## exits when the requester disconnects if this is 0.
     detail*: string
+
+  CacheDeadlineChange* = enum
+    ## What an ``UpdateSessionGroup`` does to the group's cache deadline. A
+    ## separate "clear" rather than a zero sentinel: a session whose cache
+    ## has gone cold has NO deadline, which sorts after every deadline, and
+    ## that is a different statement from "the deadline is the epoch".
+    cacheDeadlineKeep = 0
+    cacheDeadlineSet = 1
+    cacheDeadlineClear = 2
+
+  UpdateSessionGroupMessage* = object
+    ## `rqUpdateSessionGroup`. ``group`` names a group of the CALLER's owner
+    ## uid; the uid is read from peer credentials and is not in the message.
+    group*: string
+    priorityPresent*: bool
+    priority*: SessionPriority
+    cacheDeadlineChange*: CacheDeadlineChange
+    cacheDeadlineUnixMillis*: uint64
+      ## Meaningful only with ``cacheDeadlineSet``.
+
+  SessionGroupUpdatedMessage* = object
+    ## The answer to `rqUpdateSessionGroup`: the attributes now in force. A
+    ## refusal is an ``rqError`` instead, and changes nothing.
+    group*: string
+    ownerUid*: uint64
+    priority*: SessionPriority
+    cacheDeadlinePresent*: bool
+    cacheDeadlineUnixMillis*: uint64
+    sessions*: uint32
+      ## Open sessions that name the group.
 
   HostConfigReloadedMessage* = object
     ## The budget in force after a `ReloadHostConfig`. A file that does not

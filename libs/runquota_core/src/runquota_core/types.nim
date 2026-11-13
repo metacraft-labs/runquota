@@ -43,6 +43,24 @@ type
     leasePurposeWork
     leasePurposeBenchmark
 
+  SessionPriority* = enum
+    ## The priority of a SESSION GROUP: every RunQuota session started under
+    ## one agent session (or one user's terminal) belongs to one group, and
+    ## the group's launcher sets this level while it runs.
+    ##
+    ## NOT ``PriorityClass``. That one ranks the requests of ONE invocation
+    ## against each other (a build's critical-path link before its tests);
+    ## this one ranks whole groups against each other on a shared host. The
+    ## two never compare: admission orders groups by this level first, and
+    ## only within a group does a request's own class matter.
+    ##
+    ## THE ORDINALS ARE THE WIRE VALUES AND THE ORDER, lowest first, so
+    ## ``a > b`` reads "a goes first". Never reorder or renumber them.
+    sessionPriorityLow = 0
+    sessionPriorityNormal = 1
+    sessionPriorityHigh = 2
+    sessionPriorityUrgent = 3
+
   DeadlineKind* = enum
     deadlineNone
     deadlineTimeout

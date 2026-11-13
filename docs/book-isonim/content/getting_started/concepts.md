@@ -40,6 +40,33 @@ was already running is held as `supervisor_lost` until that child is gone
 orphaned child may still be using its reservation. Sessions are what make a
 crashed build tool a recoverable event rather than a permanently leaked budget.
 
+## Session group
+
+Every session belongs to a **session group**: everything started under one
+agent session, or one user's terminal. A launcher names the group by exporting
+`RUNQUOTA_SESSION` (an agent session's handle, `<host>:<window>`), and every
+RunQuota client below it sends that name when it registers its session. A
+client that names no group — including every client from before groups existed
+— joins its user's `interactive` group.
+
+A group carries two attributes that its launcher sets and may change while it
+runs:
+
+| Attribute | Values | Default |
+|---|---|---|
+| `priority` | `urgent`, `high`, `normal`, `low` | `normal`; the `interactive` group is `high` |
+| `cache_deadline` | a UTC time, or none | none |
+
+The cache deadline is when the session's provider prompt cache expires if it
+keeps waiting. The launcher passes the starting values as
+`RUNQUOTA_SESSION_PRIORITY` and `RUNQUOTA_SESSION_CACHE_TTL` (seconds); the
+first session of a group creates it with them, and later sessions join it
+without resetting what the launcher has changed since. `runquota session set`
+changes them. A group belongs to the user whose connection created it (the uid
+the kernel reports, never one a client declares): only that user can change
+its attributes, and two users who use the same name have two groups. A group
+is forgotten when its last session closes.
+
 ## Resource vector
 
 What a lease asks for:
@@ -81,6 +108,30 @@ host`), from a fixed file for reproducible tests (`deterministic-file`), or not
 at all (`unavailable`). Pressure is reported as *low*, *warning*, *critical* or
 *unavailable*. `--memory-pressure-required` makes an unavailable reading a
 refusal rather than something to shrug at.
+
+When several sessions want more than is free, the daemon tries the queued
+requests in this order:
+
+1. **Between users,** the user whose granted leases hold the smallest share of
+   the host (the larger of its CPU and memory share) goes first. A user can
+   borrow what nobody else wants; nothing granted is taken back. Between users
+   with equal shares, the one whose group became busy first goes first: a
+   user's group attributes rank only that user's own requests.
+2. **Within one user, the starvation bound.** A request that has waited longer
+   than `--admission-max-wait-millis` (default two minutes, below the shortest
+   prompt-cache lifetime) goes before that user's other requests, oldest
+   first, and the capacity that frees up is held for it rather than handed to
+   a request behind it.
+3. **Then** the group with the higher priority goes first, then the one whose
+   cache deadline is earliest (a group with none goes after every group with
+   one), then the group that became busy first. Inside one group, a request's
+   own priority class and then its arrival decide.
+
+This is first come first served, not an equal split: a build that arrived
+first may take the whole machine, and the next one waits for the slots it
+frees. A request that does not fit is passed over for one behind it that does
+(backfill), unless it is held under the starvation bound. No lease is ever
+revoked.
 
 ## Estimate
 

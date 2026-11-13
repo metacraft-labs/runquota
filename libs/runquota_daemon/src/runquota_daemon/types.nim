@@ -181,6 +181,11 @@ type
     socketActivation*: SocketActivation
       ## Set by `runquotad` from `takeSocketActivation` at start. See
       ## `runquota_daemon/socket_activation`.
+    admissionMaxWaitMillis*: int64
+      ## The starvation bound (`runquotad --admission-max-wait-millis`): a
+      ## queued request that has waited this long without being granted goes
+      ## before its owner's other requests, and capacity is held for it. Zero
+      ## or negative turns the bound off. Default `DefaultMaxWaitMillis` (120 s).
 
   SessionRow* = object
     id*: SessionId
@@ -189,6 +194,50 @@ type
     supervisorProcessId*: uint64
     supervisorUserId*: uint64
     peer*: PeerIdentity
+    groupKey*: string
+      ## The key of the session group this session joined
+      ## (`sessionGroupKey`). Empty for a row built without one, which
+      ## admission treats as an interactive group of its own.
+
+  SessionGroupRow* = object
+    ## A session group: every session that named it (or, for the per-user
+    ## `interactive` group, every session of one owner that named none).
+    ##
+    ## A GROUP BELONGS TO ITS OWNER. The key is the owner, read from peer
+    ## credentials, together with the name, so two users who use the same
+    ## name have two groups, and only the owner's connections may change a
+    ## group's attributes.
+    ##
+    ## IT LIVES AS LONG AS A SESSION NAMES IT. The attributes and the counters
+    ## are forgotten when the last such session closes.
+    key*: string
+    name*: string
+    ownerKnown*: bool
+    ownerUid*: int64
+      ## Meaningful when `ownerKnown`; a transport that reports no credentials
+      ## leaves the owner unknown, and nobody may then update the group.
+    priority*: SessionPriority
+    cacheDeadlinePresent*: bool
+    cacheDeadlineUnixMillis*: uint64
+    sessions*: int
+      ## Open sessions that name the group.
+    busySince*: uint64
+      ## One past the queue position of the request with which the group last
+      ## became busy (had a lease queued or holding capacity after having
+      ## none); its place in arrival order. Zero until its first request. It
+      ## is not cleared when the group goes idle: the group's next request
+      ## finds it idle and takes a new place then.
+    grantsTotal*: uint64
+      ## Leases granted to the group since it was created.
+    grantedCpuMilliMillis*: uint64
+      ## The CPU the group's leases held, integrated over the time they held
+      ## it (milli-CPU x milliseconds), for leases that have released it.
+      ## Reservations, not measurement: the daemon does not watch process
+      ## trees.
+    waitsTotalMillis*: uint64
+    waitMaxMillis*: uint64
+      ## How long the group's granted leases had been queued: the total and
+      ## the longest single wait.
 
   LeaseRow* = object
     id*: LeaseId
@@ -222,6 +271,15 @@ type
     majorPageFaults*: uint64
     pressureEvents*: uint32
     queueDiagnostic*: Diagnostic
+    groupKey*: string
+      ## The session group of the session that made the request, copied at
+      ## request time: a lease whose supervisor was lost outlives its session
+      ## and still holds capacity on that group's behalf.
+    queuedAtMillis*: int64
+    grantedAtMillis*: int64
+      ## Monotonic milliseconds (`monoMillis`) at which the request was queued
+      ## and granted; what the starvation bound and the group counters are
+      ## measured from.
     startedAtUnixMillis*: int64
       ## When the client reported the lease as starting. Observation only:
       ## the daemon does not watch the process tree, so this is the lease
@@ -266,10 +324,11 @@ type
     nextSessionId*: uint64
     nextLeaseId*: uint64
     nextQueueOrder*: uint64
-    lastGrantedSessionId*: uint64
     totalGranted*: uint64
     totalFinished*: uint64
     sessions*: Table[uint64, SessionRow]
+    sessionGroups*: Table[string, SessionGroupRow]
+      ## Open session groups by `sessionGroupKey`.
     leases*: Table[uint64, LeaseRow]
     estimates*: Table[string, LearnedEstimateRow]
     estimateStore*: EstimateStore

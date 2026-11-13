@@ -30,6 +30,21 @@ Every variable RunQuota's binaries read. Anything not on this list is not read.
 | `RUNQUOTA_STATS_TABLE` | Exactly the value `off` disables the table — on the publisher and on every reader. Any other value is ignored. Everything still works; estimate lookups go over the socket instead. |
 | `RUNQUOTA_STATS_TABLE_PATH` | Overrides the segment path. |
 
+## Session groups
+
+Read by every RunQuota client when it registers a session. A launcher (an
+agent session's starter) exports them; see
+[Session group](/getting_started/concepts#session-group).
+
+| Variable | Meaning |
+|---|---|
+| `RUNQUOTA_SESSION` | The session group to join, at most 128 bytes with no control characters (an invalid name is an error). Unset or empty: the user's `interactive` group. |
+| `RUNQUOTA_SESSION_PRIORITY` | `urgent`, `high`, `normal` or `low`: the group's priority if this session creates it. Any other value is ignored. |
+| `RUNQUOTA_SESSION_CACHE_TTL` | Whole seconds until the group's prompt cache expires: its cache deadline, if this session creates it. Any other value is ignored. |
+
+The two attributes are starting values only: a session that joins an existing
+group does not reset them.
+
 ## Client behaviour
 
 | Variable | Default | Meaning |

@@ -1,4 +1,4 @@
-import std/[options, os, tables, strutils, monotimes]
+import std/[options, os, tables, strutils, monotimes, times]
 
 import runquota_client/types as clientTypes
 import runquota_client/standalone as clientStandalone
@@ -199,10 +199,75 @@ proc close*(client: var RunQuotaClient) =
     client.connection.close()
   client.state = csClosed
 
-proc registerSession*(client: var RunQuotaClient; name,
-    version: string): RunQuotaSession =
-  let msg = RegisterSessionMessage(name: name, version: version,
+const
+  SessionGroupEnvVar* = "RUNQUOTA_SESSION"
+    ## The session group this process's sessions join: the handle
+    ## `<host>:<window>` of the agent session it runs under, exported
+    ## by the launcher. Unset or empty: the user's `interactive` group.
+  SessionPriorityEnvVar* = "RUNQUOTA_SESSION_PRIORITY"
+    ## `urgent`, `high`, `normal` or `low`: the group's priority if this
+    ## session is the one that creates it.
+  SessionCacheTtlEnvVar* = "RUNQUOTA_SESSION_CACHE_TTL"
+    ## Seconds until the group's provider prompt cache expires: the group's
+    ## cache deadline (now + TTL) if this session creates it.
+
+proc supportsSessionGroups*(client: RunQuotaClient): bool =
+  ## Whether the daemon understands session groups: its `HelloOk` reported
+  ## protocol minor `SessionGroupsMinor` or later. An older daemon refuses a
+  ## `RegisterSession` that names a group and closes the connection on
+  ## `UpdateSessionGroup`.
+  client.capabilities.protocolMinor >= SessionGroupsMinor
+
+proc sessionGroupFromEnvironment*(): SessionGroupDeclaration =
+  ## The group the launcher exported, read from `RUNQUOTA_SESSION`,
+  ## `RUNQUOTA_SESSION_PRIORITY` and `RUNQUOTA_SESSION_CACHE_TTL`.
+  ##
+  ## A PRIORITY OR TTL THAT DOES NOT PARSE IS IGNORED, and the daemon's
+  ## default applies. Every RunQuota client below a launcher reads these, and
+  ## failing every one of them over an attribute would stop the session's
+  ## builds over what is only a scheduling preference; a group NAME that
+  ## cannot be one is different (it would merge or split sessions), and
+  ## `registerSession` refuses it.
+  result.priority = sessionPriorityNormal
+  result.name = getEnv(SessionGroupEnvVar)
+  if result.name.len == 0:
+    return
+  var priority: SessionPriority
+  if parseSessionPriority(getEnv(SessionPriorityEnvVar).strip(), priority):
+    result.priorityPresent = true
+    result.priority = priority
+  let ttlText = getEnv(SessionCacheTtlEnvVar).strip()
+  if ttlText.len > 0:
+    try:
+      let ttlSeconds = parseBiggestUInt(ttlText)
+      # Bounded so the deadline stays representable; a TTL of a million
+      # years is not a cache deadline anybody means.
+      if ttlSeconds <= 1_000_000_000'u64:
+        result.cacheDeadlinePresent = true
+        result.cacheDeadlineUnixMillis =
+          uint64(epochTime() * 1000.0) + uint64(ttlSeconds) * 1000'u64
+    except ValueError:
+      discard
+
+proc registerSession*(client: var RunQuotaClient; name, version: string;
+                      group: SessionGroupDeclaration): RunQuotaSession =
+  ## Register a session in `group` (`sessionGroupFromEnvironment` for the one
+  ## the launcher exported; a declaration with an empty name for the user's
+  ## interactive group).
+  ##
+  ## A DAEMON THAT PREDATES SESSION GROUPS IS SENT NONE. It would refuse the
+  ## registration, and its admission has no groups to put the session in;
+  ## the session is served as that daemon serves every session.
+  if group.name.len > 0:
+    let problem = sessionGroupNameProblem(group.name)
+    if problem.len > 0:
+      client.lastDiagnostic = diagnostic(diagInvalidArgument,
+        "invalid session group " & SessionGroupEnvVar & ": " & problem)
+      raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  var msg = RegisterSessionMessage(name: name, version: version,
       metadata: metadataNone())
+  if client.supportsSessionGroups():
+    msg.group = group
   let requestId = client.requestFrame(rqRegisterSession, encodeRegisterSession(msg), handshakeTimeoutMs())
   let frame = client.readResponse(requestId, handshakeTimeoutMs())
   if frame.header.messageKind != rqSessionRegistered:
@@ -213,6 +278,38 @@ proc registerSession*(client: var RunQuotaClient; name,
     client.lastDiagnostic = diagnostic(diagProtocol, "invalid SessionRegistered payload")
     raise newException(RunQuotaClientError, client.lastDiagnostic.message)
   RunQuotaSession(client: addr client, id: registered.sessionId, active: true)
+
+proc registerSession*(client: var RunQuotaClient; name,
+    version: string): RunQuotaSession =
+  ## Register a session in the group the launcher exported
+  ## (`RUNQUOTA_SESSION`), or the user's interactive group when it exported
+  ## none.
+  client.registerSession(name, version, sessionGroupFromEnvironment())
+
+proc updateSessionGroup*(client: var RunQuotaClient;
+                         update: UpdateSessionGroupMessage):
+    SessionGroupUpdatedMessage =
+  ## Change the priority or cache deadline of a session group this process's
+  ## user owns. Needs no session: a launcher that holds no lease may call it.
+  ## Raises `RunQuotaClientError` when the daemon refuses (another user's
+  ## group, or no open session names it) or predates session groups.
+  if not client.supportsSessionGroups():
+    client.lastDiagnostic = diagnostic(diagUnavailable,
+      "the daemon (" & client.daemonVersion & ", protocol minor " &
+        $client.capabilities.protocolMinor & ") predates session groups",
+      "session groups need protocol minor " & $SessionGroupsMinor)
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  let requestId = client.requestFrame(rqUpdateSessionGroup,
+    encodeUpdateSessionGroup(update), handshakeTimeoutMs())
+  let frame = client.readResponse(requestId, handshakeTimeoutMs())
+  if frame.header.messageKind != rqSessionGroupUpdated:
+    client.lastDiagnostic = diagnostic(diagProtocol,
+      "daemon did not answer UpdateSessionGroup")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  if not decodeSessionGroupUpdated(frame.payload, result):
+    client.lastDiagnostic = diagnostic(diagProtocol,
+      "invalid SessionGroupUpdated payload")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
 
 proc closeSession*(session: var RunQuotaSession) =
   if not session.active:
