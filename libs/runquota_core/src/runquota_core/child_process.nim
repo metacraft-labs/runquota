@@ -127,6 +127,102 @@ when defined(posix):
     except Defect:
       discard
 
+  when defined(runquotaChildProcessFaults):
+    # TEST-ONLY FAULT INJECTION, compiled in only under
+    # `-d:runquotaChildProcessFaults` (which a test sets through its own
+    # `.nims`); the production build has none of this. The failures it stands
+    # in for -- `poll` refusing to allocate its table, a read on a pipe
+    # failing -- have no way to be provoked from outside the process, and
+    # they are exactly the paths where an untested helper left a child
+    # blocked and unreaped. Single-threaded use only.
+    type ChildProcessFaultSite* = enum
+      faultPoll  ## the next ``poll`` fails with the injected errno
+      faultRead  ## the next ``read`` of an output pipe fails with it
+
+    type PendingFault = object
+      code: cint
+      times: int
+
+    var pendingFaults: array[ChildProcessFaultSite, array[8, PendingFault]]
+    var pendingFaultCounts: array[ChildProcessFaultSite, int]
+
+    proc injectChildProcessFault*(site: ChildProcessFaultSite; code: cint;
+                                  times = 1) =
+      ## Queue ``times`` consecutive failures with errno ``code`` at ``site``,
+      ## after any already queued there.
+      doAssert times > 0
+      doAssert pendingFaultCounts[site] < pendingFaults[site].len
+      pendingFaults[site][pendingFaultCounts[site]] =
+        PendingFault(code: code, times: times)
+      inc pendingFaultCounts[site]
+
+    proc clearChildProcessFaults*() =
+      ## Drop every queued failure, so one test case cannot inherit another's.
+      for site in ChildProcessFaultSite:
+        pendingFaultCounts[site] = 0
+
+    proc takeFault(site: ChildProcessFaultSite): cint =
+      if pendingFaultCounts[site] == 0:
+        return 0
+      result = pendingFaults[site][0].code
+      dec pendingFaults[site][0].times
+      if pendingFaults[site][0].times == 0:
+        for i in 1 ..< pendingFaultCounts[site]:
+          pendingFaults[site][i - 1] = pendingFaults[site][i]
+        dec pendingFaultCounts[site]
+
+  proc pollPipes(fds: ptr TPollfd; count: Tnfds): cint =
+    ## ``poll(2)`` with no timeout.
+    when defined(runquotaChildProcessFaults):
+      let code = takeFault(faultPoll)
+      if code != 0:
+        errno = code
+        return -1
+    poll(fds, count, -1)
+
+  proc readPipe(fd: cint; buffer: pointer; size: int): int =
+    ## ``read(2)`` of an output pipe.
+    when defined(runquotaChildProcessFaults):
+      let code = takeFault(faultRead)
+      if code != 0:
+        errno = code
+        return -1
+    read(fd, buffer, size)
+
+  const PollRetryMillis = 1
+    ## How long to wait before asking ``poll`` again after a transient
+    ## allocation failure.
+  const PollRetryLimit = 1000
+    ## How many transient ``poll`` failures IN A ROW are retried before the
+    ## exchange is abandoned as if the failure were permanent: at least a
+    ## second of waiting. Unbounded, a failure that never clears would spin
+    ## the calling thread forever while the child stayed blocked on a full
+    ## pipe -- the hang this retry exists to avoid, only slower.
+
+  when defined(runquotaChildProcessFaults):
+    proc childProcessPollRetryLimit*(): int =
+      ## ``PollRetryLimit``, for the test that drives the retry past it.
+      PollRetryLimit
+
+  proc abandonChild(process: Process; drained: var bool) =
+    ## Stop a child whose output pipes we are no longer reading, so that it
+    ## can be waited for.
+    ##
+    ## Once a pipe is abandoned before end of input -- ``poll`` itself failed,
+    ## or a read on the pipe did -- nothing reads it any more, and a child
+    ## that keeps writing blocks on it forever. ``Process.close`` does not
+    ## wait, so such a child would also stay in the process table for the
+    ## life of the daemon. Killing it makes the wait in ``runCapturedProcess``
+    ## certain to return, and the wait reaps it. Killing a child that has
+    ## already exited is harmless: it stays a zombie until that wait.
+    try:
+      process.kill()
+    except CatchableError:
+      discard
+    except Defect:
+      discard
+    drained = true
+
   proc readReady(fd: cint; chunk: var string; sink: var string;
                  open: var bool; failure: var string; readError: var bool) =
     ## One ``read(2)`` on a descriptor ``poll`` reported ready, so it does
@@ -134,7 +230,7 @@ when defined(posix):
     ## reason ``readToEnd`` gives -- and only that, or an error, closes the
     ## stream. A hang-up with data still buffered is reported as readable
     ## too, so the data is read before the zero-byte read that follows it.
-    let count = read(fd, addr chunk[0], chunk.len)
+    let count = readPipe(fd, addr chunk[0], chunk.len)
     if count > 0:
       let start = sink.len
       sink.setLen(start + count)
@@ -155,8 +251,9 @@ when defined(posix):
     ## Feed ``input`` to the child and read both of its output pipes until
     ## each reports end of input, all from the calling thread. Returns why
     ## the exchange failed, or "" when it did not. ``drained`` says whether
-    ## every output pipe reached end of input, so the child can no longer
-    ## block on one and waiting for it to exit cannot hang.
+    ## waiting for the child is now certain to return: every output pipe
+    ## reached end of input, or the exchange was abandoned and the child
+    ## killed (``abandonChild``). It is false only when this proc raised.
     ##
     ## Deadlock-free for the same reason the drain threads were: no stream
     ## is ever waited on while another one is full. ``poll`` reports whichever
@@ -185,6 +282,7 @@ when defined(posix):
     var errorOpen = not merged
     var written = 0
     var readError = false
+    var pollRetries = 0
     drained = false
 
     if inputOpen:
@@ -215,15 +313,26 @@ when defined(posix):
         errorSlot = count
         inc count
 
-      if poll(addr fds[0], Tnfds(count), -1) < 0:
+      if pollPipes(addr fds[0], Tnfds(count)) < 0:
         let code = errno
         if code == EINTR:
+          continue
+        # The kernel could not allocate poll's table this time (`EAGAIN` in
+        # POSIX, `ENOMEM` on Linux); a later call may succeed, so wait a
+        # moment and ask again rather than abandon a child that may already
+        # be blocked on a full pipe -- up to `PollRetryLimit` times in a row.
+        # https://pubs.opengroup.org/onlinepubs/9799919799/functions/poll.html
+        if (code == EAGAIN or code == ENOMEM) and pollRetries < PollRetryLimit:
+          inc pollRetries
+          discard poll(nil, 0, PollRetryMillis)
           continue
         if result.len == 0:
           result = "cannot wait on the child's pipes: " & errorText(code)
         if inputOpen:
           closeInput(process)
+        abandonChild(process, drained)
         return
+      pollRetries = 0
 
       # Any event on stdin -- room to write, or the hang-up / error a pipe
       # whose reader has gone reports -- is answered by a write, which either
@@ -252,13 +361,26 @@ when defined(posix):
         readReady(outputFd, chunk, output, outputOpen, result, readError)
       if errorSlot >= 0 and fds[errorSlot].revents != 0:
         readReady(errorFd, chunk, error, errorOpen, result, readError)
+      # A pipe that failed a read is no longer read, so a child still writing
+      # to it would block there forever -- and never close the OTHER pipe this
+      # loop is still waiting on. Stop it now, not after the loop: then every
+      # pipe it held reaches end of input and the loop ends.
+      if readError and not drained:
+        abandonChild(process, drained)
 
-    drained = not readError
+    drained = true
 
 elif compileOption("threads"):
+  # Windows only: every POSIX build takes the `poll` branch above.
+  import std/[os, winlean]
+
   proc cMalloc(size: csize_t): pointer {.importc: "malloc",
     header: "<stdlib.h>".}
   proc cFree(p: pointer) {.importc: "free", header: "<stdlib.h>".}
+
+  const ErrorBrokenPipe = 109'i32
+    ## ``ERROR_BROKEN_PIPE``, which ``std/winlean`` does not export.
+    ## https://learn.microsoft.com/windows/win32/debug/system-error-codes--0-499-
 
   type
     StreamDrain = object
@@ -275,47 +397,68 @@ elif compileOption("threads"):
       ## freed by the caller, which is exactly that shape: on Windows, where
       ## a thread's TLS block is released when it exits, it crashed
       ## ``runSqlite``'s caller with a SIGSEGV in ``rawDealloc`` on a
-      ## timing-dependent fraction of calls. Chunks are copied into
-      ## ``OwnedStrings`` on the drain thread and copied back out into
-      ## ordinary strings on the caller's.
-      stream: Stream
+      ## timing-dependent fraction of calls.
+      ##
+      ## A FAILURE IS RECORDED AS A CODE, NOT A MESSAGE: building the message
+      ## would allocate on the drain thread (see ``drainHandle``). The caller
+      ## turns the code into text on its own thread, in ``drainFailure``.
+      handle: Handle
       chunks: OwnedStrings
-      failure: OwnedStrings
+      readError: int32
+        ## The OS error code of the read that failed; 0 when none did.
+      outOfMemory: bool
+        ## The C allocator refused the read buffer or what was read.
 
-  proc drainStream(drain: ptr StreamDrain) {.thread.} =
-    ## Read one stream to EOF. Never propagates: a thread that let an exception
-    ## escape would terminate the process, and this runs inside a daemon whose
-    ## whole contract is to degrade rather than fail.
+  proc drainHandle(drain: ptr StreamDrain) {.thread, raises: [].} =
+    ## Read one pipe to end of input into ``drain.chunks``.
     ##
-    ## End of input is a read that returns nothing, for the reason
-    ## ``readToEnd`` gives.
+    ## NOTHING HERE ALLOCATES FROM THE NIM HEAP, ON ANY PATH. Every page a Nim
+    ## thread's region takes from the OS outlives the thread (see the module
+    ## comment): a 64 KiB Nim ``string`` here cost ~78 KB of resident memory
+    ## per call, for the life of the process. So the buffer comes from the C
+    ## allocator, each chunk goes straight into ``OwnedStrings``, and the read
+    ## is a raw ``ReadFile`` rather than osproc's stream, whose error path
+    ## RAISES -- an exception object is a Nim allocation, and with the stream
+    ## every failed read left a region behind.
     ##
-    ## THE SUCCESS PATH ALLOCATES NOTHING FROM THE NIM HEAP. The read buffer
-    ## comes from the C allocator and each chunk goes straight into
-    ## ``OwnedStrings``, because every page a Nim thread's region takes from
-    ## the OS outlives the thread (see the module comment): a 64 KiB Nim
-    ## ``string`` here cost ~78 KB of resident memory per call, for the life
-    ## of the process. Only a failure -- whose exception object is a Nim
-    ## allocation -- still leaves its region behind, and that is rare.
+    ## ``ReadFile`` on an anonymous pipe returns whatever the child has written
+    ## so far, so end of input is a read that returns nothing, for the reason
+    ## ``readToEnd`` gives. The writer closing its end is reported as a
+    ## FAILURE with ``ERROR_BROKEN_PIPE`` rather than as a zero-byte success,
+    ## so that error is end of input too. Any other failure is reported, which
+    ## is stricter than osproc's ``hsReadData``: it treats every failed read
+    ## that returned nothing as end of input, turning a real read error into a
+    ## silently truncated capture.
+    ## https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-readfile
     const chunkSize = 64 * 1024
     let chunk = cMalloc(csize_t(chunkSize))
     if chunk == nil:
-      discard drain.failure.add("out of memory capturing child output")
+      drain.outOfMemory = true
       return
-    try:
-      while true:
-        let count = drain.stream.readData(chunk, chunkSize)
-        if count <= 0:
-          break
-        if not drain.chunks.addBytes(chunk, count):
-          discard drain.failure.add("out of memory capturing child output")
-          break
-    except CatchableError as error:
-      discard drain.failure.add(error.msg)
-    except Defect as error:
-      discard drain.failure.add(error.msg)
-    finally:
-      cFree(chunk)
+    while true:
+      var bytesRead: int32 = 0
+      if readFile(drain.handle, chunk, int32(chunkSize), addr bytesRead,
+          nil) == 0:
+        let code = getLastError()
+        if code != ErrorBrokenPipe and code != ERROR_HANDLE_EOF:
+          drain.readError = code
+        break
+      if bytesRead <= 0:
+        break
+      if not drain.chunks.addBytes(chunk, int(bytesRead)):
+        drain.outOfMemory = true
+        break
+    cFree(chunk)
+
+  proc drainFailure(drain: StreamDrain): string =
+    ## Why ``drain`` stopped early, as text built on the CALLING thread;
+    ## empty when it read to end of input.
+    if drain.outOfMemory:
+      "out of memory capturing child output"
+    elif drain.readError != 0:
+      "cannot read child output: " & osErrorMsg(OSErrorCode(drain.readError))
+    else:
+      ""
 
   proc takeText(store: var OwnedStrings): string =
     ## Everything in ``store``, concatenated into a string allocated on the
@@ -407,19 +550,26 @@ proc runCapturedProcess*(
     except Defect as error:
       failure = error.msg
   elif compileOption("threads"):
-    var outputDrain = StreamDrain(stream: nil)
-    var errorDrain = StreamDrain(stream: nil)
+    var outputDrain = StreamDrain()
+    var errorDrain = StreamDrain()
     var outputThread: Thread[ptr StreamDrain]
     var errorThread: Thread[ptr StreamDrain]
     var drainsStarted = 0
+    # The drains read the raw handles and no `outputStream`/`errorStream` is
+    # ever created over them: `Process.close` closes a handle that has no
+    # stream around it, so ownership stays with `process` either way.
+    # osproc stores each handle as a 32-bit `FileHandle`; widening it back to
+    # a `Handle` sign-extends, which is exactly how Windows defines a 32-bit
+    # handle's 64-bit value, so nothing is lost.
+    # https://learn.microsoft.com/windows/win32/winprog64/interprocess-communication
+    outputDrain.handle = Handle(process.outputHandle)
+    errorDrain.handle = Handle(process.errorHandle)
 
     try:
-      outputDrain.stream = process.outputStream
-      createThread(outputThread, drainStream, addr outputDrain)
+      createThread(outputThread, drainHandle, addr outputDrain)
       drainsStarted = 1
       if not merged:
-        errorDrain.stream = process.errorStream
-        createThread(errorThread, drainStream, addr errorDrain)
+        createThread(errorThread, drainHandle, addr errorDrain)
         drainsStarted = 2
       if input.len > 0:
         let stdinStream = process.inputStream
@@ -449,20 +599,14 @@ proc runCapturedProcess*(
       # reach it. Read stderr on this thread instead, so both streams are still
       # serviced at the same time and the join below is guaranteed to return.
       if drainsStarted == 1 and not merged:
-        if errorDrain.stream == nil:
-          try:
-            errorDrain.stream = process.errorStream
-          except CatchableError:
-            discard
-        if errorDrain.stream != nil:
-          drainStream(addr errorDrain)
+        drainHandle(addr errorDrain)
       if drainsStarted >= 1:
         joinThread(outputThread)
       if drainsStarted >= 2:
         joinThread(errorThread)
 
-    let outputFailure = outputDrain.failure.takeText()
-    let errorFailure = errorDrain.failure.takeText()
+    let outputFailure = outputDrain.drainFailure()
+    let errorFailure = errorDrain.drainFailure()
     if failure.len == 0 and outputFailure.len > 0:
       failure = outputFailure
     if failure.len == 0 and errorFailure.len > 0:
@@ -512,12 +656,13 @@ proc runCapturedProcess*(
   try:
     if failure.len > 0:
       result.failure = "running " & command & " failed: " & failure
-      # REAP IT ANYWAY when its outputs are at end of input. The common
+      # REAP IT ANYWAY when the wait is certain to return. The common
       # failure is a write refused with EPIPE by a child that exited without
       # reading its input, and `Process.close` does not wait: unreaped, each
       # such child would stay a zombie for the life of a daemon that runs
       # for weeks. With both pipes at end of input the child cannot block on
-      # us, so the wait returns. The exit code is not reported: the call
+      # us, and a child whose pipes were abandoned has been killed, so either
+      # way the wait returns. The exit code is not reported: the call
       # already failed, and `ok`/`exitCode` keep their failure values.
       if reapable:
         discard process.waitForExit()
