@@ -85,9 +85,15 @@ type DaemonHandle = object
   process: Process
   startupLines: seq[string]
 
-proc startDaemon(socketPath: string; extraArgs: openArray[string]):
-    DaemonHandle =
+proc startDaemon(socketPath: string; extraArgs: openArray[string];
+                 capture = true): DaemonHandle =
   var args = @["--socket", socketPath]
+  # CAPTURE IS TURNED ON unless the case says otherwise: it is off by
+  # default (it costs more than the measurement budget allows), and these
+  # cases read what the daemon records. A case that passes
+  # `--no-write-stats` gets no `capture=on` beside it, which is refused.
+  if capture and "--no-write-stats" notin extraArgs:
+    args.add(["--measurement", "capture=on"])
   for arg in extraArgs:
     args.add(arg)
   let process = startProcess(daemonPath(), args = args,

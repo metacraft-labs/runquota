@@ -101,6 +101,7 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     estimateDbPath: "",
     estimateQueueCapacity: 128,
     observationDbPath: "",
+    captureOn: measureCapture in defaultMeasurements(),
     writeStatsDisabled: false,
     observationQueueCapacity: 1024,
     hostIdentityFilePath: "",
@@ -138,7 +139,7 @@ proc daemonMeasurements*(config: DaemonConfig): MeasurementSet =
   ## The daemon-side measurements this configuration takes, derived from the
   ## fields that actually govern them rather than kept beside them, so the
   ## reported state cannot drift from the behaviour.
-  if not config.writeStatsDisabled:
+  if config.captureOn and not config.writeStatsDisabled:
     result.incl(measureCapture)
   if config.ambientSampleIntervalMillis > 0:
     result.incl(measureAmbientSampling)
@@ -182,8 +183,7 @@ proc applyDaemonMeasurementSwitches*(config: var DaemonConfig;
   # nothing would read as an export that is running.
   if measureMetricsExport in namedOn and config.metricsTextfilePath.len == 0:
     return "--measurement metrics-export=on needs --metrics-textfile PATH"
-  if measureCapture notin measurements:
-    config.writeStatsDisabled = true
+  config.captureOn = measureCapture in measurements
   if measureAmbientSampling notin measurements:
     config.ambientSampleIntervalMillis = 0
   if measureMetricsExport notin measurements:
@@ -427,22 +427,22 @@ proc sessionScope(session: SessionRow): string =
 proc effectiveObservationDbPath*(config: DaemonConfig): string =
   ## Where this daemon's observation store lives, given its configuration.
   ##
-  ## CAPTURE IS ON WITHOUT ANY FLAG. The specification's §"Capture Is
-  ## Enabled By Default" gives the reason and it is not a preference:
-  ## the store's primary reader needs the history to ALREADY EXIST at the
-  ## moment a question is asked, and nobody can retroactively enable
-  ## capture for the week that would have answered it. An opt-in store is
-  ## empty exactly when it is first needed.
+  ## CAPTURE IS OFF WITHOUT A SWITCH. It is the ``capture`` measurement,
+  ## and it is off by default because it costs more than the measurement
+  ## budget allows (``runquota_core/measurement``); ``--measurement
+  ## capture=on`` turns it on. An empty path is what every downstream
+  ## component reads as "capture off".
   ##
-  ## Three states, and the order matters:
+  ## Four states, and the order matters:
   ##
-  ## 1. ``writeStatsDisabled`` — the operator said no. An empty path, which
-  ##    every downstream component already reads as "capture off". It wins
-  ##    over an explicit path, so ``--observation-db X --no-write-stats``
-  ##    is off rather than ambiguous.
-  ## 2. an explicit ``observationDbPath`` — the operator named a file.
-  ## 3. otherwise the host default, beside the host identity file.
-  if config.writeStatsDisabled:
+  ## 1. ``writeStatsDisabled`` — the operator said no. It wins over
+  ##    everything else, so ``--observation-db X --no-write-stats`` is off
+  ##    rather than ambiguous.
+  ## 2. ``captureOn`` false — capture was not turned on. Naming a store
+  ##    file alone does not turn it on: the measurement has one switch.
+  ## 3. an explicit ``observationDbPath`` — the operator named a file.
+  ## 4. otherwise the host default, beside the host identity file.
+  if config.writeStatsDisabled or not config.captureOn:
     return ""
   if config.observationDbPath.len > 0:
     return config.observationDbPath
@@ -594,8 +594,7 @@ proc openCapture*(config: DaemonConfig; createParent: bool;
       # RETENTION IS SCHEDULED HERE, AND THIS IS THE WHOLE OF WHAT M15 WAS
       # MISSING. The bounds, the cascade and the crash-safe prune all
       # existed and NOTHING CALLED THEM, so a daemon that ran for a year
-      # kept a year of rows. Capture being on by default made that a
-      # promise nobody meant to make.
+      # kept a year of rows, which is a promise nobody meant to make.
       #
       # AFTER the writer and the sampler, and deliberately: the sweeper's
       # idle gate reads the live-lease count `setAmbientLiveLeaseCount`
@@ -636,6 +635,17 @@ proc openCapture*(config: DaemonConfig; createParent: bool;
     result.identityReport =
       "runquota observation store: host identity and hardware profile not " &
         "recorded; capture disabled by --no-write-stats"
+  elif not config.captureOn:
+    # OFF BY DEFAULT, said as such: a reader of the log must be able to
+    # tell "nobody turned it on" from "the operator turned it off" and from
+    # "the store would not open", and must be told the switch.
+    result.store.report =
+      "runquota observation store: capture off (the default; turn it on " &
+        "with --measurement capture=on); no observations are recorded and " &
+        "no store file is opened"
+    result.identityReport =
+      "runquota observation store: host identity and hardware profile not " &
+        "recorded; capture off"
   else:
     result.identityReport =
       "runquota observation store " & config.observationDbPath &

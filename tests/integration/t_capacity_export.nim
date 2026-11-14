@@ -64,7 +64,10 @@ when defined(linux):
       "--cpu-milli", "16000",
       "--memory-pressure-source", "unavailable"]
     if capture:
-      args.add(["--observation-db", root / "observations.sqlite3"])
+      # Capture is off by default (it costs more than the measurement
+      # budget allows), so naming a store is not enough.
+      args.add(["--observation-db", root / "observations.sqlite3",
+        "--measurement", "capture=on"])
     else:
       args.add("--no-write-stats")
     for arg in extra: args.add(arg)

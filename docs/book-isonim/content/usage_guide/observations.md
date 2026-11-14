@@ -9,19 +9,29 @@ one row per executed process, plus the host-wide ambient load around it. It is
 what turns "how much memory will this need?" from a guess into a measurement,
 and it is what [`runquota stats`](/usage_guide/stats) reads.
 
-## Capture is on without any flag
+## Turning capture on
 
-The store is **enabled by default**. Nothing can retroactively enable capture
-for the week that would have answered "did this test ever pass on this host" —
-an opt-in store is empty exactly when it is first needed.
+Capture is **off by default**. It is the `capture` measurement (see
+[Measurement switches](#measurement-switches) below), and the overhead gate
+measured it above the measurement budget, so it stays off by default until a
+gate run passes with it on. Turn it on with `runquotad --measurement
+capture=on`. Nothing can retroactively capture the week that would have
+answered "did this test ever pass on this host", so turn it on on any host
+whose history you will want to ask about.
 
-Three ways to say where, in precedence order:
+With capture on, where the store lives, in precedence order:
 
 | Setting | Effect |
 |---|---|
-| `--no-write-stats` | Capture off. Nothing is opened, no store file and no host identity file is created, and admission carries on untouched. **Wins over `--observation-db`.** |
-| `--observation-db PATH` | Capture into `PATH`. |
+| `--no-write-stats` | Capture off; `--measurement capture=on` beside it is refused (exit 2) rather than settled by argument order. Nothing is opened, no store file and no host identity file is created, and admission carries on untouched. **Wins over `--observation-db`.** |
+| `--observation-db PATH` | Capture into `PATH`. Naming a file does not turn capture on by itself. |
 | neither | Capture into the host default. |
+
+With capture off the daemon opens no store, so `runquota stats` answers
+`capture-off`, the published table of per-command aggregates stays empty (a
+client's estimate read answers unknown, as on a fresh host), and no ambient
+samples are written either: the ambient sampler writes into the store and
+runs only while capture is on.
 
 The host default is `<host state directory>/observations.sqlite3` — beside the
 host identity file, in the directory the
@@ -45,9 +55,9 @@ measurement has a name and a switch:
 
 | Name | Taken by | Status |
 |---|---|---|
-| `capture` | the daemon: execution rows, extension rows and self-reports into this store | on by default |
-| `ambient-sampling` | the daemon: the host-wide load sampler | on by default |
-| `tree-sampling` | the launching client: samples of the child tree's resident memory and process count while it waits, which become the finish's summed peak memory | on by default |
+| `capture` | the daemon: execution rows, extension rows and self-reports into this store | off by default: it costs more than the measurement budget allows |
+| `ambient-sampling` | the daemon: the host-wide load sampler | on by default; it writes into this store, so it samples only while `capture` is on |
+| `tree-sampling` | the launching client: samples of the child tree's resident memory and process count while it waits, which become the finish's summed peak memory | off by default: it costs more than the measurement budget allows |
 | `profiles` | the launching client: a CPU profile of the child tree (Linux), see "CPU totals and profiles" below | off by default |
 | `metrics-export` | the daemon: the [capacity figures text file](/usage_guide/daemon#exporting-capacity-figures-for-prometheus) | off unless `runquotad --metrics-textfile PATH` names a file; `metrics-export=on` without one is refused |
 | `pressure-reports`, `sizing-data` | — | registered, not implemented yet: the switches are accepted and do nothing |
@@ -56,10 +66,14 @@ A switch is `NAME=on|off`, comma-separated and applied left to right;
 `all=on|off` covers every name. The daemon takes it as `runquotad
 --measurement VALUE`; the launching client (`runquota acquire`, Reprobuild)
 takes it from `RUNQUOTA_MEASUREMENT`. Both accept every name, so one value can
-be given to both; a name taken by the other side is ignored. With
-`tree-sampling=off` a finish carries no sampled peak; its peak memory is then
-the largest single process from the launcher's wait (`ru_maxrss`), which
-needs no sampling.
+be given to both; a name taken by the other side is ignored. A measurement
+that misses the budget is off by default and is turned back on by default
+only when a gate run passes with it on; the switches are how you turn one on
+anyway. So `runquotad --measurement capture=on` together with
+`RUNQUOTA_MEASUREMENT=tree-sampling=on` in the launching client's environment
+records everything the store can hold. With `tree-sampling` off (the default)
+a finish carries no sampled peak; its peak memory is then the largest single
+process from the launcher's wait (`ru_maxrss`), which needs no sampling.
 
 ## CPU totals and profiles
 

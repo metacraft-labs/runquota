@@ -918,8 +918,8 @@ suite "ambient_load_attribution":
     # is deliberately not enabled, so the sampler in this process is the
     # only writer and the rows are unambiguous.
     let daemon = startProcess(daemonBinary,
-      # `--no-write-stats` is what "not enabled" takes now that capture is
-      # on by default: without it this daemon opened the HOST-WIDE store.
+      # `--no-write-stats` says "not enabled" explicitly, whatever the
+      # default: a capturing daemon here would open the HOST-WIDE store.
       args = ["--socket", socketPath, "--cpu-milli", "64000",
               "--memory-bytes", "68719476736", "--no-write-stats"],
       options = {poStdErrToStdOut})
@@ -1137,6 +1137,9 @@ suite "ambient_load_attribution":
     let daemon = startProcess(daemonBinary,
       args = ["--socket", socketPath, "--observation-db", dbPath,
               "--host-identity-file", dir / "host-id",
+              # Capture is off by default (it costs more than the
+              # measurement budget allows); this test reads what it records.
+              "--measurement", "capture=on",
               "--ambient-sample-interval-millis", $cadenceMillis],
       options = {poStdErrToStdOut})
     var startupLines: seq[string] = @[]
@@ -1404,6 +1407,9 @@ suite "ambient_load_attribution":
       let process = startProcess(binary,
         args = ["--socket", socketPath, "--observation-db", dbPath,
                 "--host-identity-file", root / "host-id",
+                # Capture is off by default (it costs more than the
+                # measurement budget allows); this test reads what it records.
+                "--measurement", "capture=on",
                 "--ambient-sample-interval-millis", $cadenceMillis],
         options = {poStdErrToStdOut})
       # The three startup lines, so the daemon is past initialisation and

@@ -404,6 +404,9 @@ type DaemonHandle = object
 proc startDaemon(socketPath, dbPath, identityFile: string): DaemonHandle =
   let process = startProcess(daemonPath(),
     args = ["--socket", socketPath, "--observation-db", dbPath,
+            # Capture is off by default (it costs more than the
+            # measurement budget allows); this test reads what it records.
+            "--measurement", "capture=on",
             "--host-identity-file", identityFile],
     options = {poStdErrToStdOut})
   for _ in 0 ..< 400:

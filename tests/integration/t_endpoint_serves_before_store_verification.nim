@@ -201,6 +201,9 @@ suite "endpoint_serves_before_store_verification":
       daemon = startProcess(daemonPath(),
         args = ["--socket", socketPath,
                 "--observation-db", dbPath,
+                # Capture is off by default (it costs more than the
+                # measurement budget allows); this test reads what it records.
+                "--measurement", "capture=on",
                 "--host-identity-file", state / "host-id",
                 "--ambient-sample-interval-millis", "0",
                 "--retention-sweep-interval-millis", "0"],

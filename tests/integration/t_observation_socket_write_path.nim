@@ -111,9 +111,15 @@ type DaemonHandle = object
   process: Process
   startupLines: seq[string]
 
-proc startDaemon(socketPath: string; extraArgs: openArray[string]):
-    DaemonHandle =
+proc startDaemon(socketPath: string; extraArgs: openArray[string];
+                 capture = true): DaemonHandle =
   var args = @["--socket", socketPath]
+  # CAPTURE IS TURNED ON unless the case says otherwise: it is off by
+  # default (it costs more than the measurement budget allows), and these
+  # cases read what the daemon records. A case that passes
+  # `--no-write-stats` gets no `capture=on` beside it, which is refused.
+  if capture and "--no-write-stats" notin extraArgs:
+    args.add(["--measurement", "capture=on"])
   for arg in extraArgs:
     args.add(arg)
   let process = startProcess(daemonPath(), args = args,
@@ -243,10 +249,10 @@ proc forgeUnevidencedKill(client: var RunQuotaClient;
 suite "observation_socket_write_path":
 
   # -------------------------------------------------------------------------
-  # THE GATE: capture is on without any flag, and the rows are complete
+  # Capture on, no store named: the rows are complete, in the derived store
   # -------------------------------------------------------------------------
 
-  test "with NO capture flag a real run produces complete, correct spine rows":
+  test "with capture on and NO store flag a real run produces complete rows":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
     defer: restorePrivateBrokerOwner(privateOwner)
     let root = scratchRoot("on")
@@ -258,7 +264,7 @@ suite "observation_socket_write_path":
     let identityFile = state / "host-id"
     # THE DEFAULT STORE PATH IS DERIVED, NOT PASSED. Nothing below names a
     # database: `--host-identity-file` moves the whole host state, and the
-    # store follows it. If the daemon needed a flag to capture, this path
+    # store follows it. If the daemon needed a path to capture, this path
     # would not exist at the end of the test.
     let expectedDb = state / "observations.sqlite3"
     check fileExists(daemonPath())
@@ -484,6 +490,52 @@ suite "observation_socket_write_path":
   # -------------------------------------------------------------------------
   # THE GATE: --no-write-stats disables it
   # -------------------------------------------------------------------------
+
+  test "with NO capture switch nothing is written: capture is off by default":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
+    # THE DEFAULT. Capture costs more than the measurement budget allows,
+    # so a daemon given no switch records nothing, opens nothing, and says
+    # so as a default rather than as the operator's refusal. Falsifying
+    # mutation: `capture`'s `defaultOn` back to true, and the store file
+    # and the host identity appear and the startup line says "capture
+    # enabled".
+    let root = scratchRoot("dflt")
+    defer: removeScratchRoot(root)
+    var endpointPolicy: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    let socketPath = rendezvousDir(root, endpointPolicy) / "d.sock"
+    let state = hostStateDir(root)
+    let identityFile = state / "host-id"
+    let defaultDb = state / "observations.sqlite3"
+
+    putEnv("RUNQUOTA_SOCKET", socketPath)
+    var daemon = startDaemon(socketPath,
+      ["--host-identity-file", identityFile], capture = false)
+    var reported: JsonNode = nil
+    var status = DaemonStatusMessage()
+    try:
+      check daemon.startupLines[1].contains("capture off (the default")
+      check daemon.startupLines[1].contains("--measurement capture=on")
+      var client = connectDefault()
+      discard client.completeOneExecution("socket-write", true)
+      reported = client.observations()
+      status = client.daemonStatus()
+      client.close()
+      sleep(1000)
+    finally:
+      daemon.stop()
+
+    check not fileExists(defaultDb)
+    check not fileExists(identityFile)
+    check reported != nil
+    check reported["capture_enabled"].getBool() == false
+    # Off by default, NOT by the operator's flag.
+    check reported["write_stats_disabled"].getBool() == false
+    check reported["measurements"]["capture"].getStr() == "off"
+    check reported["live_self_reports"].getInt() == 0
+    check status.totalGranted >= 1'u64
+    check status.totalFinished >= 1'u64
 
   test "--no-write-stats writes nothing at all, and the daemon serves anyway":
     let privateOwner = bindPrivateBrokerOwnerToCaller()

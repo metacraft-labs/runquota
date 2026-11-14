@@ -111,6 +111,9 @@ proc startDaemon(socketPath, stateDir: string): DaemonHandle =
   let process = startProcess(daemonPath(),
     args = ["--socket", socketPath,
             "--host-identity-file", stateDir / "host-id",
+            # Capture is off by default (it costs more than the
+            # measurement budget allows); this test reads what it records.
+            "--measurement", "capture=on",
             # The ambient sampler is off so that nothing but this test's own
             # traffic can touch the store while the counters are being read.
             "--ambient-sample-interval-millis", "0"],

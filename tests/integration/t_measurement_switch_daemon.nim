@@ -12,6 +12,13 @@
 ##   reports capture `on`, ambient sampling `off`, `tree-sampling` as
 ##   `client` (switched in the client, not here) and the measurements not
 ##   implemented yet as `not-implemented`; its ambient sampler is inactive;
+## * a daemon started with no switch, but with a store named, takes the
+##   DEFAULTS: capture `off` (it costs more than the measurement budget
+##   allows), so no store file is opened and the startup report says capture
+##   is off by default and names the switch; ambient sampling stays `on`
+##   in the report. Falsifying mutation: set `capture`'s `defaultOn` back to
+##   true in `runquota_core/measurement`, or let `--observation-db` imply
+##   capture, and this case reports capture `on` and finds the store file;
 ## * a misspelt name, a value other than on/off, and an explicit `=on`
 ##   against the older off flag (`--no-write-stats`) each stop the daemon
 ##   with exit 2 and the reason, before it serves anything.
@@ -30,10 +37,10 @@ when defined(posix):
   import daemon_binary
   import private_daemon_fixture
 
-  proc captureOnArgs(root, socket: string; extra: openArray[string]):
+  proc storeNamedArgs(root, socket: string; extra: openArray[string]):
       seq[string] =
-    ## Like the fixture's `daemonArgs`, but with capture ON into a scratch
-    ## store, which the fixture turns off.
+    ## Like the fixture's `daemonArgs`, but with a scratch store named
+    ## (which the fixture turns off) and no measurement switch.
     result = @["--socket", socket,
       "--host-config", root / "host.toml",
       "--host-identity-file", root / "host-id",
@@ -41,6 +48,12 @@ when defined(posix):
       "--estimate-db", root / "est.sqlite",
       "--memory-pressure-source", "unavailable"]
     for arg in extra: result.add(arg)
+
+  proc captureOnArgs(root, socket: string; extra: openArray[string]):
+      seq[string] =
+    ## As above, with capture turned ON: it is off by default.
+    result = storeNamedArgs(root, socket,
+      @["--measurement", "capture=on"] & @extra)
 
   suite "runquotad --measurement":
     test "the daemon takes and reports what the switch says":
@@ -71,6 +84,37 @@ when defined(posix):
       check observations["ambient_sampling"]["interval_millis"].getInt == 0
       check not observations["ambient_sampling"]["active"].getBool
       check not observations["write_stats_disabled"].getBool
+
+    test "with no switch the daemon takes the defaults: capture off":
+      let root = scratchDir("rqmeasdef")
+      defer: removeDir(root)
+      let socket = root / "ep" / "d.sock"
+      let env = privateEnv(socket)
+      let daemon = startProcess(daemonPath(), env = env,
+        args = storeNamedArgs(root, socket, []),
+        options = {poStdErrToStdOut})
+      defer: stopOwned(daemon)
+      prerequisite awaitSocket(daemon, socket),
+        daemon.startupContext("the daemon did not bind " & socket)
+      let (code, text) = cli(env, ["observations", "--json"])
+      checkpoint text
+      check code == 0
+      let observations = parseJson(text)["observations"]
+      let measurements = observations["measurements"]
+      check measurements["capture"].getStr == "off"
+      check measurements["ambient-sampling"].getStr == "on"
+      check measurements["tree-sampling"].getStr == "client"
+      check not observations["capture_enabled"].getBool
+      # Off by default, not off by the operator's flag.
+      check not observations["write_stats_disabled"].getBool
+      # Naming a store did not turn capture on: nothing was opened.
+      check not fileExists(root / "observations.sqlite3")
+      daemon.terminate()
+      discard daemon.exitWithin(10_000)
+      let output = daemon.output
+      checkpoint output
+      check "capture off (the default; turn it on with --measurement " &
+        "capture=on)" in output
 
     test "unparsable or contradictory switches stop the daemon with exit 2":
       for (extra, expected) in [

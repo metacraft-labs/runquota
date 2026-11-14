@@ -83,12 +83,20 @@ const
     ## The client-side switch. Same value syntax as `runquotad --measurement`.
 
   measurementRegistry*: array[Measurement, MeasurementInfo] = [
+    # IMPLEMENTED, AND OFF BY DEFAULT: the overhead gate measured it above
+    # the budget (it costs more than the measurement budget allows). It is
+    # turned back on by default only when a gate run passes with it on.
     measureCapture: MeasurementInfo(side: measuredByDaemon, implemented: true,
-      defaultOn: true),
+      defaultOn: false),
+    # On by default. It writes into the observation store, so it samples
+    # only while `capture` is on.
     measureAmbientSampling: MeasurementInfo(side: measuredByDaemon,
       implemented: true, defaultOn: true),
+    # IMPLEMENTED, AND OFF BY DEFAULT, for the same reason as `capture`.
+    # With it off a finish still carries the largest single process's peak
+    # memory (`ru_maxrss`) from the completion totals.
     measureTreeSampling: MeasurementInfo(side: measuredByClient,
-      implemented: true, defaultOn: true),
+      implemented: true, defaultOn: false),
     # IMPLEMENTED, AND OFF BY DEFAULT until the overhead gate passes with
     # it on (see the specification's measurement switches section).
     measureProfiles: MeasurementInfo(side: measuredByClient,

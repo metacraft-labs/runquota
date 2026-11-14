@@ -17,9 +17,15 @@
 ##   refused contradiction rather than an argument-order race;
 ## * with `RUNQUOTA_MEASUREMENT=tree-sampling=off` a launched child's
 ##   completion carries no peak memory and says the sampler was off; with
-##   the default it carries a measured peak. Falsifying mutation: ignore the
-##   switch in `runquota_process` (sample unconditionally) and the "off"
-##   case reports a non-zero peak and fails.
+##   `tree-sampling=on` it carries a measured peak. Falsifying mutation:
+##   ignore the switch in `runquota_process` (sample unconditionally) and the
+##   "off" case reports a non-zero peak and fails;
+## * THE DEFAULTS. `capture` and `tree-sampling` cost more than the
+##   measurement budget allows, so they are off by default: the registry
+##   says so, a default daemon configuration opens no store even with a
+##   store path named, and a launch with no switch takes no tree samples.
+##   Falsifying mutation: set either one's `defaultOn` back to true (or let
+##   a named store path imply capture) and the default clauses fail.
 ##
 ## NO MOCKS. The real parser, the real daemon configuration type and a real
 ## child process launched through `runquota_process`.
@@ -103,25 +109,45 @@ suite "measurement switch parser":
        measureProfiles, measureMetricsExport}
     check not measurementRegistry[measureMetricsExport].defaultOn
 
+  test "capture and tree-sampling are off by default, ambient sampling on":
+    check not measurementRegistry[measureCapture].defaultOn
+    check not measurementRegistry[measureTreeSampling].defaultOn
+    check measurementRegistry[measureAmbientSampling].defaultOn
+    check defaultMeasurements() == {measureAmbientSampling}
+    var problem: string
+    check measureTreeSampling notin clientMeasurementsFrom("", problem)
+
   test "a malformed client value falls back to the defaults and says why":
     var problem: string
     check clientMeasurementsFrom("", problem) == defaultMeasurements()
     check problem == ""
-    check clientMeasurementsFrom("tree-sampling=off", problem) ==
-      defaultMeasurements() - {measureTreeSampling}
+    check clientMeasurementsFrom("tree-sampling=on", problem) ==
+      defaultMeasurements() + {measureTreeSampling}
     check problem == ""
     check clientMeasurementsFrom("tree-sampling=maybe", problem) ==
       defaultMeasurements()
     check problem.len > 0
 
 suite "daemon measurement switches":
-  test "off switches set the fields that govern the measurements":
+  test "the default configuration does not capture, even with a store named":
     var config = defaultDaemonConfig(defaultEndpoint())
+    check daemonMeasurements(config) == {measureAmbientSampling}
+    check not config.captureOn
+    check not config.writeStatsDisabled
+    config.observationDbPath = "/tmp/named-store.sqlite3"
+    check effectiveObservationDbPath(config) == ""
+    check config.applyDaemonMeasurementSwitches(["capture=on"]) == ""
+    check config.captureOn
+    check effectiveObservationDbPath(config) == "/tmp/named-store.sqlite3"
+
+  test "switches set the fields that govern the measurements":
+    var config = defaultDaemonConfig(defaultEndpoint())
+    check config.applyDaemonMeasurementSwitches(["capture=on"]) == ""
     check daemonMeasurements(config) ==
       {measureCapture, measureAmbientSampling}
     check config.applyDaemonMeasurementSwitches(["capture=off",
       "ambient-sampling=off"]) == ""
-    check config.writeStatsDisabled
+    check not config.captureOn
     check config.ambientSampleIntervalMillis == 0
     check daemonMeasurements(config) == {}
 
@@ -129,7 +155,8 @@ suite "daemon measurement switches":
     var config = defaultDaemonConfig(defaultEndpoint())
     let before = config.ambientSampleIntervalMillis
     check config.applyDaemonMeasurementSwitches(
-      ["tree-sampling=off,profiles=on,pressure-reports=on"]) == ""
+      ["tree-sampling=on,profiles=on,pressure-reports=on"]) == ""
+    check not config.captureOn
     check not config.writeStatsDisabled
     check config.ambientSampleIntervalMillis == before
 
@@ -164,7 +191,8 @@ suite "daemon measurement switches":
   test "a refused switch leaves the configuration unchanged":
     var config = defaultDaemonConfig(defaultEndpoint())
     check config.applyDaemonMeasurementSwitches(
-      ["capture=off", "bogus=off"]).len > 0
+      ["capture=on", "bogus=off"]).len > 0
+    check not config.captureOn
     check not config.writeStatsDisabled
 
 when defined(linux) or defined(macosx):
@@ -181,12 +209,19 @@ when defined(linux) or defined(macosx):
         check completion.peakResidentMemoryBytes == 0'u64
         check completion.telemetrySource.startsWith("off")
 
-    test "default: a measured peak":
-      withMeasurementEnv("") do ():
+    test "on: a measured peak":
+      withMeasurementEnv("tree-sampling=on") do ():
         let completion = runChild()
         check completion.exited
         check completion.peakResidentMemoryBytes > 0'u64
         check not completion.telemetrySource.startsWith("off")
+
+    test "default: off, so no sampled peak":
+      withMeasurementEnv("") do ():
+        let completion = runChild()
+        check completion.exited
+        check completion.peakResidentMemoryBytes == 0'u64
+        check completion.telemetrySource.startsWith("off")
 
     test "all=off turns it off too":
       withMeasurementEnv("all=off") do ():

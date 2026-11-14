@@ -13,7 +13,8 @@
 ##    it is reaped, rather than `wait4`'s rusage) and the row carries about
 ##    0 s and fails. With `profiles` off (the default) no profile row is
 ##    written: the execution keeps its totals only.
-## 2. With `RUNQUOTA_MEASUREMENT=profiles=on`, a tree that burns 8 CPUs for
+## 2. With `RUNQUOTA_MEASUREMENT=profiles=on,tree-sampling=on` (see the
+##    case for why tree sampling is named), a tree that burns 8 CPUs for
 ##    10 s and then 2 CPUs for 20 s yields a profile within 10% of that
 ##    curve. Two comparisons, both at 10%:
 ##    * against the tree's REAL CPU use per second, reconstructed from what
@@ -95,6 +96,9 @@ when defined(linux):
       "--host-config", root / "host.toml",
       "--host-identity-file", root / "host-id",
       "--observation-db", root / "observations.sqlite3",
+      # Capture is off by default (it costs more than the
+      # measurement budget allows); this test reads what it records.
+      "--measurement", "capture=on",
       "--estimate-db", root / "est.sqlite",
       "--cpu-milli", "16000",
       "--memory-pressure-source", "unavailable"]
@@ -242,7 +246,13 @@ when defined(linux):
         daemon.startupContext("the daemon did not bind " & socket)
       prerequisite awaitCapture(socket), "capture never came on"
       var env = privateEnv(socket)
-      env["RUNQUOTA_MEASUREMENT"] = "profiles=on"
+      # TREE SAMPLING IS ON TOO, explicitly, as it was by default when this
+      # test was written: it is off by default now (it costs more than the
+      # measurement budget allows). With profiles alone, the CPU of a
+      # process that exits between two profile readings is not counted in
+      # the interval it ran in (here the tail of the first phase: 1978 vs
+      # 2231 milli-CPU in second 10), a known gap of the profile-only walk.
+      env["RUNQUOTA_MEASUREMENT"] = "profiles=on,tree-sampling=on"
       var script = quoteShell(self) & " --mark " & quoteShell(root / "mark") &
         "; "
       for i in 0 ..< 8:

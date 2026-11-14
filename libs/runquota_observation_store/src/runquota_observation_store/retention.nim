@@ -287,10 +287,9 @@ proc applyRetention*(store: ObservationStore; hostId: string;
 # WHY THIS EXISTS AT ALL. Everything above was built by M15 and CALLED BY
 # NOBODY: the only occurrence of ``applyRetention`` outside the tests was
 # its own definition, so a long-lived ``runquotad`` grew its store without
-# limit. That was tolerable while capture was opt-in. It stops being
-# tolerable the moment capture is on by default, because the argument for
-# default-on is that an opt-in store is empty exactly when it is first
-# needed -- and that argument only holds if the store is also BOUNDED.
+# limit. Any store that captures for long -- capture turned on by a
+# switch today, or on by default once it fits the measurement budget --
+# must also be BOUNDED.
 # "Every machine accumulates history" and "every machine accumulates
 # history forever" are different promises.
 #

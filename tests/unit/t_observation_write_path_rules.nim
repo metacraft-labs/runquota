@@ -55,15 +55,24 @@ suite "observation_write_path_rules":
     # An empty argument is the default host, not the current directory.
     check observationDbBeside("") == defaultObservationDbFile()
 
-  test "capture is enabled with no flag at all, and --no-write-stats disables it":
-    var config = defaultDaemonConfig()
-    config.hostIdentityFilePath = "/scratch/state/host-id"
+  test "capture is off by default, capture=on turns it on, --no-write-stats wins":
+    var defaults = defaultDaemonConfig()
+    defaults.hostIdentityFilePath = "/scratch/state/host-id"
 
-    # (1) NOTHING SET: the host default. This is the gate clause "asserts
-    # capture is on without any flag" at the configuration boundary; the
-    # integration file asserts it against rows a real daemon wrote.
+    # (0) NOTHING SET: no store. Capture is off by default because it costs
+    # more than the measurement budget allows; naming a path does not
+    # change that, because the measurement has one switch.
+    check not defaults.captureOn
+    check defaults.writeStatsDisabled == false
+    check effectiveObservationDbPath(defaults) == ""
+    var namedOnly = defaults
+    namedOnly.observationDbPath = "/tmp/named.sqlite3"
+    check effectiveObservationDbPath(namedOnly) == ""
+
+    # (1) CAPTURE ON, NO PATH: the host default, beside the identity file.
+    var config = defaults
+    check config.applyDaemonMeasurementSwitches(["capture=on"]) == ""
     check config.observationDbPath.len == 0
-    check config.writeStatsDisabled == false
     check effectiveObservationDbPath(config) ==
       unixToNativePath("/scratch/state/observations.sqlite3")
 
@@ -72,9 +81,8 @@ suite "observation_write_path_rules":
     explicitConfig.observationDbPath = "/tmp/named.sqlite3"
     check effectiveObservationDbPath(explicitConfig) == "/tmp/named.sqlite3"
 
-    # (3) THE OFF SWITCH, and it is not "leave the path empty": an empty
-    # path is now the default-on case, so the two states have to be
-    # distinguishable in the config itself.
+    # (3) THE OPERATOR'S OFF SWITCH, kept apart from "off by default" in the
+    # config so the startup report can tell them apart.
     var disabledConfig = config
     disabledConfig.writeStatsDisabled = true
     check effectiveObservationDbPath(disabledConfig) == ""

@@ -49,7 +49,9 @@ conclude from a broken instrument that the system is fast.*
 
 ## The daemon starts but capture is off
 
-Its third startup line says why. The common one:
+Capture is off by default: start `runquotad` with `--measurement capture=on`
+to record. With that given, its startup lines say why capture is still off.
+The common reason:
 
 ```text
 runquota host identity /var/lib/runquota/host-id: cannot persist -- the
@@ -67,12 +69,18 @@ schema version is unreadable; the schema is newer than this build understands
 (again, the file is not modified); a table is missing; or WAL cannot be
 enabled.
 
-And one that is not a problem at all:
+And two that are not a problem at all:
 
 ```text
+runquota observation store: capture off (the default; turn it on with
+--measurement capture=on); no observations are recorded and no store file is
+opened
 runquota observation store: capture disabled by --no-write-stats; no
 observations are recorded and no store file is opened
 ```
+
+Capture is off by default because it costs more than the measurement budget
+allows; see [the observation store](/usage_guide/observations#turning-capture-on).
 
 ## The socket is owner-only and colleagues cannot connect
 

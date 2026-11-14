@@ -671,8 +671,10 @@ proc startDaemon(s: var Study) =
   for pool in s.cfg.pools:
     daemonArgs.add("--pool")
     daemonArgs.add(pool)
-  # EXTRA DAEMON FLAGS, so the SAME harness can run the capture-disabled
-  # control. `--daemon-arg=--no-write-stats` turns off the observation store,
+  # EXTRA DAEMON FLAGS, so the SAME harness can run with and without
+  # capture. Capture is off by default (it costs more than the measurement
+  # budget allows): `--daemon-arg=--measurement --daemon-arg=capture=on`
+  # turns it on. `--daemon-arg=--no-write-stats` turns off the observation store,
   # its writer thread, the ambient sampler and the self-report intake -- the
   # exact one-flag control `runquota_m13_bench` established -- and running the
   # identical build against both daemons is what turns "completion reporting

@@ -104,6 +104,9 @@ proc startDaemon(socketPath, observationDb, identityFile: string):
   let process = startProcess(
     daemonPath(),
     args = ["--socket", socketPath, "--observation-db", observationDb,
+            # Capture is off by default (it costs more than the measurement
+            # budget allows); the identity is resolved only where it is on.
+            "--measurement", "capture=on",
             "--host-identity-file", identityFile],
     options = {poStdErrToStdOut}
   )

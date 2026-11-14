@@ -31,10 +31,10 @@ not monitor client process trees. Per-execution resource figures are therefore
 only host-wide totals and derives foreign load by difference.
 
 The implementation lives in `libs/runquota_observation_store`. Capture is off
-unless `runquotad --observation-db PATH` names a store. Turning it on by default
-is M22, whose committed per-execution overhead figure over the ring is what
-justifies it; M13 measures the socket path's overhead as the fallback's cost and
-supplies the client-declared run boundaries the `runs` row is still missing.
+unless `runquotad --measurement capture=on` turns it on (see "Capture is off
+by default" below); M13 measures the socket path's overhead as the fallback's
+cost and supplies the client-declared run boundaries the `runs` row is still
+missing.
 
 ### What exists today
 
@@ -590,30 +590,35 @@ creating the directory -- and needs the rights its directory grants: an
 elevated prompt on Windows, root elsewhere. The daemon's account only reads it,
 and a budget is not a secret, so the file is world-readable.
 
-## Capture is on without any flag
+## Capture is off by default
 
-The observation store is **enabled by default**. Its primary readers need the
-history to already exist at the moment a question is asked, and nobody can
-retroactively enable capture for the week that would have answered "did this
-test ever pass on this host" — an opt-in store is empty exactly when it is
-first needed. The reasoning is normative in
-`reprobuild-specs/RunQuota-Observation-Store.md` §"Capture Is Enabled By
-Default".
+Capture is the `capture` measurement. Every measurement is held to a budget
+(with all of them on, a build may take at most 1% more wall and CPU time than
+with all of them off), and the overhead gate (`just bench-overhead-gate`)
+measured capture above it, so it is **off by default** until a gate run passes
+with it on. `runquotad --measurement capture=on` turns it on. Its readers need
+the history to already exist at the moment a question is asked, and nobody
+can retroactively capture the week that would have answered "did this test
+ever pass on this host", so turn it on on any host whose history matters.
 
-So `runquotad` with no store flag at all records into
+With capture on, `runquotad` with no store flag records into
 `<host state directory>/observations.sqlite3` — beside the host identity
 file, in the same directory the install step above provisions. The two are
 derived from one another rather than being two constants, so an operator who
 relocates the host state with `--host-identity-file` relocates the store with
 it and the two can never disagree.
 
-Three ways to say where, in precedence order:
+Where, in precedence order:
 
 | Setting | Effect |
 |---|---|
-| `--no-write-stats` | Capture off. Nothing is opened, no store file and no host identity file is created, and admission carries on untouched. Wins over `--observation-db`. |
-| `--observation-db PATH` | Capture into `PATH`. |
+| `--no-write-stats` | Capture off; `--measurement capture=on` beside it is refused (exit 2) rather than settled by argument order. Nothing is opened, no store file and no host identity file is created, and admission carries on untouched. Wins over `--observation-db`. |
+| capture not turned on | Capture off (the default); the startup report says so and names the switch. |
+| `--observation-db PATH` | Capture into `PATH`. Naming a file does not turn capture on by itself. |
 | neither | Capture into the host default beside the host identity file. |
+
+The ambient sampler writes into the store, so with capture off no ambient
+samples are taken either.
 
 On a host where the state directory has not been provisioned, capture
 degrades to off with a report naming the directory and the command that

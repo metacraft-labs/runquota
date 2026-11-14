@@ -63,12 +63,14 @@ capture: ON   status: ok
 daemon detail: {...}
 ```
 
-Caveats, when they apply, are printed as `! ` lines. The one you will see on an
-unprovisioned host:
+Caveats, when they apply, are printed as `! ` lines. The one you will see on a
+daemon that was not started with `--measurement capture=on` (capture is off by
+default), or on an unprovisioned host:
 
 ```text
 ! capture is OFF on this daemon: nothing has been recorded and nothing will be.
-  This is NOT an empty result — it is an absent instrument.
+  This is NOT an empty result — it is an absent instrument. Capture is off by
+  default; 'runquotad --measurement capture=on' turns it on.
 ```
 
 ## `stats top`

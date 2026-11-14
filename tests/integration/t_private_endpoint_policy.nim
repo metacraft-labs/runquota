@@ -64,10 +64,11 @@ when defined(posix):
       daemon.close()
 
   proc launch(root, socket: string; env: StringTableRef): Process =
-    # Capture is enabled normally, with all mutable files inside this fixture.
+    # Capture is turned on (it is off by default: it costs more than the
+    # measurement budget allows), with all mutable files inside this fixture.
     startProcess(daemonPath(), env = env, args = ["--socket", socket,
       "--host-config", root / "host.toml", "--estimate-db", root / "est.sqlite",
-      "--observation-db", root / "obs.sqlite",
+      "--observation-db", root / "obs.sqlite", "--measurement", "capture=on",
       "--host-identity-file", root / "host-id",
       "--ambient-sample-interval-millis", "0"],
       options = {poStdErrToStdOut})

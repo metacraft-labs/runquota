@@ -123,7 +123,9 @@ type
 const
   CaptureOffCaveat* =
     "capture is OFF on this daemon: nothing has been recorded and nothing " &
-    "will be. This is NOT an empty result — it is an absent instrument."
+    "will be. This is NOT an empty result — it is an absent instrument. " &
+    "Capture is off by default; 'runquotad --measurement capture=on' " &
+    "turns it on."
   RankingSpreadCaveat* =
     "a ranking is total, count and max only, and it SUMS across capture " &
     "grades. For anything else — percentiles, before-and-after, the grade " &

@@ -231,12 +231,12 @@ Recording (see [the observation store](/usage_guide/observations)):
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--observation-db PATH` | beside the host identity file | Where to record. |
-| `--no-write-stats` | off | **The off switch, and the only one.** Wins over `--observation-db` regardless of order. |
+| `--observation-db PATH` | beside the host identity file | Where to record once capture is on. Naming a file does not turn capture on. |
+| `--no-write-stats` | off | The older spelling of `--measurement capture=off`. Capture is off by default, so this matters only beside something that turns it on; it wins over `--observation-db` regardless of order. |
 | `--estimate-db PATH` | — | The learned-estimate database. |
 | `--ambient-sample-interval-millis N` | `1000` | Host-wide sampling cadence; `0` turns sampling off. |
 | `--profile-uncontended-pct N` | `25` | The most of the host's CPU that everything other than a finished execution may have used over its run for the run to be folded into its command's learned duration and CPU curve. |
-| `--measurement NAME=on\|off[,...]` | the defaults | Turns daemon-side measurements on or off by name, repeatable, applied after every other flag. `capture=off` is `--no-write-stats`; `ambient-sampling=off` is an interval of `0`; `metrics-export=off` drops `--metrics-textfile`. An explicit `=on` against one of those older flags (or `metrics-export=on` with no `--metrics-textfile`), an unknown name, or a value other than `on`/`off` is a refusal (exit 2). See [Measurement switches](/usage_guide/observations#measurement-switches). |
+| `--measurement NAME=on\|off[,...]` | the defaults | Turns daemon-side measurements on or off by name, repeatable, applied after every other flag. Capture is off by default (it costs more than the measurement budget allows); `capture=on` turns it on, and with it the ambient sampler, which writes into the store. `capture=off` is `--no-write-stats`; `ambient-sampling=off` is an interval of `0`; `metrics-export=off` drops `--metrics-textfile`. An explicit `=on` against one of those older flags (or `metrics-export=on` with no `--metrics-textfile`), an unknown name, or a value other than `on`/`off` is a refusal (exit 2). See [Measurement switches](/usage_guide/observations#measurement-switches). |
 | `--metrics-textfile PATH` | none | Write the [capacity figures](#exporting-capacity-figures-for-prometheus) to `PATH` in Prometheus text format. Naming a file is what turns the `metrics-export` measurement on. |
 | `--metrics-interval-millis N` | `15000` | How often that file is rewritten. A positive number; anything else is a usage error (exit 2). |
 | `--host-identity-file PATH` | `/var/lib/runquota/host-id` (`/var/db/...` on macOS) | Relocates the host state, and the store with it. |
@@ -245,7 +245,7 @@ Retention — four bounds, each with the **same unusual rule**:
 
 | Flag | Default |
 |---|---|
-| `--retention-sweep-interval-millis N` | 1 h (`0` or negative turns retention off; capture stays on) |
+| `--retention-sweep-interval-millis N` | 1 h (`0` or negative turns retention off; capture is unaffected) |
 | `--retention-max-deferred-sweeps N` | `24` |
 | `--retention-max-execution-age-millis N` | 90 days |
 | `--retention-max-executions N` | `2000000` |
@@ -340,14 +340,17 @@ runquota observation store /var/lib/runquota/observations.sqlite3: schema 4; cap
 runquota observation store ...: host <id>; hardware profile <id>; <ambient>; <retention>; <identity>
 ```
 
+That is a daemon with `--measurement capture=on`. With capture off (the
+default) the second line says so and names the switch, and the third says
+that no host identity or hardware profile was recorded.
+
 1. where it is listening, plus any rendezvous degradation and the state of the
    published aggregate table;
 2. the observation store — open, or the reason it is not;
 3. the host identity and hardware profile.
 
 **Three lines, unconditionally.** It used to be three when a store path was
-given and one when it was not; that distinction stopped existing when capture
-became on-by-default, and a fixed count is what lets a supervisor read the
+given and one when it was not; a fixed count is what lets a supervisor read the
 daemon's startup without guessing how much to read. Anything a message would
 have embedded a newline into is folded onto one line to keep the count true.
 

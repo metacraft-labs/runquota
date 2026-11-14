@@ -18,7 +18,11 @@ build by more than 1%, in wall time or in CPU time. It runs the case with
 every measurement off and with every implemented measurement on
 (`--measure=NAME` for one alone), switched by `runquotad --measurement` and
 `RUNQUOTA_MEASUREMENT` against a private daemon per arm, and repeats until the
-95% interval of the difference is within ±0.5%:
+95% interval of the difference is within ±0.5%. Both arms spell out every
+switch, so neither depends on the compiled-in defaults. A measurement that
+misses the budget is off by default and is turned back on by default only
+after a run of this gate passes with it on; `capture` and `tree-sampling` are
+off by default for that reason. The rule:
 
 - rounds are paired and interleaved (off-on, on-off, ...); the unit is
   `ln(on / off)` per round, so a slow round is slow in both arms;

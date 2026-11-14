@@ -77,8 +77,11 @@ in
       default = null;
       example = "/var/db/runquota/observations.sqlite";
       description = ''
-        Path to the observation store. Capture is off unless this is set;
-        see `docs/database.md`.
+        Path to the observation store, used once capture is on. Capture is
+        off by default (it costs more than the measurement budget allows);
+        naming a store does not turn it on. Add
+        `extraArgs = [ "--measurement" "capture=on" ]` to record; see
+        `docs/database.md`.
       '';
     };
 

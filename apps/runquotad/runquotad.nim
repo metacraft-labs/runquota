@@ -257,11 +257,12 @@ when isMainModule:
         quit 2
       i += 2
     of "--no-write-stats":
-      # THE OFF SWITCH, and the only one. Capture is on without any flag
-      # because the store's readers need history to already exist when a
-      # question is asked; this is how an operator who does not want that
-      # says so. It takes no argument and it wins over `--observation-db`,
-      # so "disabled" is never a matter of argument order.
+      # THE OLDER SPELLING OF `--measurement capture=off`. Capture is off
+      # by default (it costs more than the measurement budget allows), so
+      # this matters where something else turns it on; it takes no
+      # argument and it wins over `--observation-db`, and an explicit
+      # `capture=on` beside it is refused, so "disabled" is never a matter
+      # of argument order.
       config.writeStatsDisabled = true
       i += 1
     of "--measurement":

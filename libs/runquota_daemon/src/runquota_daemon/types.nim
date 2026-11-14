@@ -108,16 +108,21 @@ type
     estimateQueueCapacity*: int
     observationDbPath*: string
       ## An EXPLICIT store path, or empty for the host's default one.
-      ## Empty no longer means "capture off": capture is on by default
-      ## (the specification's §"Capture Is Enabled By Default"), and the
-      ## way to turn it off is ``writeStatsDisabled`` below.
+      ## Naming a path does not turn capture on: whether rows are written
+      ## is ``captureOn`` (and ``writeStatsDisabled``) below.
+    captureOn*: bool
+      ## Whether the ``capture`` measurement is on: execution rows,
+      ## extension rows and self-report intake. Off by default (the
+      ## ``capture`` row of ``runquota_core/measurement``'s registry): it
+      ## costs more than the measurement budget allows. Turned on by
+      ## ``runquotad --measurement capture=on``.
     writeStatsDisabled*: bool
-      ## The operator's off switch (``runquotad --no-write-stats``). It is
-      ## a FLAG rather than "leave the path empty" so that the two states
-      ## the operator cares about — "on, at the default location" and
-      ## "off, deliberately" — are distinguishable in the config, in the
-      ## startup report, and in a test. An empty path meaning "off" would
-      ## have made the default-on requirement unstatable.
+      ## The operator's explicit off switch (``runquotad --no-write-stats``,
+      ## the older spelling of ``capture=off``). It wins over ``captureOn``,
+      ## and it is kept apart from it so that "off, deliberately" stays
+      ## distinguishable from "off by default" in the startup report and so
+      ## that an explicit ``capture=on`` against it can be refused as a
+      ## contradiction rather than settled by argument order.
     observationQueueCapacity*: int
     hostIdentityFilePath*: string
       ## Where this machine's ``host_id`` is kept. Empty means the
@@ -142,10 +147,10 @@ type
     retentionPolicy*: RetentionPolicy
       ## The bounds the scheduled retention pass enforces. M15 built them
       ## and nothing called them; this is what a daemon carries so that a
-      ## store which is ON BY DEFAULT is also BOUNDED by default. The two
-      ## have to travel together: the argument for default-on capture is
-      ## that an opt-in store is empty exactly when it is first needed,
-      ## and that argument does not survive an unbounded one.
+      ## store which captures is also BOUNDED by default, whether capture
+      ## was turned on by a switch or, once it passes the overhead gate,
+      ## by default: a store that grows forever is a promise nobody meant
+      ## to make.
     retentionSweepIntervalMillis*: int
       ## Cadence of that pass. Zero or negative turns retention off while
       ## leaving capture on — the same shape as

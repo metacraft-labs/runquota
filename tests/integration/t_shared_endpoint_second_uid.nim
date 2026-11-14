@@ -384,6 +384,9 @@ else:
           "chmod 0755 " & rv & "/state",
           toolDir & "/runquotad --socket " & socketPath &
             " --observation-db " & dbPath &
+            # Capture is off by default (it costs more than the
+            # measurement budget allows); this test reads it back.
+            " --measurement capture=on" &
             " --host-identity-file " & rv & "/state/host-id" &
             " > " & rv & "/daemon.log 2>&1 &",
           "pid=$!",

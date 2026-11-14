@@ -80,6 +80,9 @@ proc startDaemon(socketPath, identityFile: string): DaemonHandle =
   let process = startProcess(daemonPath(),
     args = @["--socket", socketPath,
              "--host-identity-file", identityFile,
+             # Capture is off by default (it costs more than the
+             # measurement budget allows); this test reads what it records.
+             "--measurement", "capture=on",
              "--ambient-sample-interval-millis", "0"],
     options = {poStdErrToStdOut})
   for _ in 0 ..< 400:

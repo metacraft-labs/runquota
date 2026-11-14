@@ -10,7 +10,9 @@
 ## THE CONTROL IS ONE FLAG. Both arms run the same daemon binary, the same
 ## client library, the same lease lifecycle and the same message sequence,
 ## including the in-flight `LeaseObservation` report. The only difference
-## is `--no-write-stats` on the control daemon, which turns off the store,
+## is the capture switch: `--measurement capture=on` on the capture daemon
+## (capture is off by default) and `--no-write-stats` on the control
+## daemon, which turns off the store,
 ## the writer thread, the ambient sampler and the self-report intake. What
 ## is measured is therefore the daemon-side cost of capture and nothing
 ## else — not the cost of a different client, and not the cost of a
@@ -176,7 +178,12 @@ proc startArmDaemon(socketPath, identityFile: string;
     "--cpu-milli", "64000",
     "--memory-bytes", $(64'u64 * 1024'u64 * 1024'u64 * 1024'u64)
   ]
-  if not captureOn:
+  # Capture is off by default (it costs more than the measurement budget
+  # allows), so the capture arm turns it on; the control still says off
+  # explicitly, so neither arm depends on the default.
+  if captureOn:
+    args.add(["--measurement", "capture=on"])
+  else:
     args.add("--no-write-stats")
   result = startProcess(daemonPath(), args = args,
     options = {poStdErrToStdOut})
