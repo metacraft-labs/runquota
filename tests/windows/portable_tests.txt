@@ -53,3 +53,16 @@ tests/unit/t_owner_identity.nim
 # that helper -- Job Object, parent-pid walk, native command-line inventory --
 # is exercised nowhere else on this job.
 tests/unit/t_child_watchdog.nim
+# `runCapturedProcess`'s Windows arm: one drain thread per output stream, which
+# must never allocate from the Nim heap, because Nim 2.2 under ORC never gives
+# a finished thread's allocator pages back. The POSIX arm is a `poll` loop and
+# has no threads, so this job is the only place the drains run at all.
+# `t_child_process_partial_reads` pins that a pipe read in separate pieces is
+# captured whole; `t_child_process_capture_memory` bounds resident growth over
+# 2,000 captures and echoes 4 MiB without a deadlock. Both re-execute their
+# own binary as the child, so they need no shell, no daemon and no sqlite3.
+# Before they were added here, both were cross-compiled with mingw-w64 and run
+# under Wine 11.0 on Linux at runquota e7f7246: they pass, with growth 522 B
+# per call. The pre-fix drain (4bf105c) grew 164,528 B per call and failed.
+libs/runquota_core/tests/t_child_process_partial_reads.nim
+libs/runquota_core/tests/t_child_process_capture_memory.nim
