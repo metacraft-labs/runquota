@@ -97,8 +97,10 @@ const
       implemented: false, defaultOn: false),
     measureSizingData: MeasurementInfo(side: measuredByClient,
       implemented: false, defaultOn: false),
+    # IMPLEMENTED, AND OFF BY DEFAULT: the daemon writes the file only
+    # where `runquotad --metrics-textfile PATH` names one.
     measureMetricsExport: MeasurementInfo(side: measuredByDaemon,
-      implemented: false, defaultOn: false),
+      implemented: true, defaultOn: false),
   ]
 
 proc defaultMeasurements*(): MeasurementSet =

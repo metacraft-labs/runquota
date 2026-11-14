@@ -9,8 +9,10 @@ import runquota_protocol
 import runquota_stats_table/publisher
 import ./owners
 import ./cpu_shape
+import ./capacity_metrics
 
 export cpu_shape
+export capacity_metrics
 
 export owners
 
@@ -130,6 +132,13 @@ type
       ## The FIXED cadence of ambient load sampling (M11), independent of
       ## execution boundaries. Zero or negative turns ambient sampling off
       ## while leaving execution capture on.
+    metricsTextfilePath*: string
+      ## Where the capacity figures are written in Prometheus text format
+      ## (`runquotad --metrics-textfile`), for node-exporter's textfile
+      ## collector. Empty, the default, writes nothing: it is the
+      ## `metrics-export` measurement, and the only thing that turns it on.
+    metricsIntervalMillis*: int
+      ## How often that file is rewritten; `DefaultMetricsIntervalMillis`.
     retentionPolicy*: RetentionPolicy
       ## The bounds the scheduled retention pass enforces. M15 built them
       ## and nothing called them; this is what a daemon carries so that a
@@ -568,3 +577,8 @@ type
     cpuShareGroupUsage*: Table[string, uint32]
     namedPoolUsage*: Table[string, uint32]
     pressureFileCache*: PressureFileCache
+    capacity*: CapacityLedger
+      ## The per-host and per-session-group counters capacity tools read
+      ## (`capacity_metrics`): CPU used by finished leases, grants and
+      ## waits. Kept whether or not the text file is written, because
+      ## `runquota status --json` carries them too.

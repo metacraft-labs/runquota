@@ -40,7 +40,7 @@ The `stats` verbs have a page of their own:
 
 | Command | What it tells you |
 |---|---|
-| `runquota status [--json]` | Live counters: sessions, leases, `supervisor_lost_leases`, finished and granted totals, the memory-pressure reading, the starvation bound, and one row per [session group](/getting_started/concepts#session-group) with its counters (below). |
+| `runquota status [--json]` | Live counters: sessions, leases, `supervisor_lost_leases`, finished and granted totals, the memory-pressure reading, the starvation bound, and one row per [session group](/getting_started/concepts#session-group) with its counters (below). `--json` also carries the capacity figures (below). |
 | `runquota sessions --json` | The registered sessions. |
 | `runquota leases --json` | Every lease the daemon is tracking. |
 | `runquota topology --json` | The configured machines and CPU share groups — the budget, as the daemon sees it. |
@@ -73,6 +73,27 @@ output: read them, do not parse them into anything that persists.
 
 The figures are reservations, not measurements: the daemon does not watch
 process trees.
+
+### Capacity figures
+
+`status --json` also carries `capacity`: the figures
+`runquotad --metrics-textfile` exports for Prometheus (see
+[the daemon](/usage_guide/daemon#exporting-capacity-figures-for-prometheus)),
+in the daemon's own integer units, whether or not a file is written. Unlike
+`session_groups`, a group stays here after its last session closes, until it
+has been idle for an hour.
+
+| Field | Meaning |
+|---|---|
+| `cpu_budget_milli` | The host's CPU budget. |
+| `host`, `groups[]` | The figures below for the whole host, and for each session group (with `owner_uid` and `name`). |
+| `cpu_granted_milli`, `memory_reserved_bytes` | What granted leases hold now. |
+| `pending_requests`, `oldest_pending_wait_millis` | Requests waiting, and the longest wait so far. |
+| `cpu_used_micros` | CPU (user + system) finished leases' launchers reported; finishes without totals add nothing. |
+| `finished_with_totals`, `finished_without_totals` | Finished leases, by whether they reported totals. |
+| `grants`, `wait_millis` | Leases granted, and the time they had spent queued. |
+| `cpu_busy_pct`, `cpu_foreign_pct`, `ambient_reading_unix_millis` | (`host` only) The ambient sampler's latest reading, or `null` while it has none. |
+| `textfile` | `null` without `--metrics-textfile`; otherwise its `path`, `interval_millis`, `writes`, `failures` and `last_error` (`null` after a successful write). |
 
 ## `runquota session set`
 

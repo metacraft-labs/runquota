@@ -153,7 +153,7 @@ when isMainModule:
   var config = defaultDaemonConfig(defaultEndpoint())
   config.exitWithParentPid = exitWithParentPid
   config.socketActivation = socketActivation
-  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--measurement NAME=on|off[,...]] [--ambient-sample-interval-millis N] [--profile-uncontended-pct N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--admission-max-wait-millis N] [--log-file PATH]"
+  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--measurement NAME=on|off[,...]] [--ambient-sample-interval-millis N] [--profile-uncontended-pct N] [--metrics-textfile PATH] [--metrics-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--admission-max-wait-millis N] [--log-file PATH]"
   var measurementSwitches: seq[string]
   var i = 0
   while i < args.len:
@@ -283,6 +283,31 @@ when isMainModule:
       if i + 1 >= args.len:
         quit 2
       config.ambientSampleIntervalMillis = parseInt(args[i + 1])
+      i += 2
+    of "--metrics-textfile":
+      # THE CAPACITY FIGURES IN PROMETHEUS TEXT FORMAT, for node-exporter's
+      # textfile collector: rewritten every `--metrics-interval-millis`
+      # (15 s) through a temporary file and a rename. Naming a file is what
+      # turns the `metrics-export` measurement on; `metrics-export=off`
+      # turns it off again.
+      if i + 1 >= args.len or args[i + 1].len == 0:
+        echo "runquotad: --metrics-textfile needs a path\n" & usage
+        quit 2
+      config.metricsTextfilePath = absolutePath(args[i + 1])
+      i += 2
+    of "--metrics-interval-millis":
+      # How often that file is rewritten. Positive; a test shortens it.
+      var millis = 0
+      if i + 1 < args.len:
+        try:
+          millis = parseInt(args[i + 1])
+        except ValueError:
+          discard
+      if millis <= 0:
+        echo "runquotad: --metrics-interval-millis needs a positive " &
+          "number of milliseconds\n" & usage
+        quit 2
+      config.metricsIntervalMillis = millis
       i += 2
     of "--profile-uncontended-pct":
       # The most of the host's CPU that everything other than a finished

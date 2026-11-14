@@ -2,10 +2,10 @@
 ##
 ## WHAT IT ANSWERS. Every figure RunQuota records about a build (the
 ## observation store's rows, the ambient sampler, the launching client's
-## samples of its child tree, and the profiles, pressure reports, sizing data
-## and metrics export still to come) has a budget: with all of them on, a
-## build may take at most 1% more wall time and 1% more CPU time than with
-## all of them off. A measurement that misses the budget is off by default.
+## samples of its child tree, its CPU profiles, the capacity metrics file,
+## and the pressure reports and sizing data still to come) has a budget:
+## with all of them on, a build may take at most 1% more wall time and 1%
+## more CPU time than with all of them off. A measurement that misses the budget is off by default.
 ## This program is the judge: it runs a workload with the measurements off
 ## and on, repeatedly and interleaved, until the 95% confidence interval of
 ## the difference is within +-0.5%, and then passes or fails it. The
@@ -249,7 +249,7 @@ proc startDaemon(cfg: GateConfig; root: string; arm: Arm;
     raise newException(ValueError, "socket path too long for a Unix " &
       "socket (" & $result.socket.len & " bytes): " & result.socket &
       "; set TMPDIR to a shorter directory")
-  let args = @[cfg.daemonBin,
+  var args = @[cfg.daemonBin,
     "--socket", result.socket,
     "--host-config", dir / "host.toml",
     "--host-identity-file", dir / "host-id",
@@ -258,6 +258,13 @@ proc startDaemon(cfg: GateConfig; root: string; arm: Arm;
     "--cpu-milli", $cfg.cpuMilli,
     "--memory-bytes", $cfg.memoryBytes,
     "--measurement", switches]
+  # `metrics-export` writes a file only where one is named, and refuses an
+  # `=on` that names none; the arm that takes it writes into its own
+  # directory, at the daemon's default cadence.
+  var parsed: MeasurementSet
+  if applyMeasurementSwitches(switches, parsed) == "" and
+      measureMetricsExport in parsed:
+    args.add(["--metrics-textfile", dir / "runquota.prom"])
   result.pid = spawnChild(args, daemonEnv(), dir, result.log)
   let deadline = getMonoTime() + initDuration(seconds = 60)
   var lastError = ""

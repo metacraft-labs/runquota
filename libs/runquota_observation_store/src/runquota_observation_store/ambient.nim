@@ -588,6 +588,13 @@ var
     ## The host's CPU busy share of the most recent samples taken, kept in
     ## memory so the daemon can tell whether a finished execution ran on a
     ## contended host without reading the store (admission never reads it).
+  latestReadingAt = 0'i64
+  latestBusyPct = 0.0
+  latestForeignPct = 0.0
+    ## The most recent reading's CPU busy and foreign shares, whether or not
+    ## a lease was live over it (the live-lease gate decides what is
+    ## WRITTEN, not what is read). For capacity tools: zero `at` means no
+    ## reading yet.
 
 # ARMED AT MODULE INITIALISATION, for the reason set out at length over the
 # same line in ``writer.nim``. The lazy `ensure` proc that stood here was a
@@ -1014,9 +1021,18 @@ proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
     # first lease's start is therefore written, and so is the one
     # straddling the last lease's end -- each of those intervals really did
     # contain work -- and the tick after that is the first one dropped.
+    # THE LATEST READING IS KEPT FOR CAPACITY TOOLS BEFORE THE GATE, so the
+    # exported busy share stays current while no lease is live -- which is
+    # exactly when a capacity rule most needs to tell an idle host from one
+    # busy with work RunQuota does not see. It is the row the gate below
+    # writes when it writes one, computed once.
+    let row = attributeAmbientSample(samplerHostId, previous, current, reports)
     var covered = false
     acquire(samplerLock)
     try:
+      latestReadingAt = row.sampledAtUnixMillis
+      latestBusyPct = row.cpuBusyPct
+      latestForeignPct = row.foreignCpuPct
       covered = samplerLeaseCovered or samplerLiveLeases > 0
       samplerLeaseCovered = samplerLiveLeases > 0
       if not covered:
@@ -1027,14 +1043,13 @@ proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
       previous = current
       return
 
-    var row: AmbientSampleRow
     var collided = false
     acquire(samplerLock)
     try:
-      # `reports` is the snapshot taken WITH the reading above, not
-      # the live set as it stands NOW: re-reading it here is precisely
-      # the skew this proc exists to avoid.
-      row = attributeAmbientSample(samplerHostId, previous, current, reports)
+      # `row` was attributed from the snapshot of `reports` taken WITH the
+      # reading above, not the live set as it stands NOW: re-reading it
+      # here is precisely the skew this proc exists to avoid.
+      #
       # `(host_id, sampled_at_unix_millis)` is the primary key, so two
       # samples inside one millisecond collide. The loser is DROPPED and
       # COUNTED, which is how this module already handles a stale pair and
@@ -1156,6 +1171,7 @@ proc startAmbientSampler*(path, hostId: string;
     samplerCollided = 0
     samplerNoLease = 0
     samplerLastSampledAt = 0
+    latestReadingAt = 0
     # A sampler starts with NOTHING LIVE, and therefore writing nothing.
     # The lease authority publishes the count as leases come and go; there
     # can be no live lease before the daemon that grants them is serving,
@@ -1307,6 +1323,25 @@ proc meanHostCpuBusyPct*(fromUnixMillis, toUnixMillis: int64;
       release(samplerLock)
   if result > 0:
     meanPct = total / float64(result)
+
+proc latestAmbientCpu*(busyPct, foreignPct: var float64;
+                       takenAt: var int64): bool =
+  ## The latest reading's CPU busy and foreign shares (percent of the whole
+  ## host) and when it was taken, or false when there is none yet (the
+  ## sampler is off, or has not completed a pair of readings); `takenAt` is
+  ## the reading's Unix milliseconds. In memory and
+  ## under the sampler's lock only.
+  {.cast(gcsafe).}:
+    acquire(samplerLock)
+    try:
+      if latestReadingAt == 0'i64:
+        return false
+      busyPct = latestBusyPct
+      foreignPct = latestForeignPct
+      takenAt = latestReadingAt
+      true
+    finally:
+      release(samplerLock)
 
 proc stopAmbientSampler*() =
   ## Join the sampler, then settle its final batch before joining the writer.

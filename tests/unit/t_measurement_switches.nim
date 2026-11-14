@@ -87,8 +87,7 @@ suite "measurement switch parser":
   test "the registry says which measurements exist and where they are taken":
     check measurementRegistry[measureCapture].side == measuredByDaemon
     check measurementRegistry[measureTreeSampling].side == measuredByClient
-    for m in [measurePressureReports, measureSizingData,
-              measureMetricsExport]:
+    for m in [measurePressureReports, measureSizingData]:
       check not measurementRegistry[m].implemented
       # Not implemented, so not on by default: a measurement is on by
       # default only once it has passed the overhead gate.
@@ -101,7 +100,8 @@ suite "measurement switch parser":
     check measureProfiles notin defaultMeasurements()
     check implementedMeasurements() ==
       {measureCapture, measureAmbientSampling, measureTreeSampling,
-       measureProfiles}
+       measureProfiles, measureMetricsExport}
+    check not measurementRegistry[measureMetricsExport].defaultOn
 
   test "a malformed client value falls back to the defaults and says why":
     var problem: string
@@ -129,9 +129,26 @@ suite "daemon measurement switches":
     var config = defaultDaemonConfig(defaultEndpoint())
     let before = config.ambientSampleIntervalMillis
     check config.applyDaemonMeasurementSwitches(
-      ["tree-sampling=off,profiles=on,metrics-export=on"]) == ""
+      ["tree-sampling=off,profiles=on,pressure-reports=on"]) == ""
     check not config.writeStatsDisabled
     check config.ambientSampleIntervalMillis == before
+
+  test "metrics-export follows the text file it writes to":
+    var config = defaultDaemonConfig(defaultEndpoint())
+    # Off by default: there is no file to write.
+    check measureMetricsExport notin daemonMeasurements(config)
+    # On names nowhere to write, so it is refused rather than inert.
+    check "needs --metrics-textfile" in
+      config.applyDaemonMeasurementSwitches(["metrics-export=on"])
+    check "needs --metrics-textfile" in
+      config.applyDaemonMeasurementSwitches(["all=on"])
+    config.metricsTextfilePath = "/var/lib/textfile/runquota.prom"
+    check measureMetricsExport in daemonMeasurements(config)
+    check config.applyDaemonMeasurementSwitches(["metrics-export=on"]) == ""
+    check config.metricsTextfilePath.len > 0
+    check config.applyDaemonMeasurementSwitches(["metrics-export=off"]) == ""
+    check config.metricsTextfilePath == ""
+    check measureMetricsExport notin daemonMeasurements(config)
 
   test "an explicit on against an older off flag is refused, not ordered":
     var config = defaultDaemonConfig(defaultEndpoint())

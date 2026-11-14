@@ -49,7 +49,8 @@ measurement has a name and a switch:
 | `ambient-sampling` | the daemon: the host-wide load sampler | on by default |
 | `tree-sampling` | the launching client: samples of the child tree's resident memory and process count while it waits, which become the finish's summed peak memory | on by default |
 | `profiles` | the launching client: a CPU profile of the child tree (Linux), see "CPU totals and profiles" below | off by default |
-| `pressure-reports`, `sizing-data`, `metrics-export` | — | registered, not implemented yet: the switches are accepted and do nothing |
+| `metrics-export` | the daemon: the [capacity figures text file](/usage_guide/daemon#exporting-capacity-figures-for-prometheus) | off unless `runquotad --metrics-textfile PATH` names a file; `metrics-export=on` without one is refused |
+| `pressure-reports`, `sizing-data` | — | registered, not implemented yet: the switches are accepted and do nothing |
 
 A switch is `NAME=on|off`, comma-separated and applied left to right;
 `all=on|off` covers every name. The daemon takes it as `runquotad

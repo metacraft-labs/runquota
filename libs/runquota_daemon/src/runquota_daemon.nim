@@ -105,6 +105,8 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     observationQueueCapacity: 1024,
     hostIdentityFilePath: "",
     ambientSampleIntervalMillis: defaultAmbientCadenceMillis,
+    metricsTextfilePath: "",
+    metricsIntervalMillis: DefaultMetricsIntervalMillis,
     profileUncontendedPct: DefaultUncontendedOtherCpuPct,
     retentionPolicy: defaultRetentionPolicy(),
     retentionSweepIntervalMillis: defaultRetentionSweepIntervalMillis,
@@ -140,6 +142,8 @@ proc daemonMeasurements*(config: DaemonConfig): MeasurementSet =
     result.incl(measureCapture)
   if config.ambientSampleIntervalMillis > 0:
     result.incl(measureAmbientSampling)
+  if config.metricsTextfilePath.len > 0:
+    result.incl(measureMetricsExport)
 
 proc applyDaemonMeasurementSwitches*(config: var DaemonConfig;
                                      switches: openArray[string]): string =
@@ -173,10 +177,17 @@ proc applyDaemonMeasurementSwitches*(config: var DaemonConfig;
     return "--measurement ambient-sampling=on contradicts " &
       "--ambient-sample-interval-millis " &
       $config.ambientSampleIntervalMillis
+  # `metrics-export` has no older OFF flag but needs a destination: with no
+  # `--metrics-textfile` there is nowhere to write, and an `=on` that did
+  # nothing would read as an export that is running.
+  if measureMetricsExport in namedOn and config.metricsTextfilePath.len == 0:
+    return "--measurement metrics-export=on needs --metrics-textfile PATH"
   if measureCapture notin measurements:
     config.writeStatsDisabled = true
   if measureAmbientSampling notin measurements:
     config.ambientSampleIntervalMillis = 0
+  if measureMetricsExport notin measurements:
+    config.metricsTextfilePath = ""
   ""
 
 proc applyHostConfig*(config: var DaemonConfig; host: HostConfig) =
@@ -819,6 +830,49 @@ proc groupFor(daemon: RunQuotaDaemon; key: string): SessionGroupRow =
   SessionGroupRow(key: key, name: InteractiveSessionGroup,
     priority: sessionPriorityHigh)
 
+proc liveLeaseFigures(daemon: RunQuotaDaemon; now: int64): seq[LeaseFigure] =
+  ## What the capacity figures need of every host lease that is queued or
+  ## holds capacity. Sub-leases are left out: they hold part of their
+  ## parent, which is counted already.
+  for lease in daemon.leases.values:
+    if lease.parentLeaseId != 0'u64:
+      continue
+    if lease.state == leaseStateQueued:
+      result.add(LeaseFigure(groupKey: lease.groupKey, queued: true,
+        waitedMillis: uint64(max(0'i64, now - lease.queuedAtMillis))))
+    elif lease.state.isResourceActive:
+      result.add(LeaseFigure(groupKey: lease.groupKey, queued: false,
+        cpuMilli: uint64(lease.resources.cpu.value),
+        memoryBytes: lease.resources.memory.value))
+
+proc pruneCapacityGroups(daemon: var RunQuotaDaemon; now: int64) =
+  ## Forget the session groups that have dropped out of the capacity
+  ## figures (`pruneIdleGroups`). Run on a thread that serves requests,
+  ## never on the text file's writer: the ledger's memory is allocated here,
+  ## and the writer only reads it.
+  var working = initHashSet[string]()
+  for figure in daemon.liveLeaseFigures(now):
+    working.incl(figure.groupKey)
+  daemon.capacity.pruneIdleGroups(working, now)
+
+const CapacityPruneIntervalMillis = 60_000'i64
+  ## How often, at most, a new session prunes idle groups: the idle limit is
+  ## an hour, so a minute's lateness is immaterial, and the prune walks the
+  ## lease table.
+
+proc noteCapacityActivity(daemon: var RunQuotaDaemon; key: string) =
+  ## A session is joining group `key`. The group's entry is created now so
+  ## the group shows from its first session, and this is where idle groups
+  ## are forgotten: a new entry is the only way the ledger grows, so pruning
+  ## here bounds it -- at once when it holds more than
+  ## `MaxRetainedIdleGroups` entries, otherwise at most once a minute.
+  let now = monoMillis()
+  if not daemon.capacity.groups.hasKey(key) and
+      (daemon.capacity.groups.len >= MaxRetainedIdleGroups or
+       now - daemon.capacity.lastPruneMillis >= CapacityPruneIntervalMillis):
+    daemon.pruneCapacityGroups(now)
+  daemon.capacity.touchGroup(key, now)
+
 proc joinSessionGroup(daemon: var RunQuotaDaemon; peer: PeerIdentity;
                       declaration: SessionGroupDeclaration): string =
   ## Place a new session in its group and return the group's key. The first
@@ -830,6 +884,7 @@ proc joinSessionGroup(daemon: var RunQuotaDaemon; peer: PeerIdentity;
     if declaration.name.len == 0: InteractiveSessionGroup
     else: declaration.name
   result = sessionGroupKey(peer, name)
+  daemon.noteCapacityActivity(result)
   if daemon.sessionGroups.hasKey(result):
     inc daemon.sessionGroups[result].sessions
     return
@@ -857,6 +912,7 @@ proc leaveSessionGroup(daemon: var RunQuotaDaemon; key: string) =
   ## go with its last session.
   if key.len == 0 or not daemon.sessionGroups.hasKey(key):
     return
+  daemon.capacity.touchGroup(key, monoMillis())
   dec daemon.sessionGroups[key].sessions
   if daemon.sessionGroups[key].sessions <= 0:
     daemon.sessionGroups.del(key)
@@ -962,6 +1018,8 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
         if prevPool >= demand.units: prevPool - demand.units else: 0'u32
     if daemon.activeLeaseCount > 0'u32:
       dec daemon.activeLeaseCount
+    # The group was working until now: its idle time starts here.
+    daemon.capacity.touchGroup(lease.groupKey, monoMillis())
     # What the group held, for how long, counted when it stops holding it.
     if lease.groupKey.len > 0 and daemon.sessionGroups.hasKey(lease.groupKey):
       let since =
@@ -1517,9 +1575,75 @@ proc sessionGroupsJson(daemon: RunQuotaDaemon): string =
     "}")
   result.add("]")
 
+var
+  metricsWrites: Atomic[int64]
+  metricsFailures: Atomic[int64]
+    ## The text file writer's record (`metricsWriterMain`): files written,
+    ## and attempts that failed. Atomics, so `runquota status` can read them
+    ## under the daemon lock without the writer ever taking that lock for
+    ## its own bookkeeping.
+  metricsErrorLock: Lock
+  metricsLastError: array[512, char]
+  metricsLastErrorLen = 0
+    ## Why the latest attempt failed, or empty once one succeeds. A fixed
+    ## buffer rather than a string: the writer thread fills it and request
+    ## threads read it, and a string allocated on one thread and freed on
+    ## another outlives its allocator's region when the writer stops (see
+    ## `runquota_core/process_owned`). It is reported in `runquota status`
+    ## rather than printed: the daemon's startup output is a fixed number
+    ## of lines, and the first write happens while it is still printing.
+
+initLock(metricsErrorLock)
+
+proc setMetricsError(message: string) =
+  acquire(metricsErrorLock)
+  try:
+    metricsLastErrorLen = min(message.len, metricsLastError.len)
+    for i in 0 ..< metricsLastErrorLen:
+      metricsLastError[i] = message[i]
+  finally:
+    release(metricsErrorLock)
+
+proc metricsError(): string =
+  acquire(metricsErrorLock)
+  try:
+    result = newString(metricsLastErrorLen)
+    for i in 0 ..< metricsLastErrorLen:
+      result[i] = metricsLastError[i]
+  finally:
+    release(metricsErrorLock)
+
+proc capacityCopy(daemon: RunQuotaDaemon): CapacityCopy =
+  ## What the capacity figures are computed from, copied. READ-ONLY: the
+  ## text file's writer calls this under the daemon lock from a thread that
+  ## must not change daemon-owned memory, and does the rest after releasing
+  ## the lock.
+  let now = monoMillis()
+  daemon.capacity.copyFor(daemon.liveLeaseFigures(now),
+    uint64(daemon.config.cpuSlots.value), now)
+
+proc capacitySnapshot(copy: CapacityCopy): CapacitySnapshot =
+  ## The capacity figures, with the ambient sampler's latest reading (taken
+  ## under the sampler's lock, not the daemon's).
+  result = snapshot(copy)
+  var ambient = AmbientFigures()
+  ambient.available = latestAmbientCpu(ambient.busyPct, ambient.foreignPct,
+    ambient.atUnixMillis)
+  result.ambient = ambient
+
+proc metricsTextfileJson(config: DaemonConfig): string =
+  if config.metricsTextfilePath.len == 0:
+    return "null"
+  "{\"path\":" & jsonEscape(config.metricsTextfilePath) &
+    ",\"interval_millis\":" & $config.metricsIntervalMillis &
+    ",\"writes\":" & $metricsWrites.load(moRelaxed) &
+    ",\"failures\":" & $metricsFailures.load(moRelaxed) &
+    ",\"last_error\":" & (let e = metricsError();
+      if e.len == 0: "null" else: jsonEscape(e)) & "}"
+
 proc statusJson(daemon: RunQuotaDaemon): string =
   ## The `status` inspection subject: the wire status, as JSON, with the
-  ## session groups beside it.
+  ## session groups and the capacity figures beside it.
   var base = inspectionStatusJson(daemon.status())
   base.setLen(base.len - 1)
   var order: seq[string] = @[]
@@ -1530,7 +1654,9 @@ proc statusJson(daemon: RunQuotaDaemon): string =
     ",\"admission_order\":[" & order.join(",") & "]" &
     ",\"admission_share_between_users\":" &
       jsonEscape($daemon.config.shareBetweenUsers) &
-    ",\"session_groups\":" & daemon.sessionGroupsJson() & "}"
+    ",\"session_groups\":" & daemon.sessionGroupsJson() &
+    ",\"capacity\":" & capacityJson(capacitySnapshot(daemon.capacityCopy()),
+      metricsTextfileJson(daemon.config)) & "}"
 
 proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
   var ids: seq[uint64] = @[]
@@ -2457,6 +2583,7 @@ proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
     queuedAtMillis: monoMillis()
   )
   daemon.leases[id.value] = result
+  daemon.capacity.touchGroup(session.groupKey, result.queuedAtMillis)
 
 proc widthRefusal(width: WidthRange): string =
   ## Why a requested CPU range is malformed, or "". Answered as a denial the
@@ -3090,6 +3217,9 @@ proc grantQueuedLease(daemon: var RunQuotaDaemon; id: uint64; delivered: bool) =
   inc daemon.totalGranted
   # A sub-lease's wait is a wait inside its parent's tree, not a wait of the
   # group on the host, so it stays out of the group's wait figures.
+  if lease.parentLeaseId == 0'u64:
+    daemon.capacity.noteGrant(lease.groupKey,
+      elapsedSince(lease.queuedAtMillis), monoMillis())
   if lease.parentLeaseId == 0'u64 and lease.groupKey.len > 0 and
       daemon.sessionGroups.hasKey(lease.groupKey):
     let waited = elapsedSince(lease.queuedAtMillis)
@@ -4555,6 +4685,11 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     lease.pressureEvents = msg.pressureEvents
     daemon.updateEstimateFromFinish(lease, msg)
     daemon.foldCpuEstimateFromFinish(lease, msg)
+    # THE USED-CPU COUNTER, from what the launcher measured at exit -- never
+    # from what was granted. A sub-lease's tree ran inside its parent's,
+    # whose launcher's totals already include it.
+    if lease.parentLeaseId == 0'u64:
+      daemon.capacity.noteFinish(lease.groupKey, msg.totals, monoMillis())
     daemon.captureObservation(lease, msg)
     # M13b: THE KEY IS MARKED DIRTY, NOT PUBLISHED. Ordered after
     # `captureObservation` because the aggregate must include the run that
@@ -4930,6 +5065,122 @@ proc stopAggregatePublisher() =
     publicationActive = false
   finally:
     release(publicationLock)
+
+# ---------------------------------------------------------------------------
+# The capacity text file writer (`runquotad --metrics-textfile`).
+#
+# OFF THE ADMISSION PATH. Nothing a request does waits for this thread. It
+# takes the daemon lock only to copy what the figures are computed from
+# (`capacityCopy`: one walk of the lease table and of the group ledger, no
+# I/O, no change to daemon-owned memory); computing the figures, rendering
+# the text and writing and renaming the file happen after the lock is
+# released, so a slow or full file system delays the file, never a lease.
+#
+# Its own state is behind `metricsLock`, which is never held together with
+# the daemon lock.
+# ---------------------------------------------------------------------------
+
+var
+  metricsLock: Lock
+  metricsThread: Thread[void]
+  metricsStop = false
+  metricsActive = false
+
+initLock(metricsLock)
+
+const MetricsStopPollMillis = 100
+  ## The longest the writer sleeps at once, so a shutdown never waits a
+  ## whole interval for it.
+
+proc writeCapacityTextfile() {.gcsafe.} =
+  {.cast(gcsafe).}:
+    var path = ""
+    var copy: CapacityCopy
+    acquire(sharedDaemon.lock)
+    try:
+      path = sharedDaemon.daemon.config.metricsTextfilePath
+      copy = sharedDaemon.daemon.capacityCopy()
+    finally:
+      release(sharedDaemon.lock)
+    if path.len == 0:
+      return
+    let failure = writeTextfileAtomically(path,
+      expositionText(capacitySnapshot(copy)))
+    if failure.len == 0:
+      metricsWrites.atomicInc()
+    else:
+      metricsFailures.atomicInc()
+    setMetricsError(failure)
+
+proc metricsWriterMain() {.thread, gcsafe.} =
+  ## A FAILURE HERE MUST NOT TAKE THE HOST'S LEASE AUTHORITY WITH IT, as
+  ## for the publication thread: an unhandled exception on a Nim thread ends
+  ## the process. The first file is written at once, so a scrape soon after
+  ## start finds one.
+  var interval = DefaultMetricsIntervalMillis
+  {.cast(gcsafe).}:
+    acquire(sharedDaemon.lock)
+    try:
+      interval = max(1, sharedDaemon.daemon.config.metricsIntervalMillis)
+    finally:
+      release(sharedDaemon.lock)
+  var nextAt = monoMillis()
+  while true:
+    var stopping = false
+    {.cast(gcsafe).}:
+      acquire(metricsLock)
+      try:
+        stopping = metricsStop
+      finally:
+        release(metricsLock)
+    if stopping:
+      break
+    let now = monoMillis()
+    if now >= nextAt:
+      try:
+        writeCapacityTextfile()
+      except CatchableError as err:
+        {.cast(gcsafe).}:
+          metricsFailures.atomicInc()
+          setMetricsError("metrics text file not written: " & err.msg)
+      # From the planned time, so the cadence does not drift by the time
+      # each write takes; a writer that fell behind skips ahead instead of
+      # writing back to back.
+      nextAt += int64(interval)
+      if nextAt <= monoMillis():
+        nextAt = monoMillis() + int64(interval)
+    sleep(int(max(1'i64, min(int64(MetricsStopPollMillis),
+      nextAt - monoMillis()))))
+
+proc startMetricsWriter(config: DaemonConfig) =
+  if config.metricsTextfilePath.len == 0:
+    return
+  acquire(metricsLock)
+  try:
+    if metricsActive:
+      return
+    metricsStop = false
+    metricsActive = true
+  finally:
+    release(metricsLock)
+  createThread(metricsThread, metricsWriterMain)
+
+proc stopMetricsWriter() =
+  var running = false
+  acquire(metricsLock)
+  try:
+    running = metricsActive
+    metricsStop = true
+  finally:
+    release(metricsLock)
+  if not running:
+    return
+  joinThread(metricsThread)
+  acquire(metricsLock)
+  try:
+    metricsActive = false
+  finally:
+    release(metricsLock)
 
 proc connectionWorkerCount(): int =
   max(4, min(32, countProcessors()))
@@ -5897,6 +6148,9 @@ proc serve*(config: DaemonConfig): int =
   # into it, and before any connection is accepted, because a key marked
   # dirty with nobody draining it would never reach the table.
   startAggregatePublisher()
+  # The capacity text file, when one is named. It reads the daemon under
+  # its lock and nothing else, so it can start once the daemon is serving.
+  startMetricsWriter(config)
   # THE DEGRADATION IS SAID OUT LOUD, and it is appended to the listening
   # line rather than printed on one of its own: the startup output is a
   # FIXED number of lines that readers consume by count, and a fourth line
@@ -6116,6 +6370,10 @@ proc serve*(config: DaemonConfig): int =
     # inside would deadlock, and its final drain needs the observation
     # writer still alive to flush.
     stopAggregatePublisher()
+    # Also before the daemon lock: the text file writer takes it. The file
+    # is left in place, like the published table: node-exporter's
+    # `node_textfile_mtime_seconds` tells a reader how old it is.
+    stopMetricsWriter()
     acquire(sharedDaemon.lock)
     try:
       sharedDaemon.daemon.state = dsStopping

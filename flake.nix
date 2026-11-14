@@ -557,6 +557,12 @@
               pkgs.rustc
               pkgs.gnumake
               pkgs.ninja
+              # PROMETHEUS'S `promtool`, which the capacity-metrics tests run
+              # over the file `runquotad --metrics-textfile` writes: the
+              # format is checked by the parser and linter of the project
+              # that defines it, not by a reimplementation in the test. The
+              # `cli` output holds promtool alone, without the server.
+              pkgs.prometheus.cli
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
               pkgs.zig

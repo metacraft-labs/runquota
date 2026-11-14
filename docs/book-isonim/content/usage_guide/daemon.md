@@ -236,7 +236,9 @@ Recording (see [the observation store](/usage_guide/observations)):
 | `--estimate-db PATH` | — | The learned-estimate database. |
 | `--ambient-sample-interval-millis N` | `1000` | Host-wide sampling cadence; `0` turns sampling off. |
 | `--profile-uncontended-pct N` | `25` | The most of the host's CPU that everything other than a finished execution may have used over its run for the run to be folded into its command's learned duration and CPU curve. |
-| `--measurement NAME=on\|off[,...]` | the defaults | Turns daemon-side measurements on or off by name, repeatable, applied after every other flag. `capture=off` is `--no-write-stats`; `ambient-sampling=off` is an interval of `0`. An explicit `=on` against one of those older flags, an unknown name, or a value other than `on`/`off` is a refusal (exit 2). See [Measurement switches](/usage_guide/observations#measurement-switches). |
+| `--measurement NAME=on\|off[,...]` | the defaults | Turns daemon-side measurements on or off by name, repeatable, applied after every other flag. `capture=off` is `--no-write-stats`; `ambient-sampling=off` is an interval of `0`; `metrics-export=off` drops `--metrics-textfile`. An explicit `=on` against one of those older flags (or `metrics-export=on` with no `--metrics-textfile`), an unknown name, or a value other than `on`/`off` is a refusal (exit 2). See [Measurement switches](/usage_guide/observations#measurement-switches). |
+| `--metrics-textfile PATH` | none | Write the [capacity figures](#exporting-capacity-figures-for-prometheus) to `PATH` in Prometheus text format. Naming a file is what turns the `metrics-export` measurement on. |
+| `--metrics-interval-millis N` | `15000` | How often that file is rewritten. A positive number; anything else is a usage error (exit 2). |
 | `--host-identity-file PATH` | `/var/lib/runquota/host-id` (`/var/db/...` on macOS) | Relocates the host state, and the store with it. |
 
 Retention — four bounds, each with the **same unusual rule**:
@@ -257,6 +259,78 @@ Retention — four bounds, each with the **same unusual rule**:
 
 An unrecognised flag is a refusal, not a warning: `unknown runquotad argument:
 <arg>`, exit **2**.
+
+## Exporting capacity figures for Prometheus
+
+A capacity tool (a launch gate, a dashboard, a fleet balancer) can see how
+much of a host's CPU builds hold and use, per host and per
+[session group](/getting_started/concepts#session-group), and tell it from
+other load. Nothing is sampled for this and nothing is asked of the build
+tools: the figures come from the lease table, from the CPU totals each
+launching client reads from its own `wait4` for the tree's root and sends
+when the lease finishes, and from the ambient sampler.
+
+`runquotad --metrics-textfile PATH` writes them in the Prometheus text
+exposition format every 15 seconds (`--metrics-interval-millis`), for
+[node-exporter's textfile collector](https://github.com/prometheus/node_exporter#textfile-collector):
+point `PATH` into the collector's directory and give it a `.prom` name. The
+file is written beside the target under a temporary name (`.<name>.<pid>.tmp`,
+which the collector ignores) and renamed over it, so a scrape never reads half
+a file. It is readable by everyone (mode 0644), because the collector usually
+runs as another user. A write that fails leaves the previous file in place, and
+is counted in `runquota status --json` (`capacity.textfile`) with its reason.
+The file is left in place when the daemon stops; node-exporter's
+`node_textfile_mtime_seconds` says how old it is. The writer runs on a thread
+of its own and holds the daemon's lock only to copy the figures, so writing the
+file never delays a lease.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `runquota_host_cpu_budget_cpus` | gauge | The CPU budget the daemon admits against. |
+| `runquota_host_cpu_granted_cpus` | gauge | CPU granted to leases now. |
+| `runquota_host_memory_reserved_bytes` | gauge | Memory reserved by granted leases now. |
+| `runquota_host_pending_requests` | gauge | Requests waiting in the queue. |
+| `runquota_host_oldest_pending_wait_seconds` | gauge | How long the longest-waiting request has waited. |
+| `runquota_host_cpu_used_seconds_total` | counter | CPU time (user + system) of finished lease trees, as their launchers reported it at exit. |
+| `runquota_host_finished_leases_total{totals}` | counter | Finished leases, `totals="reported"` or `"missing"`. |
+| `runquota_host_grants_total` | counter | Leases granted. |
+| `runquota_host_wait_seconds_total` | counter | Time granted leases spent queued, summed. |
+| `runquota_host_cpu_busy_ratio` | gauge | Share of the host's whole CPU capacity that was busy, from the ambient sampler's latest reading. |
+| `runquota_host_cpu_foreign_ratio` | gauge | The busy share less what clients reported their running leases used. No client reports that today, so it equals the busy share. |
+| `runquota_host_ambient_reading_timestamp_seconds` | gauge | When that reading was taken. |
+| `runquota_group_*` | as above | The same live figures and counters per session group, labelled `owner_uid` and `group`. |
+
+A few rules make the figures safe to compute with:
+
+- **Used CPU counts what was reported, never what was granted.** A finish
+  without totals (a client older than them, or a launcher that could not reap
+  its root) adds no CPU; it is counted under `totals="missing"`, so the share
+  of work the counter does not cover is visible. A lease released without
+  any finish (released early, or its session closed while it ran) is a grant
+  and neither kind of finish.
+- **Sub-leases are left out.** A sub-lease runs inside its parent lease's tree,
+  whose launcher's totals already include it.
+- **Counters only grow, and saturate** at 2^64 - 1 microseconds rather than
+  wrap, whatever a client sends.
+- **Idle groups drop out.** A group that has held nothing, queued nothing and
+  finished nothing for an hour leaves the file and the status output; if it
+  comes back, its counters start again from zero, which Prometheus's `rate()`
+  reads as a counter reset. Host series never drop out. At most 1024 idle
+  groups are kept.
+- **Labels are escaped** as the format requires. `owner_uid` comes from the
+  peer's credentials (`unknown` where the transport reports none). A group
+  name that is not valid UTF-8 is shown with U+FFFD in `group` and its bytes in
+  hex in an extra `group_hex` label, so two such names never merge.
+- **The busy and foreign shares are present only while the ambient sampler
+  runs** (it needs the observation store and a positive
+  `--ambient-sample-interval-millis`). Build load is the rate of
+  `runquota_host_cpu_used_seconds_total`, which lags by one lease, beside
+  `runquota_host_cpu_granted_cpus`, which is live.
+
+The export is the `metrics-export` measurement and is off unless a file is
+named. `runquota status --json` carries the same figures as `capacity`,
+whether or not a file is written (see
+[the CLI](/usage_guide/cli#capacity-figures)).
 
 ## What it prints at startup: exactly three lines, always
 
