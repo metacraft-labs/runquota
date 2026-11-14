@@ -593,21 +593,29 @@ suite "observation_extension_write_path_codec":
       maxProcesses: 1, majorPageFaults: 0, ioReadBytes: none(int64),
       ioWriteBytes: none(int64), captureCompleteness: ccComplete,
       droppedObservations: 0, ownerUid: none(int64))
-    let childInsert =
-      "insert into ext_m17_probe (host_id, execution_id, probe_label) " &
-      "values ('host-order-probe', 'exec-order-probe', 'ordered');"
-    let sql = batchStatement([], [execution], [childInsert])
-    let parentAt = sql.find("insert into executions")
-    let childAt = sql.find(childInsert)
+    let childInsert = extensionInsertStatement("ext_m17_probe", ExtensionRow(
+      hostId: "host-order-probe", executionId: "exec-order-probe",
+      columns: @["probe_label"], values: @[extText("ordered")]))
+    let batch = batchStatement([], [execution], [childInsert])
+    # The batch is the byte form of bound statements, which `runSqlite` runs
+    # as ONE `begin immediate` transaction, so "both in the same
+    # transaction" is a property of the form; what this asserts is the
+    # ORDER inside it.
+    check batch.isBound
+    var statements: seq[BoundStatement] = @[]
+    check decodeBound(batch, statements)
+    var parentAt = -1
+    var childAt = -1
+    for i, statement in statements:
+      if statement.sql.startsWith("insert into executions"):
+        parentAt = i
+      if statement.sql.startsWith("insert into ext_m17_probe"):
+        childAt = i
     # NON-VACUITY: both really are in this batch, so the comparison below
     # is an ordering statement and not a statement about one being absent.
     check parentAt >= 0
     check childAt >= 0
     check parentAt < childAt
-    # And both are inside the one transaction, so "the parent is there"
-    # cannot be satisfied by a batch that committed it separately.
-    check sql.find("begin immediate;") < parentAt
-    check childAt < sql.rfind("commit;")
 
   test "every storage class survives the round trip unchanged":
     let msg = ExtensionRowMessage(

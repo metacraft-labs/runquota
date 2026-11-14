@@ -515,6 +515,10 @@ proc commandSpec*(argv: openArray[string]; cwd = ""; env: openArray[string] = []
   result.createProcessGroup = createProcessGroup
   result.stdio = stdio
 
+const treeSampleIntervalSeconds = 0.1
+  ## The `tree-sampling` cadence: the launcher reads its tree's resident
+  ## memory and process count at most this often while it waits.
+
 proc launchTelemetrySource(treeSampling: bool): string =
   ## The telemetry source a launch starts with. With `tree-sampling` off the
   ## completion says so, so a reader of a zero peak can tell "nobody
@@ -1314,9 +1318,17 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
 
     if not child.doneFlag:
       let now = epochTime()
+      # A TREE SAMPLE ONLY WHEN ONE IS DUE: one interval after the launch,
+      # then one interval after the previous sample, however often the
+      # caller polls (every 10 ms in `waitForCompletion`, as often as an
+      # engine likes through `pollCompletion`). Not at the first poll, which
+      # comes right after the fork: the tree is then the launcher's own
+      # forked image, not yet the command, and a command that exits inside
+      # the first interval is covered by `ru_maxrss` from the totals, which
+      # the daemon takes as the peak when no sample is larger.
       let treeDue = child.treeSampling and
-        (child.lastTelemetrySampleSeconds == 0.0 or
-          now - child.lastTelemetrySampleSeconds >= 0.1)
+        now - max(child.lastTelemetrySampleSeconds, child.startedSeconds) >=
+          treeSampleIntervalSeconds
       # ONE READING OF THE TREE SERVES BOTH MEASUREMENTS when both are due;
       # the profile's own reading comes once per profile interval (1 s,
       # doubling as the run lengthens), so with tree sampling off a profile
@@ -1325,6 +1337,7 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
         child.launchMonoMillis
       let profileDue = child.profiles and child.profileSampler.due(sinceLaunch)
       if treeDue or profileDue:
+        inc child.treeWalks
         let sample =
           when defined(linux):
             sampleLinuxProcessTreeTelemetry(uint64(child.pid))

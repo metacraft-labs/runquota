@@ -21,6 +21,7 @@ import runquota_admission
 import runquota_codec
 import runquota_core
 import runquota_core/process_owned
+import runquota_core/sqlite_inproc
 import runquota_core/image_digest
 import runquota_core/measurement
 import runquota_host
@@ -4969,8 +4970,8 @@ var connectionQueue: ConnectionQueue
 # the daemon lock on its own.
 #
 # THE EXPENSIVE PART IS OUTSIDE BOTH LOCKS. `flushObservationWriter` and
-# `estimateForAt` spawn `sqlite3`; holding the daemon-wide lock across
-# either of them is what the old code did, and it stalled every other
+# `estimateForAt` read and write the store; holding the daemon-wide lock
+# across either of them is what the old code did, and it stalled every other
 # connection worker for the duration.
 # ---------------------------------------------------------------------------
 
@@ -4992,7 +4993,7 @@ proc publishDirtyAggregates() {.gcsafe.} =
     # THIS COMMENT USED TO READ "one drain writes every queued row, so a
     # second would find nothing", and that was the defect. This thread was
     # never the only drainer: `drainOnce` swaps the queues under
-    # `writerLock` and spawns `sqlite3` outside it, so the writer's own
+    # `writerLock` and writes them to SQLite outside it, so the writer's own
     # thread leaves a window in which the queue is empty and the rows are
     # unwritten. A flush landing in it returned at once, the aggregate below
     # was computed over a row that had not committed, and the wrong figure
@@ -6366,8 +6367,8 @@ proc serve*(config: DaemonConfig): int =
     # would let it start them again behind the shutdown. It also takes the
     # daemon lock, so this wait comes before that lock is taken here. A
     # shutdown that arrives during the store's check therefore waits for the
-    # check -- the one `sqlite3` child it is waiting on is not ours to kill
-    # mid-read. It is JOINED at the very end; see `captureOpenerLock`.
+    # check -- a read in progress on that thread is not ours to interrupt
+    # mid-way. It is JOINED at the very end; see `captureOpenerLock`.
     if captureOpenerRunning:
       acquire(captureOpenerLock)
       try:
@@ -6395,6 +6396,11 @@ proc serve*(config: DaemonConfig): int =
       # waiting on any more.
       stopRetentionSweeper()
       stopObservationWriter()
+      # EVERY WRITER HAS STOPPED, so the pooled SQLite connections are idle
+      # and nothing will take one again. Closing them is what checkpoints
+      # each store's write-ahead log into its database file on the way out,
+      # as the exit of each `sqlite3` run used to.
+      closePooledConnections()
       # The FILE is deliberately left behind. A table whose publisher has
       # exited is STALE, not invalid, and a stale entry is a slightly worse
       # estimate rather than an incorrect admission — the anchor in its

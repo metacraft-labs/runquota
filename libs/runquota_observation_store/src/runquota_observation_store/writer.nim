@@ -53,7 +53,7 @@
 ## A FLUSH MEANS "EVERY ROW QUEUED BEFORE THIS CALL IS COMMITTED", and
 ## for a while it meant "the queue was empty when I looked". The two differ
 ## for exactly as long as a drain pass takes, because ``drainOnce`` swaps
-## the queues under ``writerLock`` and then spawns ``sqlite3`` OUTSIDE it:
+## the queues under ``writerLock`` and then writes them to SQLite OUTSIDE it:
 ## in that window the queue is EMPTY and the rows are UNWRITTEN, and a
 ## second drainer arriving found nothing and returned. ``writerQueued`` and
 ## ``writerSettled`` close it -- see ``flushObservationWriter``.
@@ -172,7 +172,7 @@ proc drainOnce() {.gcsafe.} =
   ## ``owner_uid`` always names a ``users`` row "in the same batch or an
   ## earlier one". An earlier batch TAKEN is not an earlier batch COMMITTED:
   ## the writer's own thread and a flusher (the aggregate publisher, a
-  ## ``stats`` query) could each take a batch and spawn ``sqlite3`` for it
+  ## ``stats`` query) could each take a batch and write it to SQLite
   ## concurrently, and whichever finished first committed first. A batch
   ## holding only an execution then reached the store before the batch
   ## holding its owner, the schema refused it (``executions.owner_uid names
@@ -235,9 +235,10 @@ proc drainOnceSerialized() {.gcsafe.} =
     # COUPLING RATHER THAN AN OVERSIGHT. These rows have already left the
     # queue; if this call could raise, they would never settle and every
     # flush waiting on them would park until the epoch changed. It cannot:
-    # ``appendStatementsAt`` reaches SQLite through ``runSqlite``, which
-    # documents "never raises" and honours it -- a tool that will not even
-    # start comes back as ``ok == false`` with the reason in ``error``. If
+    # ``appendStatementsAt`` reaches SQLite through ``sqlite_inproc``, which
+    # documents "never raises" and honours it -- a library that was never
+    # loaded or a store that will not open comes back as ``ok == false``
+    # with the reason in ``error``. If
     # that ever stops being true, ``writerSettled`` and its broadcast have
     # to move into a ``finally`` before the raise is allowed.
     let outcome = appendStatementsAt(path, statements)
@@ -432,8 +433,8 @@ proc flushObservationWriter*() =
   ##
   ## THE CONTRACT IS "EVERY ROW QUEUED BEFORE THIS CALL IS COMMITTED", and
   ## it used to be "the queue was empty when I looked". ``drainOnce`` swaps
-  ## the queues under ``writerLock`` and then spawns ``sqlite3`` OUTSIDE it,
-  ## so for the length of that spawn the queue is EMPTY and the rows are
+  ## the queues under ``writerLock`` and then writes them to SQLite OUTSIDE
+  ## it, so for the length of that write the queue is EMPTY and the rows are
   ## UNWRITTEN. A second drainer arriving in that window found nothing and
   ## returned, and the writer's own thread is always a second drainer.
   ##
@@ -451,15 +452,15 @@ proc flushObservationWriter*() =
   ## Rows queued AFTER the call are none of its business, which is what
   ## bounds the wait.
   ##
-  ## WHY NOT HOLD ``writerLock`` ACROSS THE SPAWN. That is the other way to
+  ## WHY NOT HOLD ``writerLock`` ACROSS THE WRITE. That is the other way to
   ## make the queue and the database agree, and it puts every connection
   ## worker's ``enqueueRunRow`` behind a 25-40 ms batch -- the hot-path
   ## perturbation OS-1 forbids, and the one M13b was spent removing.
   ##
   ## WHAT THE WAIT COSTS. In the ordinary case one batch write, which is what
   ## this caller would have paid had it been the thread that took those rows:
-  ## the two cases are "I spawn ``sqlite3``" and "I wait for the ``sqlite3``
-  ## somebody else spawned a moment ago", and with nothing in flight there is
+  ## the two cases are "I write the batch" and "I wait for the batch
+  ## somebody else began a moment ago", and with nothing in flight there is
   ## no wait at all.
   ##
   ## ONE BATCH IS NOT A CEILING, and this comment used to say it was. Several

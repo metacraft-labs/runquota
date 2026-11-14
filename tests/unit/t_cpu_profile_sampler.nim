@@ -65,6 +65,42 @@ suite "CPU profile sampler":
     for value in profile.samples:
       check value == 3000'u16
 
+  test "late readings do not move the sample boundaries off the grid":
+    # THE LAUNCHER READS LATE, ALWAYS: it polls every 10 ms or so, so the
+    # reading that closes a sample comes a few milliseconds after the
+    # boundary it was due at. Polling every 9 ms here makes every reading
+    # 8 ms late. A sampler that set the next boundary from the late reading
+    # drifted 8 ms per sample, so by the tenth second its sample 10 began
+    # after a step in the load that really happened inside second 10 --
+    # and reported that second without it. Falsifying mutation:
+    # `nextDueMillis` = the last reading's time + the interval; sample 10
+    # then reads as the second phase alone (2000) and the boundary check
+    # fails.
+    var sampler = initCpuProfileSampler()
+    sampler.start(0)
+    proc cumulative(now: int64): uint64 =
+      # 8 CPUs until 10.030 s, then 2.
+      if now <= 10_030: uint64(now) * 8000'u64
+      else: 10_030'u64 * 8000'u64 + uint64(now - 10_030) * 2000'u64
+    var now = 0'i64
+    while now < 14_000:
+      now += 9
+      if sampler.due(now):
+        sampler.observe(now, cumulative(now))
+        # Every boundary stays on the launch-relative grid.
+        check sampler.nextDueMillis() mod 1000 == 0
+        check sampler.nextDueMillis() > now
+    sampler.finish(now, cumulative(now))
+    let samples = sampler.profile().samples
+    checkpoint $samples
+    check samples.len >= 14
+    for i in 1 .. 9:
+      check samples[i] >= 7900'u16 and samples[i] <= 8100'u16
+    # Second 10 holds the first phase's last 22-30 ms at 8 CPUs.
+    check samples[10] >= 2080'u16 and samples[10] <= 2300'u16
+    for i in 11 .. 13:
+      check samples[i] >= 1950'u16 and samples[i] <= 2050'u16
+
   test "a steady load reads back as its rate across a merge":
     var sampler = initCpuProfileSampler()
     sampler.start(0)

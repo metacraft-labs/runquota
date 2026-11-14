@@ -1,5 +1,9 @@
-## The estimate store's ``sqlite3`` call must reach its child, must not wedge
-## on it, and must not lose a batch quietly when something goes wrong.
+## The estimate store's SQLite call must reach the store, must not wedge on
+## a large diagnostic, and must not lose a batch quietly when something goes
+## wrong. It used to run the ``sqlite3`` tool; it now runs SQLite in process
+## (``runquota_core/sqlite_inproc``), and the cases below still hold of it.
+## The flood case keeps its ``sqlite3`` control, which measures how large the
+## diagnostic is.
 ##
 ## TWO DEFECTS, ONE CALL SITE.
 ##
@@ -194,13 +198,13 @@ suite "estimate store sqlite streams":
         # `poStdErrToStdOut` would have done.
         check report.reportField("outputBytes").parseInt() == 0
 
-        # THE FAILURE IS REPORTED, not swallowed. `sqlite3` ran and rejected
-        # the statement, so `ok` is false and `failure` -- which is only for a
-        # tool that could not be run at all -- is empty. `runSqlite` used to
-        # return a bare stdout string, in which those two outcomes and a clean
-        # commit were the same value.
+        # THE FAILURE IS REPORTED, not swallowed. SQLite rejected the
+        # statement, so `ok` is false and `failure` carries SQLite's reason
+        # (it runs in process now; there is no tool that could fail to
+        # start). `runSqlite` used to return a bare stdout string, in which a
+        # rejection and a clean commit were the same value.
         check report.reportField("ok") == "false"
-        check report.reportField("failureBytes").parseInt() == 0
+        check report.reportField("failureBytes").parseInt() > 0
 
       # Asserted on both paths: a run that wedges `sqlite3` and then walks away
       # leaves processes that outlive the suite entirely.

@@ -373,7 +373,7 @@ proc mergeObservationStore*(destination: ObservationStore;
     return
   if not sqliteToolAvailable():
     result.outcome = moUnavailable
-    result.detail = "the '" & sqliteTool & "' tool is not on PATH"
+    result.detail = sqliteLibraryReport()
     return
   if not fileExists(sourcePath):
     result.outcome = moSourceUnreadable

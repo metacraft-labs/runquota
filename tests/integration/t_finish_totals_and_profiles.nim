@@ -13,27 +13,34 @@
 ##    it is reaped, rather than `wait4`'s rusage) and the row carries about
 ##    0 s and fails. With `profiles` off (the default) no profile row is
 ##    written: the execution keeps its totals only.
-## 2. With `RUNQUOTA_MEASUREMENT=profiles=on,tree-sampling=on` (see the
-##    case for why tree sampling is named), a tree that burns 8 CPUs for
+## 2. With `RUNQUOTA_MEASUREMENT=profiles=on`, once with `tree-sampling`
+##    off and once with it on (see the case), a tree that burns 8 CPUs for
 ##    10 s and then 2 CPUs for 20 s yields a profile within 10% of that
 ##    curve. Two comparisons, both at 10%:
-##    * against the tree's REAL CPU use per second, reconstructed from what
-##      each burner says it used (its own CPU clock) and when it ran. This
-##      is independent of host load: a burner that was starved of a core
-##      ran longer and says so, so the comparison measures the sampler, not
-##      the host;
+##    * against the tree's REAL CPU use per second, read from the burners'
+##      own CPU clocks: each burner records its CPU clock against the
+##      monotonic clock every few milliseconds while it runs, so the CPU it
+##      used in any one second is known exactly, not assumed spread evenly
+##      over its life. This is independent of host load: a burner that was
+##      starved of a core in some second says so for that second, so the
+##      comparison measures the sampler, not the host;
 ##    * against the nominal curve (8000 then 2000 milli-CPUs), for the
-##      seconds wholly inside each phase. The burners are bounded by CPU
-##      time, so on a host with fewer than 8 idle CPUs the first phase
-##      stretches and this comparison fails -- reported as such, never
-##      loosened.
+##      seconds wholly inside each phase -- ONLY WHEN THE BURNERS GOT THEIR
+##      CPU. The burners are bounded by CPU time, so on a host without 8
+##      idle CPUs the first phase stretches and the nominal curve is simply
+##      not what ran. Whether they got it is read from the same clocks
+##      (every burner's wall time within 5% of its CPU time); when they did
+##      not, the nominal comparison is skipped and the output says so and
+##      why. The tolerance is never widened to make a loaded host pass.
 ##    Falsifying mutation: feed the sampler the live processes' own CPU
 ##    only (no reaped descendants' time): when the first phase's burners
 ##    are reaped the reading falls, the sampler holds it, and the second
 ##    phase reads as idle.
 ## 3. The daemon folds that uncontended profile into the key's learned
-##    shape: twenty points, the first phase's near 8000 and the second's
-##    near 2000, and an expected duration at the granted width. The
+##    shape: twenty points, each within 10% of the burners' real CPU over
+##    its twentieth of the run (and, when the burners got their CPU, the
+##    first phase's near 8000 and the second's near 2000), and an expected
+##    duration at the granted width. The
 ##    uncontended ceiling is set to 100% here (`--profile-uncontended-pct`)
 ##    because whether the host is busy when the suite runs is not what this
 ##    test is about; the verdict itself is unit-tested.
@@ -61,19 +68,31 @@ when defined(linux):
 
   proc burn(seconds: float64; output: string) =
     ## Spin until this process has used `seconds` of CPU, then record when
-    ## it started and ended (monotonic ns) and the CPU it used (µs).
+    ## it started and ended (monotonic ns) and the CPU it used (µs) on the
+    ## first line, followed by one `monotonic-ns cpu-ns` line per
+    ## checkpoint: the CPU clock read against the monotonic clock every
+    ## 5 ms or so, so the CPU this burner used in any window can be read
+    ## off to within one checkpoint.
     let started = getMonoTime().ticks
     let target = int64(seconds * 1e9)
     let cpuStart = cpuNanos()
     var x = 0'u64
+    var checkpoints = newStringOfCap(64 * 1024)
+    var lastCheckpoint = started
     while true:
       for i in 0 ..< 100_000:
         x = x * 6364136223846793005'u64 + 1442695040888963407'u64
-      if cpuNanos() - cpuStart >= target:
+      let used = cpuNanos() - cpuStart
+      let now = getMonoTime().ticks
+      if now - lastCheckpoint >= 5_000_000 or used >= target:
+        checkpoints.add($now & " " & $used & "\n")
+        lastCheckpoint = now
+      if used >= target:
         break
     let ended = getMonoTime().ticks
     let used = (cpuNanos() - cpuStart) div 1000
-    writeFile(output, $started & " " & $ended & " " & $used & " " & $(x and 1))
+    writeFile(output, $started & " " & $ended & " " & $used & " " &
+      $(x and 1) & "\n" & checkpoints)
 
   if paramCount() >= 3 and paramStr(1) == "--burn":
     burn(parseFloat(paramStr(2)), paramStr(3))
@@ -85,11 +104,47 @@ when defined(linux):
   type Burn = object
     startNs, endNs: int64
     cpuMicros: int64
+    clock: seq[(int64, int64)]
+      ## (monotonic ns, CPU ns used so far), in time order.
 
   proc readBurn(path: string): Burn =
-    let parts = readFile(path).splitWhitespace()
-    Burn(startNs: parseBiggestInt(parts[0]), endNs: parseBiggestInt(parts[1]),
-      cpuMicros: parseBiggestInt(parts[2]))
+    let lines = readFile(path).splitLines()
+    let parts = lines[0].splitWhitespace()
+    result = Burn(startNs: parseBiggestInt(parts[0]),
+      endNs: parseBiggestInt(parts[1]), cpuMicros: parseBiggestInt(parts[2]))
+    result.clock.add((result.startNs, 0'i64))
+    for line in lines[1 .. ^1]:
+      let fields = line.splitWhitespace()
+      if fields.len == 2:
+        result.clock.add((parseBiggestInt(fields[0]),
+          parseBiggestInt(fields[1])))
+
+  proc cpuNanosAt(b: Burn; at: float64): float64 =
+    ## The CPU this burner had used by monotonic time `at`, interpolated
+    ## between its checkpoints: 0 before it started, all of it after.
+    if b.clock.len == 0 or at <= float64(b.clock[0][0]):
+      return 0.0
+    for k in 1 ..< b.clock.len:
+      let (t1, c1) = b.clock[k]
+      if at <= float64(t1):
+        let (t0, c0) = b.clock[k - 1]
+        if t1 <= t0:
+          return float64(c1)
+        return float64(c0) + float64(c1 - c0) *
+          (at - float64(t0)) / float64(t1 - t0)
+    float64(b.clock[^1][1])
+
+  proc cpuMilliIn(burns: openArray[Burn]; origin: int64;
+                  loMillis, hiMillis: float64): float64 =
+    ## The tree's mean CPU use, in milli-CPUs, over `[lo, hi)` ms after
+    ## `origin`, from the burners' own clocks.
+    if hiMillis <= loMillis:
+      return 0.0
+    var nanos = 0.0
+    for b in burns:
+      nanos += b.cpuNanosAt(float64(origin) + hiMillis * 1e6) -
+        b.cpuNanosAt(float64(origin) + loMillis * 1e6)
+    nanos / 1e6 / (hiMillis - loMillis) * 1000.0
 
   proc startDaemon(root, socket: string; extra: openArray[string]): Process =
     var args = @["--socket", socket,
@@ -233,8 +288,7 @@ when defined(linux):
         # Divided to milliseconds first, so this one fits exactly.
         check row.cpuUserMillis == some(int64(high(uint64) div 1000'u64))
 
-  suite "CPU profiles":
-    test "a tree burning 8 CPUs for 10 s then 2 for 20 s yields that curve":
+  template curveCase(measurement: string) =
       let root = scratchDir("rqprofile")
       defer: removeDir(root)
       let socket = root / "ep" / "d.sock"
@@ -246,13 +300,13 @@ when defined(linux):
         daemon.startupContext("the daemon did not bind " & socket)
       prerequisite awaitCapture(socket), "capture never came on"
       var env = privateEnv(socket)
-      # TREE SAMPLING IS ON TOO, explicitly, as it was by default when this
-      # test was written: it is off by default now (it costs more than the
-      # measurement budget allows). With profiles alone, the CPU of a
-      # process that exits between two profile readings is not counted in
-      # the interval it ran in (here the tail of the first phase: 1978 vs
-      # 2231 milli-CPU in second 10), a known gap of the profile-only walk.
-      env["RUNQUOTA_MEASUREMENT"] = "profiles=on,tree-sampling=on"
+      # BOTH WAYS: with profiles alone, and with tree sampling on as well.
+      # The profile-only walk used to read second 10 low (1978 vs 2231
+      # milli-CPU) because its interval boundaries drifted a few ms per
+      # second behind the launch-relative grid, so the first phase's last
+      # ms fell into sample 9; the boundaries are on the grid now and the
+      # case must hold without tree sampling's extra readings.
+      env["RUNQUOTA_MEASUREMENT"] = measurement
       var script = quoteShell(self) & " --mark " & quoteShell(root / "mark") &
         "; "
       for i in 0 ..< 8:
@@ -289,17 +343,27 @@ when defined(linux):
 
       # The tree's real CPU per second, from the burners' own clocks.
       proc truth(i: int): float64 =
-        let lo = float64(i) * 1e9
-        let hi = float64(i + 1) * 1e9
-        for b in burns:
-          let s = float64(b.startNs - origin)
-          let e = float64(b.endNs - origin)
-          let overlap = min(hi, e) - max(lo, s)
-          if overlap > 0.0 and e > s:
-            result += float64(b.cpuMicros) / 1000.0 * overlap / (e - s)
+        cpuMilliIn(burns, origin, float64(i) * 1000.0, float64(i + 1) * 1000.0)
       var phase1End = 0'i64
       for i in 0 ..< 8: phase1End = max(phase1End, burns[i].endNs - origin)
       checkpoint "first phase ended at " & $(phase1End div 1_000_000) & " ms"
+      # DID THE BURNERS GET THEIR CPU? Each is bounded by CPU time, so one
+      # that shared its core ran longer than the CPU it used. Within 5%,
+      # every one of them had a core to itself and the nominal curve is
+      # what ran; otherwise it is not, and comparing against it would test
+      # the host's load rather than the sampler.
+      var worstStretch = 0.0
+      for b in burns:
+        if b.cpuMicros > 0:
+          worstStretch = max(worstStretch,
+            float64(b.endNs - b.startNs) / 1000.0 / float64(b.cpuMicros))
+      let gotTheirCpu = worstStretch <= 1.05
+      let starvedReason = "a burner ran " &
+        formatFloat(worstStretch, ffDecimal, 2) &
+        "x longer than the CPU it used, so the host did not give the tree " &
+        "8 then 2 idle CPUs; the per-second and shape comparisons against " &
+        "the burners' own clocks above stand in for it"
+      checkpoint "worst burner wall/CPU " & formatFloat(worstStretch, ffDecimal, 3)
 
       # Every full second but the boundary seconds: within 10% of the real
       # use. The last sample may be partial and the first includes launch.
@@ -313,9 +377,12 @@ when defined(linux):
       checkpoint "against the burners' own CPU: " & $mismatches
       check mismatches.len == 0
 
-      # Against the nominal curve, the seconds wholly inside each phase.
+      # Against the nominal curve, the seconds wholly inside each phase --
+      # when that is the curve that ran.
       var nominalMisses: seq[string] = @[]
-      for i in 1 ..< samples.len - 1:
+      if not gotTheirCpu:
+        echo "SKIPPED the nominal-curve comparison: ", starvedReason
+      for i in (if gotTheirCpu: 1 else: samples.len) ..< samples.len - 1:
         let lo = int64(i) * 1_000_000_000'i64
         let hi = lo + 1_000_000_000'i64
         let nominal =
@@ -346,15 +413,46 @@ when defined(linux):
         let shape = entry["shape_milli_cpu"]
         check shape.kind == JArray and shape.len == 20
         if shape.kind == JArray and shape.len == 20:
-          # Points 1-5 lie in the first phase (1.5 s each), 8-19 in the
-          # second.
-          for k in 1 .. 5:
-            check within(float64(shape[k].getInt), 8000.0, 0.10)
-          for k in 8 .. 19:
-            check within(float64(shape[k].getInt), 2000.0, 0.10)
+          # Each point against the burners' real CPU over its twentieth of
+          # the run (the launcher's duration). Skipped: the first (it holds
+          # the launch), the last (the profile's last sample is partial and
+          # is stretched to the end), and any point within one profile
+          # interval of the phase change, where the profile's one-second
+          # resolution blurs a step the clocks see exactly.
+          let duration = float64(row.durationMillis)
+          let bin = duration / 20.0
+          let change = float64(phase1End) / 1e6
+          var shapeMisses: seq[string] = @[]
+          for k in 1 .. 18:
+            let lo = bin * float64(k)
+            let hi = lo + bin
+            if hi > change - 1000.0 and lo < change + 1000.0:
+              continue
+            let expected = cpuMilliIn(burns, origin, lo, hi)
+            if not within(float64(shape[k].getInt), expected, 0.10):
+              shapeMisses.add($k & ": " & $shape[k].getInt & " vs " &
+                formatFloat(expected, ffDecimal, 0))
+          checkpoint "shape against the burners' own CPU: " & $shapeMisses
+          check shapeMisses.len == 0
+          # And, when the nominal curve is what ran: points 1-5 lie in the
+          # first phase (1.5 s each), 8-19 in the second.
+          if gotTheirCpu:
+            for k in 1 .. 5:
+              check within(float64(shape[k].getInt), 8000.0, 0.10)
+            for k in 8 .. 19:
+              check within(float64(shape[k].getInt), 2000.0, 0.10)
+          else:
+            echo "SKIPPED the nominal-shape comparison: ", starvedReason
         let widths = entry["expected_duration_by_width"]
         check widths.len == 1
         if widths.len == 1:
           check widths[0]["cpu_milli"].getInt == 8000
           check widths[0]["expected_duration_millis"].getInt >= 29_000
       check found
+
+  suite "CPU profiles":
+    test "a tree burning 8 CPUs for 10 s then 2 for 20 s yields that curve (profiles alone)":
+      curveCase("profiles=on,tree-sampling=off")
+
+    test "a tree burning 8 CPUs for 10 s then 2 for 20 s yields that curve (with tree sampling)":
+      curveCase("profiles=on,tree-sampling=on")

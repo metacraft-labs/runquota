@@ -120,7 +120,23 @@ proc nextDueMillis*(sampler: CpuProfileSampler): int64 =
   ## When the launcher should next read the tree. One reading per interval:
   ## as the interval doubles, so does the gap between readings, which is
   ## what keeps the cost of a long run from growing with its length.
-  sampler.boundaryMillis + int64(sampler.intervalMillis)
+  ##
+  ## ON THE LAUNCH-RELATIVE GRID: the first grid point after the reading
+  ## that closed the last sample, ``start + k * interval``. NOT that
+  ## reading's time plus an interval. A reading always lands a little after
+  ## it was due -- the launcher polls every 10 ms or so -- and adding the
+  ## interval to the late time carried each lateness into every later
+  ## boundary: measured at about 7 ms per interval, so ten seconds into a
+  ## run sample 10 covered [10.07 s, 11.07 s), and the CPU of processes that
+  ## exited at 10.03 s was reported in sample 9. That read as the profile
+  ## losing the CPU of descendants that exited between two readings. It did
+  ## not lose it -- the cumulative reading includes what every live process
+  ## has reaped (proc(5) ``cutime``/``cstime``) -- it put it in the wrong
+  ## second. Anchored to the grid, every boundary is within one poll of
+  ## where it belongs, however long the run.
+  let interval = int64(max(1'u32, sampler.intervalMillis))
+  let elapsed = max(0'i64, sampler.boundaryMillis - sampler.startMillis)
+  sampler.startMillis + (elapsed div interval + 1) * interval
 
 proc due*(sampler: CpuProfileSampler; nowMillis: int64): bool =
   sampler.started and nowMillis >= sampler.nextDueMillis()

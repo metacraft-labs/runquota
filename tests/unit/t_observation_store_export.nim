@@ -66,9 +66,29 @@
 ## own WAL-keeping settings, because that is the only way to put this
 ## host's ``sqlite3`` in the condition Apple's build is in by default.
 
-import std/[exitprocs, options, os, strutils, times, unittest]
+import std/[exitprocs, options, os, osproc, strtabs, strutils, times, unittest]
 
 import runquota_observation_store
+
+const noLibraryFlag = "--export-without-sqlite-library"
+
+proc lineOf(text, prefix: string): string =
+  for line in text.splitLines():
+    if line.startsWith(prefix):
+      return line
+
+if paramCount() >= 3 and paramStr(1) == noLibraryFlag:
+  # THE CHILD of the no-SQLite-library arm: export and read a manifest with
+  # no library loaded, and report.
+  echo "available=", sqliteToolAvailable()
+  let exported = exportObservationStore(paramStr(2), paramStr(3), rpDefault)
+  echo "export=", exported.outcome
+  echo "export-detail=", exported.detail
+  let manifest = readExportManifest(paramStr(2))
+  echo "manifest-present=", manifest.present
+  echo "manifest-ok=", manifest.ok
+  echo "manifest-detail=", manifest.detail
+  quit(0)
 
 proc scratchDir(name: string): string =
   result = getTempDir() / ("rq-m16x-" & name & "-" &
@@ -254,9 +274,14 @@ proc buildLocalStoreOnce(dir, path: string): ObservationStore =
   discard vendorSource(vendor)
   doAssert result.mergeObservationStore(vendor).outcome == moMerged
 
-proc buildLocalStoreTemplate(dir: string): string =
+proc buildLocalStoreTemplate(dir: string; holdLog = false): string =
   ## Builds the local store in ``dir`` and returns a file ``buildLocalStore``
   ## may copy byte for byte.
+  ##
+  ## ``holdLog`` leaves the built store with committed rows that are ONLY in
+  ## its write-ahead log when the snapshot is taken: one more row is written
+  ## through a pooled connection, which stays open, so nothing checkpoints
+  ## it into the main file. See the case that passes it.
   ##
   ## The file returned is a SNAPSHOT of the built store, taken with
   ## ``vacuum into`` (``backupTo``), and not the built store itself. A WAL
@@ -269,6 +294,9 @@ proc buildLocalStoreTemplate(dir: string): string =
   ## every build (https://sqlite.org/lang_vacuum.html#vacuuminto).
   let built = dir / "built.sqlite"
   let store = buildLocalStoreOnce(dir, built)
+  if holdLog:
+    doAssert store.insertHost(HostRow(hostId: "host-held-in-the-log",
+      createdAtUnixMillis: 1, lastBootId: "boot-held")), store.lastError
   result = dir / "template.sqlite"
   doAssert store.backupTo(result), "could not snapshot " & built
   # Nothing has opened the snapshot, so nothing can have left a log beside
@@ -904,7 +932,7 @@ suite "observation_store_export":
       rpDefault).outcome == xoExported
 
   # -------------------------------------------------------------------
-  test "the copy that cannot be written, and no sqlite3 at all":
+  test "the copy that cannot be written, and no SQLite library at all":
     # TWO REFUSAL ARMS NO WELL-BEHAVED CALLER REACHES, and neither is
     # expensive to reach on purpose. An arm nothing exercises is an arm
     # nobody knows the shape of.
@@ -924,32 +952,37 @@ suite "observation_store_export":
     check not fileExists(unwritable)
     check canonicalDigest(local) == digest
 
-    # NO `sqlite3` ON PATH AT ALL — OS-4's condition, and the reason this
-    # library reaches SQLite through the tool rather than a linked
-    # library. Both entry points have this arm and both must take it.
-    let savedPath = getEnv("PATH")
-    defer: putEnv("PATH", savedPath)
-    putEnv("PATH", dir / "no-tools-here")
-    check not sqliteToolAvailable()
-    let unavailable = exportObservationStore(local, dir / "u.sqlite",
-      rpDefault)
-    check unavailable.outcome == xoUnavailable
-    check "not on PATH" in unavailable.detail
+    # NO SQLITE LIBRARY AT ALL — OS-4's condition, and the reason the
+    # library is loaded at start-up rather than linked. Both entry points
+    # have this arm and both must take it. The library is loaded once per
+    # process, so the absence is arranged for a CHILD: this binary,
+    # re-executed with `RUNQUOTA_SQLITE_LIBRARY` naming a file that does
+    # not exist (the only candidate when it is set).
+    var childEnv = newStringTable(modeCaseSensitive)
+    for key, value in envPairs():
+      childEnv[key] = value
+    childEnv["RUNQUOTA_SQLITE_LIBRARY"] = dir / "no-such-libsqlite3.so"
+    let (text, code) = execCmdEx(quoteShell(getAppFilename()) & " " &
+      noLibraryFlag & " " & quoteShell(local) & " " &
+      quoteShell(dir / "u.sqlite"), env = childEnv)
+    checkpoint text
+    check code == 0
+    check "available=false" in text
+    check ("export=" & $xoUnavailable) in text
+    check "no-such-libsqlite3.so" in lineOf(text, "export-detail=")
     check not fileExists(dir / "u.sqlite")
     # AND THE READER'S SAME ARM, which is where it matters most: a store
     # NOBODY COULD LOOK AT must not read as a store that carries no
     # manifest. Both answer `present == false`, so the two are told apart
     # by `detail` and that is asserted here rather than assumed.
-    let blind = readExportManifest(local)
-    check not blind.present
-    check not blind.ok
-    check "not on PATH" in blind.detail
-    putEnv("PATH", savedPath)
+    check "manifest-present=false" in text
+    check "manifest-ok=false" in text
+    check "no-such-libsqlite3.so" in lineOf(text, "manifest-detail=")
     check sqliteToolAvailable()
     let sighted = readExportManifest(local)
     check not sighted.present
     check "no export manifest" in sighted.detail
-    check "not on PATH" notin sighted.detail
+    check "no-such-libsqlite3.so" notin sighted.detail
 
   # -------------------------------------------------------------------
   test "a table the pass cannot address is refused, not silently skipped":
@@ -1002,52 +1035,30 @@ create table ext_m16x_rowidless (
 
   # -------------------------------------------------------------------
   test "the fixture's template is whole under a SQLite that keeps its WAL":
-    # THE FIXTURE ITSELF, ON A HOST WHOSE `sqlite3` IS NOT THIS ONE'S.
-    # Apple's `/usr/bin/sqlite3` leaves `-wal` beside a WAL database after
-    # its last connection closes, and every case in this file then failed
-    # inside the fixture before it had asserted anything. The condition is
-    # reproduced here, on any POSIX host, by a `sqlite3` on PATH that runs
-    # the REAL tool with three of SQLite's own documented switches set
-    # first: `persist_wal` keeps both sidecars
-    # (https://sqlite.org/c3ref/c_fcntl_begin_atomic_write.html#sqlitefcntlpersistwal),
-    # and `no_ckpt_on_close`
-    # (https://sqlite.org/c3ref/c_dbconfig_defensive.html#sqlitedbconfignockptonclose)
-    # with `wal_autocheckpoint = 0` leaves the committed rows in the log
-    # and not in the main file. That is the worst case of the same
-    # condition: the main file copied alone holds an empty store.
-    #
-    # It is a WRAPPER, not a fake: the arguments, input, output and exit
-    # status are the real tool's, and the three settings are switched on
-    # with stdout discarded so their echoes cannot reach a caller.
-    when defined(windows):
-      skip()  # a `#!/bin/sh` wrapper cannot stand in for `sqlite3.exe`
-    else:
+    # THE FIXTURE ITSELF, WHEN THE STORE'S LAST ROWS ARE STILL IN ITS LOG.
+    # A WAL database's main file is complete only once the log has been
+    # checkpointed into it, and that happens when the last connection
+    # closes -- or, on a SQLite built to keep its log (Apple's keeps
+    # `-wal` after the last close, and a build can skip the closing
+    # checkpoint), not then either. SQLite now runs in this process and
+    # keeps a POOLED CONNECTION open, which produces exactly that condition
+    # on every host: `holdLog` writes one more row through that connection
+    # and leaves it open, so the row is committed and in the log, and not
+    # in the main file. Every case in this file copies the template, so a
+    # template taken from the main file alone would lose rows in all of
+    # them before they had asserted anything.
+    block:
       let dir = scratchDir("keptwal")
       defer: removeDir(dir)
-      let realSqlite = findExe(sqliteTool)
-      require realSqlite.len > 0
-      let tools = dir / "tools"
-      createDir(tools)
-      let wrapper = tools / sqliteTool
-      writeFile(wrapper, "#!/bin/sh\n" &
-        "{ printf '%s\\n' '.output /dev/null' '.filectrl persist_wal 1' " &
-        "'.dbconfig no_ckpt_on_close on' 'pragma wal_autocheckpoint = 0;' " &
-        "'.output'; cat; } | " & quoteShell(realSqlite) & " \"$@\"\n")
-      setFilePermissions(wrapper, {fpUserRead, fpUserWrite, fpUserExec})
-      let savedPath = getEnv("PATH")
-      defer: putEnv("PATH", savedPath)
-      putEnv("PATH", tools & PathSep & savedPath)
-      require findExe(sqliteTool) == wrapper
-
       let templateDir = dir / "template"
       createDir(templateDir)
-      let copyable = buildLocalStoreTemplate(templateDir)
+      let copyable = buildLocalStoreTemplate(templateDir, holdLog = true)
       let built = templateDir / "built.sqlite"
 
       # POSITIVE CONTROLS: the condition really holds. The sidecars are
       # there, and the main file copied alone has lost rows. Without these
-      # a wrapper that quietly stopped working would turn this case green
-      # against the very fixture it exists to catch.
+      # a connection that had quietly been checkpointed would turn this
+      # case green against the very fixture it exists to catch.
       check fileExists(built & "-wal")
       check fileExists(built & "-shm")
       let mainOnly = dir / "main-only.sqlite"
@@ -1065,3 +1076,4 @@ create table ext_m16x_rowidless (
       check "executions=5" in rowCounts(copy)
       check canonicalDigest(copy) == canonicalDigest(built)
       check openObservationStore(copy).captureEnabled
+      closePooledConnections()

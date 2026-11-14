@@ -207,11 +207,18 @@ proc identityFor(profiles: Table[string, ProfileIdentity];
   ProfileIdentity(hostId: "", profileId: profileId,
     profileHash: unknownProfileHash, cpuModel: "", logicalCores: 0)
 
-proc statsKeyPredicate(statsKey: string): string =
-  if statsKey.len == 0: "" else:
-    " and command_stats_id = " & encodeText(statsKey)
+# THE PREDICATES BIND THEIR VALUES. A stats key, an owner and a profile id
+# arrive in a client's query; each becomes a ``?`` in the statement and a
+# value in ``params``, never SQL text.
 
-proc ownerPredicate(scope: StatsScope; ownerUid: Option[int64]): string =
+proc statsKeyPredicate(statsKey: string; params: var seq[SqlValue];
+                       prefix = ""): string =
+  if statsKey.len == 0: "" else:
+    params.add(sqlText(statsKey))
+    " and " & prefix & "command_stats_id = ?"
+
+proc ownerPredicate(scope: StatsScope; ownerUid: Option[int64];
+                    params: var seq[SqlValue]; prefix = ""): string =
   ## ``owner_uid = N`` also excludes NULL rows, which is correct: a row
   ## whose owner the transport could not report belongs to nobody in
   ## particular, and handing it to whoever happens to be asking would be
@@ -220,14 +227,19 @@ proc ownerPredicate(scope: StatsScope; ownerUid: Option[int64]): string =
   of statsScopeHost: ""
   of statsScopeOwner:
     if ownerUid.isNone: " and 0 = 1"
-    else: " and owner_uid = " & encodeInt(ownerUid.get)
+    else:
+      params.add(sqlInt(ownerUid.get))
+      " and " & prefix & "owner_uid = ?"
 
-proc profilePredicate(span: ProfileSpan; profileId: Option[string]): string =
+proc profilePredicate(span: ProfileSpan; profileId: Option[string];
+                      params: var seq[SqlValue]; prefix = ""): string =
   case span
   of spanAllProfiles: ""
   of spanSingleProfile:
-    if profileId.isNone: " and host_profile_id is null"
-    else: " and host_profile_id = " & encodeText(profileId.get)
+    if profileId.isNone: " and " & prefix & "host_profile_id is null"
+    else:
+      params.add(sqlText(profileId.get))
+      " and " & prefix & "host_profile_id = ?"
 
 proc limitClause(limit: int): string =
   if limit > 0: " limit " & $limit else: ""
@@ -251,19 +263,20 @@ proc estimateFor*(store: ObservationStore; statsKey: string;
   if store.isNil or not store.captureEnabled:
     return
   let profiles = store.profileTable()
+  var params: seq[SqlValue] = @[]
   let sql = "select " & [
       selectText("host_profile_id"), selectInt("duration_millis"),
       selectInt("peak_rss_bytes")
     ].join(" || '|' || ") &
     " from executions where host_profile_id is not null" &
-    statsKeyPredicate(statsKey) &
-    profilePredicate(span, profileId) &
+    statsKeyPredicate(statsKey, params) &
+    profilePredicate(span, profileId, params) &
     " order by host_profile_id, started_at_unix_millis;"
 
   var durations = initTable[string, seq[int64]]()
   var peaks = initTable[string, int64]()
   var order: seq[string] = @[]
-  for row in store.runQuery(sql):
+  for row in store.runQuery(sql, params):
     let id = decodeText(row[0])
     if not durations.hasKey(id):
       durations[id] = @[]
@@ -340,6 +353,7 @@ proc queryExecutions*(store: ObservationStore;
   if store.isNil or not store.captureEnabled:
     return @[]
   let profiles = store.profileTable()
+  var params: seq[SqlValue] = @[]
   let sql = "select " & [
       selectText("execution_id"), selectText("command_stats_id"),
       selectText("host_profile_id"), selectInt("owner_uid"),
@@ -348,12 +362,12 @@ proc queryExecutions*(store: ObservationStore;
       selectText("termination")
     ].join(" || '|' || ") &
     " from executions where 1 = 1" &
-    statsKeyPredicate(query.statsKey) &
-    ownerPredicate(query.scope, query.ownerUid) &
-    profilePredicate(query.span, query.profileId) &
+    statsKeyPredicate(query.statsKey, params) &
+    ownerPredicate(query.scope, query.ownerUid, params) &
+    profilePredicate(query.span, query.profileId, params) &
     " order by started_at_unix_millis desc, execution_id" &
     limitClause(query.limit) & ";"
-  for row in store.runQuery(sql):
+  for row in store.runQuery(sql, params):
     let profileId =
       if row[2].isNullField: none(string) else: some(decodeText(row[2]))
     result.add(ExecutionSummary(
@@ -401,9 +415,11 @@ proc queryExtensionRows*(store: ObservationStore; query: RowQuery;
 
   var visible = initTable[string, ExecutionSummary]()
   var wanted: seq[string] = @[]
+  var params: seq[SqlValue] = @[]
   for row in store.queryExecutions(query):
     visible[row.executionId] = row
-    wanted.add(encodeText(row.executionId))
+    wanted.add("?")
+    params.add(sqlText(row.executionId))
   if wanted.len == 0:
     return @[]
 
@@ -412,7 +428,7 @@ proc queryExtensionRows*(store: ObservationStore; query: RowQuery;
     " from " & extensionTableName(extensionId) &
     " where " & keyExecutionColumn & " in (" & wanted.join(", ") & ")" &
     " order by " & keyHostColumn & ", " & keyExecutionColumn & ";"
-  for row in store.runQuery(sql):
+  for row in store.runQuery(sql, params):
     let executionId = decodeText(row[1])
     if not visible.hasKey(executionId):
       continue
@@ -551,6 +567,7 @@ proc queryExport*(store: ObservationStore;
       case column.kind
       of exportText: selectText(column.expression)
       of exportInt: selectInt(column.expression))
+  var params: seq[SqlValue] = @[]
   let sql = "select " & selected.join(" || '|' || ") &
     " from executions e" &
     " left join runs r on r.host_id = e.host_id and r.run_id = e.run_id" &
@@ -558,21 +575,12 @@ proc queryExport*(store: ObservationStore;
     " and p.profile_id = e.host_profile_id" &
     " left join users u on u.owner_uid = e.owner_uid" &
     " where 1 = 1" &
-    (if query.statsKey.len == 0: ""
-     else: " and e.command_stats_id = " & encodeText(query.statsKey)) &
-    (case query.scope
-     of statsScopeHost: ""
-     of statsScopeOwner:
-       if query.ownerUid.isNone: " and 0 = 1"
-       else: " and e.owner_uid = " & encodeInt(query.ownerUid.get)) &
-    (case query.span
-     of spanAllProfiles: ""
-     of spanSingleProfile:
-       if query.profileId.isNone: " and e.host_profile_id is null"
-       else: " and e.host_profile_id = " & encodeText(query.profileId.get)) &
+    statsKeyPredicate(query.statsKey, params, "e.") &
+    ownerPredicate(query.scope, query.ownerUid, params, "e.") &
+    profilePredicate(query.span, query.profileId, params, "e.") &
     " order by e.started_at_unix_millis desc, e.execution_id" &
     limitClause(query.limit) & ";"
-  for row in store.runQuery(sql):
+  for row in store.runQuery(sql, params):
     if row.len != columns.len:
       continue
     var cells: seq[ExportCell] = @[]
@@ -592,19 +600,20 @@ proc queryRanking*(store: ObservationStore;
   if store.isNil or not store.captureEnabled:
     return @[]
   let profiles = store.profileTable()
+  var params: seq[SqlValue] = @[]
   let sql = "select " & [
       selectText("command_stats_id"), selectText("host_profile_id"),
       selectInt("count(*)"), selectInt("sum(duration_millis)"),
       selectInt("max(duration_millis)")
     ].join(" || '|' || ") &
     " from executions where 1 = 1" &
-    statsKeyPredicate(query.statsKey) &
-    ownerPredicate(query.scope, query.ownerUid) &
-    profilePredicate(query.span, query.profileId) &
+    statsKeyPredicate(query.statsKey, params) &
+    ownerPredicate(query.scope, query.ownerUid, params) &
+    profilePredicate(query.span, query.profileId, params) &
     " group by command_stats_id, host_profile_id" &
     " order by sum(duration_millis) desc, command_stats_id" &
     limitClause(query.limit) & ";"
-  for row in store.runQuery(sql):
+  for row in store.runQuery(sql, params):
     let profileId =
       if row[1].isNullField: none(string) else: some(decodeText(row[1]))
     result.add(KeyRanking(

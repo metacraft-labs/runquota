@@ -76,6 +76,11 @@ type
     policy*: GatePolicy
     maxSeconds*: float
     measure*: string            ## "all" or one measurement name
+    baseline*: MeasurementSet
+      ## Measurements on in BOTH arms (`--baseline`), so the one under test
+      ## is judged on top of them. Needed for a measurement that only has
+      ## something to do when another is on: ambient sampling writes into
+      ## the observation store, so it samples only where capture is on.
     outPath*: string
     # synthetic
     burnIterations*: int
@@ -114,12 +119,14 @@ const
 # The arms' measurement switches
 # ---------------------------------------------------------------------------
 
-proc armMeasurements*(measure: string; arm: Arm): MeasurementSet =
-  ## OFF: nothing. ON: every implemented measurement, or only `measure`.
+proc armMeasurements*(measure: string; arm: Arm;
+                      baseline: MeasurementSet = {}): MeasurementSet =
+  ## OFF: the baseline (nothing by default). ON: the baseline plus every
+  ## implemented measurement, or plus only `measure`.
   if arm == armOff:
-    return {}
+    return baseline
   if measure == "all":
-    return implementedMeasurements()
+    return baseline + implementedMeasurements()
   var m: Measurement
   if not parseMeasurementName(measure, m):
     raise newException(ValueError, "unknown measurement '" & measure &
@@ -127,7 +134,7 @@ proc armMeasurements*(measure: string; arm: Arm): MeasurementSet =
   if not measurementRegistry[m].implemented:
     raise newException(CaseUnavailable, "measurement '" & measure &
       "' is not implemented yet, so it has no cost to measure")
-  {m}
+  baseline + {m}
 
 proc firstArm*(round: int): Arm =
   ## Which arm a round runs first: OFF in even rounds, ON in odd ones, so an
@@ -409,7 +416,7 @@ proc reprobuildCase(cfg: GateConfig; scratch: string): GateCase =
     raise newException(CaseUnavailable, "no fixture at " & cfg.fixtureDir)
   let clientSide = block:
     var any = false
-    for m in armMeasurements(cfg.measure, armOn):
+    for m in armMeasurements(cfg.measure, armOn, cfg.baseline):
       if measurementRegistry[m].side == measuredByClient:
         any = true
     any
@@ -423,10 +430,10 @@ proc reprobuildCase(cfg: GateConfig; scratch: string): GateCase =
   var switches: array[Arm, string]
   var projects: array[Arm, string]
   for arm in Arm:
-    switches[arm] = formatMeasurementSwitches(armMeasurements(cfg.measure, arm))
+    switches[arm] = formatMeasurementSwitches(armMeasurements(cfg.measure, arm, cfg.baseline))
     daemons[arm] = startDaemon(cfg, scratch, arm, switches[arm])
     reported[$arm] = verifyDaemonMeasurements(daemons[arm], arm,
-      armMeasurements(cfg.measure, arm))
+      armMeasurements(cfg.measure, arm, cfg.baseline))
     projects[arm] = scratch / $arm / "project"
     copyFixture(cfg.fixtureDir, projects[arm])
   let engine = cfg.engineBin
@@ -547,9 +554,10 @@ proc runGate*(cfg: GateConfig; gateCase: GateCase;
       "max_rounds": cfg.policy.maxRounds,
       "max_seconds": cfg.maxSeconds},
     "measure": cfg.measure,
+    "baseline": formatMeasurementSwitches(cfg.baseline),
     "switches": {
-      "off": formatMeasurementSwitches(armMeasurements(cfg.measure, armOff)),
-      "on": formatMeasurementSwitches(armMeasurements(cfg.measure, armOn))},
+      "off": formatMeasurementSwitches(armMeasurements(cfg.measure, armOff, cfg.baseline)),
+      "on": formatMeasurementSwitches(armMeasurements(cfg.measure, armOn, cfg.baseline))},
     "not_implemented_not_measured": notImplemented(),
     "host": {"cpus": countProcessors(), "os": hostOS, "arch": hostCPU,
       "load_start": loadStart, "load_end": loadAverage(),
@@ -575,6 +583,8 @@ const usageText = """
 runquota_overhead_gate --case=reprobuild-64|cargo-jobserver|synthetic [options]
 
   --measure=all|NAME          ON arm: every implemented measurement, or one
+  --baseline=NAME[,NAME...]   on in BOTH arms (e.g. capture, under which
+                              ambient-sampling has a store to write to)
   --budget-percent=1          allowed overhead
   --precision-percent=0.5     required 95% interval half-width
   --min-rounds=10 --max-rounds=200 --max-minutes=90
@@ -604,6 +614,13 @@ proc parseGateArgs*(args: openArray[string]): GateConfig =
     case key
     of "--case": result.caseName = value
     of "--measure": result.measure = value
+    of "--baseline":
+      for name in value.split(','):
+        var m: Measurement
+        if not parseMeasurementName(name.strip(), m):
+          raise newException(ValueError, "unknown measurement '" & name &
+            "' in --baseline")
+        result.baseline.incl(m)
     of "--budget-percent": result.policy.budget = parseFloat(value) / 100
     of "--precision-percent":
       result.policy.precision = parseFloat(value) / 100

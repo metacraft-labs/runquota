@@ -128,7 +128,7 @@ proc canonicalDump*(path: string): CanonicalDump =
                          tables: @[], objects: @[], rows: 0, text: "",
                          digest: "")
   if not sqliteToolAvailable():
-    result.detail = "the '" & sqliteTool & "' tool is not on PATH"
+    result.detail = sqliteLibraryReport()
     return
   if not fileExists(path):
     result.detail = "no such database: " & path

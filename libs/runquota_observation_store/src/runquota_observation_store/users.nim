@@ -35,13 +35,11 @@ const usersColumns = [
   "owner_uid", "principal_kind", "principal", "name",
   "first_seen_at_unix_millis", "name_updated_at_unix_millis"]
 
-proc encodeOptionalText(value: Option[string]): string =
-  if value.isNone: "null" else: encodeText(value.get)
-
 proc userUpsertStatement*(ownerUid: int64; kind: PrincipalKind;
                           principal: string; name: Option[string];
                           atUnixMillis: int64): string =
-  ## Records that the principal ``principal`` owns ``ownerUid``, seen at
+  ## The byte form of a bound statement (``sqlite_inproc.encodeBound``) that
+  ## records that the principal ``principal`` owns ``ownerUid``, seen at
   ## ``atUnixMillis`` with display name ``name`` (none: it did not resolve).
   ##
   ## * An owner not yet in the table is inserted, first seen now.
@@ -55,12 +53,9 @@ proc userUpsertStatement*(ownerUid: int64; kind: PrincipalKind;
   ##   trigger aborts it. That is deliberate: a collision must fail loudly,
   ##   and a ``where`` that merely skipped it would let the second
   ##   principal's executions land under the first one's scope.
-  let nameText = encodeOptionalText(name)
-  "insert into users (" & usersColumns.join(", ") & ") values (" &
-    encodeInt(ownerUid) & ", " & encodeText($kind) & ", " &
-    encodeText(principal) & ", " & nameText & ", " &
-    encodeInt(atUnixMillis) & ", " &
-    (if name.isSome: encodeInt(atUnixMillis) else: "null") & ")" &
+  encodeBound(bound(
+    "insert into users (" & usersColumns.join(", ") & ") values (" &
+    "?, ?, ?, ?, ?, ?)" &
     " on conflict (owner_uid) do update set" &
     " principal_kind = excluded.principal_kind," &
     " principal = excluded.principal," &
@@ -71,7 +66,11 @@ proc userUpsertStatement*(ownerUid: int64; kind: PrincipalKind;
     " else users.name_updated_at_unix_millis end" &
     " where users.principal_kind is not excluded.principal_kind" &
     " or users.principal is not excluded.principal" &
-    " or (excluded.name is not null and users.name is not excluded.name);"
+    " or (excluded.name is not null and users.name is not excluded.name)",
+    sqlInt(ownerUid), sqlText($kind), sqlText(principal),
+    (if name.isSome: sqlText(name.get) else: sqlNull()),
+    sqlInt(atUnixMillis),
+    (if name.isSome: sqlInt(atUnixMillis) else: sqlNull())))
 
 proc recordUser*(store: ObservationStore; ownerUid: int64;
                  kind: PrincipalKind; principal: string;

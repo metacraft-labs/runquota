@@ -115,13 +115,14 @@ case "${channel}" in
     grep -Fq "usr/bin/runquotad" build/package-contents-${channel}.txt || \
       fail "the .deb does not contain usr/bin/runquotad"
     # THE DEGRADING DEPENDENCY IS A RECOMMENDS AND MUST STAY ONE. A
-    # `Depends: sqlite3` would refuse to install RunQuota on a host that
-    # deliberately has no sqlite3, converting OS-4's designed degradation
-    # into an installation failure.
-    grep -Eq '^Recommends: .*sqlite3' build/package-control-${channel}.txt || \
-      fail "the .deb does not Recommend sqlite3"
+    # `Depends: libsqlite3-0` would refuse to install RunQuota on a host
+    # that deliberately has no SQLite, converting OS-4's designed
+    # degradation into an installation failure. The daemon loads the
+    # LIBRARY at start-up; the `sqlite3` tool is not run.
+    grep -Eq '^Recommends: .*libsqlite3' build/package-control-${channel}.txt || \
+      fail "the .deb does not Recommend libsqlite3"
     if grep -Eq '^Depends: .*sqlite3' build/package-control-${channel}.txt; then
-      fail "the .deb DEPENDS on sqlite3; it must only Recommend it"
+      fail "the .deb DEPENDS on SQLite; it must only Recommend it"
     fi
     echo "verify-package: deb contents and control fields check out"
     ;;

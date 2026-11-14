@@ -63,7 +63,7 @@ recording is off. [Provision the state directory](/getting_started/provisioning)
 and restart.
 
 Other reasons, all reported the same way and all leaving admission untouched:
-the `sqlite3` tool is not on `PATH`; the store's parent directory cannot be
+no SQLite library could be loaded (see `RUNQUOTA_SQLITE_LIBRARY`); the store's parent directory cannot be
 created; the database is corrupt (it is **left untouched**, not repaired); the
 schema version is unreadable; the schema is newer than this build understands
 (again, the file is not modified); a table is missing; or WAL cannot be

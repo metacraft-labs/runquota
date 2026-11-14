@@ -128,6 +128,12 @@ type
       ## measurement switch, read once at launch, and only where the tree
       ## can be read (Linux `/proc`).
     profileSampler*: CpuProfileSampler
+    treeWalks*: uint32
+      ## How many times this launch has read its process tree while waiting
+      ## (POSIX). The cost of `tree-sampling` and `profiles` is this count
+      ## times one walk, so the cadence rule -- a walk only when a sample is
+      ## due, one walk for both measurements -- is asserted on it rather
+      ## than on a stopwatch.
     launchMonoMillis*: int64
       ## The launch on the monotonic clock: the origin of the profile's
       ## intervals and of the totals' duration.

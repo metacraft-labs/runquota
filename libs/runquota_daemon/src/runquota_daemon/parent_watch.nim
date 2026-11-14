@@ -46,9 +46,8 @@
 ## negative sentinel, keeping those two meanings of PID 1 distinct.
 ##
 ## THE VARIABLE IS REMOVED FROM THE DAEMON'S OWN ENVIRONMENT as soon as it is
-## read, so nothing this process starts -- the `sqlite3` children of the
-## observation store, for one -- inherits a request that was addressed to this
-## process alone.
+## read, so nothing this process starts inherits a request that was
+## addressed to this process alone.
 ##
 ## WINDOWS IGNORES THE VARIABLE. Its daemon serves the shared per-user pipe and
 ## is deliberately left running for invocations that adopted it, and it has no

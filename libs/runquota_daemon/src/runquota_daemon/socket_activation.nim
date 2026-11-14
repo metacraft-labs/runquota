@@ -21,8 +21,7 @@
 ##
 ## THE VARIABLES ARE REMOVED FROM THE DAEMON'S OWN ENVIRONMENT as soon as they
 ## are read, whether or not they were addressed to it, so nothing the daemon
-## starts -- the `sqlite3` children of the observation store, for one --
-## inherits a hand-over addressed to this process alone. Read them once, first
+## starts inherits a hand-over addressed to this process alone. Read them once, first
 ## thing in the entry point.
 ##
 ## WINDOWS has no socket activation; `takeSocketActivation` answers "not

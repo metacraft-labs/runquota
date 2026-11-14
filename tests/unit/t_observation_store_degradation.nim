@@ -7,7 +7,7 @@
 ##
 ## Every degradation mode the daemon can meet is exercised against the real
 ## thing: a real truncated file, a real overwritten header, a real missing
-## `sqlite3` on PATH, a real unwritable path. None of them may raise, and
+## SQLite library, a real unwritable path. None of them may raise, and
 ## none of them may repair the file behind the operator's back.
 ##
 ## One fixture exists for a reason the others do not cover. Truncation and a
@@ -20,7 +20,7 @@
 ## check is the ONLY thing standing between the daemon and a store it would
 ## otherwise open and write into.
 
-import std/[os, strutils, times, unittest]
+import std/[os, osproc, strtabs, strutils, times, unittest]
 
 import runquota_observation_store
 
@@ -29,6 +29,14 @@ proc scratchDir(name: string): string =
     $getCurrentProcessId() & "-" & $epochTime())
   removeDir(result)
   createDir(result)
+
+const noLibraryFlag = "--open-without-sqlite-library"
+
+proc noLibraryEnv(library: string): StringTableRef =
+  result = newStringTable(modeCaseSensitive)
+  for key, value in envPairs():
+    result[key] = value
+  result["RUNQUOTA_SQLITE_LIBRARY"] = library
 
 proc seed(path: string) =
   let store = openObservationStore(path)
@@ -46,6 +54,14 @@ proc seed(path: string) =
       exitStatus: 0, termination: tExited, attempt: 1, peakRssBytes: 1,
       maxProcesses: 1, majorPageFaults: 0, captureCompleteness: ccComplete))
   doAssert store.appendBatch([], rows)
+  # THE STORE'S CONNECTIONS ARE CLOSED BEFORE ANY CASE TAMPERS WITH THE FILE,
+  # as the daemon closes them when it stops. SQLite runs in this process and
+  # keeps a pooled connection open, so until it is closed the committed rows
+  # may still sit in the `-wal` sidecar and a later open would read page 1
+  # from there rather than from the bytes a case has just overwritten. The
+  # close checkpoints them into the main file, which is then what the
+  # `sqlite3` tool's exits used to leave behind.
+  closePooledConnections(path)
 
 proc truncateFile(path: string; newSize: int) =
   let data = readFile(path)
@@ -54,6 +70,16 @@ proc truncateFile(path: string; newSize: int) =
 proc healthyRow(store: ObservationStore): bool =
   store.insertHost(HostRow(hostId: "h-new", createdAtUnixMillis: 2,
     lastBootId: "b"))
+
+if paramCount() >= 2 and paramStr(1) == noLibraryFlag:
+  # THE CHILD of "no SQLite library degrades to no capture".
+  let store = openObservationStore(paramStr(2))
+  echo "available=", sqliteToolAvailable()
+  echo "status=", store.status
+  echo "capture=", store.captureEnabled
+  echo "report=", store.report
+  echo "healthy=", store.healthyRow()
+  quit(0)
 
 suite "observation_store_degradation":
   test "a truncated store degrades to no capture with a clear report":
@@ -166,20 +192,63 @@ suite "observation_store_degradation":
     check not store.healthyRow()
     check getFileSize(path) == corruptSize
 
-  test "no sqlite3 on PATH degrades to no capture":
+  test "no SQLite library degrades to no capture":
+    # The library is loaded once, when the process starts, so the absence is
+    # arranged for a CHILD: this binary, re-executed with
+    # `RUNQUOTA_SQLITE_LIBRARY` naming a file that does not exist, which
+    # makes it the only candidate. The child opens a store and reports.
     let dir = scratchDir("nosqlite")
     defer: removeDir(dir)
-    let emptyBin = dir / "empty-bin"
-    createDir(emptyBin)
-    let savedPath = getEnv("PATH")
-    putEnv("PATH", emptyBin)
-    defer: putEnv("PATH", savedPath)
-    check not sqliteToolAvailable()
-    let store = openObservationStore(dir / "observations.sqlite")
-    check store.status == ssNoSqliteTool
-    check not store.captureEnabled
-    check "capture disabled" in store.report
-    check not store.healthyRow()
+    let (text, code) = execCmdEx(quoteShell(getAppFilename()) & " " &
+      noLibraryFlag & " " & quoteShell(dir / "observations.sqlite"),
+      env = noLibraryEnv(dir / "no-such-libsqlite3.so"))
+    checkpoint text
+    check code == 0
+    check "available=false" in text
+    check ("status=" & $ssNoSqliteTool) in text
+    check "capture=false" in text
+    check "capture disabled" in text
+    check "no-such-libsqlite3.so" in text
+    check "healthy=false" in text
+    # Nothing was created: a store that could not be opened is not touched.
+    check not fileExists(dir / "observations.sqlite")
+
+  test "a library that is not SQLite is passed over, not called":
+    # `RUNQUOTA_SQLITE_LIBRARY` names a library that loads but is not
+    # SQLite: the C library, already mapped into every process. Every
+    # binding must resolve before any is used, so the candidate is refused
+    # by name and the store degrades. Falsifying mutation: accept a
+    # candidate once `dlopen` succeeds, without resolving the bindings --
+    # the child then calls a nil function pointer and dies.
+    let dir = scratchDir("notsqlite")
+    defer: removeDir(dir)
+    let (text, code) = execCmdEx(quoteShell(getAppFilename()) & " " &
+      noLibraryFlag & " " & quoteShell(dir / "observations.sqlite"),
+      env = noLibraryEnv("libc.so.6"))
+    checkpoint text
+    check code == 0
+    check "available=false" in text
+    check "capture=false" in text
+    check "libc.so.6: has no sqlite3_" in text
+    check not fileExists(dir / "observations.sqlite")
+
+  test "the library in use is reported with its version":
+    # The other side of the two cases above: the library the dev shell and
+    # the Nix build record loads, and the report names it and its version.
+    let library = getEnv("RUNQUOTA_SQLITE_LIBRARY")
+    check library.len > 0
+    if library.len > 0:
+      let dir = scratchDir("withsqlite")
+      defer: removeDir(dir)
+      let (text, code) = execCmdEx(quoteShell(getAppFilename()) & " " &
+        noLibraryFlag & " " & quoteShell(dir / "observations.sqlite"),
+        env = noLibraryEnv(library))
+      checkpoint text
+      check code == 0
+      check "available=true" in text
+      check "capture=true" in text
+      check "SQLite 3." in sqliteLibraryReport()
+      check library in sqliteLibraryReport()
 
   test "an unwritable location degrades to no capture":
     let dir = scratchDir("unwritable")

@@ -51,7 +51,12 @@ const
     # database-access leg of the scan would otherwise report it; it is
     # exempt because it is daemon-side and never linked by a client, and
     # THAT is asserted below rather than asserted here in a comment.
-    "libs/runquota_persistence"]
+    "libs/runquota_persistence",
+    # THE IN-PROCESS SQLITE BINDING both of the above reach SQLite through.
+    # It is a library and opens no store of its own; it is exempt for the
+    # same reason as the estimate store, and the same assertion below --
+    # no client-facing module imports it -- is what makes that sound.
+    "libs/runquota_core/src/runquota_core/sqlite_inproc.nim"]
 
   clientFacingRoots = [
     # What a consumer links. If the store were reachable from any of these
@@ -277,6 +282,7 @@ suite "observation_store_reader_boundary":
       let text = codeOnly(readFile(path))
       check "runquota_persistence" notin text
       check "runquota_observation_store" notin text
+      check "sqlite_inproc" notin text
 
   test "the client library reaches the store only over the socket":
     # Stated separately from the sweep above, because this is the file the

@@ -411,7 +411,11 @@ suite "observation_store_merge":
 
     # AND THE BYTES ARE NOT THE IDENTITY, recorded here at the exact place
     # the gate asks for byte-identity rather than left to the note at the
-    # top of the file.
+    # top of the file. The FILES are compared, so this process's pooled
+    # connections are closed first: until then committed pages may still be
+    # in each store's `-wal` sidecar and the two main files could both be
+    # the untouched seed.
+    closePooledConnections()
     check readFile(forwardPath) != readFile(backwardPath)
 
   test "an extension schema the receiver does not know is carried, not dropped":

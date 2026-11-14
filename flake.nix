@@ -287,6 +287,13 @@
           buildSourceEnv = {
             REPROBUILD_PACKAGES_ROOT = inputs.runquota-package-catalog;
             SHM_LEASE_SRC = shmLeaseSrc;
+            # THE SQLITE LIBRARY THE STORES LOAD, recorded into every binary
+            # at build time (`runquota_core/sqlite_inproc`). The daemon opens
+            # it with dlopen rather than linking it, so that a host without
+            # SQLite degrades to no capture instead of failing to start; the
+            # recorded store path is what makes nixpkgs' library the one a
+            # Nix-built daemon finds, and puts it in the runtime closure.
+            RUNQUOTA_SQLITE_LIBRARY = "${pkgs.sqlite.out}/lib/libsqlite3${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
           };
           runquota = pkgs.stdenv.mkDerivation {
             pname = "runquota";
@@ -300,7 +307,7 @@
             # published aggregate table does not compile, and the point of
             # setting it HERE is that the packaged daemon is built from the
             # same sources as the developer's.
-            inherit (buildSourceEnv) REPROBUILD_PACKAGES_ROOT SHM_LEASE_SRC;
+            inherit (buildSourceEnv) REPROBUILD_PACKAGES_ROOT SHM_LEASE_SRC RUNQUOTA_SQLITE_LIBRARY;
 
             nativeBuildInputs = [
               pkgs.bash
@@ -529,21 +536,12 @@
               pkgs.pre-commit
               pkgs.shellcheck
               pkgs.shfmt
-              # THE `sqlite3` TOOL, which is a RUNTIME dependency of the
-              # observation store and of `runquota_persistence`: both reach
-              # SQLite by spawning the command-line tool rather than by
-              # linking a library, precisely so that its absence is a
-              # catchable condition (OS-4, "degrade, never fail") instead of
-              # a load-time abort. `findExe "sqlite3"` is the whole test.
-              #
-              # Its absence from this list is what made that degradation the
-              # DEFAULT in CI: `nix develop --command just test` ran with no
-              # tool on PATH, every store opened as
-              # `degraded-no-sqlite-tool`, and roughly half the suite
-              # asserted against a store that had refused to exist. A green
-              # run then meant "the tool is missing", not "the store works".
-              # The `bin` output is `pkgs.sqlite`'s first, so this is the
-              # CLI and not just the library.
+              # SQLITE. The stores load the LIBRARY in process, from the path
+              # `RUNQUOTA_SQLITE_LIBRARY` (below) records; the `sqlite3` TOOL
+              # (the `bin` output, `pkgs.sqlite`'s first) is here for the
+              # tests, which inspect and corrupt stores with it, and for a
+              # developer reading one. Neither the daemon nor the CLI spawns
+              # it.
               pkgs.sqlite
               pkgs.typos
               # THE JOBSERVER CLIENTS `runquota jobserver` IS TESTED AGAINST.
@@ -572,7 +570,7 @@
               pkgs.rpm
               pkgs.libarchive
             ];
-            inherit (buildSourceEnv) REPROBUILD_PACKAGES_ROOT SHM_LEASE_SRC;
+            inherit (buildSourceEnv) REPROBUILD_PACKAGES_ROOT SHM_LEASE_SRC RUNQUOTA_SQLITE_LIBRARY;
             RELEASE_PACKAGING_SRC = inputs.release-packaging-src;
             RELEASE_NIMCRYPTO_SRC = inputs.release-nimcrypto-src;
             RELEASE_BEARSSL_SRC = inputs.release-bearssl-src;

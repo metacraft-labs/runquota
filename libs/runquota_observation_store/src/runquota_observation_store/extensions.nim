@@ -189,13 +189,6 @@ proc isStorableIdentifier*(name: string): bool =
       return false
   true
 
-proc encodeValue(value: ExtensionValue): string =
-  case value.kind
-  of evNull: "null"
-  of evText: encodeText(value.text)
-  of evInt: encodeInt(value.number)
-  of evReal: encodeFloat(value.real)
-
 # ---------------------------------------------------------------------------
 # Statement builders. Exported so that what RunQuota emits against an
 # extension table can be inspected directly, rather than inferred from the
@@ -229,16 +222,28 @@ proc extensionShapeGate*(tableName: string): string =
     "count(distinct id) from pragma_foreign_key_list(" & quoted &
     ") where \"table\" = 'executions') >= 1 then 1 else 0 end;\n"
 
+proc boundValue(value: ExtensionValue): SqlValue =
+  case value.kind
+  of evNull: sqlNull()
+  of evText: sqlText(value.text)
+  of evInt: sqlInt(value.number)
+  of evReal: sqlFloat(value.real)
+
 proc extensionInsertStatement*(tableName: string; row: ExtensionRow): string =
-  ## The insert for one extension row. The key columns are RunQuota's; every
-  ## other column name in the result arrived in ``row.columns``.
+  ## The insert for one extension row, in the byte form of a bound statement
+  ## (``sqlite_inproc.encodeBound``). The key columns are RunQuota's; every
+  ## other column name in the result arrived in ``row.columns`` and was
+  ## checked to be a storable identifier by the caller. Every VALUE is bound,
+  ## never written into the SQL.
   var columns = @[keyHostColumn, keyExecutionColumn]
-  var values = @[encodeText(row.hostId), encodeText(row.executionId)]
+  var values = @[sqlText(row.hostId), sqlText(row.executionId)]
+  var marks = @["?", "?"]
   for i, name in row.columns:
     columns.add(name)
-    values.add(encodeValue(row.values[i]))
-  "insert into " & tableName & " (" & columns.join(", ") & ") values (" &
-    values.join(", ") & ");"
+    values.add(boundValue(row.values[i]))
+    marks.add("?")
+  encodeBound(bound("insert into " & tableName & " (" & columns.join(", ") &
+    ") values (" & marks.join(", ") & ")", values))
 
 proc startedBefore*(cutoffUnixMillis: int64): DoomedExecutions =
   DoomedExecutions(kind: dkStartedBefore, cutoffUnixMillis: cutoffUnixMillis)

@@ -9,7 +9,7 @@
 ## Two rules shape every entry point below.
 ##
 ## * **Degrade, never fail (OS-4).** Nothing here raises. A missing
-##   ``sqlite3``, a corrupt file, an unwritable directory, or a database
+##   SQLite library, a corrupt file, an unwritable directory, or a database
 ##   written by a newer RunQuota all produce a store whose ``status`` is not
 ##   ``ssOpen`` and whose ``report`` says why. Callers check
 ##   ``captureEnabled`` and carry on; a build or a test run MUST NOT fail
@@ -41,12 +41,12 @@ type
       ## problem; it does not turn capture off.
     registryReads*: int64
       ## How many times the extension registry has been read FROM THE
-      ## DATABASE, which means how many `sqlite3` processes were spawned to
+      ## DATABASE, which means how many registry reads were made to
       ## answer "what does this store know about this extension".
       ##
       ## IT IS A COUNTER BECAUSE THE DEFECT IT BOUNDS IS INVISIBLE
       ## OTHERWISE. Reading the registry once per declaration is the design;
-      ## reading it once per extension ROW is a subprocess spawn per
+      ## reading it once per extension ROW is a database read per
       ## observed execution, and the two produce byte-identical stores. Only
       ## a count can tell them apart from outside the daemon, and the
       ## regression test asserts on this rather than on a stopwatch.
@@ -111,7 +111,7 @@ proc integrityDetail(path: string): string =
   let outcome = runSqlite(path, "pragma quick_check;")
   if not outcome.ok:
     let detail = outcome.error.strip()
-    return if detail.len > 0: detail else: "sqlite3 exited " & $outcome.exitCode
+    return if detail.len > 0: detail else: "quick_check failed"
   let text = outcome.output.strip()
   if text != "ok":
     return "quick_check reported: " & text
@@ -182,8 +182,8 @@ proc openObservationStore*(path: string; createParent = true): ObservationStore 
     return
   if not sqliteToolAvailable():
     result.degrade(ssNoSqliteTool,
-      "runquota observation store " & path & ": the '" & sqliteTool &
-        "' tool is not on PATH; capture disabled")
+      "runquota observation store " & path & ": " & sqliteLibraryReport() &
+        "; capture disabled")
     return
   let parent = path.parentDir
   if parent.len > 0 and not dirExists(parent) and not createParent:
@@ -262,14 +262,16 @@ proc backupTo*(store: ObservationStore; destination: string): bool =
   runSqlite(store.path, "vacuum into " & encodeText(destination) & ";").ok
 
 # ---------------------------------------------------------------------------
-# Encoding helpers for optional columns
+# Values. Every row value is BOUND to its statement, never spliced into SQL
+# text: the rows are observations clients reported, and a value that never
+# becomes SQL cannot be read as SQL.
 # ---------------------------------------------------------------------------
 
-proc encodeOptText(value: Option[string]): string =
-  if value.isNone: "null" else: encodeText(value.get)
+proc optText(value: Option[string]): SqlValue =
+  if value.isNone: sqlNull() else: sqlText(value.get)
 
-proc encodeOptInt(value: Option[int64]): string =
-  if value.isNone: "null" else: encodeInt(value.get)
+proc optInt(value: Option[int64]): SqlValue =
+  if value.isNone: sqlNull() else: sqlInt(value.get)
 
 proc decodeOptText(field: string): Option[string] =
   if field.isNullField: none(string) else: some(decodeText(field))
@@ -315,61 +317,72 @@ const
     "extension_id", "schema_version", "owner", "table_name",
     "registered_at_unix_millis"]
 
+proc placeholders(count: int): string =
+  for i in 0 ..< count:
+    if i > 0:
+      result.add(", ")
+    result.add("?")
+
+proc insertBound(table: string; columns: openArray[string];
+                 values: openArray[SqlValue]; verb = "insert"): BoundStatement =
+  bound(verb & " into " & table & " (" & columns.join(", ") & ") values (" &
+    placeholders(values.len) & ")", values)
+
 proc insertStatement(table: string; columns: openArray[string];
-                     values: openArray[string]): string =
-  "insert into " & table & " (" & columns.join(", ") & ") values (" &
-    values.join(", ") & ");"
+                     values: openArray[SqlValue]): string =
+  ## The byte form (``encodeBound``) of one insert with bound values.
+  encodeBound(insertBound(table, columns, values))
 
-proc hostValues(row: HostRow): seq[string] =
-  @[encodeText(row.hostId), encodeInt(row.createdAtUnixMillis),
-    encodeText(row.lastBootId)]
+proc hostValues(row: HostRow): seq[SqlValue] =
+  @[sqlText(row.hostId), sqlInt(row.createdAtUnixMillis),
+    sqlText(row.lastBootId)]
 
-proc hostProfileValues(row: HostProfileRow): seq[string] =
-  @[encodeText(row.hostId), encodeText(row.profileId),
-    encodeText(row.profileHash), encodeInt(row.validFromUnixMillis),
-    encodeOptInt(row.validToUnixMillis), encodeText(row.cpuModel),
-    encodeInt(row.physicalCores), encodeInt(row.logicalCores),
-    encodeInt(row.ramBytes), encodeInt(row.swapBytes),
-    encodeText($row.diskClass), encodeText(row.fsType), encodeText(row.arch),
-    encodeText(row.os), encodeText(row.osVersion),
-    encodeText(row.kernelVersion), encodeText(row.virtualization),
-    encodeText(row.cpuShareGroup)]
+proc hostProfileValues(row: HostProfileRow): seq[SqlValue] =
+  @[sqlText(row.hostId), sqlText(row.profileId),
+    sqlText(row.profileHash), sqlInt(row.validFromUnixMillis),
+    optInt(row.validToUnixMillis), sqlText(row.cpuModel),
+    sqlInt(row.physicalCores), sqlInt(row.logicalCores),
+    sqlInt(row.ramBytes), sqlInt(row.swapBytes),
+    sqlText($row.diskClass), sqlText(row.fsType), sqlText(row.arch),
+    sqlText(row.os), sqlText(row.osVersion),
+    sqlText(row.kernelVersion), sqlText(row.virtualization),
+    sqlText(row.cpuShareGroup)]
 
-proc runValues(row: RunRow): seq[string] =
-  @[encodeText(row.runId), encodeText(row.hostId), encodeText(row.tool),
-    encodeText(row.toolVersion), encodeText(row.invocationKind),
-    encodeInt(row.startedAtUnixMillis),
-    encodeOptInt(row.finishedAtUnixMillis), encodeOptInt(row.exitStatus),
-    encodeOptText(row.workspaceId), encodeOptText(row.profile),
-    encodeOptText(row.gitCommit), encodeOptText(row.gitBranch),
-    encodeText($row.captureCompleteness), encodeInt(row.droppedObservations)]
+proc runValues(row: RunRow): seq[SqlValue] =
+  @[sqlText(row.runId), sqlText(row.hostId), sqlText(row.tool),
+    sqlText(row.toolVersion), sqlText(row.invocationKind),
+    sqlInt(row.startedAtUnixMillis),
+    optInt(row.finishedAtUnixMillis), optInt(row.exitStatus),
+    optText(row.workspaceId), optText(row.profile),
+    optText(row.gitCommit), optText(row.gitBranch),
+    sqlText($row.captureCompleteness), sqlInt(row.droppedObservations)]
 
-proc executionValues(row: ExecutionRow): seq[string] =
-  @[encodeText(row.executionId), encodeText(row.hostId),
-    encodeOptText(row.hostProfileId), encodeText(row.runId),
-    encodeText(row.commandStatsId), encodeOptInt(row.leaseId),
-    encodeInt(row.startedAtUnixMillis), encodeInt(row.finishedAtUnixMillis),
-    encodeInt(row.durationMillis), encodeInt(row.exitStatus),
-    encodeText($row.termination), encodeInt(row.attempt),
-    encodeOptText(row.retryOf), encodeInt(row.peakRssBytes),
-    encodeOptInt(row.cpuUserMillis), encodeOptInt(row.cpuSysMillis),
-    encodeInt(row.maxProcesses), encodeInt(row.majorPageFaults),
-    encodeOptInt(row.ioReadBytes), encodeOptInt(row.ioWriteBytes),
-    encodeText($row.captureCompleteness), encodeInt(row.droppedObservations),
-    encodeOptInt(row.ownerUid)]
+proc executionValues(row: ExecutionRow): seq[SqlValue] =
+  @[sqlText(row.executionId), sqlText(row.hostId),
+    optText(row.hostProfileId), sqlText(row.runId),
+    sqlText(row.commandStatsId), optInt(row.leaseId),
+    sqlInt(row.startedAtUnixMillis), sqlInt(row.finishedAtUnixMillis),
+    sqlInt(row.durationMillis), sqlInt(row.exitStatus),
+    sqlText($row.termination), sqlInt(row.attempt),
+    optText(row.retryOf), sqlInt(row.peakRssBytes),
+    optInt(row.cpuUserMillis), optInt(row.cpuSysMillis),
+    sqlInt(row.maxProcesses), sqlInt(row.majorPageFaults),
+    optInt(row.ioReadBytes), optInt(row.ioWriteBytes),
+    sqlText($row.captureCompleteness), sqlInt(row.droppedObservations),
+    optInt(row.ownerUid)]
 
-proc ambientValues(row: AmbientSampleRow): seq[string] =
-  @[encodeText(row.hostId), encodeInt(row.sampledAtUnixMillis),
-    encodeFloat(row.cpuBusyPct), encodeInt(row.memAvailableBytes),
-    encodeFloat(row.swapInRate), encodeFloat(row.ioQueueDepth),
-    encodeFloat(row.loadAvg1m), encodeFloat(row.selfCpuPct),
-    encodeInt(row.selfRssBytes), encodeFloat(row.foreignCpuPct),
-    encodeInt(row.foreignRssBytes)]
+proc ambientValues(row: AmbientSampleRow): seq[SqlValue] =
+  @[sqlText(row.hostId), sqlInt(row.sampledAtUnixMillis),
+    sqlFloat(row.cpuBusyPct), sqlInt(row.memAvailableBytes),
+    sqlFloat(row.swapInRate), sqlFloat(row.ioQueueDepth),
+    sqlFloat(row.loadAvg1m), sqlFloat(row.selfCpuPct),
+    sqlInt(row.selfRssBytes), sqlFloat(row.foreignCpuPct),
+    sqlInt(row.foreignRssBytes)]
 
-proc extensionValues(row: ExtensionRegistryRow): seq[string] =
-  @[encodeText(row.extensionId), encodeInt(row.schemaVersion),
-    encodeText(row.owner), encodeText(row.tableName),
-    encodeInt(row.registeredAtUnixMillis)]
+proc extensionValues(row: ExtensionRegistryRow): seq[SqlValue] =
+  @[sqlText(row.extensionId), sqlInt(row.schemaVersion),
+    sqlText(row.owner), sqlText(row.tableName),
+    sqlInt(row.registeredAtUnixMillis)]
 
 proc isRejection(error: string): bool =
   ## A row the schema refused, as opposed to a store that has stopped
@@ -419,46 +432,45 @@ proc registerExtension*(store: ObservationStore;
     extensionValues(row)))
 
 proc runInsertStatement*(row: RunRow): string =
-  ## One run's insert, on its own. ``insert or ignore`` because several
+  ## One run's insert, on its own, in the byte form of a bound statement
+  ## (``sqlite_inproc.encodeBound``). ``insert or ignore`` because several
   ## executions share a run and the row may already exist.
   ##
   ## Exposed per-row because the background writer's queue holds BYTES rather
   ## than rows -- see the note at the head of ``writer.nim`` -- so the
   ## statement is composed on the thread that recorded the observation.
-  "insert or ignore into runs (" & runColumns.join(", ") & ") values (" &
-    runValues(row).join(", ") & ");"
+  encodeBound(insertBound("runs", runColumns, runValues(row),
+    verb = "insert or ignore"))
 
-proc cpuProfileBlob*(samples: openArray[uint16]): string =
-  ## The ``samples`` column: little-endian u16, as a SQL blob literal.
-  const hexDigits = "0123456789ABCDEF"
-  result = "X'"
+proc cpuProfileBytes*(samples: openArray[uint16]): string =
+  ## The ``samples`` column: little-endian u16, as the blob's bytes.
   for value in samples:
-    for b in [uint8(value and 0xff'u16), uint8(value shr 8)]:
-      result.add(hexDigits[int(b shr 4)])
-      result.add(hexDigits[int(b and 0x0f'u8)])
-  result.add("'")
+    result.add(char(value and 0xff'u16))
+    result.add(char(value shr 8))
 
 proc executionInsertStatement*(row: ExecutionRow): string =
-  ## One execution's insert, and its CPU profile's when it has one. Same
-  ## reason as ``runInsertStatement``.
+  ## One execution's insert, and its CPU profile's when it has one, in the
+  ## byte form. Same reason as ``runInsertStatement``.
   ##
-  ## THE PROFILE TRAVELS IN THE SAME STATEMENT TEXT, so the writer queues,
+  ## THE PROFILE TRAVELS IN THE SAME QUEUE ENTRY, so the writer queues,
   ## counts and commits the pair as one observation: a profile can never
   ## reach the store without its execution, and its foreign key is
-  ## satisfied by the line above it.
+  ## satisfied by the statement before it.
   result = insertStatement("executions", executionColumns, executionValues(row))
   if row.cpuProfileIntervalMillis > 0 and row.cpuProfileSamples.len > 0:
-    result.add("\n" & insertStatement(cpuProfileTable,
+    result.add(insertStatement(cpuProfileTable,
       ["host_id", "execution_id", "interval_ms", "samples", "source"],
-      [encodeText(row.hostId), encodeText(row.executionId),
-       encodeInt(row.cpuProfileIntervalMillis),
-       cpuProfileBlob(row.cpuProfileSamples), encodeText("client-tree")]))
+      [sqlText(row.hostId), sqlText(row.executionId),
+       sqlInt(row.cpuProfileIntervalMillis),
+       sqlBlob(cpuProfileBytes(row.cpuProfileSamples)),
+       sqlText("client-tree")]))
 
 proc batchStatement*(runs: openArray[RunRow];
                      executions: openArray[ExecutionRow];
                      extensionInserts: openArray[string] = []): string =
-  ## One transaction for a drained queue. ``insert or ignore`` for runs
-  ## because several executions share a run and the row may already exist.
+  ## A drained queue's statements, in the byte form, which ``runSqlite``
+  ## runs as ONE transaction. ``insert or ignore`` for runs because several
+  ## executions share a run and the row may already exist.
   ##
   ## EXTENSION INSERTS COME LAST, AND THE ORDER IS LOAD-BEARING. An
   ## extension row carries a foreign key to ``executions`` and
@@ -469,15 +481,14 @@ proc batchStatement*(runs: openArray[RunRow];
   ## only admitted after the lease that produced it finished.
   ##
   ## The statements are opaque here (see ``enqueueExtensionInsert``); this
-  ## procedure appends them and does not read them.
-  result = "begin immediate;\n"
+  ## procedure appends them and does not read them. The byte form
+  ## concatenates, so appending is all that joining them takes.
   for row in runs:
-    result.add(runInsertStatement(row) & "\n")
+    result.add(runInsertStatement(row))
   for row in executions:
-    result.add(executionInsertStatement(row) & "\n")
+    result.add(executionInsertStatement(row))
   for statement in extensionInserts:
-    result.add(statement & "\n")
-  result.add("commit;\n")
+    result.add(statement)
 
 proc appendBatchAt*(path: string; runs: openArray[RunRow];
                     executions: openArray[ExecutionRow];
@@ -490,7 +501,9 @@ proc appendBatchAt*(path: string; runs: openArray[RunRow];
 
 proc appendStatementsAt*(path: string;
                          statements: openArray[string]): SqliteOutcome =
-  ## Path-addressed batch append for statements the caller composed itself.
+  ## Path-addressed batch append for statements the caller composed itself,
+  ## each in the byte form of bound statements. One transaction, on a
+  ## pooled connection, with no SQLite process involved.
   ##
   ## ``appendBatchAt`` above is the same thing for callers that still hold
   ## rows. The background writer does not: its queue is process-owned storage
@@ -499,24 +512,29 @@ proc appendStatementsAt*(path: string;
   ## the order ``batchStatement`` would have put them in -- runs, then
   ## executions, then extension rows, which is load-bearing because an
   ## extension row carries a foreign key to its execution.
+  ##
+  ## A statement that is SQL text rather than the byte form is refused, and
+  ## the batch with it: the batch must be one transaction, and text runs on
+  ## a connection of its own.
   if statements.len == 0:
     return SqliteOutcome(ok: true, exitCode: 0, output: "", error: "")
-  var sql = "begin immediate;\n"
+  var decoded: seq[BoundStatement] = @[]
   for statement in statements:
-    sql.add(statement & "\n")
-  sql.add("commit;\n")
-  runSqlite(path, sql)
+    if not statement.isBound or not decodeBound(statement, decoded):
+      return SqliteOutcome(ok: false, exitCode: 1, output: "",
+        error: "a queued statement is not a bound statement")
+  let outcome = runBound(path, decoded)
+  SqliteOutcome(ok: outcome.ok, exitCode: (if outcome.ok: 0 else: 1),
+    output: outcome.output, error: outcome.error)
 
 proc ambientInsertStatement*(row: AmbientSampleRow): string =
   ## Compose on the sampling thread before copying bytes to the writer queue.
   insertStatement("ambient_samples", ambientColumns, ambientValues(row))
 
 proc ambientBatchStatement*(rows: openArray[AmbientSampleRow]): string =
-  ## One transaction for a drained run of ambient samples.
-  result = "begin immediate;\n"
+  ## One transaction's worth of ambient samples, in the byte form.
   for row in rows:
-    result.add(ambientInsertStatement(row) & "\n")
-  result.add("commit;\n")
+    result.add(ambientInsertStatement(row))
 
 proc appendAmbientSamplesAt*(path: string;
                              rows: openArray[AmbientSampleRow]): SqliteOutcome =
@@ -539,10 +557,19 @@ proc appendBatch*(store: ObservationStore; runs: openArray[RunRow];
 # Readers. Used by the round-trip gate and by clients reading history.
 # ---------------------------------------------------------------------------
 
-proc query(store: ObservationStore; sql: string): seq[seq[string]] =
+proc query(store: ObservationStore; sql: string;
+           params: openArray[SqlValue] = []): seq[seq[string]] =
   if store.isNil or store.status notin {ssOpen}:
     return @[]
-  let outcome = runSqlite(store.path, sql)
+  # ONE STATEMENT READS ON A POOLED CONNECTION, with or without bound
+  # values: that is every typed reader here, and the aggregate publisher
+  # reads through them once per dirty key. A multi-statement script (a
+  # caller's own ``begin; ...; commit``) runs as a script, on a connection
+  # of its own.
+  let outcome =
+    if params.len > 0 or sql.count(';') <= 1:
+      querySqlite(store.path, sql, params)
+    else: runSqlite(store.path, sql)
   if not outcome.ok:
     return @[]
   splitRows(outcome.output)
@@ -710,13 +737,16 @@ proc runStatement*(store: ObservationStore; sql: string): bool =
   ## extension tables and MUST NOT interpret their columns (OS-5).
   store.execute(sql)
 
-proc runQuery*(store: ObservationStore; sql: string): seq[seq[string]] =
+proc runQuery*(store: ObservationStore; sql: string;
+               params: openArray[SqlValue] = []): seq[seq[string]] =
   ## The read half of ``runStatement``, with the same reason to exist.
-  store.query(sql)
+  ## ``params`` are bound to the statement's ``?`` placeholders; a value a
+  ## client supplied is passed there, never written into ``sql``.
+  store.query(sql, params)
 
 proc readExtensionRegistry*(store: ObservationStore):
     seq[ExtensionRegistryRow] =
-  ## The registry, read from the database. ALWAYS a `sqlite3` spawn, and
+  ## The registry, read from the database. ALWAYS a database read, and
   ## counted as one.
   inc store.registryReads
   let sql = "select " & [
@@ -751,11 +781,11 @@ proc ensureHostRow*(store: ObservationStore; hostId, lastBootId: string): bool =
   ## the immutable table (OS-3), and this is not it.
   if not store.captureEnabled or hostId.len == 0:
     return false
-  store.execute(
+  store.execute(encodeBound(bound(
     "insert into hosts (host_id, created_at_unix_millis, last_boot_id) " &
-    "values (" & encodeText(hostId) & ", " & encodeInt(unixMillisNow()) &
-      ", " & encodeText(lastBootId) & ") " &
-    "on conflict(host_id) do update set last_boot_id = excluded.last_boot_id;")
+    "values (?, ?, ?) " &
+    "on conflict(host_id) do update set last_boot_id = excluded.last_boot_id",
+    sqlText(hostId), sqlInt(unixMillisNow()), sqlText(lastBootId))))
 
 proc currentHostProfile*(store: ObservationStore;
                          hostId: string): Option[HostProfileRow] =
@@ -829,18 +859,13 @@ proc ensureHostProfile*(store: ObservationStore; hostId: string;
     # host with no current hardware at all, and an open successor beside an
     # open predecessor is refused by `host_profiles_current` anyway.
     if not store.execute(
-        "begin immediate;\n" &
-        "update host_profiles set valid_to_unix_millis = " &
-          encodeInt(closedAt) & " where host_id = " & encodeText(hostId) &
-          " and valid_to_unix_millis is null;\n" &
+        encodeBound(bound("update host_profiles set valid_to_unix_millis = " &
+          "? where host_id = ? and valid_to_unix_millis is null",
+          sqlInt(closedAt), sqlText(hostId))) &
         insertStatement("host_profiles", hostProfileColumns,
-          hostProfileValues(successor)) & "\n" &
-        "commit;"):
-      # No rollback is issued: every `runSqlite` is its own process and its
-      # own connection, so an aborted transaction dies with it. Issuing one
-      # would fail with "no transaction is active" and that failure, not
-      # being a constraint rejection, would disable capture for a write
-      # that already did nothing.
+          hostProfileValues(successor))):
+      # No rollback is issued here: bound statements run as one transaction
+      # that `runBound` itself rolls back on any failure.
       return ""
     return successor.profileId
 

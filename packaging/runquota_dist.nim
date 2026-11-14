@@ -268,21 +268,21 @@ proc newRunQuotaDistribution*(version: string; targetOs: TargetOs;
   ##   no env defaults, and a wrapper here would be a script that
   ##   resolves a prefix, sets nothing and execs.
   ##
-  ## * NO `dlopen` LEAF NAMES. Every `{.dynlib.}` binding in the tree
-  ##   names a Win32 system DLL (`kernel32.dll`, `advapi32.dll`) or a
-  ##   POSIX libc symbol; there is no third-party shared library opened
-  ##   by leaf name anywhere in `libs/` or `apps/`. Declaring a system
-  ##   DLL here would ask the layer to vendor a file it must never
-  ##   vendor.
+  ## * NO VENDORED `dlopen` LEAF NAMES. The `{.dynlib.}` bindings in the
+  ##   tree name Win32 system DLLs (`kernel32.dll`, `advapi32.dll`) or POSIX
+  ##   libc symbols. The one third-party library opened at run time is
+  ##   SQLite (`runquota_core/sqlite_inproc`), and it is deliberately NOT
+  ##   declared here: it is the system's library, found by the loader, and
+  ##   its absence is a supported state (below), so the package must neither
+  ##   ship a copy nor require one.
   ##
-  ## * SQLITE IS A TOOL, NOT A LIBRARY. RunQuota reaches SQLite through
-  ##   the `sqlite3` COMMAND (`sqlite_cli.nim`: `findExe(sqliteTool)`),
-  ##   deliberately — "a missing tool is an ordinary, catchable
-  ##   condition here, which is what OS-4 ('degrade, never fail') needs;
-  ##   a missing shared library would be a load-time abort." So it
-  ##   contributes nothing to any runtime closure and nothing to any
-  ##   import table. See the dependency note below for what the package
-  ##   says about it.
+  ## * SQLITE IS LOADED, NOT LINKED. RunQuota runs SQLite in process but
+  ##   opens the library with `dlopen` at start-up rather than naming it on
+  ##   the link line, deliberately: a library that cannot be loaded turns
+  ##   capture off and the daemon keeps granting leases (OS-4, "degrade,
+  ##   never fail"), where a linked one would stop the daemon from starting.
+  ##   So it contributes nothing to any import table. See the dependency
+  ##   note below for what the package says about it.
   ##
   ## `vendorRuntimeClosure` is left at its default `true` and
   ## `computeDependencyFloor` at `true`: both are Linux-only mechanisms
@@ -332,30 +332,32 @@ proc newRunQuotaDistribution*(version: string; targetOs: TargetOs;
     # cannot run." Mandatory in the payload, therefore mandatory in the
     # metadata.
     #
-    # RunQuota's `sqlite3` is the opposite case, and it is opposite by
-    # design rather than by accident. `sqliteToolAvailable()` is a real
+    # RunQuota's SQLite is the opposite case, and it is opposite by
+    # design rather than by accident. `sqliteAvailable()` is a real
     # branch with real behaviour behind it (OS-4: "degrade, never
-    # fail"): with no `sqlite3` on PATH the daemon still binds its
+    # fail"): with no loadable SQLite library the daemon still binds its
     # endpoint, still admits and releases leases, still publishes its
     # aggregate table, and says on its own startup line that capture is
     # off. RunQuota's test runner carries
     # `RUNQUOTA_ALLOW_MISSING_SQLITE=1` for exactly this reason — the
     # absence is a SUPPORTED STATE, not a broken host.
     #
-    # `Depends: sqlite3` would therefore refuse to install RunQuota on a
-    # machine that deliberately has no sqlite3, converting a designed
+    # `Depends: libsqlite3-0` would therefore refuse to install RunQuota
+    # on a machine that deliberately has no SQLite, converting a designed
     # degradation into an installation failure. `Recommends:` is
     # Debian's word for "found together with this package in all but
     # unusual installations", which is precisely true here: apt
     # installs it by default and `--no-install-recommends` does not,
-    # and both of those are correct outcomes.
+    # and both of those are correct outcomes. It names the LIBRARY
+    # package, which is what the daemon loads; the `sqlite3` command-line
+    # tool is no longer run by anything RunQuota ships.
     #
     # It goes through `debControlExtraFields` because the layer's named
     # lists (`debDepends`, `rpmRequires`, `archDepends`) are all HARD
     # requirements and there is no Recommends/optdepends field. rpm and
-    # Arch therefore say nothing about sqlite3 in their metadata, and
+    # Arch therefore say nothing about SQLite in their metadata, and
     # the packaging runbook records that gap rather than letting a
     # `Requires:` paper over it with the wrong strength. The MSI has no
     # dependency mechanism of this kind at all.
-    debControlExtraFields: @[("Recommends", "sqlite3")],
+    debControlExtraFields: @[("Recommends", "libsqlite3-0")],
     upgradeCode: RunQuotaUpgradeCode)

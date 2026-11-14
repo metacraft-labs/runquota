@@ -481,11 +481,14 @@ suite "standalone_daemonless_degradation":
     # this file exists to keep out of the arms below.
     let seen = probe.calls()
     let leftBehind = databaseFilesUnder(root, probe)
-    # AND THE DETECTOR SEES IT. At least one database operation per
-    # execution, on the path that had just finished a piece of work: the
-    # role zeroed this counter after its one-time setup, so what is counted
-    # here is the per-execution traffic and nothing else.
-    check seen >= Runs
+    # AND THE DETECTOR SEES IT -- through the DATABASE FILE. SQLite runs in
+    # process now (`runquota_core/sqlite_inproc`), so a per-execution write
+    # starts no `sqlite3` and the probe's count is 0 for the violator too;
+    # what catches it is the database it leaves behind, which is the half
+    # of the detector the arms below also assert. The probe stays armed in
+    # them as a guard against a write path that goes back to spawning the
+    # tool.
+    check seen == 0
     check leftBehind.len > 0
     echo "  [probe] violating implementation: " & $seen &
       " sqlite3 invocations for " & $Runs & " executions"

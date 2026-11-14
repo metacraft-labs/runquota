@@ -1,90 +1,75 @@
-## A very small SQLite access layer built on the ``sqlite3`` command-line
-## tool.
+## The observation store's SQLite access layer.
 ##
-## Why the CLI and not a linked library: ``runquota_persistence`` already
-## reaches SQLite this way for learned estimates, so this adds no new build
-## or link dependency to a daemon that must keep working when the store does
-## not. A missing tool is an ordinary, catchable condition here, which is
-## what OS-4 ("degrade, never fail") needs; a missing shared library would
-## be a load-time abort.
+## The module keeps its historical name: it used to run the ``sqlite3``
+## command-line tool once per call. It now runs SQLite IN THIS PROCESS,
+## through ``runquota_core/sqlite_inproc``, which documents how the library
+## is found, why it is loaded rather than linked (a missing library degrades
+## to no capture, as a missing tool did), and the connection and threading
+## rules.
 ##
-## Values crossing this boundary are encoded so that no textual delimiter
-## can ever appear inside a value: text is written as ``cast(x'..' as text)``
-## and read back as ``hex()``, integers and reals are written and read as
-## digits, and SQL ``NULL`` is read back as a single ``~``. The column
-## separator is therefore never ambiguous.
+## Two shapes of call reach it:
+##
+## * SQL text this library composed itself -- schema, migrations,
+##   maintenance, the offline tools. ``runSqlite`` runs it on a fresh
+##   connection with the tool's ``-bail`` semantics, and returns the rows in
+##   the tool's list format, so every reader written against the tool reads
+##   the same bytes.
+## * Statements with BOUND VALUES (``sqlite_inproc.BoundStatement`` in its
+##   byte form). Every value that arrives from a client -- an observed row,
+##   an extension row, a stats key in a query -- travels this way and never
+##   becomes SQL text. ``runSqlite`` recognises the byte form and runs it on
+##   a pooled connection in one transaction.
+##
+## The text encoders below remain for the first shape: text is written as
+## ``cast(x'..' as text)`` and read back as ``hex()``, integers and reals as
+## digits, and SQL ``NULL`` reads back as a single ``~``, so the column
+## separator is never ambiguous.
 
-import std/[os, osproc, strutils]
+import std/strutils
 
-import runquota_core/child_process
+import runquota_core/sqlite_inproc
+
+export sqlite_inproc
 
 const
-  sqliteTool* = "sqlite3"
   nullMarker* = "~"
+  sqliteTool* = "sqlite3"
+    ## The command-line tool's name. Nothing in RunQuota runs it any more;
+    ## it is kept for tests that drive the tool directly against a store.
 
 type
   SqliteOutcome* = object
     ok*: bool
     exitCode*: int
+      ## 0 on success, 1 on a failure -- what the tool's exit status said,
+      ## kept so the callers written against it read the same.
     output*: string
     error*: string
 
 proc sqliteToolAvailable*(): bool =
-  findExe(sqliteTool).len > 0
+  ## Whether SQLite can be used at all. The name is historical; it now asks
+  ## whether the library was loaded (``sqlite_inproc.sqliteAvailable``).
+  sqliteAvailable()
 
-# `foreign_keys` keeps the spine's parent links real; `synchronous = normal`
-# trades a crash-window of recent observations for not fsyncing on every
-# batch. Both are per-connection settings and so must be repeated on every
-# invocation. Losing the last few observations to a power cut is precisely
-# the trade OS-1 already makes on the hot path.
-#
-# A busy timeout exists because the daemon now has TWO writers against one
-# store: the observation writer draining executions and the ambient sampler
-# flushing samples. Under WAL a second writer is refused immediately rather
-# than queued, and that refusal is not a constraint rejection -- `execute`
-# would read it as a store that has stopped working and turn capture off
-# for everyone. Waiting is the correct response to a lock somebody else
-# holds for the length of one batch.
-#
-# It is set with the `.timeout` DOT-COMMAND and not with `pragma
-# busy_timeout`, because the pragma RETURNS A ROW: it would prepend "5000"
-# to the output of every statement that followed it, and the first casualty
-# was `pragma user_version`, which then read back as `5000\n0` and made
-# every store on the machine look like it had an unreadable schema version.
-const sqlitePreamble =
-  ".timeout 5000\npragma foreign_keys = on;\npragma synchronous = normal;\n"
+proc toOutcome(outcome: SqlOutcome): SqliteOutcome =
+  SqliteOutcome(ok: outcome.ok, exitCode: (if outcome.ok: 0 else: 1),
+    output: outcome.output, error: outcome.error)
 
-proc runSqlite*(dbPath, sql: string): SqliteOutcome =
-  ## Runs ``sql`` against ``dbPath``. Never raises: a failure to even start
-  ## the tool is reported as ``ok == false`` with the reason in ``error``.
-  ##
-  ## The statements go in over **stdin**, not as an argument. A drained
-  ## batch of observations is easily larger than the operating system's
-  ## argument limit, and passing it as `argv` made a large batch fail as a
-  ## whole while a small one succeeded — a size-dependent failure with no
-  ## natural test to catch it.
-  ##
-  ## All three pipes are serviced CONCURRENTLY, which is what
-  ## `runquota_core/child_process` exists to guarantee, along with taking the
-  ## spawn guard so a concurrent spawn elsewhere in the daemon cannot inherit
-  ## these pipes. Both defects and the reasoning behind them are documented
-  ## there; this proc is now only the `sqlite3`-specific part -- the argv, the
-  ## preamble, and the outcome shape the store expects.
-  let captured = runCapturedProcess(
-    sqliteTool,
-    args = ["-batch", "-noheader", "-bail", dbPath],
-    input = sqlitePreamble & sql & "\n",
-    options = {poUsePath}
-  )
-  if captured.failure.len > 0:
-    return SqliteOutcome(
-      ok: false, exitCode: -1, output: "", error: captured.failure)
-  SqliteOutcome(
-    ok: captured.ok,
-    exitCode: captured.exitCode,
-    output: captured.output,
-    error: captured.error
-  )
+proc runSqlite*(dbPath, sql: string): SqliteOutcome {.gcsafe.} =
+  ## Runs ``sql`` against ``dbPath``. Never raises. SQL text runs on a fresh
+  ## connection, statement by statement, stopping at the first failure,
+  ## which rolls back whatever that script had open. Bound statements
+  ## (``isBound``) run on a pooled connection in one transaction.
+  if sql.isBound:
+    toOutcome(runBoundEncoded(dbPath, sql))
+  else:
+    toOutcome(runSqlScript(dbPath, sql))
+
+proc querySqlite*(dbPath, sql: string;
+                  params: openArray[SqlValue]): SqliteOutcome {.gcsafe.} =
+  ## One read whose ``?`` parameters are bound to ``params``, on a pooled
+  ## connection. For a read that carries a client's value.
+  toOutcome(queryBound(dbPath, sql, params))
 
 proc encodeText*(value: string): string =
   ## SQL literal for a text value, immune to quoting and to embedded

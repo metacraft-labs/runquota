@@ -174,31 +174,39 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# The `sqlite3` prerequisite
+# The SQLite prerequisite: the library and the tool
 # ---------------------------------------------------------------------------
 #
 # THE SAME FALSE-SIGNAL CLASS AS AN UNBOUNDED RUN, POINTING THE OTHER WAY.
-# `openObservationStore` degrades to no capture when `sqlite3` is not on
-# PATH, which is correct PRODUCT behaviour (OS-4) and is itself driven by
-# `tests/unit/t_observation_store_degradation`'s "no sqlite3 on PATH" case,
-# which empties PATH from INSIDE the test. It is not correct TEST-HOST
-# behaviour: a suite run outside the nix devshell reddens
+# `openObservationStore` degrades to no capture when no SQLite library can be
+# loaded, which is correct PRODUCT behaviour (OS-4) and is itself driven by
+# `tests/unit/t_observation_store_degradation`'s "no SQLite library" case,
+# which arranges the absence from INSIDE the test. It is not correct
+# TEST-HOST behaviour: a suite run without the library reddens
 # `t_observation_flush_contract`, `t_ambient_sample_atomicity` and
 # `t_hardware_run_tool_streams` on `store.captureEnabled`, with nothing in
-# the output naming the cause. Three tests failing for a reason that is not
-# in the tree is as misleading as a wedge nobody bounded, and it has already
-# cost one review its first run.
+# the output naming the cause.
+#
+# The library is the one `RUNQUOTA_SQLITE_LIBRARY` names (the dev shell sets
+# it; the binaries record it when they are built). The `sqlite3` TOOL is
+# needed too: the stores no longer run it, but many tests inspect and corrupt
+# a store with it.
 #
 # SO THE RUNNER REFUSES, the same way it refuses to run unbounded, and the
 # override is again a VALUE rather than an inference:
 # `RUNQUOTA_ALLOW_MISSING_SQLITE=1` runs anyway and says loudly which three
-# results are not to be believed. Refusing costs nothing legitimate --
-# no test in this suite needs `sqlite3` to be ABSENT from the runner's PATH,
-# because the one that needs that arranges it for itself.
+# results are not to be believed.
+sqlite_missing=""
 if ! command -v sqlite3 >/dev/null 2>&1; then
+  sqlite_missing="no sqlite3 tool on PATH"
+fi
+if [ -z "${RUNQUOTA_SQLITE_LIBRARY:-}" ] || [ ! -f "${RUNQUOTA_SQLITE_LIBRARY}" ]; then
+  sqlite_missing="${sqlite_missing:+${sqlite_missing}; }RUNQUOTA_SQLITE_LIBRARY does not name a SQLite library"
+fi
+if [ -n "${sqlite_missing}" ]; then
   if [ "${RUNQUOTA_ALLOW_MISSING_SQLITE:-0}" = "1" ]; then
     echo "==============================================================" >&2
-    echo "WARNING: no sqlite3 on PATH; running anyway on your say-so." >&2
+    echo "WARNING: ${sqlite_missing}; running anyway on your say-so." >&2
     echo "  These results are NOT a signal about this tree:" >&2
     echo "    - t_observation_flush_contract" >&2
     echo "    - t_ambient_sample_atomicity" >&2
@@ -206,13 +214,13 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
     echo "  They assert store.captureEnabled, which is false without it." >&2
     echo "==============================================================" >&2
   else
-    echo "no sqlite3 on PATH" >&2
-    echo "the observation store degrades to no capture without it, so three" >&2
+    echo "${sqlite_missing}" >&2
+    echo "the observation store degrades to no capture without SQLite, so" >&2
     echo "tests would fail for a reason that is not in this tree:" >&2
     echo "  t_observation_flush_contract, t_ambient_sample_atomicity," >&2
     echo "  t_hardware_run_tool_streams" >&2
     echo "run inside 'nix develop', or set RUNQUOTA_ALLOW_MISSING_SQLITE=1" >&2
-    echo "to accept those three failures on purpose" >&2
+    echo "to accept those failures on purpose" >&2
     exit 1
   fi
 fi

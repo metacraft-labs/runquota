@@ -96,10 +96,44 @@ threads, and both exist so that nothing on the lease path waits for IO:
   tables are bounded in row count and in age, not only by how much work the
   host does.
 
-Because there are two of them, `sqlite3` is given a busy timeout — through the
-`.timeout` dot-command rather than `pragma busy_timeout`, since the pragma
-returns a row and would prepend its value to the output of every statement
-after it, starting with `pragma user_version`.
+Because there are two of them, every connection has a 5-second busy timeout:
+under WAL a second writer is refused at once rather than queued, and that
+refusal must read as "wait", not as a store that has stopped working.
+
+**SQLite runs in the daemon's process.** The daemon used to run the `sqlite3`
+command-line tool once per batch, per learned-estimate write and per
+aggregate publication — about 170 processes for a 64-action build, and most
+of what recording cost. It now calls the library itself
+(`libs/runquota_core/src/runquota_core/sqlite_inproc.nim`), and no path of
+the daemon starts a `sqlite3` process:
+
+- The library is **loaded at start-up, not linked**: from the path recorded
+  when the binary was built (the Nix package and dev shell record nixpkgs'
+  `libsqlite3`), else the platform's usual name. `RUNQUOTA_SQLITE_LIBRARY`
+  in the daemon's environment overrides both and is then the only candidate;
+  it carries the trust of `LD_PRELOAD` and, like it, is ignored when the
+  process runs set-user-ID, set-group-ID or with file capabilities. A
+  candidate is accepted only if every function RunQuota calls resolves, its
+  version is at least 3.27.0 (`VACUUM INTO`) and it was built thread-safe;
+  otherwise the next one is tried.
+  A library that cannot be loaded turns capture off with the reason on the
+  startup line, and the daemon goes on granting leases — the same
+  degradation a missing `sqlite3` tool used to cause.
+- **Every value a client supplied is bound** to a prepared statement: rows,
+  extension rows, learned estimates, and the stats key, owner and profile
+  of a query. SQL text is only what RunQuota composes itself (schema,
+  migrations, extension declarations, retention, merge, export).
+- Bound statements run on **pooled connections**, each used by one thread
+  at a time, put back only with no transaction open, and reopened when the
+  file was removed, replaced or made unwritable; idle ones are evicted least
+  recently used first. A batch is one `begin immediate`
+  transaction, rolled back whole on any failure. SQL text runs on a
+  connection of its own, closed after it, as the tool's run was.
+- While the daemon runs, committed rows may still be in the `-wal` sidecar,
+  because a pooled connection keeps the store open; the daemon closes its
+  connections when it stops, which checkpoints them into the main file. Read
+  a live store through the daemon, or copy it with `VACUUM INTO` (the backup
+  path does), never by copying the main file alone.
 
 The sampler reads **host-wide totals only**: `runquotad` is a lease authority
 and does not inspect client process trees, so `self_*` is the arithmetic sum of
@@ -213,9 +247,9 @@ Two consequences, stated rather than discovered:
   during verification is judged against the owners seen by this daemon only;
   an owner-id collision with an owner recorded by an EARLIER daemon is refused
   from the moment the store is installed, not before.
-- **A shutdown during verification waits for the check.** The `sqlite3` child
-  running it is not interrupted; the daemon joins the thread before it stops
-  the writer threads that thread starts.
+- **A shutdown during verification waits for the check.** The check running
+  on its thread is not interrupted; the daemon joins the thread before it
+  stops the writer threads that thread starts.
 
 `tests/integration/t_endpoint_serves_before_store_verification.nim` pins all of
 this against a store whose check is held up by a real exclusive lock.

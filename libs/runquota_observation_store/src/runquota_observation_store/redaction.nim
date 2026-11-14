@@ -578,7 +578,7 @@ proc exportObservationStore*(sourcePath, destinationPath: string;
 
   if not sqliteToolAvailable():
     result.outcome = xoUnavailable
-    result.detail = "the '" & sqliteTool & "' tool is not on PATH"
+    result.detail = sqliteLibraryReport()
     return
   if not fileExists(sourcePath):
     result.outcome = xoSourceUnreadable
@@ -676,7 +676,7 @@ proc readExportManifest*(path: string): ExportManifest =
     policy: rpNone, policyText: "", categories: {}, cellsRewritten: 0,
     sourceDigest: "")
   if not sqliteToolAvailable():
-    result.detail = "the '" & sqliteTool & "' tool is not on PATH"
+    result.detail = sqliteLibraryReport()
     return
   if not fileExists(path):
     result.detail = "no such database: " & path
