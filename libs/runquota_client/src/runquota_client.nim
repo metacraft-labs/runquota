@@ -589,6 +589,109 @@ proc requestLeaseWaiting*(session: var RunQuotaSession; request: ResourceRequest
   raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
 
 # ---------------------------------------------------------------------------
+# Nested bridges: sub-leases of a parent lease
+# ---------------------------------------------------------------------------
+
+const ParentLeaseEnvVar* = "RUNQUOTA_PARENT_LEASE"
+  ## Set by a supervising client for the process tree it launched, to the id
+  ## of the lease that tree runs under. A client that finds it asks for a
+  ## sub-lease of that lease instead of a host lease, rather than queueing
+  ## on the host behind its own parent.
+
+proc parentLeaseFromEnvironment*(): Option[LeaseId] =
+  ## The parent lease named by `RUNQUOTA_PARENT_LEASE`, or none. A value that
+  ## is not a positive decimal lease id is treated as absent: the variable is
+  ## a scheduling hint inherited through arbitrary process trees, and a
+  ## malformed one must not make every client below it fail.
+  let text = getEnv(ParentLeaseEnvVar).strip()
+  if text.len == 0 or text.len > 20:
+    return none(LeaseId)
+  for ch in text:
+    if ch notin {'0' .. '9'}:
+      return none(LeaseId)
+  try:
+    let value = parseBiggestUInt(text)
+    if value == 0'u64: none(LeaseId) else: some(leaseId(uint64(value)))
+  except ValueError:
+    none(LeaseId)
+
+proc supportsSubLeases*(client: RunQuotaClient): bool =
+  ## Whether the daemon understands `RequestSubLease`. Below
+  ## `SubLeaseMinor` a client takes a host lease instead.
+  client.capabilities.protocolMinor >= SubLeaseMinor
+
+proc requestSubLeaseWaiting*(session: var RunQuotaSession; parent: LeaseId;
+                             label, commandStatsId: string;
+                             cpuMin, cpuPreferred: MilliCpu;
+                             memory: Bytes;
+                             pollMillis = 50; maxPolls = 0): RunQuotaLease =
+  ## Ask for a sub-lease of `parent` with a CPU range, waiting while the
+  ## parent's other sub-leases hold what it needs. The grant's
+  ## `resources.cpu` is the width the daemon fitted into the range.
+  ##
+  ## On refusal raises `RunQuotaClientError` with `lastDiagnostic` set:
+  ## `diagInvalidArgument` means the PARENT is unusable (unknown, ended, or
+  ## another owner's) and the caller may fall back to a host lease;
+  ## `diagDenied` means the request can never fit the parent.
+  if not session.active:
+    session.client[].lastDiagnostic = diagnostic(diagInvalidArgument,
+      "session is not active")
+    raise newException(RunQuotaClientError,
+      session.client[].lastDiagnostic.message)
+  if not session.client[].supportsSubLeases():
+    session.client[].lastDiagnostic = diagnostic(diagUnsupportedVersion,
+      "daemon (protocol minor " &
+      $session.client[].capabilities.protocolMinor &
+      ") predates sub-leases")
+    raise newException(RunQuotaClientError,
+      session.client[].lastDiagnostic.message)
+  let candidateId = session.client[].nextRequestId + 1'u64
+  let msg = RequestSubLeaseMessage(
+    sessionId: session.id,
+    parentLeaseId: parent,
+    clientCandidateId: candidateId,
+    label: label,
+    commandStatsId: commandStatsId,
+    cpuMinMilli: cpuMin.value,
+    cpuPreferredMilli: cpuPreferred.value,
+    memoryBytes: memory.value)
+  let requestId = session.client[].requestFrame(rqRequestSubLease,
+    encodeRequestSubLease(msg))
+  let decisions = session.decodeDecisionBatch(
+    session.client[].readResponse(requestId))
+  var queued = false
+  for decision in decisions:
+    if decision.clientCandidateId == candidateId:
+      if not decision.lease.active:
+        session.client[].lastDiagnostic = decision.diagnostic
+        raise newException(RunQuotaClientError, decision.diagnostic.message)
+      if decision.queued:
+        queued = true
+        break
+      return decision.lease
+  if not queued:
+    session.client[].lastDiagnostic = diagnostic(diagProtocol,
+      "daemon omitted the sub-lease decision")
+    raise newException(RunQuotaClientError,
+      session.client[].lastDiagnostic.message)
+  var polls = 0
+  while maxPolls <= 0 or polls < maxPolls:
+    for grant in session.pollNextGrant():
+      if grant.clientCandidateId == candidateId and not grant.queued:
+        # A later denial (the parent ended while this waited) arrives here
+        # as an inactive decision, never as a grant.
+        if not grant.lease.active:
+          session.client[].lastDiagnostic = grant.diagnostic
+          raise newException(RunQuotaClientError, grant.diagnostic.message)
+        return grant.lease
+    inc polls
+    sleep(pollMillis)
+  session.client[].lastDiagnostic = diagnostic(diagDenied,
+    "timed out waiting for sub-lease grant")
+  raise newException(RunQuotaClientError,
+    session.client[].lastDiagnostic.message)
+
+# ---------------------------------------------------------------------------
 # Domain extensions: the write path (M17)
 # ---------------------------------------------------------------------------
 

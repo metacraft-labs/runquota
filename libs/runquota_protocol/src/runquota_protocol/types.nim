@@ -75,6 +75,13 @@ type
       ## protocol minor >= `SessionGroupsMinor`, for the reason
       ## `rqDeclarePools` gives.
     rqSessionGroupUpdated = 40
+    rqRequestSubLease = 41
+      ## Ask for a lease carved out of a lease the caller's process tree
+      ## already runs under (`RUNQUOTA_PARENT_LEASE`), instead of from the
+      ## host ledger. Answered with `rqLeaseDecisionBatch`, one decision; a
+      ## queued sub-lease is delivered by `rqGrantNext`. Sent only to a daemon
+      ## whose `HelloOk` reports protocol minor >= `SubLeaseMinor`, for the
+      ## reason `rqDeclarePools` gives.
 
   MessageKind* = RqspMessageKind
 
@@ -184,6 +191,29 @@ type
     purpose*: LeasePurpose
     metadata*: DynamicMetadata
     estimate*: ClientEstimate
+
+  RequestSubLeaseMessage* = object
+    ## A lease granted from a PARENT lease's width and memory, never from
+    ## the host ledger: the parent already holds that capacity on the host,
+    ## and the process asking for it runs inside the tree the parent's
+    ## supervisor launched. Asking the host instead is the hold-and-wait the
+    ## nested-bridge design removes: once parents fill the host budget, a
+    ## child that queues on the host waits for capacity only its own parent
+    ## can release.
+    ##
+    ## THE CPU IS A RANGE. The daemon grants the widest value in
+    ## ``cpuMinMilli .. cpuPreferredMilli`` that the parent's CPU not held by
+    ## its other sub-leases allows, and queues the request while not even the
+    ## minimum fits. ``memoryBytes`` of 0 means "inside the parent's own
+    ## reservation": nothing more is held for it.
+    sessionId*: SessionId
+    parentLeaseId*: LeaseId
+    clientCandidateId*: uint64
+    label*: string
+    commandStatsId*: string
+    cpuMinMilli*: uint32
+    cpuPreferredMilli*: uint32
+    memoryBytes*: uint64
 
   LeaseCandidate* = object
     clientCandidateId*: uint64

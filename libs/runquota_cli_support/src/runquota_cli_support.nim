@@ -13,6 +13,7 @@ import runquota_stats_table
 import runquota_cli_support/stats
 import runquota_cli_support/config
 import runquota_cli_support/run_command
+import runquota_cli_support/jobserver_command
 
 proc wantsVersion*(args: openArray[string]): bool =
   args.len == 1 and args[0] in ["--version", "-V"]
@@ -56,6 +57,11 @@ proc renderUsage*(programName: string): string =
     "    adapter (nim, go, nextest, nix, pnpm, yarn, playwright; --adapter list);\n" &
     "    exits with the command's status, 2 on bad arguments or --cap (not yet\n" &
     "    available), 1 when no lease was granted, 127 when it cannot start\n" &
+    "  " & programName & " jobserver [--width N|MIN:PREF] [--mem SIZE] [--stats-key KEY] [--verbose] -- COMMAND [ARG...]\n" &
+    "    runs COMMAND under one lease and serves it a GNU make jobserver (FIFO)\n" &
+    "    of N-1 tokens for an N-slot grant, through MAKEFLAGS/CARGO_MAKEFLAGS;\n" &
+    "    with RUNQUOTA_PARENT_LEASE set the lease is a sub-lease of that parent.\n" &
+    "    Exit statuses as for run\n" &
     "  " & programName & " acquire --cpu N --mem BYTES [--label TEXT] [--machine ID] [--stats-key KEY] [--benchmark] [-- COMMAND [ARG...]]"
 
 proc parseMemory(value: string): uint64 =
@@ -1081,6 +1087,10 @@ proc runThinApp*(programName: string): int =
         # module (`runquota_cli_support/run_command`) so this dispatcher
         # carries one line of it.
         return runRun(args[1 .. ^1], clientFailureText, versionString())
+      of "jobserver":
+        # One lease for a jobserver client, its slots served as GNU make
+        # jobserver tokens (`runquota_cli_support/jobserver_command`).
+        return runJobserver(args[1 .. ^1], clientFailureText, versionString())
       of "session":
         if args.len >= 2 and args[1] == "set":
           return runSessionSet(args[2 .. ^1])

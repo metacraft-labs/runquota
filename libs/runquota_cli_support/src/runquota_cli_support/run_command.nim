@@ -327,7 +327,8 @@ proc runRun*(args: seq[string];
 
   let slots = grantedSlots(lease)
   var command = options.command
-  var env = @[WidthEnvVar & "=" & $slots, StatsKeyEnvVar & "=" & statsKey]
+  var env = @[WidthEnvVar & "=" & $slots, StatsKeyEnvVar & "=" & statsKey,
+    lease.parentLeaseEnvEntry()]
   if adapterIndex >= 0:
     let outcome = applyAdapter(adapters[adapterIndex], options.command, slots)
     command = outcome.argv

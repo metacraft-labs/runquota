@@ -25,6 +25,7 @@ usage:
   runquota stats top [KEY] [--limit N] [--all-users] [--all-profiles] [--json]
   runquota stats export [KEY] [--limit N] [--all-users] [--all-profiles] [--json]
   runquota run [--width N|MIN:PREF] [--stats-key KEY] [--adapter NAME|none|list] [--verbose] -- COMMAND [ARG...]
+  runquota jobserver [--width N|MIN:PREF] [--mem SIZE] [--stats-key KEY] [--verbose] -- COMMAND [ARG...]
   runquota acquire --cpu N --mem BYTES [--label TEXT] [--machine ID] [--stats-key KEY] [--benchmark] [-- COMMAND [ARG...]]
 ```
 
@@ -232,3 +233,66 @@ started. The lease is released when the command ends, whatever its status.
 
 The command's standard streams are the terminal's: its output is not captured
 and replayed, unlike `acquire`.
+
+## `runquota jobserver`
+
+Run a command that speaks the GNU make jobserver protocol under one lease, and
+serve it a jobserver whose tokens are the lease's slots. GNU make 4.4, cargo
+and rustc, ninja 1.13 and GCC's `-flto=jobserver` ask the jobserver before
+each job beyond their first, so their parallelism follows the lease without
+any flag being rewritten.
+
+```sh
+runquota jobserver --width 4 -- cargo build --release   # at most 4 rustc at once
+runquota jobserver -- make                               # make with no -j follows the jobserver
+runquota jobserver --width 2:8 --mem 6GiB -- ninja -C build
+```
+
+**N slots serve N − 1 tokens.** A jobserver client holds one implicit token
+for itself and takes a token only for each further job, so a 4-slot lease
+puts 3 tokens in the jobserver and the command runs at most 4 jobs. The
+jobserver is a named FIFO (`--jobserver-auth=fifo:PATH`, the GNU make 4.4
+form) in a fresh private directory, removed when the command ends.
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--width N` / `--width MIN:PREF` | `1:` host CPUs, at most 8 | As for `run`. |
+| `--mem SIZE` | 512 MiB per slot; inside a parent, the parent's reservation | The memory reserved on the lease (bytes, or with `KiB`, `MiB`, `GiB`). Tokens carry only CPU, so memory is reserved here. A learned estimate under the stats key raises the default. |
+| `--stats-key KEY` | `run/<program>@<project>` | As for `run`. |
+| `--verbose`, `-v` | off | Print the lease, the tokens served and returned, and any width flag removed. |
+
+The command gets `MAKEFLAGS` and `CARGO_MAKEFLAGS` (the inherited `MAKEFLAGS`
+words, minus any job count or jobserver, followed by
+` -jN --jobserver-auth=fifo:PATH`), `RUNQUOTA_JOBSERVER_FIFO`,
+`RUNQUOTA_RUN_WIDTH` and `RUNQUOTA_RUN_STATS_KEY`.
+
+**An explicit width overrides a jobserver** in make and ninja: `make -j8` or
+`ninja -j8` would run 8 jobs whatever the jobserver holds. For a command whose
+program is `make`, `gmake` or `ninja`, `jobserver` removes `-j`, `-jN`,
+`-j N`, `--jobs` and `--jobs=N` from the command line.
+
+**Nesting.** `runquota acquire` and `runquota run` give the command they start
+`RUNQUOTA_PARENT_LEASE`, naming their lease. A `runquota jobserver` started
+with it takes a *sub-lease* of that parent: its slots come out of the
+parent's grant and never from the host's budget, so a nested build cannot
+wait on the host behind its own parent. The daemon fits the sub-lease's width
+to what the parent's other sub-leases leave and queues it while not even the
+minimum fits. A parent that is unknown or has ended makes `jobserver` fall back
+to an ordinary lease (and say so); a width larger than the parent's is
+refused. Inside a bridge, the jobserver is the nesting mechanism: the command
+does not get `RUNQUOTA_PARENT_LEASE`, and a `runquota jobserver` started
+inside it joins the existing jobserver and takes no lease of its own, as a
+recursive make does. The lease keeps its granted width for the command's
+lifetime.
+
+**The command runs in its own process group**, and gets the terminal when
+`jobserver` has it. SIGINT, SIGTERM and SIGHUP are forwarded to the group. When
+the command exits, anything left in its group is ended (SIGTERM, then SIGKILL
+after two seconds), since it would otherwise keep running after the lease is
+released. A process meant to outlive the build leaves the group, as daemons
+do. Then the lease is finished, with the command's CPU totals, and released,
+which returns every slot to the host (or to the parent) whatever the tokens'
+fate.
+
+**Exit codes and the no-daemon case** are as for `run`. Linux and macOS only
+for now.

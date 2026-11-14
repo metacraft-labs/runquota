@@ -866,6 +866,7 @@ proc groupIsBusy(daemon: RunQuotaDaemon; key: string; excluding: uint64): bool =
   ## capacity.
   for id, lease in daemon.leases.pairs:
     if id != excluding and lease.groupKey == key and
+        lease.parentLeaseId == 0'u64 and
         (lease.state == leaseStateQueued or lease.state in
           {leaseStateGranted, leaseStateStarting, leaseStateRunning,
            leaseStateSupervisorLost}):
@@ -891,8 +892,32 @@ proc changeHeldCpu(group: var SessionGroupRow; delta: int64) =
     group.heldCpuMilli =
       if group.heldCpuMilli >= less: group.heldCpuMilli - less else: 0'u64
 
+proc applySubLeaseUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
+                        add: bool) =
+  ## A sub-lease holds part of its PARENT, and nothing of the host. A parent
+  ## that has left the table (released) has nothing left to charge: the
+  ## sub-lease's tree outlived its supervisor, and its release frees nothing.
+  if not daemon.leases.hasKey(lease.parentLeaseId):
+    return
+  var parent = daemon.leases[lease.parentLeaseId]
+  let cpu = lease.resources.cpu.value
+  let memory = lease.resources.memory.value
+  if add:
+    parent.subHeldCpuMilli += cpu
+    parent.subHeldMemoryBytes += memory
+  else:
+    parent.subHeldCpuMilli =
+      if parent.subHeldCpuMilli >= cpu: parent.subHeldCpuMilli - cpu else: 0'u32
+    parent.subHeldMemoryBytes =
+      if parent.subHeldMemoryBytes >= memory: parent.subHeldMemoryBytes - memory
+      else: 0'u64
+  daemon.leases[lease.parentLeaseId] = parent
+
 proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
                              add: bool) =
+  if lease.parentLeaseId != 0'u64:
+    daemon.applySubLeaseUsage(lease, add)
+    return
   # Maintains live aggregates so fitsNow/countActiveLeases/hasActiveBenchmark
   # avoid a full leases-table walk per admission decision. Skips silently when
   # the lease targets an unknown machine: possible() rejects such leases before
@@ -1357,7 +1382,8 @@ proc sessionGroupsJson(daemon: RunQuotaDaemon): string =
     var heldMemory = 0'u64
     var oldestWait = 0'i64
     for lease in daemon.leases.values:
-      if lease.groupKey != key:
+      # A sub-lease holds part of its parent, which is counted already.
+      if lease.groupKey != key or lease.parentLeaseId != 0'u64:
         continue
       if lease.state == leaseStateQueued:
         inc queued
@@ -1438,6 +1464,7 @@ proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
       # daemon could not read the child's start time (pid-only judgement).
       "\"child_process_id\":" & $lease.childProcessId & "," &
       "\"child_start_stamp\":" & $lease.childStartStamp & "," &
+      "\"parent_lease_id\":" & $lease.parentLeaseId & "," &
       "\"diagnostic\":{\"code\":" & jsonEscape($lease.queueDiagnostic.code) &
         ",\"message\":" & jsonEscape(lease.queueDiagnostic.message) &
         ",\"detail\":" & jsonEscape(lease.queueDiagnostic.detail) & "}" &
@@ -2920,7 +2947,10 @@ proc grantQueuedLease(daemon: var RunQuotaDaemon; id: uint64; delivered: bool) =
   lease.delivered = delivered
   daemon.leases[id] = lease
   inc daemon.totalGranted
-  if lease.groupKey.len > 0 and daemon.sessionGroups.hasKey(lease.groupKey):
+  # A sub-lease's wait is a wait inside its parent's tree, not a wait of the
+  # group on the host, so it stays out of the group's wait figures.
+  if lease.parentLeaseId == 0'u64 and lease.groupKey.len > 0 and
+      daemon.sessionGroups.hasKey(lease.groupKey):
     let waited = elapsedSince(lease.queuedAtMillis)
     inc daemon.sessionGroups[lease.groupKey].grantsTotal
     daemon.sessionGroups[lease.groupKey].waitsTotalMillis += waited
@@ -2950,7 +2980,7 @@ proc ownerLoads(daemon: RunQuotaDaemon): Table[string, OwnerLoad] =
   ## What each owner's granted leases hold now, for dominant-resource
   ## fairness between owners.
   for lease in daemon.leases.values:
-    if lease.state.isResourceActive:
+    if lease.state.isResourceActive and lease.parentLeaseId == 0'u64:
       let owner = ownerKeyOf(lease.peer)
       var held = result.getOrDefault(owner, OwnerLoad())
       held.cpuMilli += uint64(lease.resources.cpu.value)
@@ -3004,6 +3034,119 @@ proc reapLostLeases(daemon: var RunQuotaDaemon): int =
   daemon.lostLeasesReaped += uint64(dead.len)
   dead.len
 
+proc parentHolds(parent: LeaseRow): bool =
+  ## Whether a lease may grant sub-leases now: it holds its reservation and
+  ## its supervisor is still there. A `supervisor_lost` lease still holds
+  ## capacity, but nothing supervises the tree any more, so it grants no new
+  ## sub-lease: a parent that is not running cannot have children asking.
+  parent.state in {leaseStateGranted, leaseStateStarting, leaseStateRunning}
+
+proc subLeaseFit(parent: LeaseRow; minimum, preferred: uint32;
+                 memory: uint64): uint32 =
+  ## The widest CPU in `minimum .. preferred` that the parent's CPU not held
+  ## by its other sub-leases allows, with `memory` within the memory they do
+  ## not hold; 0 when not even the minimum fits now.
+  let freeCpu =
+    if parent.resources.cpu.value >= parent.subHeldCpuMilli:
+      parent.resources.cpu.value - parent.subHeldCpuMilli
+    else: 0'u32
+  let freeMemory =
+    if parent.resources.memory.value >= parent.subHeldMemoryBytes:
+      parent.resources.memory.value - parent.subHeldMemoryBytes
+    else: 0'u64
+  if memory > freeMemory or minimum > freeCpu:
+    return 0'u32
+  min(preferred, freeCpu)
+
+proc subLeaseRefusal(daemon: RunQuotaDaemon; peer: PeerIdentity;
+                     msg: RequestSubLeaseMessage;
+                     code: var DiagnosticCode): string =
+  ## Why this sub-lease can never be granted, or "" when it can wait.
+  ##
+  ## TWO CODES, AND THE CLIENT ACTS ON THE DIFFERENCE. `invalid argument`
+  ## says the PARENT is unusable -- unknown, ended, or another owner's -- and
+  ## the client then falls back to a host lease: the variable that named it
+  ## is stale or foreign, and there is no parent to wait behind.
+  ## `denied` says the REQUEST is larger than the parent can ever hold, which
+  ## a host lease would not fix.
+  code = diagInvalidArgument
+  if msg.cpuMinMilli == 0'u32 or msg.cpuPreferredMilli < msg.cpuMinMilli:
+    return "sub-lease CPU range must have 0 < minimum <= preferred " &
+      "(requested " & $msg.cpuMinMilli & "m.." & $msg.cpuPreferredMilli & "m)"
+  if not daemon.leases.hasKey(msg.parentLeaseId.value):
+    return "parent lease " & $msg.parentLeaseId.value & " is unknown"
+  let parent = daemon.leases[msg.parentLeaseId.value]
+  if ownerKeyOf(parent.peer) != ownerKeyOf(peer):
+    # The lease id is a capability only for the uid that holds the parent:
+    # another user could otherwise run inside a reservation that is not
+    # theirs simply by guessing a small integer.
+    return "parent lease " & $msg.parentLeaseId.value &
+      " belongs to another owner"
+  if not parent.parentHolds():
+    return "parent lease " & $msg.parentLeaseId.value & " is not running (" &
+      parent.state.stateName & ")"
+  code = diagDenied
+  if msg.cpuMinMilli > parent.resources.cpu.value:
+    return "sub-lease exceeds its parent's CPU: lease " &
+      $msg.parentLeaseId.value & " (requested at least " &
+      $msg.cpuMinMilli & "m, parent " & milliCpuText(parent.resources.cpu) & ")"
+  if msg.memoryBytes > parent.resources.memory.value:
+    return "sub-lease exceeds its parent's memory: lease " &
+      $msg.parentLeaseId.value & " (requested " & humanBytes(msg.memoryBytes) &
+      ", parent " & humanBytes(parent.resources.memory.value) & ")"
+  ""
+
+proc promoteQueuedSubLeases(daemon: var RunQuotaDaemon): seq[uint64] =
+  ## Grant what fits of the queued sub-leases, against their parents only.
+  ##
+  ## IN ARRIVAL ORDER PER PARENT, WITHOUT BACKFILL: once one sub-lease of a
+  ## parent does not fit, later ones of the same parent wait behind it, so a
+  ## wide request is not starved by a stream of narrow ones. Parents are
+  ## independent of each other and of the host queue.
+  ##
+  ## A queued sub-lease whose parent has stopped holding its reservation is
+  ## DENIED, delivered on its session's next `GrantNext`: what it waits for
+  ## can no longer happen.
+  var queued: seq[(uint64, uint64)] = @[]
+  for id, lease in daemon.leases.pairs:
+    if lease.state == leaseStateQueued and lease.parentLeaseId != 0'u64:
+      queued.add((lease.queueOrder, id))
+  if queued.len == 0:
+    return
+  queued.sort()
+  var blockedParents: seq[uint64] = @[]
+  for (_, id) in queued:
+    var lease = daemon.leases[id]
+    let parentId = lease.parentLeaseId
+    if not daemon.leases.hasKey(parentId) or
+        not daemon.leases[parentId].parentHolds():
+      let why =
+        if daemon.leases.hasKey(parentId):
+          "parent lease " & $parentId & " is not running (" &
+            daemon.leases[parentId].state.stateName & ")"
+        else: "parent lease " & $parentId & " was released"
+      daemon.pendingDenials.mgetOrPut(lease.sessionId.value, @[]).add(
+        lease.leaseDecision(leaseDecisionDenied, diagnostic(
+          diagInvalidArgument, why,
+          "a queued sub-lease is denied when its parent ends")))
+      daemon.removeLeaseFromTable(id)
+      continue
+    if parentId in blockedParents:
+      continue
+    let width = daemon.leases[parentId].subLeaseFit(lease.subCpuMinMilli,
+      lease.resources.cpu.value, lease.resources.memory.value)
+    if width == 0'u32:
+      blockedParents.add(parentId)
+      lease.queueDiagnostic = diagnostic(diagDenied,
+        "waiting for the parent lease's capacity",
+        "the parent's other sub-leases hold what this one needs")
+      daemon.leases[id] = lease
+      continue
+    lease.resources.cpu = milliCpu(width)
+    daemon.leases[id] = lease
+    daemon.grantQueuedLease(id, false)
+    result.add(id)
+
 proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
     uint32)): seq[uint64] =
   # Before deciding what fits, stop counting what is no longer there.
@@ -3018,10 +3161,11 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
   # starvation bound -- then nothing behind it is granted in this pass, so
   # the capacity that frees up is kept for it. Nothing already granted is
   # ever revoked.
+  result = daemon.promoteQueuedSubLeases()
   let now = monoMillis()
   var pending: seq[PendingRequest] = @[]
   for lease in daemon.leases.values:
-    if lease.state == leaseStateQueued:
+    if lease.state == leaseStateQueued and lease.parentLeaseId == 0'u64:
       pending.add(daemon.pendingRequest(lease, now))
   var plan = planAdmission(pending, daemon.ownerLoads(), AdmissionPolicy(
     order: daemon.config.admissionOrder,
@@ -3055,7 +3199,7 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
       # instead of going to a request that arrived later.
       break
   for id, lease in daemon.leases.pairs:
-    if lease.state == leaseStateQueued:
+    if lease.state == leaseStateQueued and lease.parentLeaseId == 0'u64:
       var updated = lease
       updated.queueDiagnostic = daemon.waitingDiagnostic(lease)
       daemon.leases[id] = updated
@@ -3071,7 +3215,8 @@ proc rebudgetQueuedLeases(daemon: var RunQuotaDaemon;
   ## returned.
   var doomed: seq[uint64] = @[]
   for id, lease in daemon.leases.pairs:
-    if lease.state == leaseStateQueued:
+    # A queued sub-lease waits on its parent, which no budget change touches.
+    if lease.state == leaseStateQueued and lease.parentLeaseId == 0'u64:
       var reason = ""
       if not daemon.possible(lease.resources, reason):
         doomed.add(id)
@@ -3765,6 +3910,85 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     )
     connection.sendResponse(rqLeaseGranted, frame.header.requestId,
         encodeLeaseGranted(granted))
+  of rqRequestSubLease:
+    var msg: RequestSubLeaseMessage
+    if not decodeRequestSubLease(frame.payload, msg):
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "invalid RequestSubLease payload"))
+      return
+    # Only on the connection that registered the session, as `DeclarePools`:
+    # the sub-lease is created in that session and under that session's
+    # owner, so a session id from another connection -- possibly another
+    # user's -- must not be able to carry a lease carved from this caller's
+    # parent, nor a parent check made against one owner stand for a lease
+    # recorded under another.
+    var owned = false
+    for id in context.sessionIds:
+      if id.value == msg.sessionId.value:
+        owned = true
+    if not owned or not daemon.sessions.hasKey(msg.sessionId.value):
+      connection.sendError(frame.header.requestId, diagnostic(
+          diagInvalidArgument, "unknown session id"))
+      return
+    var code = diagOk
+    let refusal = daemon.subLeaseRefusal(context.peer, msg, code)
+    var decision: LeaseDecision
+    if refusal.len > 0:
+      decision = LeaseDecision(
+        clientCandidateId: msg.clientCandidateId,
+        leaseId: leaseId(0),
+        kind: leaseDecisionDenied,
+        resources: resourceVector(milliCpu(msg.cpuPreferredMilli),
+          bytes(msg.memoryBytes)),
+        diagnostic: diagnostic(code, refusal, daemon.refusedByText()))
+    else:
+      let parent = daemon.leases[msg.parentLeaseId.value]
+      # THE PARENT'S MACHINE, so inspection shows where the capacity lives;
+      # nothing on that machine's ledger moves for it.
+      var resources = resourceVector(milliCpu(msg.cpuPreferredMilli),
+        bytes(msg.memoryBytes))
+      resources.machineId = parent.resources.machineId
+      let session = daemon.sessions[msg.sessionId.value]
+      let id = leaseId(daemon.nextLeaseId)
+      inc daemon.nextLeaseId
+      let queueOrder = daemon.nextQueueOrder
+      inc daemon.nextQueueOrder
+      daemon.leases[id.value] = LeaseRow(
+        id: id,
+        sessionId: msg.sessionId,
+        label: msg.label,
+        commandStatsId: msg.commandStatsId,
+        clientCandidateId: msg.clientCandidateId,
+        resources: resources,
+        priority: parent.priority,
+        purpose: leasePurposeWork,
+        queueOrder: queueOrder,
+        delivered: false,
+        state: leaseStateQueued,
+        supervisorProcessId: session.supervisorProcessId,
+        supervisorUserId: session.supervisorUserId,
+        peer: session.peer,
+        finish: cancelled(),
+        finishDiagnostic: okDiagnostic(),
+        queueDiagnostic: okDiagnostic(),
+        groupKey: session.groupKey,
+        queuedAtMillis: monoMillis(),
+        parentLeaseId: msg.parentLeaseId.value,
+        subCpuMinMilli: msg.cpuMinMilli)
+      discard daemon.tryPromoteQueued(
+        defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
+      var row = daemon.leases[id.value]
+      if row.state == leaseStateGranted:
+        row.delivered = true
+        daemon.leases[id.value] = row
+        decision = row.leaseDecision(leaseDecisionGranted)
+      else:
+        decision = row.leaseDecision(leaseDecisionQueued)
+    connection.sendResponse(
+      rqLeaseDecisionBatch,
+      frame.header.requestId,
+      encodeLeaseDecisionBatch(LeaseDecisionBatchMessage(
+          sessionId: msg.sessionId, decisions: @[decision])))
   of rqReleaseLease:
     var msg: ReleaseLeaseMessage
     if not decodeReleaseLease(frame.payload, msg):

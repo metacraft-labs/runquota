@@ -314,6 +314,21 @@ type
       ## When the client reported the lease as starting. Observation only:
       ## the daemon does not watch the process tree, so this is the lease
       ## window it was told about, not a measurement it took.
+    parentLeaseId*: uint64
+      ## 0 for a host lease. Otherwise this is a SUB-LEASE, granted from the
+      ## named parent's width and memory and never from the host ledger
+      ## (`RequestSubLease`): it is invisible to host admission -- no machine
+      ## or share-group usage, no active-lease count, no group held CPU, no
+      ## fairness load, no benchmark or pressure gate -- because the parent
+      ## already passed all of them for the whole tree it supervises.
+    subCpuMinMilli*: uint32
+      ## A queued sub-lease's minimum width. Its `resources.cpu` holds the
+      ## preferred width until the grant, which narrows it to what fits.
+    subHeldCpuMilli*: uint32
+    subHeldMemoryBytes*: uint64
+      ## What this lease's granted sub-leases hold of it. Maintained on the
+      ## parent by `applyLeaseResourceUsage`, the one place every grant and
+      ## every release passes, for the reason the host aggregates are.
 
   ConnectionContext* = object
     supervisorProcessId*: uint64

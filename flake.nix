@@ -546,6 +546,17 @@
               # CLI and not just the library.
               pkgs.sqlite
               pkgs.typos
+              # THE JOBSERVER CLIENTS `runquota jobserver` IS TESTED AGAINST.
+              # Its integration tests run the real tools under the bridge and
+              # measure their concurrency: cargo and rustc (an inherited FIFO
+              # jobserver plus cargo's own implicit token), GNU make 4.4 (the
+              # first make that speaks `--jobserver-auth=fifo:PATH`) and ninja
+              # 1.13 (the first ninja that is a jobserver client). A test that
+              # cannot find one of them fails rather than skips.
+              pkgs.cargo
+              pkgs.rustc
+              pkgs.gnumake
+              pkgs.ninja
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
               pkgs.zig

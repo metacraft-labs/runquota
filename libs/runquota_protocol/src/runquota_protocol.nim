@@ -7,7 +7,7 @@ export protocolTypes
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 2'u16
-const RqspProtocolMinor* = 4'u16
+const RqspProtocolMinor* = 5'u16
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -66,6 +66,13 @@ const FinishTotalsMinor* = 4'u16
   ## with trailing bytes as malformed, so a client sends the block only to a
   ## daemon at this minor or above, and an older client's finish, which has
   ## no block, still decodes here with the totals not known.
+const SubLeaseMinor* = 5'u16
+  ## The first daemon minor that understands `RequestSubLease`: a lease
+  ## granted from a parent lease rather than from the host ledger. MINOR 5
+  ## ANNOUNCES IT, additively and for the same reason minor 1 announced
+  ## `DeclarePools`: an older daemon closes the connection on a message kind
+  ## it does not know. A client below this minor takes a host lease, which is
+  ## what every client did before nested bridges existed.
 const RqspHeaderLen* = 24'u16
 const MaxCommandStatsIdBytes* = 64
 const FrameFlagRequest* = 0x0001'u16
@@ -564,6 +571,43 @@ proc readLeaseCandidate(r: var BinaryReader;
     metadata: metadata,
     estimate: estimate
   )
+  true
+
+proc encodeRequestSubLease*(msg: RequestSubLeaseMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU64(msg.parentLeaseId.value)
+  w.writeU64(msg.clientCandidateId)
+  w.writeString(msg.label)
+  w.writeBytes(msg.commandStatsId)
+  w.writeU32(msg.cpuMinMilli)
+  w.writeU32(msg.cpuPreferredMilli)
+  w.writeU64(msg.memoryBytes)
+  w.data
+
+proc decodeRequestSubLease*(payload: string;
+    msg: var RequestSubLeaseMessage): bool =
+  ## Structural decode only. Whether the range is well formed (non-zero
+  ## minimum, minimum <= preferred) is the daemon's to answer, with a
+  ## diagnostic the client can show, not a frame it cannot read.
+  var r = reader(payload)
+  var decoded: RequestSubLeaseMessage
+  var sessionRaw, parentRaw: uint64
+  if not r.readU64(sessionRaw): return false
+  if not r.readU64(parentRaw): return false
+  if not r.readU64(decoded.clientCandidateId): return false
+  if not r.readString(decoded.label): return false
+  if not r.readBytes(decoded.commandStatsId): return false
+  # Truncated, not refused, for the reason `decodeLeaseRequest` gives.
+  if decoded.commandStatsId.len > MaxCommandStatsIdBytes:
+    decoded.commandStatsId.setLen(MaxCommandStatsIdBytes)
+  if not r.readU32(decoded.cpuMinMilli): return false
+  if not r.readU32(decoded.cpuPreferredMilli): return false
+  if not r.readU64(decoded.memoryBytes): return false
+  if r.remaining != 0: return false
+  decoded.sessionId = sessionId(sessionRaw)
+  decoded.parentLeaseId = leaseId(parentRaw)
+  msg = decoded
   true
 
 proc encodeCandidateOffer*(msg: CandidateOfferMessage): string =

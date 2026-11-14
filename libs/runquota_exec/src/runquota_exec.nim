@@ -46,9 +46,20 @@ proc finishOutcome*(completion: ProcessCompletion): LeaseFinish =
     # untruth this type exists to prevent.
     cancelled()
 
+proc parentLeaseEnvEntry*(lease: RunQuotaLease): string =
+  ## `RUNQUOTA_PARENT_LEASE=<id>` for the tree launched under `lease`: a
+  ## client in that tree asks for a sub-lease of it instead of queueing on
+  ## the host behind its own parent.
+  ParentLeaseEnvVar & "=" & $lease.id.value
+
 proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
                    command: CommandSpec; releaseAfterFinish = true;
-                   waitForQueued = false): LeaseExecutionResult =
+                   waitForQueued = false;
+                   exportParentLease = true): LeaseExecutionResult =
+  ## `exportParentLease` gives the child `RUNQUOTA_PARENT_LEASE` naming the
+  ## lease it runs under. It is layered over `command.env`, so it also
+  ## replaces a value the launcher itself inherited: the nearest supervisor
+  ## is the one whose capacity the tree runs in.
   result = LeaseExecutionResult(
     state: esWaitingForLease
   )
@@ -61,7 +72,10 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
   try:
     result.state = esStarting
     lease.markStarting()
-    var child = launchProcess(command)
+    var spec = command
+    if exportParentLease:
+      spec.env.add(lease.parentLeaseEnvEntry())
+    var child = launchProcess(spec)
     result.backend = child.info.backend
     result.state = esRunning
     lease.markRunning(
