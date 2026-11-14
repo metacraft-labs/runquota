@@ -82,6 +82,22 @@ type
       ## queued sub-lease is delivered by `rqGrantNext`. Sent only to a daemon
       ## whose `HelloOk` reports protocol minor >= `SubLeaseMinor`, for the
       ## reason `rqDeclarePools` gives.
+    rqLeaseGrowRequest = 42
+      ## The holder of a RESIZABLE lease asks to grow towards a width within
+      ## its range. Answered with `rqLeaseResize`; the growth itself happens
+      ## in admission passes, in the configured admission order.
+    rqLeaseResize = 43
+      ## The daemon's answer to `rqLeaseGrowRequest` and `rqLeaseResized`:
+      ## the width the lease's jobserver should follow now. RQSP is request
+      ## and response, so a target set in an admission pass reaches the
+      ## client in the answer to its next report.
+    rqLeaseResized = 44
+      ## The holder of a resizable lease reports the width its jobserver
+      ## holds now (tokens in circulation plus the implicit one). Sent
+      ## periodically while the command runs; answered with `rqLeaseResize`.
+      ## All three are sent only to a daemon whose `HelloOk` reports protocol
+      ## minor >= `NegotiatedWidthsMinor`, for the reason `rqDeclarePools`
+      ## gives.
 
   MessageKind* = RqspMessageKind
 
@@ -181,6 +197,24 @@ type
     supplied*: bool
     memoryBytes*: uint64
 
+  WidthRange* = object
+    ## A request's CPU as a RANGE (negotiated widths). The daemon grants the
+    ## widest value in ``minMilli .. preferredMilli`` that is free, at least
+    ## ``minMilli``, and the request waits while not even that fits.
+    ##
+    ## ``present = false`` is a request for exactly its resource vector's
+    ## CPU, which is all a peer below ``NegotiatedWidthsMinor`` can say; the
+    ## encoders write the range only when it is present, so such a message
+    ## is byte-identical to one from before ranges existed.
+    ##
+    ## ``resizable`` says the client follows a moving width (a jobserver
+    ## that issues and withholds tokens): the daemon may then widen the lease
+    ## while it runs and narrow it back, with `LeaseResize`.
+    present*: bool
+    minMilli*: uint32
+    preferredMilli*: uint32
+    resizable*: bool
+
   LeaseRequestMessage* = object
     sessionId*: SessionId
     label*: string
@@ -191,6 +225,8 @@ type
     purpose*: LeasePurpose
     metadata*: DynamicMetadata
     estimate*: ClientEstimate
+    width*: WidthRange
+      ## Optional trailing block (protocol minor ``NegotiatedWidthsMinor``).
 
   RequestSubLeaseMessage* = object
     ## A lease granted from a PARENT lease's width and memory, never from
@@ -225,6 +261,9 @@ type
     purpose*: LeasePurpose
     metadata*: DynamicMetadata
     estimate*: ClientEstimate
+    width*: WidthRange
+      ## Travels in the offer's optional trailing width block, one entry per
+      ## candidate, written only when some candidate has a range.
 
   CandidateOfferMessage* = object
     sessionId*: SessionId
@@ -481,6 +520,32 @@ type
     cacheDeadlineChange*: CacheDeadlineChange
     cacheDeadlineUnixMillis*: uint64
       ## Meaningful only with ``cacheDeadlineSet``.
+
+  LeaseGrowRequestMessage* = object
+    ## `rqLeaseGrowRequest`. ``cpuWantedMilli`` is clamped to the lease's
+    ## range by the daemon.
+    sessionId*: SessionId
+    leaseId*: LeaseId
+    cpuWantedMilli*: uint32
+
+  LeaseResizedMessage* = object
+    ## `rqLeaseResized`: the width the client's jobserver holds now. The
+    ## daemon charges the larger of this and the target, and clamps this to
+    ## what it charged before (a client cannot raise its own charge).
+    sessionId*: SessionId
+    leaseId*: LeaseId
+    cpuCurrentMilli*: uint32
+
+  LeaseResizeMessage* = object
+    ## `rqLeaseResize`: the width the lease should follow now. Widening is
+    ## to be reached at once (issue the tokens); narrowing only as tokens
+    ## come back -- never by taking one from a running process.
+    sessionId*: SessionId
+    leaseId*: LeaseId
+    cpuTargetMilli*: uint32
+    cpuChargedMilli*: uint32
+      ## What the ledger charges for the lease after this exchange:
+      ## max(target, current). For inspection and tests.
 
   SessionGroupUpdatedMessage* = object
     ## The answer to `rqUpdateSessionGroup`: the attributes now in force. A

@@ -7,7 +7,7 @@ export protocolTypes
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 2'u16
-const RqspProtocolMinor* = 5'u16
+const RqspProtocolMinor* = 6'u16
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -66,6 +66,15 @@ const FinishTotalsMinor* = 4'u16
   ## with trailing bytes as malformed, so a client sends the block only to a
   ## daemon at this minor or above, and an older client's finish, which has
   ## no block, still decodes here with the totals not known.
+const NegotiatedWidthsMinor* = 6'u16
+  ## The first daemon minor that understands NEGOTIATED WIDTHS: the optional
+  ## trailing width block of `RequestLease` and `OfferCandidates` (a CPU
+  ## range and the `resizable` flag), and the `LeaseGrowRequest`,
+  ## `LeaseResize` and `LeaseResized` messages. MINOR 6 ANNOUNCES THEM,
+  ## additively. An older daemon refuses a request with trailing bytes and
+  ## closes the connection on a message kind it does not know, so a client
+  ## sends neither below this minor and asks for one CPU value instead, as
+  ## every client did before ranges existed.
 const SubLeaseMinor* = 5'u16
   ## The first daemon minor that understands `RequestSubLease`: a lease
   ## granted from a parent lease rather than from the host ledger. MINOR 5
@@ -443,6 +452,28 @@ proc readClientEstimate(r: var BinaryReader;
   estimate = ClientEstimate(supplied: supplied, memoryBytes: memoryBytes)
   true
 
+const WidthResizableBit = 1'u32
+  ## Bit 0 of a width block's flags. The other bits are reserved: a decoder
+  ## ignores them, so a later minor can add a flag an older daemon reads as
+  ## absent rather than as a malformed frame.
+
+proc writeWidthFields(w: var BinaryWriter; width: WidthRange) =
+  w.writeU32(width.minMilli)
+  w.writeU32(width.preferredMilli)
+  w.writeU32(if width.resizable: WidthResizableBit else: 0'u32)
+
+proc readWidthFields(r: var BinaryReader; width: var WidthRange): bool =
+  ## Structural only. Whether the range is well formed (non-zero minimum,
+  ## minimum <= preferred) is the daemon's to answer with a diagnostic the
+  ## client can show, not a frame it cannot read.
+  var flags: uint32
+  if not r.readU32(width.minMilli): return false
+  if not r.readU32(width.preferredMilli): return false
+  if not r.readU32(flags): return false
+  width.present = true
+  width.resizable = (flags and WidthResizableBit) != 0'u32
+  true
+
 proc encodeLeaseRequest*(msg: LeaseRequestMessage): string =
   var w = writer()
   w.writeU64(msg.sessionId.value)
@@ -454,6 +485,8 @@ proc encodeLeaseRequest*(msg: LeaseRequestMessage): string =
   w.writeU32(uint32(ord(msg.purpose)))
   w.writeMetadata(msg.metadata)
   w.writeClientEstimate(msg.estimate)
+  if msg.width.present:
+    w.writeWidthFields(msg.width)
   w.data
 
 proc decodeLeaseRequest*(payload: string; msg: var LeaseRequestMessage): bool =
@@ -504,6 +537,12 @@ proc decodeLeaseRequest*(payload: string; msg: var LeaseRequestMessage): bool =
   var estimate = ClientEstimate(supplied: false, memoryBytes: 0'u64)
   if r.remaining != 0:
     if not r.readClientEstimate(estimate): return false
+  # The width block follows the estimate, optional for the same reason: a
+  # request from before negotiated widths ends here and asks for exactly
+  # its CPU field.
+  var width: WidthRange
+  if r.remaining != 0:
+    if not r.readWidthFields(width): return false
   if r.remaining != 0: return false
   msg = LeaseRequestMessage(
     sessionId: sessionId(id),
@@ -514,7 +553,8 @@ proc decodeLeaseRequest*(payload: string; msg: var LeaseRequestMessage): bool =
     priority: PriorityClass(int(priorityRaw)),
     purpose: LeasePurpose(int(purposeRaw)),
     metadata: metadata,
-    estimate: estimate
+    estimate: estimate,
+    width: width
   )
   true
 
@@ -616,6 +656,24 @@ proc encodeCandidateOffer*(msg: CandidateOfferMessage): string =
   w.writeU32(uint32(msg.candidates.len))
   for candidate in msg.candidates:
     w.writeLeaseCandidate(candidate)
+  # THE WIDTH BLOCK, after the last candidate: a list cannot carry a
+  # trailing field per element, so the ranges travel as one parallel list,
+  # written only when some candidate has one. Without it the offer is
+  # byte-identical to one from before ranges existed.
+  var anyRange = false
+  for candidate in msg.candidates:
+    if candidate.width.present:
+      anyRange = true
+  if anyRange:
+    w.writeU32(uint32(msg.candidates.len))
+    for candidate in msg.candidates:
+      if candidate.width.present:
+        w.writeWidthFields(candidate.width)
+      else:
+        # A fixed candidate in a ranged offer: its own CPU, both ends.
+        w.writeWidthFields(WidthRange(present: true,
+          minMilli: candidate.resources.cpu.value,
+          preferredMilli: candidate.resources.cpu.value))
   w.data
 
 proc decodeCandidateOffer*(payload: string;
@@ -630,6 +688,14 @@ proc decodeCandidateOffer*(payload: string;
     var candidate: LeaseCandidate
     if not r.readLeaseCandidate(candidate): return false
     candidates.add(candidate)
+  if r.remaining != 0:
+    var widths: uint32
+    if not r.readU32(widths): return false
+    # One entry per candidate or the block is malformed: a shorter list
+    # would leave which candidate a range belongs to to guesswork.
+    if widths != count: return false
+    for i in 0 ..< candidates.len:
+      if not r.readWidthFields(candidates[i].width): return false
   if r.remaining != 0: return false
   msg = CandidateOfferMessage(sessionId: sessionId(sessionRaw),
       candidates: candidates)
@@ -1955,3 +2021,65 @@ proc retirementWord*(decision: RetirementDecision): string =
   of retirementCurrent: "current"
   of retirementRefused: "refused"
   of retirementManaged: "managed"
+
+proc encodeLeaseGrowRequest*(msg: LeaseGrowRequestMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU64(msg.leaseId.value)
+  w.writeU32(msg.cpuWantedMilli)
+  w.data
+
+proc decodeLeaseGrowRequest*(payload: string;
+                             msg: var LeaseGrowRequestMessage): bool =
+  var r = reader(payload)
+  var sessionRaw, leaseRaw: uint64
+  var wanted: uint32
+  if not r.readU64(sessionRaw): return false
+  if not r.readU64(leaseRaw): return false
+  if not r.readU32(wanted): return false
+  if r.remaining != 0: return false
+  msg = LeaseGrowRequestMessage(sessionId: sessionId(sessionRaw),
+    leaseId: leaseId(leaseRaw), cpuWantedMilli: wanted)
+  true
+
+proc encodeLeaseResized*(msg: LeaseResizedMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU64(msg.leaseId.value)
+  w.writeU32(msg.cpuCurrentMilli)
+  w.data
+
+proc decodeLeaseResized*(payload: string;
+                         msg: var LeaseResizedMessage): bool =
+  var r = reader(payload)
+  var sessionRaw, leaseRaw: uint64
+  var current: uint32
+  if not r.readU64(sessionRaw): return false
+  if not r.readU64(leaseRaw): return false
+  if not r.readU32(current): return false
+  if r.remaining != 0: return false
+  msg = LeaseResizedMessage(sessionId: sessionId(sessionRaw),
+    leaseId: leaseId(leaseRaw), cpuCurrentMilli: current)
+  true
+
+proc encodeLeaseResize*(msg: LeaseResizeMessage): string =
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU64(msg.leaseId.value)
+  w.writeU32(msg.cpuTargetMilli)
+  w.writeU32(msg.cpuChargedMilli)
+  w.data
+
+proc decodeLeaseResize*(payload: string; msg: var LeaseResizeMessage): bool =
+  var r = reader(payload)
+  var sessionRaw, leaseRaw: uint64
+  var target, charged: uint32
+  if not r.readU64(sessionRaw): return false
+  if not r.readU64(leaseRaw): return false
+  if not r.readU32(target): return false
+  if not r.readU32(charged): return false
+  if r.remaining != 0: return false
+  msg = LeaseResizeMessage(sessionId: sessionId(sessionRaw),
+    leaseId: leaseId(leaseRaw), cpuTargetMilli: target,
+    cpuChargedMilli: charged)
+  true

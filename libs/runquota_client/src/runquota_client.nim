@@ -63,6 +63,26 @@ proc withEstimate*(request: ResourceRequest;
   result = request
   result.estimate = ClientEstimate(supplied: true, memoryBytes: memoryBytes)
 
+proc withWidthRange*(request: ResourceRequest; minimum, preferred: MilliCpu;
+                     resizable = false): ResourceRequest =
+  ## Asks for a CPU RANGE: the daemon grants the widest value in
+  ## ``minimum .. preferred`` that is free, at least ``minimum``, and the
+  ## request waits while not even that fits. The grant's ``resources.cpu`` is
+  ## the width chosen.
+  ##
+  ## ``resizable`` is for a client that follows a moving width -- a jobserver
+  ## that issues and withholds tokens -- and then reports with
+  ## ``reportResized``. A client that passes the width to its child once, as
+  ## a flag, must not set it.
+  ##
+  ## ``resources.cpu`` is set to ``preferred``: it is what a daemon that
+  ## predates ranges is asked for (``sendCandidateOffer`` caps it to that
+  ## daemon's CPU budget, so it does not ask for the impossible).
+  result = request
+  result.resources.cpu = preferred
+  result.width = WidthRange(present: true, minMilli: minimum.value,
+    preferredMilli: preferred.value, resizable: resizable)
+
 proc benchmarkRequest*(request: ResourceRequest): ResourceRequest =
   result = request
   result.purpose = leasePurposeBenchmark
@@ -211,6 +231,29 @@ const
     ## Seconds until the group's provider prompt cache expires: the group's
     ## cache deadline (now + TTL) if this session creates it.
 
+proc supportsNegotiatedWidths*(client: RunQuotaClient): bool =
+  ## Whether the daemon understands CPU ranges on host leases and the resize
+  ## messages. Below ``NegotiatedWidthsMinor`` a request asks for one value.
+  client.capabilities.protocolMinor >= NegotiatedWidthsMinor
+
+proc widthForPeer*(width: WidthRange; peerMinor: uint16; peerCpuSlots: uint32;
+                   resources: var ResourceVector): WidthRange =
+  ## The width as a daemon at protocol minor `peerMinor` can be asked for
+  ## it. One below `NegotiatedWidthsMinor` gets no range: it is asked for
+  ## ``resources.cpu`` (the preferred width), capped to its CPU budget but
+  ## never below the minimum, so a range it cannot express does not turn
+  ## into a request it must refuse.
+  if not width.present or peerMinor >= NegotiatedWidthsMinor:
+    return width
+  if peerCpuSlots > 0'u32 and resources.cpu.value > peerCpuSlots:
+    resources.cpu = milliCpu(max(peerCpuSlots, width.minMilli))
+  WidthRange(present: false)
+
+proc forDaemon(client: RunQuotaClient; width: WidthRange;
+               resources: var ResourceVector): WidthRange =
+  widthForPeer(width, client.capabilities.protocolMinor,
+    client.capabilities.cpuSlots.value, resources)
+
 proc supportsSessionGroups*(client: RunQuotaClient): bool =
   ## Whether the daemon understands session groups: its `HelloOk` reported
   ## protocol minor `SessionGroupsMinor` or later. An older daemon refuses a
@@ -350,16 +393,19 @@ proc requestLease*(session: var RunQuotaSession;
   if not session.active:
     session.client[].lastDiagnostic = diagnostic(diagInvalidArgument, "session is not active")
     raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+  var resources = request.resources
+  let width = session.client[].forDaemon(request.width, resources)
   let msg = LeaseRequestMessage(
     sessionId: session.id,
     label: request.label,
     commandStatsId: request.commandStatsId,
-    resources: request.resources,
+    resources: resources,
     deadline: request.deadline,
     priority: request.priority,
     purpose: request.purpose,
     metadata: request.metadata,
-    estimate: request.estimate
+    estimate: request.estimate,
+    width: width
   )
   var validDenial = false
   try:
@@ -407,7 +453,8 @@ proc toCandidate*(clientCandidateId: uint64;
     priority: request.priority,
     purpose: request.purpose,
     metadata: request.metadata,
-    estimate: request.estimate
+    estimate: request.estimate,
+    width: request.width
   )
 
 proc sendCandidateOffer*(session: var RunQuotaSession;
@@ -420,7 +467,9 @@ proc sendCandidateOffer*(session: var RunQuotaSession;
     raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
   var copied: seq[LeaseCandidate] = @[]
   for candidate in candidates:
-    copied.add(candidate)
+    var entry = candidate
+    entry.width = session.client[].forDaemon(entry.width, entry.resources)
+    copied.add(entry)
   let msg = CandidateOfferMessage(sessionId: session.id, candidates: copied)
   session.client[].requestFrame(rqOfferCandidates, encodeCandidateOffer(msg))
 
@@ -587,6 +636,57 @@ proc requestLeaseWaiting*(session: var RunQuotaSession; request: ResourceRequest
     sleep(pollMillis)
   session.client[].lastDiagnostic = diagnostic(diagDenied, "timed out waiting for lease grant")
   raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
+
+# ---------------------------------------------------------------------------
+# Negotiated widths: resizing a running lease
+# ---------------------------------------------------------------------------
+
+proc resizeExchange(lease: var RunQuotaLease; kind: RqspMessageKind;
+                    payload: string): LeaseResizeMessage =
+  let session = lease.session
+  let requestId = session.client[].requestFrame(kind, payload)
+  let frame = session.client[].readResponse(requestId)
+  if frame.header.messageKind != rqLeaseResize or
+      not decodeLeaseResize(frame.payload, result) or
+      result.leaseId.value != lease.id.value:
+    session.client[].lastDiagnostic = diagnostic(diagProtocol,
+      "daemon did not answer with LeaseResize")
+    raise newException(RunQuotaClientError,
+      session.client[].lastDiagnostic.message)
+
+proc checkResizable(lease: RunQuotaLease) =
+  if lease.session.isNil or not lease.active:
+    raise newException(RunQuotaClientError, "lease is not active")
+  if not lease.session.client[].supportsNegotiatedWidths():
+    lease.session.client[].lastDiagnostic = diagnostic(diagUnsupportedVersion,
+      "daemon (protocol minor " &
+      $lease.session.client[].capabilities.protocolMinor &
+      ") predates negotiated widths")
+    raise newException(RunQuotaClientError,
+      lease.session.client[].lastDiagnostic.message)
+
+proc reportResized*(lease: var RunQuotaLease;
+                    current: MilliCpu): LeaseResizeMessage =
+  ## Tell the daemon the width this lease's jobserver holds now (tokens in
+  ## circulation plus the implicit one) and learn the target in force. A
+  ## resizable client calls it periodically while its command runs: RQSP is
+  ## request and response, so this is how a target set in an admission pass
+  ## reaches it. The daemon charges max(target, current).
+  lease.checkResizable()
+  lease.resizeExchange(rqLeaseResized, encodeLeaseResized(LeaseResizedMessage(
+    sessionId: lease.session.id, leaseId: lease.id,
+    cpuCurrentMilli: current.value)))
+
+proc requestGrow*(lease: var RunQuotaLease;
+                  wanted: MilliCpu): LeaseResizeMessage =
+  ## Ask that the lease grow towards ``wanted`` (clamped to its range) when
+  ## admission finds free CPU for it. Answers with the target in force now;
+  ## the growth itself arrives in a later ``reportResized`` answer.
+  lease.checkResizable()
+  lease.resizeExchange(rqLeaseGrowRequest,
+    encodeLeaseGrowRequest(LeaseGrowRequestMessage(
+      sessionId: lease.session.id, leaseId: lease.id,
+      cpuWantedMilli: wanted.value)))
 
 # ---------------------------------------------------------------------------
 # Nested bridges: sub-leases of a parent lease

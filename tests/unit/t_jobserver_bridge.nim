@@ -6,7 +6,7 @@
 ## NO MOCKS: every case is a value in and a value out. The behaviour against
 ## real tools and a real daemon is in `tests/integration/t_jobserver_command.nim`
 ## and `tests/integration/t_sub_lease_admission.nim`.
-import std/[options, os, strutils, unittest]
+import std/[options, os, posix, strutils, unittest]
 
 import runquota_client
 import runquota_core
@@ -129,3 +129,54 @@ suite "RequestSubLease wire form":
     var kind: RqspMessageKind
     check messageKindFromWire(41'u16, kind) and kind == rqRequestSubLease
     check RqspProtocolMinor >= SubLeaseMinor
+
+suite "following a moving width":
+  test "a target is whole slots, never more than it allows, never below 1":
+    check slotsForTarget(8000) == 8
+    check slotsForTarget(2500) == 2
+    check slotsForTarget(999) == 1
+    check slotsForTarget(0) == 1
+    check slotsForTarget(high(uint32)) == int(high(uint32) div 1000'u32)
+
+  test "widening issues tokens at once; narrowing takes only returned ones":
+    var fifo = openJobserverFifo(1)
+    defer: fifo.closeJobserverFifo()
+    check fifo.served == 1
+    check fifo.issueTokens(6) == 6
+    check fifo.served == 7
+    # A client takes five tokens, as five running jobs would.
+    let reader = posix.open(fifo.path.cstring, O_RDONLY or O_NONBLOCK)
+    check reader >= 0
+    var held: array[5, char]
+    check posix.read(reader, addr held[0], held.len) == 5
+    # Narrowing to 2 slots (1 token) owes 6, but only the 2 tokens back in
+    # the FIFO can be taken: the five held are not the bridge's to take.
+    check fifo.withholdTokens(6) == 2
+    check fifo.served == 5
+    # Nothing more is there; a bounded wait returns empty-handed.
+    check fifo.withholdTokens(4, waitMillis = 20) == 0
+    # Three jobs finish and hand their tokens back: the bridge keeps them.
+    let writer = posix.open(fifo.path.cstring, O_WRONLY or O_NONBLOCK)
+    check posix.write(writer, addr held[0], 3) == 3
+    check fifo.withholdTokens(4, waitMillis = 20) == 3
+    check fifo.served == 2
+    discard posix.close(reader)
+    discard posix.close(writer)
+
+suite "a range asked of an older daemon":
+  test "below the negotiated-widths minor, the range becomes one value":
+    var resources = resourceVector(milliCpu(16000), bytes(1024'u64))
+    let range = WidthRange(present: true, minMilli: 2000,
+      preferredMilli: 16000, resizable: true)
+    # Minor 5, 8-slot budget: asked for 8 (capped), no block written.
+    check not widthForPeer(range, 5, 8000, resources).present
+    check resources.cpu.value == 8000'u32
+    # Never below the minimum, even when the budget is smaller.
+    resources.cpu = milliCpu(16000)
+    discard widthForPeer(WidthRange(present: true, minMilli: 4000,
+      preferredMilli: 16000), 5, 2000, resources)
+    check resources.cpu.value == 4000'u32
+    # At minor 6 the range travels unchanged.
+    resources.cpu = milliCpu(16000)
+    check widthForPeer(range, NegotiatedWidthsMinor, 8000, resources) == range
+    check resources.cpu.value == 16000'u32

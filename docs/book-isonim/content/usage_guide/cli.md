@@ -185,7 +185,7 @@ runquota run --adapter list
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--width N` / `--width MIN:PREF` | `1:` host CPUs, at most 8 | `N` alone is a fixed width. With a range, `run` asks for `PREF` slots and, if the daemon refuses that many, retries at half, down to `MIN`; the grant is whole or not at all. `MIN:` keeps the default `PREF`, `:PREF` keeps `MIN` at 1. A fixed width the budget cannot grant fails with exit 1 and the command does not run. |
+| `--width N` / `--width MIN:PREF` | `1:` host CPUs, at most 8 | `N` alone is a fixed width. With a range, the daemon grants the widest width in `MIN..PREF` that is free, at least `MIN`, and the command waits while not even `MIN` is free. Against a daemon too old to grant ranges, `run` asks for `PREF` slots and, if refused, retries at half, down to `MIN`. `MIN:` keeps the default `PREF`, `:PREF` keeps `MIN` at 1. A fixed width the budget cannot grant fails with exit 1 and the command does not run. |
 | `--stats-key KEY` | `run/<program>@<project>` | Keys the recorded row and the [estimate](/getting_started/concepts#estimate) lookup. The default is the program's base name plus the name of the nearest enclosing git checkout of the working directory (or of the directory itself). |
 | `--adapter NAME` | detected | `nim`, `go`, `nextest`, `nix`, `pnpm`, `yarn`, `playwright`, `npm`; `none` leaves the command line alone and only holds the lease; `list` prints the table and exits. |
 | `--verbose`, `-v` | off | Print the chosen width, what the adapter did and the final command line to stderr. |
@@ -282,8 +282,22 @@ to an ordinary lease (and say so); a width larger than the parent's is
 refused. Inside a bridge, the jobserver is the nesting mechanism: the command
 does not get `RUNQUOTA_PARENT_LEASE`, and a `runquota jobserver` started
 inside it joins the existing jobserver and takes no lease of its own, as a
-recursive make does. The lease keeps its granted width for the command's
+recursive make does. A sub-lease keeps its granted width for the command's
 lifetime.
+
+**The width moves while the command runs.** An ordinary (not nested) lease is
+asked for as a range and declared resizable. When slots are free and nothing
+waits for them, the daemon widens it, up to `PREF`, and `jobserver` puts the
+extra tokens into the FIFO at once. When other work waits, the daemon narrows
+it back towards the width it was first granted: `jobserver` keeps the tokens
+the command hands back until it is down to the new width. No token is taken
+from a running job and no process is signalled, so a narrowing completes only
+as jobs finish; slots return to the host as each token comes back. A tool that
+picks a returned token up again straight away competes with `jobserver` for
+it, so narrowing a build that keeps every token busy can take longer than one
+job. `jobserver` reports the width it holds to the daemon every 100 ms and
+follows the answer. `MAKEFLAGS`' `-jN` and `RUNQUOTA_RUN_WIDTH` give the width
+at start.
 
 **The command runs in its own process group**, and gets the terminal when
 `jobserver` has it. SIGINT, SIGTERM and SIGHUP are forwarded to the group. When

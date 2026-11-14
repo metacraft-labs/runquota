@@ -34,11 +34,22 @@
 ## inside another bridge's tree joins that bridge's jobserver, as a recursive
 ## make joins its parent's.
 ##
+## A MOVING WIDTH. Against a daemon that negotiates widths, a host lease is
+## one request for the range MIN..PREF, declared resizable: the daemon may
+## widen it while slots are free and narrow it back towards its grant when
+## other work waits. The bridge reports the width it holds every
+## `ResizePollMillis` (`LeaseResized`) and follows the target in each
+## answer: widening by writing the extra tokens into the FIFO at once,
+## narrowing by reading tokens back as the command returns them and keeping
+## them. A token a running process holds is never taken and no process is
+## signalled; while a narrowing is owed the bridge waits on the FIFO, so it
+## is a reader of each returned token like the tool's own.
+##
 ## EXIT STATUS: as `runquota run` -- the command's status, 128 + N for a
 ## command killed by signal N, 2 for bad arguments, 1 when no lease could be
 ## had, 127 when the command could not be started. With no daemon answering
 ## the command runs unchanged, with no jobserver.
-import std/[options, os, strutils]
+import std/[monotimes, options, os, strutils, times]
 when defined(posix):
   import std/posix
 
@@ -63,6 +74,14 @@ const
     ## GNU make writes `+`; clients hand back whatever byte they read, so
     ## the value only matters for being one byte.
   LeftoverGraceMillis = 2000
+  ResizePollMillis* = 100
+    ## How often a resizable bridge reports its width and fetches the target.
+    ## RQSP is request and response, so this bounds how long a target set in
+    ## an admission pass waits before the jobserver follows it. One small
+    ## exchange per tenth of a second is far inside the measurement budget.
+  OwedPollMillis = 5
+    ## How long one wait on the FIFO lasts while a narrowing is owed, between
+    ## checks on the command.
     ## How long what is left of the command's process group gets between
     ## SIGTERM and SIGKILL once the command itself has exited.
 
@@ -303,6 +322,43 @@ when defined(posix):
       discard rmdir(fifo.dir.cstring)
       fifo.dir = ""
 
+  proc issueTokens*(fifo: var JobserverFifo; count: int): int =
+    ## Puts `count` more tokens into circulation (widening): written at once,
+    ## as the target asks. Answers how many went in.
+    if count <= 0:
+      return 0
+    let bytes = repeat(TokenByte, count)
+    let wrote = posix.write(fifo.fd, bytes.cstring, bytes.len)
+    if wrote > 0:
+      fifo.served += wrote
+      result = wrote
+
+  proc withholdTokens*(fifo: var JobserverFifo; count: int;
+                       waitMillis = 0): int =
+    ## Takes up to `count` tokens out of circulation (narrowing), from those
+    ## the command has RETURNED to the FIFO: a token a running process holds
+    ## is not in the FIFO and cannot be taken. With `waitMillis` > 0 the
+    ## bridge first waits that long for one to come back, so it reads a
+    ## returned token as promptly as the tool itself would. Answers how many
+    ## it took.
+    if count <= 0:
+      return 0
+    if waitMillis > 0:
+      var pfd = TPollfd(fd: fifo.fd, events: POLLIN)
+      if posix.poll(addr pfd, 1, cint(waitMillis)) <= 0:
+        return 0
+    var buffer: array[256, char]
+    let got = posix.read(fifo.fd, addr buffer[0], min(count, buffer.len))
+    if got > 0:
+      fifo.served -= got
+      result = got
+
+proc slotsForTarget*(targetMilli: uint32): int =
+  ## The whole slots a target asks for: never more than it allows (a token
+  ## too many would run a job nothing reserved), never fewer than one (the
+  ## command's own implicit token is not the bridge's to take).
+  max(1, int(targetMilli div 1000'u32))
+
 # ---------------------------------------------------------------------------
 # Signals, the terminal, and what the command leaves behind
 # ---------------------------------------------------------------------------
@@ -434,9 +490,12 @@ proc acquireBridgeLease(session: var RunQuotaSession;
                         options: JobserverOptions; statsKey: string;
                         describeFailure: proc(message: string;
                           last: Diagnostic): string;
-                        lease: var RunQuotaLease; error: var string): bool =
+                        lease: var RunQuotaLease; resizable: var bool;
+                        error: var string): bool =
   ## A sub-lease of the inherited parent when there is a usable one, else a
-  ## host lease negotiated down the same ladder as `runquota run`'s.
+  ## host lease: one resizable request for the range when the daemon
+  ## negotiates widths, otherwise negotiated down the same ladder as
+  ## `runquota run`'s.
   let label = "jobserver " & extractFilename(options.command[0])
   let preferred = preferredWidthFor(RunOptions(minWidth: options.minWidth,
     preferredWidth: options.preferredWidth), statsKey)
@@ -466,6 +525,24 @@ proc acquireBridgeLease(session: var RunQuotaSession;
     stderr.writeLine("runquota jobserver: the daemon predates sub-leases; " &
       "taking a host lease although " & ParentLeaseEnvVar & " is set")
   var lastError = ""
+  if client.supportsNegotiatedWidths():
+    # ONE REQUEST FOR THE RANGE, RESIZABLE: the daemon grants the widest
+    # width that is free and moves it while the command runs; the ladder
+    # below is for a daemon that can only grant one value whole.
+    var request = resourceRequest(label,
+      milliCpu(uint32(preferred) * 1000'u32),
+      bytes(options.hostMemoryFor(preferred))).withWidthRange(
+        milliCpu(uint32(options.minWidth) * 1000'u32),
+        milliCpu(uint32(preferred) * 1000'u32), resizable = true)
+    request.commandStatsId = statsKey
+    try:
+      lease = session.requestLeaseWaiting(request)
+      resizable = true
+      return true
+    except RunQuotaClientError as refusal:
+      error = "no lease at width " & $options.minWidth & " or above: " &
+        describeFailure(refusal.msg, client.lastDiagnostic)
+      return false
   for width in widthLadder(preferred, options.minWidth):
     var request = resourceRequest(label,
       milliCpu(uint32(width) * 1000'u32),
@@ -478,6 +555,48 @@ proc acquireBridgeLease(session: var RunQuotaSession;
       lastError = describeFailure(refusal.msg, client.lastDiagnostic)
   error = "no lease at width " & $options.minWidth & " or above: " & lastError
   false
+
+when defined(posix):
+  proc followLeaseWidth(child: var LaunchedProcess; lease: var RunQuotaLease;
+                        fifo: var JobserverFifo; grantedSlots: int;
+                        verbose: bool) =
+    ## While the command runs, keep the tokens in circulation equal to the
+    ## lease's target: report the width held (`LeaseResized`) every
+    ## `ResizePollMillis` and whenever it changes, and follow each answer.
+    ## Widening writes the extra tokens at once; narrowing keeps tokens the
+    ## command returns until the width is down to the target. Returns when
+    ## the command has exited; `waitForCompletion` then reads its status.
+    var target = grantedSlots
+    var lastReported = -1
+    var nextReport = getMonoTime()
+    var daemonLost = false
+    while not child.pollCompletion():
+      let held = fifo.served + 1
+      if held < target:
+        discard fifo.issueTokens(target - held)
+      elif held > target:
+        discard fifo.withholdTokens(held - target, OwedPollMillis)
+      let now = getMonoTime()
+      let width = fifo.served + 1
+      if not daemonLost and (width != lastReported or now >= nextReport):
+        try:
+          let answer = lease.reportResized(milliCpu(uint32(width) * 1000'u32))
+          let wanted = slotsForTarget(answer.cpuTargetMilli)
+          if verbose and wanted != target:
+            stderr.writeLine("runquota jobserver: lease " & $lease.id.value &
+              " target " & $wanted & " (holding " & $width & ")")
+          target = wanted
+          lastReported = width
+        except RunQuotaClientError as failure:
+          # The daemon went away: keep the width held, as a lease of fixed
+          # width would, and let the command finish.
+          daemonLost = true
+          if verbose:
+            stderr.writeLine("runquota jobserver: cannot report the width (" &
+              failure.msg & "); keeping " & $width)
+        nextReport = now + initDuration(milliseconds = ResizePollMillis)
+      if fifo.served + 1 <= target:
+        sleep(OwedPollMillis * 4)
 
 proc runJobserver*(args: seq[string];
                    describeFailure: proc(message: string;
@@ -523,10 +642,11 @@ proc runJobserver*(args: seq[string];
 
     var session: RunQuotaSession
     var lease: RunQuotaLease
+    var resizable = false
     try:
       session = client.registerSession("runquota jobserver", clientVersion)
       if not acquireBridgeLease(session, client, options, statsKey,
-          describeFailure, lease, error):
+          describeFailure, lease, resizable, error):
         stderr.writeLine("runquota jobserver: " & error)
         return 1
     except RunQuotaClientError as failure:
@@ -582,6 +702,8 @@ proc runJobserver*(args: seq[string];
       let handed = handTerminalTo(group)
       lease.markRunning(childProcessId = child.info.processId,
         processGroupId = child.info.processGroupId)
+      if resizable:
+        followLeaseWidth(child, lease, fifo, slots, options.verbose)
       let completion = child.waitForCompletion()
       if handed:
         takeTerminalBack()

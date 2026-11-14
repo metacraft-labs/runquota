@@ -329,6 +329,35 @@ type
       ## What this lease's granted sub-leases hold of it. Maintained on the
       ## parent by `applyLeaseResourceUsage`, the one place every grant and
       ## every release passes, for the reason the host aggregates are.
+    cpuMinMilli*: uint32
+    cpuPreferredMilli*: uint32
+      ## A host lease's CPU range (negotiated widths). A request with one CPU
+      ## value has both equal to it. While QUEUED, `resources.cpu` holds the
+      ## preferred width; the grant narrows it to the widest value that fits.
+    resizable*: bool
+      ## The client follows a moving width (a jobserver): the daemon may
+      ## widen the lease above its grant while nothing waits, and narrow it
+      ## back towards the grant when something does.
+    grantCpuMilli*: uint32
+      ## The width the lease was granted. Narrowing never goes below it: the
+      ## grant is what admission promised, and only width added by widening
+      ## is lent.
+    cpuTargetMilli*: uint32
+    cpuCurrentMilli*: uint32
+      ## The width the jobserver should follow, and the width it last said it
+      ## holds. A granted resizable lease charges max(target, current) --
+      ## that is its `resources.cpu` -- so a narrowing frees slots only as
+      ## tokens come back, and a widening is charged at once.
+    growWantedMilli*: uint32
+      ## The width the lease grows towards: its preferred width, or less
+      ## when its client asked for less (`LeaseGrowRequest`).
+    growOrder*: uint64
+      ## Arrival order among growth candidates: taken from the queue-order
+      ## counter when the lease last fell below the width it grows towards.
+    chargeSinceMillis*: int64
+      ## Monotonic milliseconds since which `resources.cpu` has been the
+      ## charge; the group's CPU-time counter integrates each charge over
+      ## its own interval.
 
   ConnectionContext* = object
     supervisorProcessId*: uint64

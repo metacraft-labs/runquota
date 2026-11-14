@@ -76,3 +76,7 @@ type
       ## a client that caches nothing and never estimates must keep
       ## working, and for it the daemon's learned table remains the
       ## fallback exactly as before. See ``withEstimate``.
+    width*: WidthRange
+      ## A CPU range instead of one value (``withWidthRange``). Sent only to
+      ## a daemon at ``NegotiatedWidthsMinor`` or above; to an older one the
+      ## request asks for exactly ``resources.cpu``.

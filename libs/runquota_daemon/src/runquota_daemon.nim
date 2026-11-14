@@ -964,8 +964,11 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
       dec daemon.activeLeaseCount
     # What the group held, for how long, counted when it stops holding it.
     if lease.groupKey.len > 0 and daemon.sessionGroups.hasKey(lease.groupKey):
+      let since =
+        if lease.chargeSinceMillis != 0'i64: lease.chargeSinceMillis
+        else: lease.grantedAtMillis
       daemon.sessionGroups[lease.groupKey].grantedCpuMilliMillis +=
-        uint64(cpuDelta) * elapsedSince(lease.grantedAtMillis)
+        uint64(cpuDelta) * elapsedSince(since)
       daemon.sessionGroups[lease.groupKey].changeHeldCpu(-int64(cpuDelta))
     if lease.purpose == leasePurposeBenchmark and daemon.activeBenchmarkCount > 0'u32:
       dec daemon.activeBenchmarkCount
@@ -975,6 +978,56 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
   # release passes -- rather than sampled from the lease table on a
   # cadence, which would be the same walk this aggregate exists to avoid.
   setAmbientLiveLeaseCount(int(daemon.activeLeaseCount))
+
+proc setLeaseCharge(daemon: var RunQuotaDaemon; id: uint64;
+                    charge: uint32) =
+  ## Change what a granted host lease charges the ledger, in place: the
+  ## machine's and shared group's CPU usage, its session group's held CPU,
+  ## and the group's CPU-time counter for the interval at the old charge.
+  ## A resize is the one way a running lease's charge moves; every other
+  ## change goes through `applyLeaseResourceUsage` at grant and release.
+  var lease = daemon.leases[id]
+  let old = lease.resources.cpu.value
+  if charge == old or not lease.state.isResourceActive or
+      lease.parentLeaseId != 0'u64:
+    return
+  var machine: MachineCapacity
+  if not daemon.machineFor(lease.resources.resolvedMachineId(), machine):
+    return
+  let groupId =
+    if machine.cpuShareGroup.len == 0: machine.id else: machine.cpuShareGroup
+  var usage = daemon.machineUsage.getOrDefault(machine.id, MachineUsage())
+  let shared = daemon.cpuShareGroupUsage.getOrDefault(groupId, 0'u32)
+  if charge > old:
+    let more = charge - old
+    usage.cpu += more
+    daemon.cpuShareGroupUsage[groupId] = shared + more
+  else:
+    let less = old - charge
+    usage.cpu = (if usage.cpu >= less: usage.cpu - less else: 0'u32)
+    daemon.cpuShareGroupUsage[groupId] =
+      if shared >= less: shared - less else: 0'u32
+  daemon.machineUsage[machine.id] = usage
+  let since =
+    if lease.chargeSinceMillis != 0'i64: lease.chargeSinceMillis
+    else: lease.grantedAtMillis
+  if lease.groupKey.len > 0 and daemon.sessionGroups.hasKey(lease.groupKey):
+    daemon.sessionGroups[lease.groupKey].grantedCpuMilliMillis +=
+      uint64(old) * elapsedSince(since)
+    daemon.sessionGroups[lease.groupKey].changeHeldCpu(
+      int64(charge) - int64(old))
+  lease.chargeSinceMillis = monoMillis()
+  lease.resources.cpu = milliCpu(charge)
+  daemon.leases[id] = lease
+
+proc resizeCharge(lease: LeaseRow): uint32 =
+  ## What a resizable lease charges: the larger of the width its jobserver
+  ## should follow and the width it last said it holds -- and never less
+  ## than its own granted sub-leases hold. Those are carved from the
+  ## lease's charge (`subLeaseFit`), so a report below them would leave CPU
+  ## that sub-leases run on missing from the host ledger.
+  max(max(lease.cpuTargetMilli, lease.cpuCurrentMilli),
+    lease.subHeldCpuMilli)
 
 proc transitionLeaseState(daemon: var RunQuotaDaemon; lease: var LeaseRow;
                           newState: LeaseLifecycleState) =
@@ -1275,6 +1328,50 @@ proc fitsNow(daemon: RunQuotaDaemon; resources: ResourceVector): bool =
       return false
   true
 
+proc freeCpuFor(daemon: RunQuotaDaemon; resources: ResourceVector): uint32 =
+  ## The CPU a lease on `resources`' machine could still be granted now: the
+  ## smaller of what the machine's and its shared CPU group's budgets have
+  ## left. Saturating, so a ledger that is over its budget (a reload shrank
+  ## it under running leases) reads as nothing free, never as a wrap.
+  var machine: MachineCapacity
+  if not daemon.machineFor(resources.resolvedMachineId(), machine):
+    return 0'u32
+  let group = daemon.cpuShareGroupFor(machine)
+  let usage = daemon.machineUsage.getOrDefault(machine.id, MachineUsage())
+  let usedShared = daemon.cpuShareGroupUsage.getOrDefault(group.id, 0'u32)
+  let machineFree =
+    if machine.cpuSlots.value > usage.cpu: machine.cpuSlots.value - usage.cpu
+    else: 0'u32
+  let groupFree =
+    if group.cpuSlots.value > usedShared: group.cpuSlots.value - usedShared
+    else: 0'u32
+  min(machineFree, groupFree)
+
+const SlotMilli = 1000'u32
+  ## Widths above a range's minimum move in whole slots: a jobserver serves
+  ## tokens, and a tool given `-j` or `--test-threads` takes a whole number,
+  ## so a fraction of a slot granted above the minimum would be held and
+  ## never used.
+
+proc rangedWidth(minimum, preferred, free: uint32): uint32 =
+  ## The widest value in `minimum .. preferred` within `free`, moving above
+  ## the minimum in whole slots; 0 when not even the minimum fits.
+  if minimum > free:
+    return 0'u32
+  let widest = min(preferred, free)
+  if widest == preferred:
+    return preferred
+  max(minimum, widest - widest mod SlotMilli)
+
+proc minimumResources(lease: LeaseRow): ResourceVector =
+  ## What a queued host lease needs in order to be granted at all: its
+  ## resources at its minimum width. Fitting, backfill and the starvation
+  ## hold are decided on this, so a ranged request is admitted exactly when
+  ## a fixed request of its minimum would be.
+  result = lease.resources
+  if lease.cpuMinMilli > 0'u32:
+    result.cpu = milliCpu(lease.cpuMinMilli)
+
 proc earliestQueuedBenchmarkId(daemon: RunQuotaDaemon): uint64 =
   var bestPriority = high(int)
   var bestOrder = high(uint64)
@@ -1465,6 +1562,16 @@ proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
       "\"child_process_id\":" & $lease.childProcessId & "," &
       "\"child_start_stamp\":" & $lease.childStartStamp & "," &
       "\"parent_lease_id\":" & $lease.parentLeaseId & "," &
+      # NEGOTIATED WIDTH: the range asked for, the width granted, and for a
+      # resizable lease the target its jobserver follows and the width it
+      # last reported. `resources.cpu` is the charge, max(target, current).
+      "\"width\":{\"min_milli\":" & $lease.cpuMinMilli &
+        ",\"preferred_milli\":" & $lease.cpuPreferredMilli &
+        ",\"granted_milli\":" & $lease.grantCpuMilli &
+        ",\"resizable\":" & $lease.resizable &
+        ",\"target_milli\":" & $lease.cpuTargetMilli &
+        ",\"current_milli\":" & $lease.cpuCurrentMilli &
+        ",\"wanted_milli\":" & $lease.growWantedMilli & "}," &
       "\"diagnostic\":{\"code\":" & jsonEscape($lease.queueDiagnostic.code) &
         ",\"message\":" & jsonEscape(lease.queueDiagnostic.message) &
         ",\"detail\":" & jsonEscape(lease.queueDiagnostic.detail) & "}" &
@@ -2351,6 +2458,40 @@ proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
   )
   daemon.leases[id.value] = result
 
+proc widthRefusal(width: WidthRange): string =
+  ## Why a requested CPU range is malformed, or "". Answered as a denial the
+  ## client can show, never as a frame it cannot read.
+  if width.present and
+      (width.minMilli == 0'u32 or width.preferredMilli < width.minMilli):
+    return "lease CPU range must have 0 < minimum <= preferred (requested " &
+      $width.minMilli & "m.." & $width.preferredMilli & "m)"
+  ""
+
+proc rangedResources(effective: ResourceVector;
+                     width: WidthRange): ResourceVector =
+  ## The resources a request is judged by for `possible`: its minimum width.
+  ## A preferred width above the budget is not an error -- the grant is
+  ## capped by what is free -- but a minimum above it can never be granted.
+  result = effective
+  if width.present:
+    result.cpu = milliCpu(width.minMilli)
+
+proc recordWidth(daemon: var RunQuotaDaemon; id: uint64;
+                 width: WidthRange) =
+  ## Store a queued host lease's range. While queued its `resources.cpu`
+  ## holds the preferred width; the grant narrows it to what fits.
+  var lease = daemon.leases[id]
+  if width.present:
+    lease.cpuMinMilli = width.minMilli
+    lease.cpuPreferredMilli = width.preferredMilli
+    lease.resizable = width.resizable
+    lease.resources.cpu = milliCpu(width.preferredMilli)
+  else:
+    lease.cpuMinMilli = lease.resources.cpu.value
+    lease.cpuPreferredMilli = lease.resources.cpu.value
+  lease.growWantedMilli = lease.cpuPreferredMilli
+  daemon.leases[id] = lease
+
 proc effectiveResources(daemon: RunQuotaDaemon; sessionId: SessionId;
                         commandStatsId: string; requested: ResourceVector;
                         estimate: ClientEstimate): ResourceVector =
@@ -3147,6 +3288,115 @@ proc promoteQueuedSubLeases(daemon: var RunQuotaDaemon): seq[uint64] =
     daemon.grantQueuedLease(id, false)
     result.add(id)
 
+proc resizableHolds(lease: LeaseRow): bool =
+  ## A host lease the daemon may widen or narrow now: declared resizable,
+  ## and held by a supervisor that is still there to follow the target.
+  lease.resizable and lease.parentLeaseId == 0'u64 and
+    lease.state in {leaseStateGranted, leaseStateStarting, leaseStateRunning}
+
+proc narrowFor(daemon: var RunQuotaDaemon; waiterId: uint64) =
+  ## Lower the targets of widened resizable leases so the CPU the waiting
+  ## request lacks comes back to the ledger as their tokens are returned.
+  ##
+  ## ONLY WIDTH ADDED BY WIDENING IS TAKEN BACK: a lease is never narrowed
+  ## below the width it was granted, nor below what its own sub-leases hold.
+  ## The grant is what admission promised; widening lent the rest, from
+  ## slots nothing was waiting for, and a waiter is what ends the loan.
+  ##
+  ## Narrowing that is already on its way (target below current) counts
+  ## towards the deficit, so each pass asks only for what is still missing
+  ## instead of narrowing further every time the waiter is passed over.
+  let waiter = daemon.leases[waiterId]
+  let minimum = waiter.minimumResources()
+  var withoutCpu = minimum
+  withoutCpu.cpu = milliCpu(0)
+  if not daemon.fitsNow(withoutCpu):
+    # Memory, IO or a pool is what it waits for: CPU would not help.
+    return
+  let machineId = minimum.resolvedMachineId()
+  let free = daemon.freeCpuFor(minimum)
+  if minimum.cpu.value <= free:
+    return
+  var deficit = minimum.cpu.value - free
+  var narrowable: seq[(uint32, uint64)] = @[]
+  for id, lease in daemon.leases.pairs:
+    if not lease.resizableHolds() or
+        lease.resources.resolvedMachineId() != machineId:
+      continue
+    if lease.cpuCurrentMilli > lease.cpuTargetMilli:
+      let coming = lease.cpuCurrentMilli - lease.cpuTargetMilli
+      deficit = (if deficit > coming: deficit - coming else: 0'u32)
+    let floor = max(lease.grantCpuMilli, lease.subHeldCpuMilli)
+    if lease.cpuTargetMilli > floor:
+      narrowable.add((lease.cpuTargetMilli - floor, id))
+  if deficit == 0'u32 or narrowable.len == 0:
+    return
+  # Furthest above its grant first: the lease that borrowed most gives back
+  # first, in whole slots so the jobserver can follow.
+  narrowable.sort(proc (a, b: (uint32, uint64)): int =
+    if a[0] != b[0]: cmp(b[0], a[0]) else: cmp(a[1], b[1]))
+  for (spare, id) in narrowable:
+    if deficit == 0'u32:
+      break
+    let wanted = ((deficit + SlotMilli - 1'u32) div SlotMilli) * SlotMilli
+    let take = min(spare, wanted)
+    var lease = daemon.leases[id]
+    lease.cpuTargetMilli -= take
+    # It now sits below the width it grows towards: its place among growth
+    # candidates is taken from now.
+    lease.growOrder = daemon.nextQueueOrder
+    inc daemon.nextQueueOrder
+    daemon.leases[id] = lease
+    daemon.setLeaseCharge(id, lease.resizeCharge())
+    deficit = (if deficit > take: deficit - take else: 0'u32)
+
+proc widenIntoFreeSlots(daemon: var RunQuotaDaemon; now: int64) =
+  ## Hand slots no queued request could use to resizable leases below the
+  ## width they grow towards, IN THE CONFIGURED ADMISSION ORDER: each such
+  ## lease is a growth candidate, ordered (with the division between owners)
+  ## exactly like a queued request, by when it last fell below its width.
+  ## Called only when nothing waits for capacity, so a widening never takes
+  ## a slot a queued request could have had.
+  if daemon.hasActiveBenchmark() or daemon.earliestQueuedBenchmarkId() != 0'u64:
+    # Benchmark isolation: no lease grows while one holds or waits for the
+    # host.
+    return
+  var growth: seq[PendingRequest] = @[]
+  for id, lease in daemon.leases.pairs:
+    if lease.resizableHolds() and lease.cpuTargetMilli < lease.growWantedMilli:
+      var entry = daemon.pendingRequest(lease, now)
+      entry.queueOrder = lease.growOrder
+      # A running lease that could be wider is not WAITING work: it never
+      # counts as starved, whatever its age.
+      entry.waitedMillis = 0
+      growth.add(entry)
+  if growth.len == 0:
+    return
+  var plan = planAdmission(growth, daemon.ownerLoads(), AdmissionPolicy(
+    order: daemon.config.admissionOrder,
+    shareBetweenUsers: daemon.config.shareBetweenUsers,
+    maxWaitMillis: daemon.config.admissionMaxWaitMillis,
+    capacityCpuMilli: uint64(daemon.config.cpuSlots.value),
+    capacityMemoryBytes: daemon.config.memoryBytes.value))
+  var candidate: PendingRequest
+  while plan.next(candidate):
+    var lease = daemon.leases[candidate.id]
+    let charged = lease.resources.cpu.value
+    let free = daemon.freeCpuFor(lease.resources)
+    # The new target may reach the current charge plus whole free slots;
+    # up to the charge it costs nothing (a narrowing not yet completed).
+    let whole = free - free mod SlotMilli
+    let reach =
+      if high(uint32) - charged < whole: high(uint32) else: charged + whole
+    let target = min(lease.growWantedMilli, reach)
+    if target <= lease.cpuTargetMilli:
+      continue
+    lease.cpuTargetMilli = target
+    daemon.leases[candidate.id] = lease
+    daemon.setLeaseCharge(candidate.id, lease.resizeCharge())
+    let added = daemon.leases[candidate.id].resources.cpu.value - charged
+    plan.noteGranted(candidate.owner, uint64(added), 0'u64, candidate.groupKey)
+
 proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
     uint32)): seq[uint64] =
   # Before deciding what fits, stop counting what is no longer there.
@@ -3175,8 +3425,13 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
     capacityMemoryBytes: daemon.config.memoryBytes.value))
   var promoted = 0'u32
   var candidate: PendingRequest
+  # THE FIRST REQUEST IN ADMISSION ORDER THAT WAITS FOR CAPACITY, if any. It
+  # is what narrowing serves, and while it (or any request) waits, nothing
+  # is widened: widening only ever uses slots queued work could not.
+  var headWaiter = 0'u64
+  var waiting = false
   while promoted < maxDecisions and plan.next(candidate):
-    let lease = daemon.leases[candidate.id]
+    var lease = daemon.leases[candidate.id]
     var pressureDiagnostic: Diagnostic
     if not daemon.benchmarkGateAllows(lease) or
         not daemon.pressureAllows(lease.resources, pressureDiagnostic):
@@ -3187,17 +3442,43 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
       # freeing up, so holding capacity for it would stall the whole queue
       # on a condition no grant can change.
       continue
-    if daemon.fitsNow(lease.resources):
+    let minimum = lease.minimumResources()
+    if daemon.fitsNow(minimum):
+      # THE GRANT IS THE WIDEST VALUE IN THE RANGE THAT IS FREE, at least the
+      # minimum (which fits). A request with one CPU value has both ends
+      # equal to it, and is granted exactly that.
+      let width = rangedWidth(minimum.cpu.value,
+        max(lease.cpuPreferredMilli, minimum.cpu.value),
+        daemon.freeCpuFor(minimum))
+      lease.resources.cpu = milliCpu(width)
+      lease.grantCpuMilli = width
+      lease.cpuTargetMilli = width
+      lease.cpuCurrentMilli = width
+      if lease.resizable and width < lease.growWantedMilli:
+        lease.growOrder = daemon.nextQueueOrder
+        inc daemon.nextQueueOrder
+      daemon.leases[candidate.id] = lease
       daemon.grantQueuedLease(candidate.id, false)
-      plan.noteGranted(candidate.owner, uint64(lease.resources.cpu.value),
+      plan.noteGranted(candidate.owner, uint64(width),
         lease.resources.memory.value, candidate.groupKey)
       result.add(candidate.id)
       inc promoted
-    elif candidate.starved:
-      # HELD FOR: it waits only for capacity, so nothing behind it is granted
-      # in this pass, and the slots that free up accumulate until it fits
-      # instead of going to a request that arrived later.
-      break
+    else:
+      waiting = true
+      if headWaiter == 0'u64:
+        headWaiter = candidate.id
+      if candidate.starved:
+        # HELD FOR: it waits only for capacity, so nothing behind it is
+        # granted in this pass, and the slots that free up accumulate until
+        # it fits instead of going to a request that arrived later.
+        break
+  if promoted >= maxDecisions:
+    # The pass stopped early; what it did not reach may be waiting too.
+    waiting = true
+  if headWaiter != 0'u64:
+    daemon.narrowFor(headWaiter)
+  elif not waiting:
+    daemon.widenIntoFreeSlots(now)
   for id, lease in daemon.leases.pairs:
     if lease.state == leaseStateQueued and lease.parentLeaseId == 0'u64:
       var updated = lease
@@ -3218,12 +3499,12 @@ proc rebudgetQueuedLeases(daemon: var RunQuotaDaemon;
     # A queued sub-lease waits on its parent, which no budget change touches.
     if lease.state == leaseStateQueued and lease.parentLeaseId == 0'u64:
       var reason = ""
-      if not daemon.possible(lease.resources, reason):
+      if not daemon.possible(lease.minimumResources(), reason):
         doomed.add(id)
   for id in doomed:
     let lease = daemon.leases[id]
     var reason = ""
-    discard daemon.possible(lease.resources, reason)
+    discard daemon.possible(lease.minimumResources(), reason)
     # THE CAUSE AND THE DAEMON, both: they answer different questions --
     # WHY NOW (the budget changed under a lease that was already waiting)
     # and WHO (which daemon holds that budget) -- so the identity is
@@ -3871,8 +4152,14 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       return
     let effective = daemon.effectiveResources(msg.sessionId,
         msg.commandStatsId, msg.resources, msg.estimate)
+    let malformed = widthRefusal(msg.width)
+    if malformed.len > 0:
+      connection.sendResponse(rqLeaseDenied, frame.header.requestId,
+        encodeLeaseDenied(LeaseDeniedMessage(sessionId: msg.sessionId,
+          diagnostic: diagnostic(diagInvalidArgument, malformed))))
+      return
     var reason = ""
-    if not daemon.possible(effective, reason):
+    if not daemon.possible(effective.rangedResources(msg.width), reason):
       let denied = LeaseDeniedMessage(
         sessionId: msg.sessionId,
         diagnostic: diagnostic(diagDenied, reason, daemon.refusedByText())
@@ -3889,6 +4176,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       msg.priority,
       msg.purpose
     )
+    daemon.recordWidth(queued.id.value, msg.width)
     discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
     if daemon.leases[queued.id.value].state != leaseStateGranted:
       let deniedDiagnostic = daemon.leases[queued.id.value].queueDiagnostic
@@ -3989,6 +4277,81 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       frame.header.requestId,
       encodeLeaseDecisionBatch(LeaseDecisionBatchMessage(
           sessionId: msg.sessionId, decisions: @[decision])))
+  of rqLeaseResized, rqLeaseGrowRequest:
+    # Both report on, or ask about, a RESIZABLE lease and are answered with
+    # the target in force (`LeaseResize`): RQSP is request and response, so
+    # this answer is how a target set in an admission pass reaches the
+    # client.
+    var sessionRaw = sessionId(0)
+    var leaseRaw = leaseId(0)
+    var figure = 0'u32
+    var decoded = false
+    if frame.header.messageKind == rqLeaseResized:
+      var msg: LeaseResizedMessage
+      decoded = decodeLeaseResized(frame.payload, msg)
+      sessionRaw = msg.sessionId
+      leaseRaw = msg.leaseId
+      figure = msg.cpuCurrentMilli
+    else:
+      var msg: LeaseGrowRequestMessage
+      decoded = decodeLeaseGrowRequest(frame.payload, msg)
+      sessionRaw = msg.sessionId
+      leaseRaw = msg.leaseId
+      figure = msg.cpuWantedMilli
+    if not decoded:
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "invalid " & (if frame.header.messageKind == rqLeaseResized:
+            "LeaseResized" else: "LeaseGrowRequest") & " payload"))
+      return
+    # Only on the connection that registered the session, as `DeclarePools`
+    # and `RequestSubLease`: a session id is a small integer, and another
+    # connection -- possibly another user's -- must not be able to move a
+    # lease's charge or its target.
+    var owned = false
+    for id in context.sessionIds:
+      if id.value == sessionRaw.value:
+        owned = true
+    if not owned or not daemon.sessions.hasKey(sessionRaw.value):
+      connection.sendError(frame.header.requestId, diagnostic(
+          diagInvalidArgument, "unknown session id"))
+      return
+    var lease: LeaseRow
+    if not daemon.requireOwnedLease(connection, frame.header.requestId,
+        sessionRaw, leaseRaw, lease):
+      return
+    if not lease.resizableHolds():
+      connection.sendError(frame.header.requestId, diagnostic(
+          diagInvalidArgument, "lease is not a running resizable host lease",
+          "only a granted, starting or running lease whose request declared " &
+          "resizable can be resized"))
+      return
+    if frame.header.messageKind == rqLeaseResized:
+      # CLAMPED TO WHAT WAS CHARGED: a client cannot raise its own charge by
+      # claiming to hold more than it was given. Below that it is taken as
+      # stated; the charge is max(target, current) either way.
+      lease.cpuCurrentMilli = min(figure, lease.resources.cpu.value)
+    else:
+      let wanted = min(max(figure, lease.cpuMinMilli), lease.cpuPreferredMilli)
+      if wanted != lease.growWantedMilli:
+        lease.growWantedMilli = wanted
+        if lease.cpuTargetMilli < wanted:
+          # A new pending request in the admission order: it arrives now.
+          lease.growOrder = daemon.nextQueueOrder
+          inc daemon.nextQueueOrder
+    daemon.leases[leaseRaw.value] = lease
+    daemon.setLeaseCharge(leaseRaw.value, lease.resizeCharge())
+    # Capacity a narrowing returned goes to waiting work, and a grow request
+    # is weighed, in this same pass.
+    discard daemon.tryPromoteQueued(
+      defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
+    let now = daemon.leases[leaseRaw.value]
+    connection.sendResponse(rqLeaseResize, frame.header.requestId,
+      encodeLeaseResize(LeaseResizeMessage(sessionId: sessionRaw,
+        leaseId: leaseRaw, cpuTargetMilli: now.cpuTargetMilli,
+        cpuChargedMilli: now.resources.cpu.value)))
+  of rqLeaseResize:
+    connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+        "LeaseResize is the daemon's answer, not a request"))
   of rqReleaseLease:
     var msg: ReleaseLeaseMessage
     if not decodeReleaseLease(frame.payload, msg):
@@ -4036,7 +4399,16 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       var reason = ""
       let effective = daemon.effectiveResources(msg.sessionId,
           candidate.commandStatsId, candidate.resources, candidate.estimate)
-      if not daemon.possible(effective, reason):
+      let malformed = widthRefusal(candidate.width)
+      if malformed.len > 0:
+        decisions.add(LeaseDecision(
+          clientCandidateId: candidate.clientCandidateId,
+          leaseId: leaseId(0),
+          kind: leaseDecisionDenied,
+          resources: effective,
+          diagnostic: diagnostic(diagInvalidArgument, malformed)))
+      elif not daemon.possible(effective.rangedResources(candidate.width),
+          reason):
         decisions.add(LeaseDecision(
           clientCandidateId: candidate.clientCandidateId,
           leaseId: leaseId(0),
@@ -4054,6 +4426,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           candidate.priority,
           candidate.purpose
         )
+        daemon.recordWidth(lease.id.value, candidate.width)
         offeredIds.add(lease.id.value)
     discard daemon.tryPromoteQueued(flow.maxLeaseDecisionsPerBatch)
     for id in offeredIds:

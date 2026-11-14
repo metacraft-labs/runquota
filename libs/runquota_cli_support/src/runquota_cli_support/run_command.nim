@@ -225,8 +225,9 @@ proc preferredWidthFor*(options: RunOptions; statsKey: string): int =
 
 proc widthLadder*(preferred, minimum: int): seq[int] =
   ## The widths to try, widest first: PREF, then halves of it, ending at
-  ## MIN. The daemon grants a lease whole or refuses it, so a range is
-  ## negotiated by asking again lower after a refusal.
+  ## MIN. A daemon that predates negotiated widths grants a lease whole or
+  ## refuses it, so against one a range is negotiated by asking again lower
+  ## after a refusal.
   var width = preferred
   while width > minimum:
     result.add width
@@ -303,12 +304,22 @@ proc runRun*(args: seq[string];
   var lease: RunQuotaLease
   var granted = false
   try:
-    let ladder = widthLadder(preferredWidthFor(options, statsKey),
-      options.minWidth)
+    let preferred = preferredWidthFor(options, statsKey)
+    # A daemon that negotiates widths is asked once, for the range: it
+    # grants the widest width that is free. An older one grants a single
+    # value whole or refuses it, so the range is walked down a ladder.
+    let ladder =
+      if client.supportsNegotiatedWidths(): @[preferred]
+      else: widthLadder(preferred, options.minWidth)
     var lastError = ""
     for width in ladder:
       var request = resourceRequest("run " & baseName(options.command[0]),
         milliCpu(uint32(width) * 1000'u32), bytes(RunLeaseMemoryBytes))
+      if client.supportsNegotiatedWidths():
+        # Not resizable: the width reaches the command once, as a flag.
+        request = request.withWidthRange(
+          milliCpu(uint32(options.minWidth) * 1000'u32),
+          milliCpu(uint32(width) * 1000'u32))
       request.commandStatsId = statsKey
       try:
         lease = session.requestLeaseWaiting(request)
