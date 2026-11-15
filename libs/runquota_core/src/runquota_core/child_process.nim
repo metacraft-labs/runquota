@@ -600,10 +600,17 @@ proc runCapturedProcess*(
       # serviced at the same time and the join below is guaranteed to return.
       if drainsStarted == 1 and not merged:
         drainHandle(addr errorDrain)
+      # `joinThread` only waits on `t.sys` (`WaitForSingleObject`); Nim's
+      # runtime never calls `CloseHandle` on the handle `CreateThread`
+      # returned (`std/typedthreads`, Windows branch), so without this the
+      # `CreateThread` handle stays open for the life of the process -- two
+      # per captured child, for every child this helper ever runs.
       if drainsStarted >= 1:
         joinThread(outputThread)
+        discard closeHandle(Handle(handle(outputThread)))
       if drainsStarted >= 2:
         joinThread(errorThread)
+        discard closeHandle(Handle(handle(errorThread)))
 
     let outputFailure = outputDrain.drainFailure()
     let errorFailure = errorDrain.drainFailure()
