@@ -26,7 +26,7 @@ usage:
   runquota stats export [KEY] [--limit N] [--all-users] [--all-profiles] [--json]
   runquota run [--width N|MIN:PREF] [--stats-key KEY] [--adapter NAME|none|list] [--verbose] -- COMMAND [ARG...]
   runquota jobserver [--width N|MIN:PREF] [--mem SIZE] [--stats-key KEY] [--verbose] -- COMMAND [ARG...]
-  runquota acquire --cpu N --mem BYTES [--label TEXT] [--machine ID] [--stats-key KEY] [--benchmark] [-- COMMAND [ARG...]]
+  runquota acquire --cpu MILLI --mem SIZE [--label TEXT] [--machine ID] [--stats-key KEY] [--benchmark] [-- COMMAND [ARG...]]
 ```
 
 There is no `--help`. Any invocation the CLI does not recognise prints this
@@ -168,8 +168,8 @@ runquota acquire --cpu 4000 --mem 2gib -- cargo build --release
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--cpu N` | `1000` | Milli-CPU. |
-| `--mem BYTES` | 128 MiB | Accepts `gib`/`mib`/`kib` (1024-based) and `gb`/`mb`/`kb` (1000-based), case-insensitive; a bare number is bytes. |
+| `--cpu MILLI` | `1000` | Milli-CPU: `1000` is one logical CPU, so `--cpu 2` reserves 0.002 of a CPU, not two. |
+| `--mem SIZE` | 128 MiB | Accepts `gib`/`mib`/`kib` (1024-based) and `gb`/`mb`/`kb` (1000-based), case-insensitive; a bare number is bytes. |
 | `--label TEXT` | `debug` | Shows up in `runquota leases`. |
 | `--machine ID` | `local` | Which configured machine to draw from. |
 | `--stats-key KEY` | none | Keys the [estimate](/getting_started/concepts#estimate) lookup and the recorded row. |

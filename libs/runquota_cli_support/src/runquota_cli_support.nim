@@ -62,7 +62,7 @@ proc renderUsage*(programName: string): string =
     "    of N-1 tokens for an N-slot grant, through MAKEFLAGS/CARGO_MAKEFLAGS;\n" &
     "    with RUNQUOTA_PARENT_LEASE set the lease is a sub-lease of that parent.\n" &
     "    Exit statuses as for run\n" &
-    "  " & programName & " acquire --cpu N --mem BYTES [--label TEXT] [--machine ID] [--stats-key KEY] [--benchmark] [-- COMMAND [ARG...]]"
+    "  " & programName & " acquire --cpu MILLI --mem SIZE [--label TEXT] [--machine ID] [--stats-key KEY] [--benchmark] [-- COMMAND [ARG...]]"
 
 proc parseMemory(value: string): uint64 =
   let lower = value.toLowerAscii()

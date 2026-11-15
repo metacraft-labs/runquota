@@ -58,7 +58,7 @@ Direct binary archives and release checksums are available on [GitHub Releases](
 RunQuota operates via a background coordinator daemon (`runquotad`) managing the machine's resource pools:
 
 ```bash
-runquotad --config /etc/runquota/runquota.toml
+runquotad --host-config /etc/runquota/runquota.toml
 ```
 
 ### Acquiring a lease
@@ -66,13 +66,13 @@ runquotad --config /etc/runquota/runquota.toml
 Wrap resource-intensive commands to run under managed quotas:
 
 ```bash
-runquota run --cores 4 --mem 8G -- ninja -C build
+runquota run --width 4 -- ninja -C build
 ```
 
 Query current machine usage and active leases:
 
 ```bash
-runquota stats
+runquota status
 ```
 
 ## Documentation
