@@ -528,6 +528,9 @@ suite "ambient_load_attribution":
     stopAmbientSampler()
     clearSelfReportedExecutions()
     let (store, _) = openSampledStore(dir, cadenceMillis)
+    # Runs before the scratch removal above, so a fatal precondition below
+    # never leaves the sampler writing into a directory being deleted.
+    defer: stopAmbientSampler()
     check ambientSamplerActive()
     # Sampling is gated on a live lease, and this block declared one. Every
     # row asserted below therefore describes an interval in which work was
@@ -1031,14 +1034,15 @@ suite "ambient_load_attribution":
         # process more than the executions declared, so nothing below can
         # tell attribution from an absence of load. That is a failure --
         # the case was not evaluated -- but not the failure of the
-        # assertion it would otherwise have been mistaken for.
-        checkpoint("PRECONDITION NOT MET: the synthetic load reached " &
+        # assertion it would otherwise have been mistaken for. Fatal: the
+        # rows below describe an invalid measurement and are not evaluated.
+        requireUnwinding false,
+          "PRECONDITION NOT MET: the synthetic load reached " &
           formatFloat(ownCpu, ffDecimal, 2) & "% of the machine with " &
           $spinners & " spinners on " & $cores & " logical CPUs (host " &
           formatFloat(busyNow, ffDecimal, 1) & "% busy before), after " &
           $attempts & " attempts; it must exceed the " & $declaredCpu &
-          "% the admitted executions declared")
-        fail()
+          "% the admitted executions declared"
 
       # Now the clamp, under real conditions rather than constructed ones:
       # one admitted execution reports more CPU and more memory than the

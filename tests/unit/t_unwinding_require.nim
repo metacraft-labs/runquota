@@ -72,17 +72,23 @@ when isMainModule:
         check code != 0
         check steps == @["enter"]
 
-      test "the ambient attribution fixture uses no unittest.require":
-        # It owns a private daemon inside try/finally; any `require` there
-        # can orphan it. The source is read, not imported.
+      test "the ambient attribution fixture has no quitting or nonfatal failure":
+        # It owns a private daemon inside try/finally. `require` and `quit`
+        # exit past that cleanup and can orphan it; a bare `fail()` keeps
+        # evaluating a measurement it has just declared invalid. Fatal
+        # preconditions there go through `requireUnwinding`. The source is
+        # read, not imported.
         let source = readFile(currentSourcePath().parentDir.parentDir /
           "integration" / "t_ambient_load_attribution.nim")
         var offending: seq[string] = @[]
         var lineNo = 0
         for line in source.splitLines():
           inc lineNo
-          let code = line.split('#', 1)[0].strip()
-          if code.startsWith("require ") or code.startsWith("require("):
+          let code = line.split('#', 1)[0]
+          var forbidden = false
+          for token in code.split(AllChars - IdentChars):
+            if token in ["require", "quit", "fail"]: forbidden = true
+          if forbidden:
             offending.add("line " & $lineNo & ": " & line)
         checkpoint(offending.join("\n"))
         check offending.len == 0
