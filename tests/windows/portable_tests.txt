@@ -49,6 +49,14 @@ tests/unit/t_packaging_contract.nim
 # exercised on the platform-specific legs (Linux `t_build_wait_pressure`,
 # Windows `t_build_wait_pressure_windows`).
 libs/runquota_daemon/tests/t_pressure_metrics.nim
+# The capacity ledger and its renderings as pure functions of the events fed to
+# them and an injected clock: what a finish with and without totals adds, when a
+# group drops out and how many idle ones are kept, and the Prometheus and JSON
+# labelling of names that are not plain text. No `when defined` guards, no live
+# daemon and no sqlite3; the real daemon, real transport and `promtool`'s own
+# check of the rendered file are on the platform-specific legs (Linux
+# `t_capacity_export`, Windows `t_capacity_export_windows`).
+libs/runquota_daemon/tests/t_capacity_metrics.nim
 # Windows-SPECIFIC rather than platform-neutral, and here because it needs
 # neither a daemon nor sqlite3: the host-state-directory DACL rule, row by
 # row, against real directories whose ACLs `icacls` writes. Nothing else on
