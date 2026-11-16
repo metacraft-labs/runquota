@@ -205,8 +205,10 @@ type
     ## The daemon MUST NOT clamp, second-guess, or validate ``memoryBytes``
     ## against its own table. The client may have got it from its own cache
     ## or from the published aggregate table; RunQuota expresses no opinion
-    ## about that cache, and the trust is sound because a client that
-    ## under-declares spends its OWN user's budget.
+    ## about that cache. The trust rests on estimates coming from
+    ## cooperating tools, not on containment: the daemon charges the
+    ## estimate to the ONE host-wide ledger as declared, so an
+    ## under-declared one frees capacity another user may then be granted.
     supplied*: bool
     memoryBytes*: uint64
 

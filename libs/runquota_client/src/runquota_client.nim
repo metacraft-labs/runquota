@@ -56,11 +56,11 @@ proc withEstimate*(request: ResourceRequest;
   ## Attaches the client's OWN estimate to a request.
   ##
   ## The daemon takes it at face value: it MUST NOT clamp it, second-guess
-  ## it, or validate it against its own learned table. That is only sound
-  ## because the blast radius stops at the per-user boundary — a client
-  ## that under-declares spends its own user's budget — and it is what lets
+  ## it, or validate it against its own learned table, and it is what lets
   ## the estimate arrive WITH the request, so admission costs no round trip
-  ## at the moment of asking.
+  ## at the moment of asking. The estimate is charged to the ONE host-wide
+  ## ledger as declared: an under-declared one frees capacity another user's
+  ## request may be granted, so pass a figure you believe.
   result = request
   result.estimate = ClientEstimate(supplied: true, memoryBytes: memoryBytes)
 

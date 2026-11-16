@@ -2890,9 +2890,11 @@ proc effectiveResources(daemon: RunQuotaDaemon; sessionId: SessionId;
   ##   validated against it. RunQuota expresses no opinion about the cache
   ##   the client got it from — not its format, its key, its lifetime, or
   ##   its freshness — and second-guessing it here would be exactly the
-  ##   validation the specification forbids. A client that under-declares
-  ##   spends its OWN user's budget, which is the whole reason the trust is
-  ##   affordable.
+  ##   validation the specification forbids. The trust rests on estimates
+  ##   coming from cooperating tools, NOT on containment: this figure is
+  ##   charged to the one host-wide ledger, so an under-declared estimate
+  ##   frees capacity that another user's request may then be granted, the
+  ##   same exposure a soft reservation already has.
   ## * **It did not.** The daemon's learned estimate is the FALLBACK, and
   ##   this is the only branch it may be used on. It is a fallback when
   ##   none is supplied, never a check on one that is.
