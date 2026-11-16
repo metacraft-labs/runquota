@@ -34,6 +34,12 @@ type
       ## enforcement is on. 0 = off (the switchable layer does nothing; the
       ## tree keeps its unconditional class). Independent of `target`: Windows
       ## has no cgroups, so `target` is always empty there.
+    qosTier*: uint8
+      ## macOS: the priority tier to apply to the tree below admission
+      ## (`runquota_process/qos_priority`), when qos enforcement is on. 0 =
+      ## off (the switchable layer does nothing; a reclaimed tree keeps its
+      ## unconditional nice +10). Independent of `target`: macOS has no
+      ## cgroups, so `target` is always empty there.
     rootProblem*: string
       ## Why there is no target: placement off or unavailable on this host.
     prioritySource*: GroupPrioritySource
@@ -95,7 +101,8 @@ proc treePlacement*(session: var RunQuotaSession; lease: RunQuotaLease;
                     capMilli = 0'u64;
                     root = currentCgroupRoot();
                     parent = parentLeaseFromEnvironment();
-                    jobPriorityOn = false): TreePlacement =
+                    jobPriorityOn = false;
+                    qosOn = false): TreePlacement =
   ## The placement of a tree started under `lease`: its session group's
   ## cgroup with the weight of the group's priority in force, or the
   ## reclaimed subtree for a reclaimed grant; with `capMilli > 0` a leaf of
@@ -124,6 +131,14 @@ proc treePlacement*(session: var RunQuotaSession; lease: RunQuotaLease;
   ## nothing. No lock: a single `SetInformationJobObject` call has no critical
   ## section a concurrent set can land inside.
   ##
+  ## MACOS (`qosOn`) is the same late-binding read on a third layer: a
+  ## non-reclaimed tree carries the SAME `prioritySource`, and the launch
+  ## reads it right before the fork, mapping the priority in force onto the
+  ## tier (`qosTierFor`); the tier set here, from the priority last known
+  ## (else declared), is the fallback the launch keeps only if the daemon
+  ## cannot answer then. A reclaimed grant is background whatever its group
+  ## and asks nothing.
+  ##
   ## THE OUTERMOST LAUNCHER PLACES. A launcher that itself runs inside a
   ## leased tree (`RUNQUOTA_PARENT_LEASE` set: a `runquota jobserver` under
   ## `runquota run`, say) leaves its tree where its parent put it -- for both
@@ -135,7 +150,7 @@ proc treePlacement*(session: var RunQuotaSession; lease: RunQuotaLease;
       ", which its own launcher placed"
     return
   let cgroupOff = root.state == crsOff
-  if cgroupOff and not jobPriorityOn:
+  if cgroupOff and not jobPriorityOn and not qosOn:
     # Both layers off: nothing below admission changes (a reclaimed tree
     # keeps its nice +10 / unconditional below-normal class through
     # `reclaimedNice`), and the daemon is not asked for the group's priority.
@@ -153,6 +168,13 @@ proc treePlacement*(session: var RunQuotaSession; lease: RunQuotaLease;
       if session.groupPriorityKnown: session.groupPriority
       else: session.declaredGroupPriority
     result.jobPriorityClass = jobPriorityClassFor(known, lease.reclaimed)
+    if not lease.reclaimed:
+      result.prioritySource = session.groupPrioritySource()
+  if qosOn:
+    let known =
+      if session.groupPriorityKnown: session.groupPriority
+      else: session.declaredGroupPriority
+    result.qosTier = qosTierFor(known, lease.reclaimed)
     if not lease.reclaimed:
       result.prioritySource = session.groupPrioritySource()
   if cgroupOff:
@@ -181,20 +203,26 @@ proc applyPlacement*(spec: var CommandSpec; placement: TreePlacement) =
   spec.placementFallbackNice = placement.fallbackNice
   spec.cgroupPriority = placement.prioritySource
   spec.jobPriorityClass = placement.jobPriorityClass
+  spec.qosTier = placement.qosTier
   if placement.target.isCapLeaf:
     sweepStaleCapLeaves(placement.target)
 
 proc placementNote*(placement: TreePlacement; launch: LaunchResult): string =
   ## One phrase for a launcher's verbose output: the cgroup the tree runs
-  ## in, or why it runs without one and at which nice.
+  ## in, or why it runs without one and at which nice; on macOS it also
+  ## says that there are no cgroups and no hard CPU cap (what a `--cap` that
+  ## is not enforced reports) and which priority policy the tree took.
   if launch.cgroupPath.len > 0:
-    "cgroup " & launch.cgroupPath
+    result = "cgroup " & launch.cgroupPath
   else:
     let why =
       if launch.cgroupProblem.len > 0: launch.cgroupProblem
       elif placement.rootProblem.len > 0: placement.rootProblem
       else: "no cgroup"
-    "not in a cgroup (" & why & "), nice +" & $launch.fallbackNice
+    result = "not in a cgroup (" & why & "), nice +" & $launch.fallbackNice
+    when defined(macosx):
+      result.add("; macOS has no cgroups and no hard CPU cap for a process " &
+        "tree; priority policy: " & qosTierName(launch.qosTier))
 
 proc libraryInfo*(): execTypes.LibraryInfo =
   execTypes.LibraryInfo(name: libraryName)
@@ -246,7 +274,8 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
                    exportParentLease = true;
                    placeTree = true;
                    cgroupRoot = currentCgroupRoot();
-                   jobPriorityOn = currentJobPriorityOn()):
+                   jobPriorityOn = currentJobPriorityOn();
+                   qosOn = currentQosOn()):
     LeaseExecutionResult =
   ## `exportParentLease` gives the child `RUNQUOTA_PARENT_LEASE` naming the
   ## lease it runs under. It is layered over `command.env`, so it also
@@ -276,7 +305,7 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
     spec.niceIncrement = max(spec.niceIncrement, lease.reclaimedNice())
     if placeTree:
       spec.applyPlacement(session.treePlacement(lease, root = cgroupRoot,
-        jobPriorityOn = jobPriorityOn))
+        jobPriorityOn = jobPriorityOn, qosOn = qosOn))
     if exportParentLease:
       spec.env.add(lease.parentLeaseEnvEntry())
     var child = launchProcess(spec)
@@ -322,7 +351,8 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
                    stderrLimit = DefaultOutputLimit;
                    waitForQueued = false;
                    cgroupRoot = currentCgroupRoot();
-                   jobPriorityOn = currentJobPriorityOn()):
+                   jobPriorityOn = currentJobPriorityOn();
+                   qosOn = currentQosOn()):
     LeaseExecutionResult =
   session.runWithLease(
     request,
@@ -335,5 +365,6 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
     ),
     waitForQueued = waitForQueued,
     cgroupRoot = cgroupRoot,
-    jobPriorityOn = jobPriorityOn
+    jobPriorityOn = jobPriorityOn,
+    qosOn = qosOn
   )

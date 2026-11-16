@@ -261,8 +261,9 @@ suite "capability records":
     check "off by default" in turnedOff.entries[0].gap
 
   test "macOS and Windows name what they lack":
-    # macOS enforces nothing below admission; Windows (job-priority OFF by
-    # default) enforces the width cap (Job Object CPU rate control) and the
+    # macOS with the qos switch OFF (default) enforces nothing below
+    # admission (its nice +10 is applied but does not schedule); Windows
+    # (job-priority OFF by default) enforces the width cap (Job Object CPU rate control) and the
     # reclaimed tree's unconditional below-normal class.
     for (os, enforced) in [("macos", newSeq[string]()),
                            ("windows", @["width-cap", "reclaimed"])]:

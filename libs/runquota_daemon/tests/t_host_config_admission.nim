@@ -324,5 +324,63 @@ suite "[enforcement] job-priority":
         discard editHostConfig(path, "enforcement.job-priority", value,
           unset = false, changed)
 
+suite "[enforcement] qos":
+  # Read by RunQuota's macOS launchers, which apply each leased tree's
+  # priority policy (the background policy for a reclaimed tree and for a
+  # `low` group's tree) only when it is "on" (or when RUNQUOTA_QOS names
+  # on); the daemon validates it with the rest of the file. Mutation:
+  # accepting any other value, or defaulting absent to on.
+  test "on, off, absent, and everything else refused":
+    check parseHostConfig("[enforcement]\nqos = \"on\"\n",
+      "test.toml").enforcementQos == some(true)
+    check parseHostConfig("[enforcement]\nqos = \"off\"\n",
+      "test.toml").enforcementQos == some(false)
+    check parseHostConfig("", "test.toml").enforcementQos.isNone
+    check parseHostConfig("", "test.toml").enforcementQos.get(false) == false
+    for (text, needle) in [
+        ("[enforcement]\nqos = \"yes\"\n", "qos must be \"on\" or \"off\""),
+        ("[enforcement]\nqos = on\n", "double-quoted"),
+        ("[enforcement]\nweight = \"on\"\n", "unknown key `weight` in [enforcement]")]:
+      let message = refusal(text)
+      check needle in message
+      if needle notin message:
+        echo "  for ", text.escape, ": ", message
+
+  test "the three switches coexist in [enforcement]":
+    let config = parseHostConfig(
+      "[enforcement]\ncgroups = \"off\"\njob-priority = \"off\"\nqos = \"on\"\n",
+      "test.toml")
+    check config.enforcementCgroups == some(false)
+    check config.enforcementJobPriority == some(false)
+    check config.enforcementQos == some(true)
+
+  test "the launcher's reader: on, off, absent file, unreadable file":
+    let root = scratch("enforcement-qos-reader")
+    let path = root / "runquotad.toml"
+    var problem = "stale"
+    check enforcementQosOn(problem, path) == false      # no file: off
+    check problem == ""
+    writeFile(path, "[enforcement]\nqos = \"on\"\n")
+    check enforcementQosOn(problem, path) == true
+    check problem == ""
+    writeFile(path, "[enforcement]\nqos = \"maybe\"\n")
+    check enforcementQosOn(problem, path) == false      # refused: off, says why
+    check "qos must be" in problem
+
+  test "runquota config set writes it and refuses anything but on or off":
+    let root = scratch("enforcement-qos")
+    let path = root / "runquotad.toml"
+    var changed = false
+    let text = editHostConfig(path, "enforcement.qos", "on",
+      unset = false, changed)
+    check changed
+    check "[enforcement]\nqos = \"on\"" in text
+    writeFile(path, text)
+    check readHostConfig(path).enforcementQos == some(true)
+    for value in ["yes", "1", "\"on\""]:
+      expect HostConfigError:
+        discard editHostConfig(path, "enforcement.qos", value,
+          unset = false, changed)
+
 for root in scratchRoots:
   removeDir(root)

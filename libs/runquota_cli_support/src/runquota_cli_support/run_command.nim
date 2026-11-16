@@ -318,6 +318,23 @@ proc launcherJobPriorityOn*(): bool =
   else:
     false
 
+proc launcherQosOn*(): bool =
+  ## macOS: whether RunQuota's CLI launchers apply their group's priority
+  ## policy to each leased tree below admission (`runquota_process/
+  ## qos_priority`) -- the variable `RUNQUOTA_QOS`, then the host file's
+  ## `[enforcement] qos` (off when absent). A host file that cannot be read
+  ## or parsed leaves it off: a launcher never fails over a setting it only
+  ## consults. Always off off macOS, where the launcher has no such policy
+  ## to apply (and reads no host file for this).
+  when defined(macosx):
+    var switchOn = false
+    if getEnv(QosEnvVar).strip().len == 0:
+      var problem = ""
+      switchOn = enforcementQosOn(problem)
+    currentQosOn(switchOn)
+  else:
+    false
+
 proc chooseAdapter(options: RunOptions): int =
   case options.adapter
   of "none": -1
@@ -428,7 +445,8 @@ proc runRun*(args: seq[string];
     placement = session.treePlacement(lease,
       capMilli = (if options.cap: uint64(lease.resources.cpu.value) else: 0'u64),
       root = launcherCgroupRoot(),
-      jobPriorityOn = launcherJobPriorityOn())
+      jobPriorityOn = launcherJobPriorityOn(),
+      qosOn = launcherQosOn())
   except RunQuotaClientError as failure:
     stderr.writeLine("runquota run: " &
       describeFailure(failure.msg, client.lastDiagnostic))

@@ -179,7 +179,8 @@ proc printStatus(json: bool): int =
   # belong to the launching client and its user (`runquota_process/
   # enforcement`).
   let enforcement = hostEnforcementRecord(launcherCgroupRoot(),
-    jobPriorityOn = launcherJobPriorityOn())
+    jobPriorityOn = launcherJobPriorityOn(),
+    qosOn = launcherQosOn())
   if json:
     let daemonJson =
       if statusJson.len > 0: statusJson else: inspectionStatusJson(status)
@@ -857,7 +858,8 @@ proc runDebugAcquire(args: seq[string]): int =
     if command.len > 0:
       let execution = session.runWithLease(request, command,
           waitForQueued = benchmark, cgroupRoot = launcherCgroupRoot(),
-          jobPriorityOn = launcherJobPriorityOn())
+          jobPriorityOn = launcherJobPriorityOn(),
+          qosOn = launcherQosOn())
       stdout.write(execution.process.stdout)
       stderr.write(execution.process.stderr)
       session.closeSession()

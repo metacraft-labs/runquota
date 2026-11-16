@@ -24,6 +24,7 @@ import std/strutils
 
 import runquota_process/cgroup_placement
 import runquota_process/job_priority
+import runquota_process/qos_priority
 
 type
   EnforcementMechanism* = enum
@@ -124,21 +125,57 @@ proc linuxRecord(root: CgroupRoot; probeProblem: string): EnforcementRecord =
         MemoryCapGap),
     ]
 
-proc macosRecord(): EnforcementRecord =
+const
+  MacosWidthCapGap = "macOS has no hard CPU cap for a process tree"
+  MacosMemoryCapGap = "macOS has no hard memory cap for a process tree"
+  MacosNiceGap = "nice +" & $ReclaimedNiceIncrement & " is applied but " &
+    "measured not to change the CPU share of an exec'd tree on macOS, " &
+    "which schedules by QoS class"
+  MacosTwoLevelsGap = "macOS can lower a forked-and-exec'd tree only to the " &
+    "background policy: a low group is held as hard as reclaimed work, and " &
+    "high and urgent cannot be raised above normal (no QoS class can be " &
+    "set without posix_spawn, nice does not schedule an exec'd tree, and a " &
+    "negative nice needs root)"
+
+proc macosRecord(qosOn: bool; problem = ""): EnforcementRecord =
+  ## Two layers, as on Linux and Windows. A RECLAIMED tree always runs at
+  ## nice +10 (unconditional), which on macOS does not change the CPU share
+  ## of an exec'd tree (measured, `qos_priority`), so `reclaimed` is only
+  ## `degraded` while the switch is off. With `qos` on, a reclaimed tree and
+  ## a `low` group's tree run under the background policy, which the
+  ## scheduler does honour (reclaimed `enforced`); priority is `degraded`
+  ## because it has two levels, not four (`MacosTwoLevelsGap`).
   result.os = "macos"
   result.placement = "n/a"
-  result.entries = @[
-    entry(emPriority, elDegraded, "nice +" & $LowPriorityNiceIncrement &
-      " for low-priority groups; no weight between normal, high and urgent",
-      "macOS has no cgroups; process QoS classes per group are not " &
-      "implemented yet"),
-    entry(emReclaimed, elDegraded, "nice +" & $ReclaimedNiceIncrement,
-      "background QoS for reclaimed trees is not implemented yet"),
-    entry(emWidthCap, elNone, "runquota run --cap runs the command uncapped",
-      "macOS has no hard CPU cap for a process tree"),
-    entry(emMemoryCap, elNone, "admission (memory reservation)",
-      "macOS has no hard memory cap for a process tree"),
-  ]
+  if qosOn:
+    result.entries = @[
+      entry(emPriority, elDegraded,
+        "background policy (setpriority PRIO_DARWIN_BG) for low-priority " &
+        "groups and reclaimed trees; normal, high and urgent unchanged",
+        MacosTwoLevelsGap),
+      entry(emReclaimed, elEnforced,
+        "background policy (setpriority PRIO_DARWIN_BG: lowest CPU " &
+        "priority, throttled IO), inherited by every process of the tree"),
+      entry(emWidthCap, elNone, "runquota run --cap runs the command uncapped",
+        MacosWidthCapGap),
+      entry(emMemoryCap, elNone, "admission (memory reservation)",
+        MacosMemoryCapGap),
+    ]
+  else:
+    let reason = if problem.len > 0: problem
+      else: "off by default (the host file does not set [enforcement] " &
+        "qos = \"on\")"
+    result.placementProblem = reason
+    let gap = "qos priority off: " & reason
+    result.entries = @[
+      entry(emPriority, elAdmissionOnly, "admission", gap),
+      entry(emReclaimed, elDegraded, "nice +" & $ReclaimedNiceIncrement,
+        gap & "; " & MacosNiceGap),
+      entry(emWidthCap, elNone, "runquota run --cap runs the command uncapped",
+        MacosWidthCapGap),
+      entry(emMemoryCap, elNone, "admission (memory reservation)",
+        MacosMemoryCapGap),
+    ]
 
 const WindowsWidthCapHow = "Job Object CPU rate control, a hard cap at the " &
   "granted width (runquota run --cap)"
@@ -190,16 +227,19 @@ proc windowsRecord(jobPriorityOn: bool; problem = ""): EnforcementRecord =
 proc enforcementRecordFor*(os: string; root = CgroupRoot();
                            probeProblem = "";
                            jobPriorityOn = false;
-                           jobPriorityProblem = ""): EnforcementRecord =
+                           jobPriorityProblem = "";
+                           qosOn = false;
+                           qosProblem = ""): EnforcementRecord =
   ## The record for `os` (`linux`, `macos`, `windows`). On Linux `root` is
   ## the resolved cgroup root and `probeProblem` what probing it found ("" =
   ## trees can be placed there). On Windows `jobPriorityOn` is the
   ## `[enforcement] job-priority` switch in force and `jobPriorityProblem`
-  ## why it is off (for the gap text). Any other OS is recorded as enforcing
+  ## why it is off (for the gap text); on macOS `qosOn` and `qosProblem` are
+  ## the `[enforcement] qos` switch the same way. Any other OS is recorded as enforcing
   ## nothing below admission.
   case os
   of "linux": linuxRecord(root, probeProblem)
-  of "macos": macosRecord()
+  of "macos": macosRecord(qosOn, qosProblem)
   of "windows": windowsRecord(jobPriorityOn, jobPriorityProblem)
   else:
     EnforcementRecord(os: os, placement: "n/a", entries: @[
@@ -216,15 +256,18 @@ proc hostOsName*(): string =
 
 proc hostEnforcementRecord*(root = currentCgroupRoot();
                             jobPriorityOn = currentJobPriorityOn();
-                            jobPriorityProblem = jobPriorityOffReason(false)):
+                            jobPriorityProblem = jobPriorityOffReason(false);
+                            qosOn = currentQosOn();
+                            qosProblem = qosOffReason(false)):
     EnforcementRecord =
   ## This process's record for the enforcement its launchers would use (a
   ## launcher that reads the host file passes the root and the switch it
   ## resolved with it); on Linux the cgroup root is probed without creating
-  ## anything, on Windows `jobPriorityOn` is the job-priority switch. The
+  ## anything, on Windows `jobPriorityOn` is the job-priority switch, on
+  ## macOS `qosOn` the qos switch. The
   ## defaults read only the environment, as `currentCgroupRoot` does.
   enforcementRecordFor(hostOsName(), root, probeRoot(root),
-    jobPriorityOn, jobPriorityProblem)
+    jobPriorityOn, jobPriorityProblem, qosOn, qosProblem)
 
 proc gaps*(record: EnforcementRecord): seq[EnforcementEntry] =
   for item in record.entries:

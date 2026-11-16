@@ -23,14 +23,25 @@ when defined(windows):
 import runquota_process/types as processTypes
 import runquota_process/enforcement
 import runquota_process/job_priority
+import runquota_process/qos_priority
 
-export processTypes, enforcement, job_priority
+export processTypes, enforcement, job_priority, qos_priority
 
 const libraryName* = "runquota_process"
 const DefaultOutputLimit* = 1_048_576
 
 when defined(posix):
   proc childExit(status: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
+
+  when defined(macosx):
+    # The background policy of a whole process (what `taskpolicy -b` sets):
+    # `setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`. Declared here
+    # because `std/posix` has neither constant. See `runquota_process/
+    # qos_priority` for what this and nice measured as.
+    proc darwinSetpriority(which: cint; who: cint; prio: cint): cint {.
+      importc: "setpriority", header: "<sys/resource.h>".}
+    var PRIO_DARWIN_PROCESS {.importc, header: "<sys/resource.h>".}: cint
+    var PRIO_DARWIN_BG {.importc, header: "<sys/resource.h>".}: cint
 
   # ---------------------------------------------------------------------------
   # Descriptor hygiene
@@ -1428,6 +1439,19 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     else:
       if target.placed:
         placementProblem = "cgroup placement is implemented on Linux only"
+    # macOS: THE TIER IS READ AT THE LAST INSTANT, right before the fork, the
+    # same read the Linux weight takes under its lock and the Windows class
+    # takes before its Job Object call: a `session set --priority` that
+    # landed since the placement was decided is seen, not overwritten. The
+    # tier resolved at placement is the fallback when the daemon cannot
+    # answer. A reclaimed tree is background whatever its group and reads
+    # nothing (`cgroupPriority` is unset for it).
+    var qosTierWanted = when defined(macosx): spec.qosTier else: QosTierNone
+    when defined(macosx):
+      if qosTierWanted != QosTierNone:
+        var inForce: SessionPriority
+        if spec.cgroupPriority.readNow(inForce):
+          qosTierWanted = qosTierFor(inForce, reclaimed = false)
     pid = fork()
     when defined(linux):
       if pid == 0 and joining:
@@ -1456,6 +1480,15 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       let niceWanted =
         if inCgroup: spec.niceIncrement
         else: max(spec.niceIncrement, fallbackNiceWanted)
+      when defined(macosx):
+        # The priority policy of the macOS layer (`qos_priority`), applied in
+        # the child by plain system calls before the `execve`, so it is
+        # inherited by every process of the tree and the C library's fork
+        # handlers have run. A call that fails leaves the child at its
+        # inherited policy: the grant is still within what admission
+        # predicted, so failing the launch would cost the work for nothing.
+        if qosTierWanted == QosTierBackground:
+          discard darwinSetpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)
       if niceWanted > 0:
         # Async-signal-safe in effect (two syscalls, no allocation). A nice
         # that fails leaves the child at its inherited weight: the grant is
@@ -1576,7 +1609,8 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         backend: backendProfile(),
         cgroupPath: placedLeaf,
         cgroupProblem: placementProblem,
-        fallbackNice: fallbackNiceWanted
+        fallbackNice: fallbackNiceWanted,
+        qosTier: qosTierWanted
       ),
       cgroupTarget: placedTarget
     )

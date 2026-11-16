@@ -110,6 +110,16 @@ type
       ## per-process `SetPriorityClass` a child could override, forces every
       ## process in the tree, now and every one it later spawns. Ignored off
       ## Windows.
+    qosTier*: uint8
+      ## macOS: the priority policy the child applies to itself before it
+      ## executes, below admission (`runquota_process/qos_priority`: 0 none,
+      ## 1 the background policy), inherited by every
+      ## process the tree starts. 0 = the switchable layer off. The tier
+      ## resolved at PLACEMENT time is, for a reclaimed tree, final
+      ## (`cgroupPriority` is unset); for any other it is the FALLBACK the
+      ## launch keeps only if the last-instant read through `cgroupPriority`
+      ## cannot answer. Applied by an ordinary fork and execve, so the fork
+      ## handlers of preload libraries still run. Ignored off macOS.
 
   LaunchResult* = object
     processId*: uint64
@@ -125,6 +135,9 @@ type
       ## The nice the child took in place of its cgroup when it was not
       ## placed (`CommandSpec.placementFallbackNice`, or the one the launch
       ## derived from the priority it read through `cgroupPriority`).
+    qosTier*: uint8
+      ## macOS: the tier (`runquota_process/qos_priority`) the child applied
+      ## to itself before it executed; 0 elsewhere or with the layer off.
 
   ProcessCompletion* = object
     processId*: uint64
