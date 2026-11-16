@@ -34,9 +34,11 @@ when defined(macosx):
   proc alarm(seconds: cuint): cuint {.
     importc: "alarm", header: "<unistd.h>".}
 
-  proc cpuUsageMicros(): uint64 =
+  proc cpuUsageMicros(who = 0.cint): uint64 =
+    ## CPU of this process (RUSAGE_SELF, 0) or of the descendants it has
+    ## waited for (RUSAGE_CHILDREN, -1).
     var usage: Rusage
-    doAssert getRusage(0.cint, addr usage) == 0.cint
+    doAssert getRusage(who, addr usage) == 0.cint
     let userMicros =
       uint64(usage.ru_utime.tv_sec) * 1_000_000'u64 +
       uint64(usage.ru_utime.tv_usec)
@@ -209,6 +211,43 @@ suite "runquota_host_macos native process telemetry":
       let usageDelta = usageAfter - usageBefore
       check telemetryDelta >= usageDelta div 2'u64
       check telemetryDelta <= usageDelta * 3'u64 + 20_000'u64
+
+    test "the cumulative reading keeps the CPU of descendants already reaped":
+      # The CPU profile is built from differences of this reading, so it
+      # must not fall when a process of the tree exits and is reaped inside
+      # it. Here the root is this process and the descendant is a real shell
+      # loop it waits for. `cpuTimeMicros` (live processes' own time) does
+      # not see the child once it is reaped; `cumulativeCpuTimeMicros` must,
+      # to within the kernel's accounting, equal what getrusage reports for
+      # the waited-for children. Falsifying mutation: fill the cumulative
+      # figure from own time only (drop the `ri_child_*` terms) and the
+      # delta below is about zero.
+      let processId = uint64(getCurrentProcessId())
+      let before = sampleMacosProcessTreeTelemetry(processId)
+      let childrenBefore = cpuUsageMicros(-1.cint)
+      let owner = cpuUsageMicros()
+      var child = startProcess("/bin/sh",
+        args = ["-c", "i=0; while [ $i -lt 60000 ]; do i=$((i+1)); done"],
+        options = {poParentStreams})
+      check child.waitForExit(60_000) == 0
+      child.close()
+      let childUsage = cpuUsageMicros(-1.cint) - childrenBefore
+      let ownerDelta = cpuUsageMicros() - owner
+      let after = sampleMacosProcessTreeTelemetry(processId)
+
+      check before.cumulativeCpuKnown
+      check after.cumulativeCpuKnown
+      check childUsage >= 50_000'u64
+      check after.cumulativeCpuTimeMicros >= before.cumulativeCpuTimeMicros
+      let cumulativeDelta =
+        after.cumulativeCpuTimeMicros - before.cumulativeCpuTimeMicros
+      checkpoint "children " & $childUsage & " us, cumulative delta " &
+        $cumulativeDelta & " us, own " & $ownerDelta & " us"
+      check cumulativeDelta >= childUsage div 2'u64
+      check cumulativeDelta <= (childUsage + ownerDelta) * 2'u64 + 20_000'u64
+      # The live-only figure does not include the reaped child.
+      check after.cpuTimeMicros - before.cpuTimeMicros <
+        cumulativeDelta - childUsage div 2'u64
 
     test "real process trees are sampled repeatedly without touching a sentinel":
       let fixtureDir = getTempDir() /

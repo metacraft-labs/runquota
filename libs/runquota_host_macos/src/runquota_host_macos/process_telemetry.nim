@@ -8,11 +8,15 @@ const TelemetrySource = "macos-libproc"
 
 when defined(macosx):
   const
-    ProcAllPids = 1'u32
     ProcPidTBsdInfo = 3.cint
     ProcPidTaskInfo = 4.cint
-    PidGrowthMargin = 64
-    MaxPidListAttempts = 4
+    RusageFlavorV2 = 2.cint
+      ## `RUSAGE_INFO_V2` of `<sys/resource.h>`. Its leading fields are
+      ## V1's, which added the reaped-children times (`ri_child_*`).
+    MaxChildListAttempts = 8
+    MaxTreeProcesses = 65536
+      ## A bound on one walk, so a fork bomb cannot make the walk itself
+      ## unbounded; the sample then covers the processes visited.
 
   type
     DarwinPid = int32
@@ -30,6 +34,13 @@ when defined(macosx):
       pti_total_user {.importc.}: uint64
       pti_total_system {.importc.}: uint64
 
+    RusageInfoV2 {.importc: "struct rusage_info_v2",
+                    header: "<sys/resource.h>", bycopy.} = object
+      ri_user_time {.importc.}: uint64
+      ri_system_time {.importc.}: uint64
+      ri_child_user_time {.importc.}: uint64
+      ri_child_system_time {.importc.}: uint64
+
     MachTimebaseInfoData {.importc: "mach_timebase_info_data_t",
                             header: "<mach/mach_time.h>", bycopy.} = object
       numer {.importc.}: uint32
@@ -41,13 +52,17 @@ when defined(macosx):
       startSeconds: uint64
       startMicroseconds: uint64
 
-  proc procListPids(kind, kindInfo: uint32; buffer: pointer;
-                    bufferSize: cint): cint {.
-    importc: "proc_listpids", header: "<libproc.h>".}
-
   proc procPidInfo(pid, flavor: cint; arg: uint64; buffer: pointer;
                    bufferSize: cint): cint {.
     importc: "proc_pidinfo", header: "<libproc.h>".}
+
+  proc procListChildPids(parent: DarwinPid; buffer: pointer;
+                         bufferSize: cint): cint {.
+    importc: "proc_listchildpids", header: "<libproc.h>".}
+    ## Returns the NUMBER of child pids written (not bytes), or -1.
+
+  proc procPidRusage(pid, flavor: cint; buffer: pointer): cint {.
+    importc: "proc_pid_rusage", header: "<libproc.h>".}
 
   proc machTimebaseInfo(info: ptr MachTimebaseInfoData): cint {.
     importc: "mach_timebase_info", header: "<mach/mach_time.h>".}
@@ -76,55 +91,49 @@ when defined(macosx):
       left.startSeconds == right.startSeconds and
       left.startMicroseconds == right.startMicroseconds
 
-  proc processIdentities(): tuple[rows: seq[MacosProcessIdentity];
-                                  detail: string] =
-    let queriedBytes = procListPids(ProcAllPids, 0'u32, nil, 0.cint)
-    if queriedBytes <= 0:
-      return (@[], "libproc could not size the process list")
-
-    let pidBytes = sizeof(DarwinPid)
-    var capacity = (int(queriedBytes) + pidBytes - 1) div pidBytes
-    capacity += PidGrowthMargin
-    for _ in 0 ..< MaxPidListAttempts:
+  proc childPids(parent: DarwinPid; children: var seq[DarwinPid]) =
+    ## Appends the direct children of `parent`. The buffer is grown until
+    ## the answer fits: a full buffer means the list may be truncated.
+    var capacity = 32
+    for _ in 0 ..< MaxChildListAttempts:
       var pids = newSeq[DarwinPid](capacity)
-      let returnedBytes = procListPids(
-        ProcAllPids,
-        0'u32,
-        addr pids[0],
-        cint(pids.len * pidBytes)
-      )
-      if returnedBytes < 0:
-        return (@[], "libproc could not enumerate processes")
-      if int(returnedBytes) < pids.len * pidBytes:
-        let returnedCount = int(returnedBytes) div pidBytes
-        var seen = initHashSet[uint64]()
-        for index in 0 ..< returnedCount:
-          let pid = pids[index]
-          if pid <= 0:
-            continue
-          var identity: MacosProcessIdentity
-          if readIdentity(pid, identity) and identity.pid notin seen:
-            result.rows.add(identity)
-            seen.incl(identity.pid)
+      let count = procListChildPids(parent, addr pids[0],
+        cint(pids.len * sizeof(DarwinPid)))
+      if count < 0:
         return
-      capacity = capacity * 2
+      if int(count) < capacity:
+        for index in 0 ..< int(count):
+          if pids[index] > 0:
+            children.add(pids[index])
+        return
+      capacity *= 4
 
-    result.detail = "the process list kept growing during the bounded snapshot"
-
-  proc collectTreePids(rows: openArray[MacosProcessIdentity];
-                       rootProcessId: uint64): HashSet[uint64] =
-    result = initHashSet[uint64]()
-    for row in rows:
-      if row.pid == rootProcessId:
-        result.incl(rootProcessId)
-        break
-    var changed = true
-    while changed:
-      changed = false
-      for row in rows:
-        if row.pid notin result and row.ppid in result:
-          result.incl(row.pid)
-          changed = true
+  proc treeIdentities(rootProcessId: DarwinPid): seq[MacosProcessIdentity] =
+    ## The processes of the tree under `rootProcessId` (the root included),
+    ## breadth first through `proc_listchildpids`. One cheap call per tree
+    ## member, NOT a snapshot of every process on the host: on a busy
+    ## machine that snapshot is thousands of `proc_pidinfo` calls per
+    ## reading. Empty when the root is not there.
+    var root: MacosProcessIdentity
+    if not readIdentity(rootProcessId, root):
+      return
+    var queue = @[rootProcessId]
+    var seen = initHashSet[uint64]()
+    seen.incl(uint64(rootProcessId))
+    result.add(root)
+    var index = 0
+    while index < queue.len and result.len < MaxTreeProcesses:
+      var children: seq[DarwinPid] = @[]
+      childPids(queue[index], children)
+      inc index
+      for child in children:
+        if uint64(child) in seen:
+          continue
+        seen.incl(uint64(child))
+        var identity: MacosProcessIdentity
+        if readIdentity(child, identity):
+          result.add(identity)
+          queue.add(child)
 
   proc checkedAdd(total: var uint64; value: uint64) =
     if value > high(uint64) - total:
@@ -149,7 +158,7 @@ when defined(macosx):
     nanoseconds div 1_000'u64
 
   proc readMetrics(identity: MacosProcessIdentity; residentBytes,
-                   cpuTimeMicros: var uint64;
+                   cpuTimeMicros, cumulativeMicros: var uint64;
                    timebase: MachTimebaseInfoData): bool =
     if identity.pid > uint64(high(DarwinPid)):
       return false
@@ -178,6 +187,21 @@ when defined(macosx):
     var cpuTimeTicks = task.pti_total_user
     cpuTimeTicks.checkedAdd(task.pti_total_system)
     cpuTimeMicros = absoluteTimeMicros(cpuTimeTicks, timebase)
+
+    # Own plus reaped descendants (`ri_child_*`): the macOS counterpart of
+    # `utime + stime + cutime + cstime` in Linux's /proc/<pid>/stat, which is
+    # what makes a reading of the tree not fall when a process exits and is
+    # reaped inside it. Also in Mach absolute-time ticks. A process whose
+    # rusage cannot be read (it exited meanwhile) is skipped like one whose
+    # task info cannot.
+    var usage: RusageInfoV2
+    if procPidRusage(pid, RusageFlavorV2, addr usage) != 0.cint:
+      return false
+    var cumulativeTicks = usage.ri_user_time
+    cumulativeTicks.checkedAdd(usage.ri_system_time)
+    cumulativeTicks.checkedAdd(usage.ri_child_user_time)
+    cumulativeTicks.checkedAdd(usage.ri_child_system_time)
+    cumulativeMicros = absoluteTimeMicros(cumulativeTicks, timebase)
     true
 
 proc sampleMacosProcessTreeTelemetryNative*(
@@ -190,14 +214,9 @@ proc sampleMacosProcessTreeTelemetryNative*(
         "root process id is outside the Darwin PID range"
       )
 
-    let snapshot = processIdentities()
-    let treePids = collectTreePids(snapshot.rows, rootProcessId)
-    if treePids.len == 0:
-      let detail =
-        if snapshot.detail.len > 0:
-          snapshot.detail
-        else:
-          "root process is not present in the libproc snapshot"
+    let tree = treeIdentities(DarwinPid(rootProcessId))
+    if tree.len == 0:
+      let detail = "root process is not present in libproc"
       return HostProcessTreeTelemetrySample(
         rootProcessId: rootProcessId,
         rootAlive: false,
@@ -214,6 +233,7 @@ proc sampleMacosProcessTreeTelemetryNative*(
 
     var residentMemoryBytes = 0'u64
     var cpuTimeMicros = 0'u64
+    var cumulativeMicros = 0'u64
     var timebase: MachTimebaseInfoData
     if machTimebaseInfo(addr timebase) != 0.cint or timebase.denom == 0'u32:
       return unavailableProcessTreeTelemetrySample(
@@ -221,19 +241,22 @@ proc sampleMacosProcessTreeTelemetryNative*(
         rootProcessId,
         "the Mach absolute-time conversion is unavailable"
       )
-    for row in snapshot.rows:
-      if row.pid in treePids:
-        var rowResidentBytes, rowCpuTimeMicros: uint64
-        if readMetrics(row, rowResidentBytes, rowCpuTimeMicros, timebase):
-          residentMemoryBytes.checkedAdd(rowResidentBytes)
-          cpuTimeMicros.checkedAdd(rowCpuTimeMicros)
+    for row in tree:
+      var rowResidentBytes, rowCpuTimeMicros, rowCumulativeMicros: uint64
+      if readMetrics(row, rowResidentBytes, rowCpuTimeMicros,
+                     rowCumulativeMicros, timebase):
+        residentMemoryBytes.checkedAdd(rowResidentBytes)
+        cpuTimeMicros.checkedAdd(rowCpuTimeMicros)
+        cumulativeMicros.checkedAdd(rowCumulativeMicros)
 
     HostProcessTreeTelemetrySample(
       rootProcessId: rootProcessId,
       rootAlive: true,
-      processCount: uint32(treePids.len),
+      processCount: uint32(tree.len),
       residentMemoryBytes: residentMemoryBytes,
       cpuTimeMicros: cpuTimeMicros,
+      cumulativeCpuTimeMicros: cumulativeMicros,
+      cumulativeCpuKnown: true,
       source: TelemetrySource,
       diagnostic: okDiagnostic()
     )
