@@ -16,6 +16,14 @@
 ## figure's arithmetic and the division between owners are clearest on the
 ## pure order.
 ##
+## The suite "more session groups take nothing from another user" is the
+## regression test for reprobuild-pm issue
+## `issues/2026-11-12-cross-user-fairness-is-claimed-but-unspecified-and-keyed-on-client-declared-identity.md`:
+## the host is divided between owners (uids from peer credentials) before any
+## session-group attribute, so a user cannot take more of it by opening more
+## groups (RunQuota-Protocol-And-Client-Libraries.md § Session Groups,
+## "Admission between owners").
+##
 ## Each case names the change that makes it fail.
 
 import std/[math, strutils, tables, unittest]
@@ -266,10 +274,17 @@ type
     cpuMilli: uint64
     leaseMillis: int64
     arrival: uint64
+    owner: string
+      ## The owner (uid) the group belongs to; empty means "1000". Group
+      ## names are unique across owners here, so a name is also the group key.
+
+proc ownerOf(g: SimGroup): string =
+  if g.owner.len > 0: g.owner else: "1000"
 
 proc simulateFairShare(groups: openArray[SimGroup]; capacity: uint64;
                        keys: seq[AdmissionKey]; maxWait, totalMillis,
-                       warmupMillis: int64): Table[string, float64] =
+                       warmupMillis: int64;
+                       share = sbuDrf): Table[string, float64] =
   ## CPU held x time per group, after `warmupMillis`, over `totalMillis` of
   ## simulated time in 1 s steps. Every step ends the leases that are due,
   ## tops each group's queue up to the whole host, runs one admission pass
@@ -287,6 +302,7 @@ proc simulateFairShare(groups: openArray[SimGroup]; capacity: uint64;
   type Running = tuple[group: string, cpu: uint64, endsAt: int64]
   var held, sizes, durations = initTable[string, uint64]()
   var arrivals = initTable[string, uint64]()
+  var owners = initTable[string, string]()
   var recent = initTable[string, float64]()
   var running: seq[Running] = @[]
   var queue: seq[tuple[id: uint64, group: string, queuedAt: int64]] = @[]
@@ -297,6 +313,7 @@ proc simulateFairShare(groups: openArray[SimGroup]; capacity: uint64;
     sizes[g.name] = g.cpuMilli
     durations[g.name] = uint64(g.leaseMillis)
     arrivals[g.name] = g.arrival
+    owners[g.name] = g.ownerOf
     recent[g.name] = 0.0
     result[g.name] = 0.0
   var now = 0'i64
@@ -320,14 +337,22 @@ proc simulateFairShare(groups: openArray[SimGroup]; capacity: uint64;
         inc queued
     var pending: seq[PendingRequest] = @[]
     for entry in queue:
-      pending.add(PendingRequest(id: entry.id, owner: "1000",
+      pending.add(PendingRequest(id: entry.id, owner: owners[entry.group],
         groupPriority: sessionPriorityNormal,
         groupArrival: arrivals[entry.group], queueOrder: entry.id,
         waitedMillis: now - entry.queuedAt, groupKey: entry.group,
         fairShareCpu: fairShareFigure(recent[entry.group], held[entry.group])))
-    var plan = planAdmission(pending, initTable[string, OwnerLoad](),
-      AdmissionPolicy(order: keys, maxWaitMillis: maxWait,
-        capacityCpuMilli: capacity, capacityMemoryBytes: 1))
+    # What each owner's granted leases hold now, as the daemon passes it
+    # from its lease table: the input dominant-resource fairness divides by.
+    var load = initTable[string, OwnerLoad]()
+    for g in groups:
+      var owned = load.getOrDefault(g.ownerOf, OwnerLoad())
+      owned.cpuMilli += held[g.name]
+      load[g.ownerOf] = owned
+    var plan = planAdmission(pending, load,
+      AdmissionPolicy(order: keys, shareBetweenUsers: share,
+        maxWaitMillis: maxWait, capacityCpuMilli: capacity,
+        capacityMemoryBytes: 1))
     var granted: seq[uint64] = @[]
     var next: PendingRequest
     while plan.next(next):
@@ -459,3 +484,66 @@ suite "share-between-users = none":
       request(2, owner = "2000", arrival = 2, group = "b", waited = 9_000)]
     check order(starved, maxWait = 500, keys = fs, share = sbuNone) ==
       @[2'u64, 1]
+
+proc ownerShares(held: Table[string, float64];
+                 groups: openArray[SimGroup]): Table[string, float64] =
+  ## Each owner's fraction of all CPU x time the simulation granted.
+  var total = 0.0
+  for value in held.values:
+    total += value
+  for g in groups:
+    result[g.ownerOf] = result.getOrDefault(g.ownerOf, 0.0) +
+      held[g.name] / total
+  for owner, fraction in result:
+    echo "    owner " & owner & ": " & formatFloat(fraction, ffDecimal, 3)
+
+suite "more session groups take nothing from another user":
+  # The attack of reprobuild-pm issue
+  # `issues/2026-11-12-cross-user-fairness-is-claimed-but-unspecified-and-keyed-on-client-declared-identity.md`:
+  # a group is named by whatever `RUNQUOTA_SESSION` its launcher exports, so
+  # one user can open as many groups as it likes. Owner 1000 runs seven busy
+  # groups and owner 2000 one; every group always wants the whole host. The
+  # host is divided between OWNERS (uids from peer credentials) by dominant-
+  # resource fairness, so owner 2000 still holds half of it over time, under
+  # the default order and under `fair-share` alike.
+  #
+  # Mutations that fail it: make `dominantShare` return 0, so every owner
+  # ties and the division never decides (owner 2000 then gets 0.077 under
+  # both orders: only its starvation turns); or drop the division as
+  # `share-between-users = none` does (the controls below: 1/8 under
+  # fair-share, which is one group's share rather than one user's, and
+  # nothing under the default order, where owner 1000's groups became busy
+  # first and keep the host).
+  const Hour = 3_600_000'i64
+  const Warmup = 600_000'i64
+  const Capacity = 8000'u64
+  var groups: seq[SimGroup] = @[]
+  for i in 0 ..< 7:
+    groups.add(SimGroup(name: "many-" & $i, cpuMilli: 1000,
+      leaseMillis: 10_000, arrival: uint64(i + 1), owner: "1000"))
+  groups.add(SimGroup(name: "one", cpuMilli: 1000, leaseMillis: 10_000,
+    arrival: 8, owner: "2000"))
+  let fs = @[akStarvation, akFairShare, akArrival]
+
+  test "under drf and the default order, each owner holds half the host":
+    let shares = ownerShares(simulateFairShare(groups, Capacity, @[],
+      120_000, Hour, Warmup), groups)
+    check abs(shares["2000"] - 0.5) < 0.05
+
+  test "under drf and fair-share, each owner holds half the host":
+    let shares = ownerShares(simulateFairShare(groups, Capacity, fs,
+      120_000, Hour, Warmup), groups)
+    check abs(shares["2000"] - 0.5) < 0.05
+
+  test "control: without the division, more groups take more of the host":
+    # `share-between-users = none` is the documented opt-out for hosts whose
+    # users trust each other's load. These show the cases above measure the
+    # division and not something the simulation does anyway.
+    let fair = ownerShares(simulateFairShare(groups, Capacity, fs, 120_000,
+      Hour, Warmup, share = sbuNone), groups)
+    check abs(fair["2000"] - 0.125) < 0.03
+    # Without the starvation bound (whose held slots would hand owner 2000
+    # an occasional turn), the default order is first come first served.
+    let fifo = ownerShares(simulateFairShare(groups, Capacity, @[], 0,
+      Hour, Warmup, share = sbuNone), groups)
+    check fifo["2000"] < 0.01
