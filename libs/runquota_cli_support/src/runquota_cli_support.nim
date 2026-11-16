@@ -1,6 +1,7 @@
 import std/[json, os, osproc, strutils, times]
 
 import runquota_client
+import runquota_client/pressure_text
 import runquota_core
 import runquota_exec
 import runquota_process
@@ -43,6 +44,9 @@ proc renderUsage*(programName: string): string =
     "    change a session group's priority or prompt-cache deadline; only the\n" &
     "    group's owner may (exit 1 when the daemon refuses, 2 on bad arguments)\n" &
     configUsage.replace("  runquota ", "  " & programName & " ") &
+    "  " & programName & " pressure [--group GROUP] [--json]\n" &
+    "    build-wait pressure per host, session group and open session (exit 1\n" &
+    "    when the daemon cannot be reached or predates it, 2 on bad arguments)\n" &
     "  " & programName & " stats-table [KEY]\n" &
     "  " & programName & " stats capture [--json]\n" &
     "  " & programName & " stats top [KEY] [--limit N] [--all-users] [--all-profiles] [--json]\n" &
@@ -646,6 +650,47 @@ proc clientFailureText(message: string; last: Diagnostic): string =
   else:
     message
 
+proc runPressure(programName: string; args: seq[string]): int =
+  ## `runquota pressure [--group G] [--json]`: the daemon's `QueryPressure`
+  ## answer, as text or as the JSON it sent.
+  var json = false
+  var group = ""
+  var i = 0
+  while i < args.len:
+    case args[i]
+    of "--json":
+      json = true
+      inc i
+    of "--group":
+      if i + 1 >= args.len or args[i + 1].len == 0:
+        stderr.writeLine("runquota pressure: --group needs a group name")
+        return 2
+      group = args[i + 1]
+      i += 2
+    else:
+      stderr.writeLine("runquota pressure: unrecognised argument '" &
+        args[i] & "'")
+      stderr.writeLine(renderUsage(programName))
+      return 2
+  var answer = ""
+  try:
+    var client = connectDefault()
+    defer: client.close()
+    answer = client.queryPressure(psAll, group)
+  except CatchableError as error:
+    stderr.writeLine("runquota pressure: " & error.msg)
+    return 1
+  if json:
+    echo answer
+    return 0
+  try:
+    echo renderPressureText(answer)
+  except CatchableError as error:
+    stderr.writeLine("runquota pressure: could not read the daemon's " &
+      "answer: " & error.msg)
+    return 1
+  0
+
 proc runDebugAcquire(args: seq[string]): int =
   var cpu = 1000'u32
   var memory = 128'u64 * 1024'u64 * 1024'u64
@@ -1091,6 +1136,8 @@ proc runThinApp*(programName: string): int =
         # One lease for a jobserver client, its slots served as GNU make
         # jobserver tokens (`runquota_cli_support/jobserver_command`).
         return runJobserver(args[1 .. ^1], clientFailureText, versionString())
+      of "pressure":
+        return runPressure(programName, args[1 .. ^1])
       of "session":
         if args.len >= 2 and args[1] == "set":
           return runSessionSet(args[2 .. ^1])

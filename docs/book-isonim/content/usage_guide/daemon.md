@@ -239,6 +239,7 @@ Recording (see [the observation store](/usage_guide/observations)):
 | `--measurement NAME=on\|off[,...]` | the defaults | Turns daemon-side measurements on or off by name, repeatable, applied after every other flag. Capture is off by default (it costs more than the measurement budget allows); `capture=on` turns it on, and with it the ambient sampler, which writes into the store. `capture=off` is `--no-write-stats`; `ambient-sampling=off` is an interval of `0`; `metrics-export=off` drops `--metrics-textfile`. An explicit `=on` against one of those older flags (or `metrics-export=on` with no `--metrics-textfile`), an unknown name, or a value other than `on`/`off` is a refusal (exit 2). See [Measurement switches](/usage_guide/observations#measurement-switches). |
 | `--metrics-textfile PATH` | none | Write the [capacity figures](#exporting-capacity-figures-for-prometheus) to `PATH` in Prometheus text format. Naming a file is what turns the `metrics-export` measurement on. |
 | `--metrics-interval-millis N` | `15000` | How often that file is rewritten. A positive number; anything else is a usage error (exit 2). |
+| `--pressure-long-wait-millis N` | `300000` | A reported [build-wait](#build-wait-pressure) at least this long is counted as long. A positive number; anything else is a usage error (exit 2). |
 | `--host-identity-file PATH` | `/var/lib/runquota/host-id` (`/var/db/...` on macOS) | Relocates the host state, and the store with it. |
 
 Retention — four bounds, each with the **same unusual rule**:
@@ -299,6 +300,11 @@ file never delays a lease.
 | `runquota_host_cpu_foreign_ratio` | gauge | The busy share less what clients reported their running leases used. No client reports that today, so it equals the busy share. |
 | `runquota_host_ambient_reading_timestamp_seconds` | gauge | When that reading was taken. |
 | `runquota_group_*` | as above | The same live figures and counters per session group, labelled `owner_uid` and `group`. |
+| `runquota_host_pressure_{some,full}_avg{10,60,300}` | gauge | [Build-wait pressure](#build-wait-pressure): held-up time per second of wall time, decaying over 10, 60 or 300 s, summed over the invocations that report. |
+| `runquota_host_pressure_{wall,some,full}_seconds_total` | counter | The wall time pressure reports covered, and the held-up time in it. |
+| `runquota_host_pressure_wait_seconds{kind}` | histogram | Lengths of reported waits of at least a second, by `kind` (`queue`, `slowdown`, `class-queue`). |
+| `runquota_host_pressure_long_waits_total{kind}` | counter | Reported waits at or over `--pressure-long-wait-millis`. |
+| `runquota_group_pressure_*` | as above | The same per session group, for groups that have reported. |
 
 A few rules make the figures safe to compute with:
 
@@ -326,6 +332,31 @@ A few rules make the figures safe to compute with:
   `--ambient-sample-interval-millis`). Build load is the rate of
   `runquota_host_cpu_used_seconds_total`, which lags by one lease, beside
   `runquota_host_cpu_granted_cpus`, which is live.
+
+### Build-wait pressure
+
+A build that waits for RunQuota, or whose commands run slower than they do
+on an idle host, is *held up*. A launching client measures that over its own
+wall time, in the manner of Linux PSI: *some* is the time in which at least
+one of its ready or running commands was held up, *full* the time in which
+all of them were. It sends what those grew by to the daemon, with the wall
+time covered and each wait of a second or more, in a one-way
+`PressureReport`; the daemon computes nothing itself. Reprobuild's engine,
+`runquota run` and `runquota jobserver` report when the `pressure-reports`
+measurement is on (`RUNQUOTA_MEASUREMENT=pressure-reports=on`; off by
+default). A client that knows no expected duration for its commands
+(`runquota run` never does) reports its queue waits only, and says so.
+
+The daemon keeps, per host, per session group and per open session,
+cumulative totals, averages decaying over 10, 60 and 300 s, and per wait
+kind a histogram of lengths and a count of waits at or over
+`--pressure-long-wait-millis` (default 300000, five minutes). Every figure
+is clamped to what the reporting session could have measured (no more wall
+time over all its reports than the session has existed, plus a second; no
+wait longer than the session's life) and every counter saturates. A report is accepted only on
+the connection that registered its session; a refused report is counted.
+`runquota pressure` prints the figures and `runquota pressure --json`
+serves them (see [the CLI](/usage_guide/cli#build-wait-pressure)).
 
 The export is the `metrics-export` measurement and is off unless a file is
 named. `runquota status --json` carries the same figures as `capacity`,

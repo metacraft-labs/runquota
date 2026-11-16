@@ -101,8 +101,11 @@ const
     # it on (see the specification's measurement switches section).
     measureProfiles: MeasurementInfo(side: measuredByClient,
       implemented: true, defaultOn: false),
+    # IMPLEMENTED, AND OFF BY DEFAULT until the overhead gate passes with
+    # it on: the launching client's build-wait pressure reports
+    # (Reprobuild's engine, `runquota run`, `runquota jobserver`).
     measurePressureReports: MeasurementInfo(side: measuredByClient,
-      implemented: false, defaultOn: false),
+      implemented: true, defaultOn: false),
     measureSizingData: MeasurementInfo(side: measuredByClient,
       implemented: false, defaultOn: false),
     # IMPLEMENTED, AND OFF BY DEFAULT: the daemon writes the file only

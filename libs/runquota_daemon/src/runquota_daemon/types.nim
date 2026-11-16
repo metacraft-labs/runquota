@@ -144,6 +144,10 @@ type
       ## `metrics-export` measurement, and the only thing that turns it on.
     metricsIntervalMillis*: int
       ## How often that file is rewritten; `DefaultMetricsIntervalMillis`.
+    pressureLongWaitMillis*: uint64
+      ## `pressure.long-wait`: a reported wait at least this long is counted
+      ## as long. `runquotad --pressure-long-wait-millis`;
+      ## `DefaultLongWaitMillis`.
     retentionPolicy*: RetentionPolicy
       ## The bounds the scheduled retention pass enforces. M15 built them
       ## and nothing called them; this is what a daemon carries so that a
@@ -232,6 +236,12 @@ type
       ## The key of the session group this session joined
       ## (`sessionGroupKey`). Empty for a row built without one, which
       ## admission treats as an interactive group of its own.
+    registeredAtMillis*: int64
+      ## Monotonic milliseconds of registration: bounds the total wall time
+      ## and each wait length this session's pressure reports may claim.
+    pressure*: PressureFigures
+      ## What this session (one invocation) reported, so its own figures are
+      ## readable while it runs. Goes with the row.
 
   SessionGroupRow* = object
     ## A session group: every session that named it (or, for the per-user
@@ -481,6 +491,10 @@ type
       ## a reply is the round trip it exists to avoid.
     observationsAccepted*: uint64
       ## In-flight ``LeaseObservation`` reports folded into ``self_*``.
+    pressureReportsRefused*: uint64
+      ## ``PressureReport`` messages refused (unreadable, or naming a session
+      ## this connection did not register). Counted rather than answered:
+      ## the message is one-way.
     observationsRejected*: uint64
       ## Reports refused, for any reason. OS-2 wants every lost
       ## observation COUNTED, and a refusal is a loss: the client believes

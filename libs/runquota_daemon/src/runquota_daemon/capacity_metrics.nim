@@ -53,6 +53,9 @@ when defined(posix):
     ## Not exported by `std/posix`.
 
 import runquota_core/cpu_profile
+import ./pressure_metrics
+
+export pressure_metrics
 
 const
   GroupIdleDropMillis* = 60'i64 * 60'i64 * 1000'i64
@@ -88,6 +91,8 @@ type
 
   GroupCapacity* = object
     counters*: CapacityCounters
+    pressure*: PressureFigures
+      ## Build-wait pressure its invocations reported (`pressure_metrics`).
     lastActiveMillis*: int64
       ## Monotonic milliseconds of the last event that involved the group:
       ## a session joining or leaving, a lease queued, granted, released or
@@ -97,6 +102,7 @@ type
     ## What the daemon keeps. Owned by the lease authority and changed only
     ## under its lock, on the threads that serve requests.
     host*: CapacityCounters
+    hostPressure*: PressureFigures
     groups*: Table[string, GroupCapacity]
       ## By session group key, `<owner>/<name>` (`sessionGroupKey`).
     lastPruneMillis*: int64
@@ -118,6 +124,7 @@ type
     name*: string
     counters*: CapacityCounters
     live*: LiveFigures
+    pressure*: PressureFigures
 
   CapacitySnapshot* = object
     cpuBudgetMilli*: uint64
@@ -126,12 +133,16 @@ type
     groups*: seq[GroupSnapshot]
       ## Sorted by owner, then name.
     ambient*: AmbientFigures
+    hostPressure*: PressureFigures
+    nowMillis*: int64
+      ## Monotonic time of the snapshot: the pressure averages decay to it.
 
   CapacityCopy* = object
     ## What a snapshot is computed from, copied out of the daemon under its
     ## lock so that everything else -- filtering, parsing keys, sorting,
     ## rendering -- happens after the lock is released.
     host*: CapacityCounters
+    hostPressure*: PressureFigures
     groups*: seq[tuple[key: string, group: GroupCapacity]]
     leases*: seq[LeaseFigure]
     cpuBudgetMilli*: uint64
@@ -210,6 +221,26 @@ proc addFinish(counters: var CapacityCounters; totals: FinishTotals) =
     counters.finishedWithoutTotals =
       saturatingAdd(counters.finishedWithoutTotals, 1)
 
+proc notePressureReport*(ledger: var CapacityLedger; key: string;
+                         sample: PressureSample; nowMillis: int64) =
+  ## A report from a session of group `key`, already clamped. A report is
+  ## activity of the group: it keeps the group's figures from dropping out.
+  ledger.hostPressure.noteReport(sample, nowMillis)
+  if key.len == 0:
+    return
+  ledger.touchGroup(key, nowMillis)
+  ledger.groups[key].pressure.noteReport(sample, nowMillis)
+
+proc notePressureWait*(ledger: var CapacityLedger; key: string;
+                       kind: PressureWaitKindIndex;
+                       lengthMillis, longWaitMillis: uint64) =
+  ## One reported wait, for the host and group `key` (which
+  ## `notePressureReport` has created).
+  ledger.hostPressure.noteWait(kind, lengthMillis, longWaitMillis)
+  if key.len == 0 or not ledger.groups.hasKey(key):
+    return
+  ledger.groups[key].pressure.noteWait(kind, lengthMillis, longWaitMillis)
+
 proc noteFinish*(ledger: var CapacityLedger; key: string; totals: FinishTotals;
                  nowMillis: int64) =
   ## A host lease finished with `totals` (which may be unknown).
@@ -276,6 +307,7 @@ proc copyFor*(ledger: CapacityLedger; leases: sink seq[LeaseFigure];
   ## own the ledger's memory may call it: idle groups are left out by
   ## `snapshot` and forgotten by `pruneIdleGroups`.
   result.host = ledger.host
+  result.hostPressure = ledger.hostPressure
   result.groups = newSeqOfCap[tuple[key: string, group: GroupCapacity]](
     ledger.groups.len)
   for key, group in ledger.groups.pairs:
@@ -290,13 +322,15 @@ proc snapshot*(copy: CapacityCopy): CapacitySnapshot =
   result.cpuBudgetMilli = copy.cpuBudgetMilli
   result.hostCounters = copy.host
   result.hostLive = live.host
+  result.hostPressure = copy.hostPressure
+  result.nowMillis = copy.nowMillis
   var seen = initHashSet[string]()
   for (key, entry) in copy.groups:
     seen.incl(key)
     if entry.groupIsIdle(live.groups.hasKey(key), copy.nowMillis):
       continue
     var group = GroupSnapshot(counters: entry.counters,
-      live: live.groups.getOrDefault(key))
+      live: live.groups.getOrDefault(key), pressure: entry.pressure)
     groupKeyParts(key, group.ownerKnown, group.ownerUid, group.name)
     result.groups.add(group)
   # A lease whose group has no entry (impossible today: every queue and
@@ -429,6 +463,15 @@ proc expositionText*(snap: CapacitySnapshot): string =
       "Unix time of the ambient reading the busy and foreign shares are from.")
     result.sample("runquota_host_ambient_reading_timestamp_seconds", "",
       fixedPoint(uint64(max(0'i64, snap.ambient.atUnixMillis)), 1000, 3))
+  # Build-wait pressure: the host always (its counters never drop out),
+  # and every group that has reported.
+  var pressureGroups: seq[tuple[labels: string, figures: PressureFigures]]
+  for group in snap.groups:
+    if group.pressure.hasReports:
+      pressureGroups.add((groupLabels(group), group.pressure))
+  result.expositionFamilies("runquota_host", [("", snap.hostPressure)],
+    snap.nowMillis)
+  result.expositionFamilies("runquota_group", pressureGroups, snap.nowMillis)
   if snap.groups.len == 0:
     return
   # One family at a time: the format wants every sample of a family

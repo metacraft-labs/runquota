@@ -98,6 +98,19 @@ type
       ## All three are sent only to a daemon whose `HelloOk` reports protocol
       ## minor >= `NegotiatedWidthsMinor`, for the reason `rqDeclarePools`
       ## gives.
+    rqPressureReport = 45
+      ## ONE-WAY: an invocation's build-wait pressure since its previous
+      ## report (held-up time, the wall time it covers, and its long waits).
+      ## Never answered, like `rqLeaseObservation`, so a report adds no
+      ## round trip to the build it measures; a refusal is counted by the
+      ## daemon instead. Accepted only on the connection that registered the
+      ## session it names.
+    rqQueryPressure = 46
+      ## Read the daemon's pressure figures (host, groups, open sessions).
+      ## Answered with `rqPressureAnswer`.
+    rqPressureAnswer = 47
+      ## Both are sent only to a daemon whose `HelloOk` reports protocol
+      ## minor >= `PressureMinor`, for the reason `rqDeclarePools` gives.
 
   MessageKind* = RqspMessageKind
 
@@ -425,10 +438,24 @@ type
       ## as not known and the spine stores NULL CPU, never zero.
     cpuProfile*: CpuProfile
       ## Optional CPU profile of the tree (`profiles` measurement).
+    wantExpectedDuration*: bool
+      ## Ask for the expected uncontended duration in the acknowledgement
+      ## (presence bit 2 of the totals block, protocol minor
+      ## ``PressureMinor``). Set only towards a daemon at that minor: an
+      ## older one refuses an unknown presence bit.
 
   LeaseFinishedAckMessage* = object
     sessionId*: SessionId
     leaseId*: LeaseId
+    expectedKnown*: bool
+      ## Whether the optional trailing field is on the wire. The daemon
+      ## writes it only when the finish asked (``wantExpectedDuration``),
+      ## so an ack to a client that did not ask is byte-identical to one
+      ## from before the field existed.
+    expectedUncontendedMillis*: uint64
+      ## The learned expected uncontended duration of the lease's command
+      ## at its granted width, as the daemon held it BEFORE this finish was
+      ## folded in; 0 when none is known.
 
   DaemonStatusMessage* = object
     activeSessions*: uint32
@@ -546,6 +573,51 @@ type
     cpuChargedMilli*: uint32
       ## What the ledger charges for the lease after this exchange:
       ## max(target, current). For inspection and tests.
+
+  PressureWaitKind* = enum
+    ## What a reported wait was spent on. The ordinals are the wire values.
+    pwkQueue = "queue"
+      ## Ready, waiting in RunQuota's queue for a lease.
+    pwkSlowdown = "slowdown"
+      ## Running, for longer than its expected uncontended duration.
+    pwkClassQueue = "class-queue"
+      ## A pool's job waiting for a slot of a reserved class.
+
+  PressureWait* = object
+    startedAtUnixMillis*: uint64
+    lengthMillis*: uint64
+    kind*: PressureWaitKind
+
+  PressureReportMessage* = object
+    ## `rqPressureReport`: what one invocation accumulated since its
+    ## previous report. ``wallMicros`` is the wall time the report covers;
+    ## ``someMicros`` / ``fullMicros`` the held-up time in it. The daemon
+    ## clamps every figure (see the daemon's pressure intake).
+    sessionId*: SessionId
+    queueOnly*: bool
+      ## The client knew no expected uncontended duration for some command
+      ## the report covers, so its held-up time is the queue part only.
+    wallMicros*: uint64
+    someMicros*: uint64
+    fullMicros*: uint64
+    waits*: seq[PressureWait]
+      ## At most ``MaxPressureWaitsPerReport``.
+
+  PressureScope* = enum
+    ## The ordinals are the wire values.
+    psAll = "all"
+    psHost = "host"
+    psGroups = "groups"
+    psClass = "class"
+
+  QueryPressureMessage* = object
+    scope*: PressureScope
+    groupName*: string
+      ## With ``psAll`` or ``psGroups``: only the groups of this name (any
+      ## owner); empty for every group.
+
+  PressureAnswerMessage* = object
+    json*: string
 
   SessionGroupUpdatedMessage* = object
     ## The answer to `rqUpdateSessionGroup`: the attributes now in force. A

@@ -301,9 +301,13 @@ proc runRun*(args: seq[string];
   defer: client.close()
 
   var session = client.registerSession("runquota run", clientVersion)
+  # Build-wait pressure: the queue wait, reported at the grant
+  # (`pressure-reports`, off by default).
+  var pressure = startSingleCommandPressure()
   var lease: RunQuotaLease
   var granted = false
   try:
+    pressure.noteRequested()
     let preferred = preferredWidthFor(options, statsKey)
     # A daemon that negotiates widths is asked once, for the range: it
     # grants the widest width that is free. An older one grants a single
@@ -331,6 +335,7 @@ proc runRun*(args: seq[string];
       stderr.writeLine("runquota run: no lease at width " &
         $options.minWidth & " or above: " & lastError)
       return 1
+    pressure.reportGranted(session)
   except RunQuotaClientError as failure:
     stderr.writeLine("runquota run: " &
       describeFailure(failure.msg, client.lastDiagnostic))
@@ -382,6 +387,7 @@ proc runRun*(args: seq[string];
     code = exitCodeOf(completion)
     ran = true
     lease.release()
+    pressure.reportEnded(session)
     session.closeSession()
   except RunQuotaClientError as failure:
     # The command already ran (or never started); losing the daemon at the

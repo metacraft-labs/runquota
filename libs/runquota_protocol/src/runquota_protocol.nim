@@ -7,7 +7,7 @@ export protocolTypes
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 2'u16
-const RqspProtocolMinor* = 6'u16
+const RqspProtocolMinor* = 7'u16
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -75,6 +75,18 @@ const NegotiatedWidthsMinor* = 6'u16
   ## closes the connection on a message kind it does not know, so a client
   ## sends neither below this minor and asks for one CPU value instead, as
   ## every client did before ranges existed.
+const PressureMinor* = 7'u16
+  ## The first daemon minor that understands BUILD-WAIT PRESSURE: the
+  ## one-way `PressureReport`, `QueryPressure` and its answer, and bit 2 of
+  ## the `LeaseFinished` totals block, which asks for the expected
+  ## uncontended duration in the acknowledgement. MINOR 7 ANNOUNCES THEM,
+  ## additively: an older daemon closes the connection on a message kind it
+  ## does not know and refuses an unknown presence bit, so a client sends
+  ## none of them below this minor and reports no pressure there.
+const MaxPressureWaitsPerReport* = 64
+  ## The most waits one `PressureReport` carries. A client with more keeps
+  ## the rest for its next report; the daemon refuses a longer list, so a
+  ## peer cannot make one report cost it unbounded work.
 const SubLeaseMinor* = 5'u16
   ## The first daemon minor that understands `RequestSubLease`: a lease
   ## granted from a parent lease rather than from the host ledger. MINOR 5
@@ -992,10 +1004,14 @@ proc leaseFinishFromWire*(kindRaw, exitCode, signal: uint32;
 const
   finishBlockTotals = 1'u32
   finishBlockProfile = 2'u32
-  finishBlockKnownBits = finishBlockTotals or finishBlockProfile
+  finishBlockWantExpected = 4'u32
+    ## No fields: asks for the expected uncontended duration in the
+    ## acknowledgement (`PressureMinor`).
+  finishBlockKnownBits = finishBlockTotals or finishBlockProfile or
+    finishBlockWantExpected
 
 proc writeFinishTotalsBlock(w: var BinaryWriter; totals: FinishTotals;
-                            profile: CpuProfile) =
+                            profile: CpuProfile; wantExpected: bool) =
   ## The optional trailing block of `LeaseFinished` (`FinishTotalsMinor`):
   ## a u32 of presence bits, then the totals (bit 0) and the profile
   ## (bit 1). Written only when there is something in it, so a finish with
@@ -1005,6 +1021,7 @@ proc writeFinishTotalsBlock(w: var BinaryWriter; totals: FinishTotals;
   var bits = 0'u32
   if totals.known: bits = bits or finishBlockTotals
   if profile.present: bits = bits or finishBlockProfile
+  if wantExpected: bits = bits or finishBlockWantExpected
   if bits == 0'u32:
     return
   w.writeU32(bits)
@@ -1022,7 +1039,8 @@ proc writeFinishTotalsBlock(w: var BinaryWriter; totals: FinishTotals;
       w.writeU16(profile.samples[i])
 
 proc readFinishTotalsBlock(r: var BinaryReader; totals: var FinishTotals;
-                           profile: var CpuProfile): bool =
+                           profile: var CpuProfile;
+                           wantExpected: var bool): bool =
   ## Reads the block `writeFinishTotalsBlock` wrote. Refuses unknown
   ## presence bits, a profile with a zero interval, and a profile longer
   ## than `MaxCpuProfileSamples`: a bound the sender is required to keep is
@@ -1032,6 +1050,7 @@ proc readFinishTotalsBlock(r: var BinaryReader; totals: var FinishTotals;
   if not r.readU32(bits): return false
   if bits == 0'u32 or (bits and not finishBlockKnownBits) != 0'u32:
     return false
+  wantExpected = (bits and finishBlockWantExpected) != 0'u32
   if (bits and finishBlockTotals) != 0'u32:
     totals.known = true
     if not r.readU64(totals.cpuUserMicros): return false
@@ -1082,7 +1101,8 @@ proc encodeLeaseFinished*(msg: LeaseFinishedMessage): string =
   w.writeU64(msg.majorPageFaults)
   w.writeU32(msg.pressureEvents)
   w.writeDiagnostic(msg.diagnostic)
-  w.writeFinishTotalsBlock(msg.totals, msg.cpuProfile)
+  w.writeFinishTotalsBlock(msg.totals, msg.cpuProfile,
+    msg.wantExpectedDuration)
   w.data
 
 proc decodeLeaseFinished*(payload: string;
@@ -1112,8 +1132,10 @@ proc decodeLeaseFinished*(payload: string;
   # sends none, and its finish decodes with the totals not known.
   var totals = FinishTotals(known: false)
   var profile = noCpuProfile()
+  var wantExpected = false
   if r.remaining != 0:
-    if not r.readFinishTotalsBlock(totals, profile): return lfdMalformedPayload
+    if not r.readFinishTotalsBlock(totals, profile, wantExpected):
+      return lfdMalformedPayload
   if r.remaining != 0: return lfdMalformedPayload
   var finish: LeaseFinish
   if leaseFinishFromWire(kindRaw, exitCode, signal, finish).len > 0:
@@ -1128,7 +1150,8 @@ proc decodeLeaseFinished*(payload: string;
     pressureEvents: pressureEvents,
     diagnostic: diagnostic,
     totals: totals,
-    cpuProfile: profile
+    cpuProfile: profile,
+    wantExpectedDuration: wantExpected
   )
   lfdOk
 
@@ -1136,6 +1159,10 @@ proc encodeLeaseFinishedAck*(msg: LeaseFinishedAckMessage): string =
   var w = writer()
   w.writeU64(msg.sessionId.value)
   w.writeU64(msg.leaseId.value)
+  # The expected duration trails only when the finish asked for it, so an
+  # ack to a client that did not is byte-identical to minor 6's.
+  if msg.expectedKnown:
+    w.writeU64(msg.expectedUncontendedMillis)
   w.data
 
 proc decodeLeaseFinishedAck*(payload: string;
@@ -1145,9 +1172,15 @@ proc decodeLeaseFinishedAck*(payload: string;
   var leaseRaw: uint64
   if not r.readU64(sessionRaw): return false
   if not r.readU64(leaseRaw): return false
+  var expectedKnown = false
+  var expected = 0'u64
+  if r.remaining != 0:
+    if not r.readU64(expected): return false
+    expectedKnown = true
   if r.remaining != 0: return false
   msg = LeaseFinishedAckMessage(sessionId: sessionId(sessionRaw),
-      leaseId: leaseId(leaseRaw))
+      leaseId: leaseId(leaseRaw), expectedKnown: expectedKnown,
+      expectedUncontendedMillis: expected)
   true
 
 proc encodeStatus*(msg: DaemonStatusMessage): string =
@@ -2082,4 +2115,93 @@ proc decodeLeaseResize*(payload: string; msg: var LeaseResizeMessage): bool =
   msg = LeaseResizeMessage(sessionId: sessionId(sessionRaw),
     leaseId: leaseId(leaseRaw), cpuTargetMilli: target,
     cpuChargedMilli: charged)
+  true
+
+# ---------------------------------------------------------------------------
+# Build-wait pressure (`PressureMinor`)
+# ---------------------------------------------------------------------------
+
+const pressureQueueOnlyBit = 1'u32
+  ## Bit 0 of a report's flags. The other bits are reserved and ignored, so
+  ## a later minor can add a flag an older daemon reads as absent.
+
+proc encodePressureReport*(msg: PressureReportMessage): string =
+  ## At most ``MaxPressureWaitsPerReport`` waits are written; the caller
+  ## keeps the rest for its next report.
+  var w = writer()
+  w.writeU64(msg.sessionId.value)
+  w.writeU32(if msg.queueOnly: pressureQueueOnlyBit else: 0'u32)
+  w.writeU64(msg.wallMicros)
+  w.writeU64(msg.someMicros)
+  w.writeU64(msg.fullMicros)
+  let count = min(msg.waits.len, MaxPressureWaitsPerReport)
+  w.writeU32(uint32(count))
+  for i in 0 ..< count:
+    w.writeU64(msg.waits[i].startedAtUnixMillis)
+    w.writeU64(msg.waits[i].lengthMillis)
+    w.writeU8(uint8(ord(msg.waits[i].kind)))
+  w.data
+
+proc decodePressureReport*(payload: string;
+                           msg: var PressureReportMessage): bool =
+  ## Structural. Refuses more than ``MaxPressureWaitsPerReport`` waits, a
+  ## wait kind this side does not know, and trailing bytes. The figures
+  ## themselves are clamped by the daemon, not here: a decoder cannot know
+  ## how long the session has been connected.
+  var r = reader(payload)
+  var sessionRaw, wall, some, full: uint64
+  var flags, count: uint32
+  if not r.readU64(sessionRaw): return false
+  if not r.readU32(flags): return false
+  if not r.readU64(wall): return false
+  if not r.readU64(some): return false
+  if not r.readU64(full): return false
+  if not r.readU32(count): return false
+  if count > uint32(MaxPressureWaitsPerReport): return false
+  var waits = newSeqOfCap[PressureWait](int(count))
+  for i in 0 ..< int(count):
+    var started, length: uint64
+    var kind: uint8
+    if not r.readU64(started): return false
+    if not r.readU64(length): return false
+    if not r.readU8(kind): return false
+    if int(kind) > ord(high(PressureWaitKind)): return false
+    waits.add(PressureWait(startedAtUnixMillis: started,
+      lengthMillis: length, kind: PressureWaitKind(int(kind))))
+  if r.remaining != 0: return false
+  msg = PressureReportMessage(sessionId: sessionId(sessionRaw),
+    queueOnly: (flags and pressureQueueOnlyBit) != 0'u32,
+    wallMicros: wall, someMicros: some, fullMicros: full, waits: waits)
+  true
+
+proc encodeQueryPressure*(msg: QueryPressureMessage): string =
+  var w = writer()
+  w.writeU8(uint8(ord(msg.scope)))
+  w.writeString(msg.groupName)
+  w.data
+
+proc decodeQueryPressure*(payload: string;
+                          msg: var QueryPressureMessage): bool =
+  var r = reader(payload)
+  var scope: uint8
+  var name: string
+  if not r.readU8(scope): return false
+  if int(scope) > ord(high(PressureScope)): return false
+  if not r.readString(name): return false
+  if r.remaining != 0: return false
+  msg = QueryPressureMessage(scope: PressureScope(int(scope)), groupName: name)
+  true
+
+proc encodePressureAnswer*(msg: PressureAnswerMessage): string =
+  var w = writer()
+  w.writeString(msg.json)
+  w.data
+
+proc decodePressureAnswer*(payload: string;
+                           msg: var PressureAnswerMessage): bool =
+  var r = reader(payload)
+  var json: string
+  if not r.readString(json): return false
+  if r.remaining != 0: return false
+  msg = PressureAnswerMessage(json: json)
   true

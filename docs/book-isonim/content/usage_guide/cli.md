@@ -46,6 +46,7 @@ The `stats` verbs have a page of their own:
 | `runquota topology --json` | The configured machines and CPU share groups — the budget, as the daemon sees it. |
 | `runquota observations --json` | The recording subsystem: whether capture is on, which store is open, and every counter about what has been accepted, refused, queued or dropped. |
 | `runquota explain SESSION_ID` | The leases belonging to one session. |
+| `runquota pressure [--group G] [--json]` | [Build-wait pressure](#build-wait-pressure) per host, session group and open session. |
 | `runquota daemon status` | Same as `status`. |
 
 > **`--json` is mandatory** on `sessions`, `leases`, `topology` and
@@ -331,3 +332,18 @@ fate.
 
 **Exit codes and the no-daemon case** are as for `run`. Linux and macOS only
 for now.
+
+### Build-wait pressure
+
+`runquota pressure` prints, for the host, every session group that has
+reported and every open session that has (with `--group G`, only the groups
+named `G` and their sessions), the *some* and *full* averages over 10, 60 and 300 seconds and their
+totals, the wall time the reports covered, and the waits of a second or more
+by kind with how many were long. `--json` prints the daemon's answer as it
+sent it; `runquota status --json` carries the same as `pressure`. An average
+is held-up time per second of wall time, summed over the invocations of a
+group or the host: 1.0 is one invocation held up all the time, or two held
+up half of it. It exits 0 when the daemon answered, 1 when no daemon could be
+reached or it predates pressure reports, 2 on bad arguments. See
+[the daemon](/usage_guide/daemon#build-wait-pressure) for what is reported
+and how it is clamped.

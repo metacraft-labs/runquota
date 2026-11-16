@@ -153,7 +153,7 @@ when isMainModule:
   var config = defaultDaemonConfig(defaultEndpoint())
   config.exitWithParentPid = exitWithParentPid
   config.socketActivation = socketActivation
-  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--measurement NAME=on|off[,...]] [--ambient-sample-interval-millis N] [--profile-uncontended-pct N] [--metrics-textfile PATH] [--metrics-interval-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--admission-max-wait-millis N] [--log-file PATH]"
+  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--measurement NAME=on|off[,...]] [--ambient-sample-interval-millis N] [--profile-uncontended-pct N] [--metrics-textfile PATH] [--metrics-interval-millis N] [--pressure-long-wait-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--admission-max-wait-millis N] [--log-file PATH]"
   var measurementSwitches: seq[string]
   var i = 0
   while i < args.len:
@@ -309,6 +309,21 @@ when isMainModule:
           "number of milliseconds\n" & usage
         quit 2
       config.metricsIntervalMillis = millis
+      i += 2
+    of "--pressure-long-wait-millis":
+      # `pressure.long-wait`: a reported wait at least this long is counted
+      # as long (default five minutes). Positive.
+      var millis = 0'i64
+      if i + 1 < args.len:
+        try:
+          millis = parseBiggestInt(args[i + 1])
+        except ValueError:
+          discard
+      if millis <= 0:
+        echo "runquotad: --pressure-long-wait-millis needs a positive " &
+          "number of milliseconds\n" & usage
+        quit 2
+      config.pressureLongWaitMillis = uint64(millis)
       i += 2
     of "--profile-uncontended-pct":
       # The most of the host's CPU that everything other than a finished

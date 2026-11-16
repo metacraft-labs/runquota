@@ -60,7 +60,8 @@ measurement has a name and a switch:
 | `tree-sampling` | the launching client: samples of the child tree's resident memory and process count while it waits, which become the finish's summed peak memory | off by default: it costs more than the measurement budget allows |
 | `profiles` | the launching client: a CPU profile of the child tree (Linux), see "CPU totals and profiles" below | off by default |
 | `metrics-export` | the daemon: the [capacity figures text file](/usage_guide/daemon#exporting-capacity-figures-for-prometheus) | off unless `runquotad --metrics-textfile PATH` names a file; `metrics-export=on` without one is refused |
-| `pressure-reports`, `sizing-data` | — | registered, not implemented yet: the switches are accepted and do nothing |
+| `pressure-reports` | the launching client: [build-wait pressure](/usage_guide/daemon#build-wait-pressure) reports (Reprobuild, `runquota run`, `runquota jobserver`) | off by default |
+| `sizing-data` | — | registered, not implemented yet: the switch is accepted and does nothing |
 
 A switch is `NAME=on|off`, comma-separated and applied left to right;
 `all=on|off` covers every name. The daemon takes it as `runquotad

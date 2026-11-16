@@ -203,7 +203,9 @@ suite "finish totals on the wire":
         processCount: 4, diagnostic: okDiagnostic())).len
     var bits = encodeLeaseFinished(sampleFinish())
     let blockStart = encodeLeaseFinished(zero).len
-    bits[blockStart] = char(7)
+    # Bit 3 is not a presence bit any version knows (bit 2 asks for the
+    # expected duration).
+    bits[blockStart] = char(8 or 3)
     check decodeLeaseFinished(bits, decoded) == lfdMalformedPayload
 
 suite "learned CPU shape":

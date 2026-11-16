@@ -643,12 +643,18 @@ proc runJobserver*(args: seq[string];
     var session: RunQuotaSession
     var lease: RunQuotaLease
     var resizable = false
+    var pressure: SingleCommandPressure
     try:
       session = client.registerSession("runquota jobserver", clientVersion)
+      # Build-wait pressure: the queue wait, reported at the grant
+      # (`pressure-reports`, off by default).
+      pressure = startSingleCommandPressure()
+      pressure.noteRequested()
       if not acquireBridgeLease(session, client, options, statsKey,
           describeFailure, lease, resizable, error):
         stderr.writeLine("runquota jobserver: " & error)
         return 1
+      pressure.reportGranted(session)
     except RunQuotaClientError as failure:
       stderr.writeLine("runquota jobserver: " &
         describeFailure(failure.msg, client.lastDiagnostic))
@@ -726,6 +732,7 @@ proc runJobserver*(args: seq[string];
       code = exitCodeOf(completion)
       ran = true
       lease.release()
+      pressure.reportEnded(session)
       session.closeSession()
     except RunQuotaClientError as failure:
       # The command already ran (or never started); losing the daemon at the

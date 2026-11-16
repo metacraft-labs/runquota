@@ -109,6 +109,7 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     ambientSampleIntervalMillis: defaultAmbientCadenceMillis,
     metricsTextfilePath: "",
     metricsIntervalMillis: DefaultMetricsIntervalMillis,
+    pressureLongWaitMillis: DefaultLongWaitMillis,
     profileUncontendedPct: DefaultUncontendedOtherCpuPct,
     retentionPolicy: defaultRetentionPolicy(),
     retentionSweepIntervalMillis: defaultRetentionSweepIntervalMillis,
@@ -1624,6 +1625,44 @@ proc metricsError(): string =
   finally:
     release(metricsErrorLock)
 
+proc applyPressureReport(daemon: var RunQuotaDaemon;
+                         msg: PressureReportMessage) =
+  ## Fold one report, from a connection that owns its session, into the
+  ## session's, its group's and the host's figures. EVERY FIGURE IS
+  ## CLIENT-SENT and is clamped before it is added: the wall time so that
+  ## the session's credited wall time never exceeds its age (plus a
+  ## second), *some* to the wall time, *full* to *some*, and each wait to the
+  ## session's age; every addition saturates. A client can misstate its own
+  ## pressure but cannot claim more held-up time than it has been connected,
+  ## however many reports it sends.
+  let now = monoMillis()
+  var session = addr daemon.sessions[msg.sessionId.value]
+  let sample = clampReport(msg.wallMicros, msg.someMicros, msg.fullMicros,
+    remainingWallMicros(now - session.registeredAtMillis,
+      session.pressure.wallMicros), msg.queueOnly)
+  session.pressure.noteReport(sample, now)
+  daemon.capacity.notePressureReport(session.groupKey, sample, now)
+  for wait in msg.waits:
+    let kind = PressureWaitKindIndex(ord(wait.kind))
+    let length = clampWaitMillis(wait.lengthMillis,
+      now - session.registeredAtMillis)
+    session.pressure.noteWait(kind, length, daemon.config.pressureLongWaitMillis)
+    daemon.capacity.notePressureWait(session.groupKey, kind, length,
+      daemon.config.pressureLongWaitMillis)
+
+proc expectedUncontendedMillis(daemon: RunQuotaDaemon; lease: LeaseRow): uint64 =
+  ## The learned expected uncontended duration of `lease`'s command at its
+  ## granted width (`cpu_shape`), or 0 when none is known: no key, or no
+  ## uncontended run at that width that the daemon could judge.
+  if lease.commandStatsId.len == 0 or
+      not daemon.sessions.hasKey(lease.sessionId.value):
+    return 0'u64
+  let scope = daemon.sessions[lease.sessionId.value].sessionScope()
+  let key = estimateTableKey(scope, lease.commandStatsId)
+  if not daemon.cpuEstimates.hasKey(key):
+    return 0'u64
+  daemon.cpuEstimates[key].expectedDurationMillis(lease.resources.cpu.value)
+
 proc capacityCopy(daemon: RunQuotaDaemon): CapacityCopy =
   ## What the capacity figures are computed from, copied. READ-ONLY: the
   ## text file's writer calls this under the daemon lock from a thread that
@@ -1641,6 +1680,72 @@ proc capacitySnapshot(copy: CapacityCopy): CapacitySnapshot =
   ambient.available = latestAmbientCpu(ambient.busyPct, ambient.foreignPct,
     ambient.atUnixMillis)
   result.ambient = ambient
+
+proc pressureJson(daemon: RunQuotaDaemon; scope: PressureScope;
+                  groupName: string): string =
+  ## The `QueryPressure` answer, and the `pressure` member of `status
+  ## --json`: the host, the groups that have reported (optionally only those
+  ## named `groupName`), the open sessions that have reported, and the
+  ## classes (none exist yet). `groupName` limits both the groups and the
+  ## sessions to those of a group so named. Averages are decayed to now.
+  let snap = capacitySnapshot(daemon.capacityCopy())
+  let now = snap.nowMillis
+  result = "{\"long_wait_millis\":" & $daemon.config.pressureLongWaitMillis &
+    ",\"reports_refused\":" & $daemon.pressureReportsRefused &
+    ",\"scope\":" & jsonEscape($scope)
+  if scope in {psAll, psHost}:
+    result.add(",\"host\":{" & pressureFiguresJson(snap.hostPressure, now) &
+      "}")
+  if scope in {psAll, psGroups}:
+    result.add(",\"groups\":[")
+    var first = true
+    for group in snap.groups:
+      if not group.pressure.hasReports:
+        continue
+      if groupName.len > 0 and group.name != groupName:
+        continue
+      if not first:
+        result.add(",")
+      first = false
+      result.add("{\"owner_uid\":" &
+        (if group.ownerKnown: $group.ownerUid else: "null") &
+        ",\"name\":" & jsonEscape(group.name) & "," &
+        pressureFiguresJson(group.pressure, now) & "}")
+    result.add("]")
+  if scope == psAll:
+    var ids: seq[uint64]
+    for id, session in daemon.sessions.pairs:
+      if not session.pressure.hasReports:
+        continue
+      if groupName.len > 0:
+        # The same filter as the groups': only sessions of a group so named.
+        var ownerKnown: bool
+        var ownerUid: int64
+        var name: string
+        groupKeyParts(session.groupKey, ownerKnown, ownerUid, name)
+        if name != groupName:
+          continue
+      ids.add(id)
+    ids.sort()
+    result.add(",\"sessions\":[")
+    for i, id in ids:
+      let session = daemon.sessions[id]
+      if i > 0:
+        result.add(",")
+      var ownerKnown: bool
+      var ownerUid: int64
+      var name: string
+      groupKeyParts(session.groupKey, ownerKnown, ownerUid, name)
+      result.add("{\"session_id\":" & $id & ",\"name\":" &
+        jsonEscape(session.name) & ",\"group\":" & jsonEscape(name) &
+        ",\"owner_uid\":" & (if ownerKnown: $ownerUid else: "null") & "," &
+        pressureFiguresJson(session.pressure, now) & "}")
+    result.add("]")
+  if scope in {psAll, psClass}:
+    # Admission classes do not exist yet; their queue time is published
+    # here once they do.
+    result.add(",\"classes\":[]")
+  result.add("}")
 
 proc metricsTextfileJson(config: DaemonConfig): string =
   if config.metricsTextfilePath.len == 0:
@@ -1667,7 +1772,8 @@ proc statusJson(daemon: RunQuotaDaemon): string =
       jsonEscape($daemon.config.shareBetweenUsers) &
     ",\"session_groups\":" & daemon.sessionGroupsJson() &
     ",\"capacity\":" & capacityJson(capacitySnapshot(daemon.capacityCopy()),
-      metricsTextfileJson(daemon.config)) & "}"
+      metricsTextfileJson(daemon.config)) &
+    ",\"pressure\":" & daemon.pressureJson(psAll, "") & "}"
 
 proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
   var ids: seq[uint64] = @[]
@@ -4245,7 +4351,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       supervisorProcessId: context.supervisorProcessId,
       supervisorUserId: context.supervisorUserId,
       peer: context.peer,
-      groupKey: groupKey
+      groupKey: groupKey,
+      registeredAtMillis: monoMillis()
     )
     context.sessionIds.add(id)
     daemon.openObservationRun(daemon.sessions[id.value])
@@ -4695,6 +4802,13 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     lease.majorPageFaults = msg.majorPageFaults
     lease.pressureEvents = msg.pressureEvents
     daemon.updateEstimateFromFinish(lease, msg)
+    # THE EXPECTED DURATION IS READ BEFORE THIS FINISH IS FOLDED IN: a
+    # client compares its run against what was expected of it, and a run
+    # compared with an estimate that already contains it would be measured
+    # partly against itself.
+    let expectedMillis =
+      if msg.wantExpectedDuration: daemon.expectedUncontendedMillis(lease)
+      else: 0'u64
     daemon.foldCpuEstimateFromFinish(lease, msg)
     # THE USED-CPU COUNTER, from what the launcher measured at exit -- never
     # from what was granted. A sub-lease's tree ran inside its parent's,
@@ -4718,7 +4832,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       rqLeaseFinishedAck,
       frame.header.requestId,
       encodeLeaseFinishedAck(LeaseFinishedAckMessage(sessionId: msg.sessionId,
-          leaseId: msg.leaseId))
+          leaseId: msg.leaseId, expectedKnown: msg.wantExpectedDuration,
+          expectedUncontendedMillis: expectedMillis))
     )
   of rqLeaseObservation:
     # ONE-WAY, AND THAT IS THE POINT. No acknowledgement is sent on any
@@ -4742,6 +4857,40 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       inc daemon.observationsAccepted
     else:
       inc daemon.observationsRejected
+  of rqPressureReport:
+    # ONE-WAY, like ``rqLeaseObservation``: a report must not add a round
+    # trip to the build it measures, so nothing is answered on any path and
+    # a refusal is counted (``reports_refused`` in the pressure answer).
+    var msg: PressureReportMessage
+    if not decodePressureReport(frame.payload, msg):
+      inc daemon.pressureReportsRefused
+      return
+    # Only on the connection that registered the session: the report is
+    # counted in that session's group, and a session id is a small integer
+    # another connection -- possibly another user's -- could guess.
+    var owned = false
+    for id in context.sessionIds:
+      if id.value == msg.sessionId.value:
+        owned = true
+    if not owned or not daemon.sessions.hasKey(msg.sessionId.value):
+      inc daemon.pressureReportsRefused
+      return
+    daemon.applyPressureReport(msg)
+  of rqQueryPressure:
+    # Read-only, and answered on any connection, as `status` is: the
+    # figures are per host and per group, the same ones the capacity
+    # export publishes.
+    var msg: QueryPressureMessage
+    if not decodeQueryPressure(frame.payload, msg):
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "invalid QueryPressure payload"))
+      return
+    connection.sendResponse(rqPressureAnswer, frame.header.requestId,
+      encodePressureAnswer(PressureAnswerMessage(
+        json: daemon.pressureJson(msg.scope, msg.groupName))))
+  of rqPressureAnswer:
+    connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+        "PressureAnswer is the daemon's answer, not a request"))
   of rqDeferredObservations:
     # ONE-WAY, for the same reason ``rqLeaseObservation`` is: the client
     # sending this is EXITING. A reply is something it would have to stay

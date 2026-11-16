@@ -55,6 +55,10 @@ type
     resources*: ResourceVector
     active*: bool
     state*: LeaseClientState
+    expectedUncontendedMillis*: uint64
+      ## After a ``finish`` that asked for it (``askExpectedDuration``), the
+      ## daemon's learned expected uncontended duration of this command at
+      ## its granted width; 0 when the daemon knew none or was not asked.
 
   OfferedLease* = object
     clientCandidateId*: uint64

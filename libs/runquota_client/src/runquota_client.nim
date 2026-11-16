@@ -4,6 +4,7 @@ import runquota_client/types as clientTypes
 import runquota_client/standalone as clientStandalone
 import runquota_codec
 import runquota_core
+import runquota_core/measurement
 import runquota_ipc
 import runquota_protocol
 
@@ -1029,6 +1030,61 @@ proc reportObservation*(lease: var RunQuotaLease; cpuMilliPct: uint32;
   except CatchableError:
     discard
 
+proc supportsPressure*(client: RunQuotaClient): bool =
+  ## Whether the daemon understands build-wait pressure reports, queries and
+  ## the expected-duration question of the finish: its `HelloOk` reported
+  ## protocol minor `PressureMinor` or later.
+  client.capabilities.protocolMinor >= PressureMinor
+
+proc reportPressure*(session: var RunQuotaSession;
+                     report: PressureReportMessage): bool =
+  ## Send one build-wait pressure report for this session: what the
+  ## invocation accumulated since its previous report (see
+  ## ``PressureReportMessage``). At most ``MaxPressureWaitsPerReport`` of
+  ## ``report.waits`` are sent; the caller keeps the rest for its next
+  ## report.
+  ##
+  ## ONE-WAY, as ``reportObservation`` is: nothing is read back and no
+  ## in-flight slot is used, so a report never makes the build wait. A
+  ## daemon below ``PressureMinor`` is sent nothing (it would close the
+  ## connection on the unknown kind). Returns whether the report was
+  ## written; a failed write is a lost report, never an error.
+  if not session.active or session.client.isNil or
+      not session.client[].supportsPressure():
+    return false
+  var msg = report
+  msg.sessionId = session.id
+  inc session.client[].nextRequestId
+  let requestId = session.client[].nextRequestId
+  try:
+    session.client[].connection.sendFrame(
+      encodeFrame(rqPressureReport, FrameFlagRequest, requestId,
+        encodePressureReport(msg)))
+    true
+  except CatchableError:
+    false
+
+proc queryPressure*(client: var RunQuotaClient; scope = psAll;
+                    groupName = ""; timeoutMs = 0): string =
+  ## The daemon's build-wait pressure figures as JSON (`QueryPressure`).
+  ## Raises ``RunQuotaClientError`` for a daemon below ``PressureMinor``.
+  if not client.supportsPressure():
+    client.lastDiagnostic = diagnostic(diagUnsupportedVersion,
+      "the RunQuota daemon predates build-wait pressure (protocol minor " &
+      $client.capabilities.protocolMinor & ", needs " & $PressureMinor & ")")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  let requestId = client.requestFrame(rqQueryPressure,
+    encodeQueryPressure(QueryPressureMessage(scope: scope,
+      groupName: groupName)), timeoutMs)
+  let frame = client.readResponse(requestId, timeoutMs)
+  var answer: PressureAnswerMessage
+  if frame.header.messageKind != rqPressureAnswer or
+      not decodePressureAnswer(frame.payload, answer):
+    client.lastDiagnostic = diagnostic(diagProtocol,
+      "invalid PressureAnswer payload")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  answer.json
+
 proc supportsFinishTotals*(client: RunQuotaClient): bool =
   ## Whether the daemon reads the totals block of `LeaseFinished`: its
   ## `HelloOk` reported protocol minor `FinishTotalsMinor` or later.
@@ -1039,7 +1095,8 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
              peakMemoryBytes = 0'u64; processCount = 0'u32;
              majorPageFaults = 0'u64; pressureEvents = 0'u32;
              totals = FinishTotals(known: false);
-             cpuProfile = noCpuProfile()) =
+             cpuProfile = noCpuProfile();
+             askExpectedDuration = false) =
   ## Report how this execution ended, and free what it held.
   ##
   ## ONE PARAMETER SAYS WHY IT ENDED, and it is a ``LeaseFinish``. It used
@@ -1056,9 +1113,18 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
   ## not sent, to a daemon older than ``FinishTotalsMinor``, which would
   ## refuse the whole finish as malformed: losing a measurement is always
   ## preferable to losing the record of the execution.
+  ##
+  ## ``askExpectedDuration`` asks the daemon for its expected uncontended
+  ## duration of the command (build-wait pressure needs it to tell a slowed
+  ## run from a long one); the answer lands in
+  ## ``lease.expectedUncontendedMillis``. Asked only of a daemon at
+  ## ``PressureMinor`` or above, which is the first that understands the
+  ## question.
   if not lease.active:
     return
   let carriesTotals = lease.session[].client[].supportsFinishTotals()
+  let asks = askExpectedDuration and
+    lease.session[].client[].supportsPressure()
   let msg = LeaseFinishedMessage(
     sessionId: lease.session[].id,
     leaseId: lease.id,
@@ -1069,7 +1135,8 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
     pressureEvents: pressureEvents,
     diagnostic: finishDiagnostic,
     totals: (if carriesTotals: totals else: FinishTotals(known: false)),
-    cpuProfile: (if carriesTotals: cpuProfile else: noCpuProfile())
+    cpuProfile: (if carriesTotals: cpuProfile else: noCpuProfile()),
+    wantExpectedDuration: asks
   )
   let requestId = lease.session[].client[].requestFrame(rqLeaseFinished,
       encodeLeaseFinished(msg))
@@ -1082,6 +1149,8 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
       acknowledged.leaseId.value != lease.id.value:
     lease.session[].client[].lastDiagnostic = diagnostic(diagProtocol, "invalid LeaseFinishedAck payload")
     raise newException(RunQuotaClientError, lease.session[].client[].lastDiagnostic.message)
+  if acknowledged.expectedKnown:
+    lease.expectedUncontendedMillis = acknowledged.expectedUncontendedMillis
   lease.state = leaseClientFinished
 
 proc supportsPoolDeclarations*(client: RunQuotaClient): bool =
@@ -1295,3 +1364,81 @@ template withLease*(session: var RunQuotaSession; request: ResourceRequest;
     body
   finally:
     release(lease)
+
+# ---------------------------------------------------------------------------
+# Build-wait pressure of a one-command client (`runquota run`, `runquota
+# jobserver`)
+# ---------------------------------------------------------------------------
+
+type
+  SingleCommandPressure* = object
+    ## The build-wait pressure of a client that runs ONE command under one
+    ## lease. With one command, *some* and *full* are the same thing: the
+    ## command is the only ready-or-running one, so it held the invocation
+    ## up exactly while it waited for its lease. Such a client knows no
+    ## expected uncontended duration, so it reports the queue part only and
+    ## says so (`queue_only`); while the command runs it is counted as not
+    ## held up.
+    ##
+    ## Two reports, each covering its own stretch of wall time, so the
+    ## daemon's decaying averages place the wait where it happened: one at
+    ## the grant (registration to grant, the queue wait held up) and one at
+    ## the end (grant to end, nothing held up).
+    enabled*: bool
+      ## The `pressure-reports` measurement switch, read once at start.
+    registeredAt*: MonoTime
+    requestedAt*: MonoTime
+    requestedAtUnixMillis*: uint64
+    grantedAt*: MonoTime
+    granted*: bool
+
+proc pressureReportsEnabled*(): bool =
+  ## Whether this client takes build-wait pressure: the `pressure-reports`
+  ## measurement, from `RUNQUOTA_MEASUREMENT` (off by default).
+  measurePressureReports in clientMeasurements()
+
+proc micros(a, b: MonoTime): uint64 =
+  let ns = (b - a).inNanoseconds
+  if ns <= 0: 0'u64 else: uint64(ns div 1000)
+
+proc startSingleCommandPressure*(): SingleCommandPressure =
+  ## Call right after the session is registered.
+  result.enabled = pressureReportsEnabled()
+  result.registeredAt = getMonoTime()
+  result.requestedAt = result.registeredAt
+  result.requestedAtUnixMillis = uint64(max(0'i64,
+    (getTime() - fromUnix(0)).inMilliseconds))
+
+proc noteRequested*(pressure: var SingleCommandPressure) =
+  ## Call just before the lease is asked for.
+  pressure.requestedAt = getMonoTime()
+  pressure.requestedAtUnixMillis = uint64(max(0'i64,
+    (getTime() - fromUnix(0)).inMilliseconds))
+
+proc reportGranted*(pressure: var SingleCommandPressure;
+                    session: var RunQuotaSession) =
+  ## Call once the lease is granted: reports the queue wait.
+  if pressure.granted:
+    return
+  pressure.granted = true
+  pressure.grantedAt = getMonoTime()
+  if not pressure.enabled:
+    return
+  let queued = micros(pressure.requestedAt, pressure.grantedAt)
+  var report = PressureReportMessage(queueOnly: true,
+    wallMicros: micros(pressure.registeredAt, pressure.grantedAt),
+    someMicros: queued, fullMicros: queued)
+  if queued >= 1_000_000'u64:
+    report.waits.add(PressureWait(
+      startedAtUnixMillis: pressure.requestedAtUnixMillis,
+      lengthMillis: queued div 1000'u64, kind: pwkQueue))
+  discard session.reportPressure(report)
+
+proc reportEnded*(pressure: var SingleCommandPressure;
+                  session: var RunQuotaSession) =
+  ## Call when the command has ended, before the session closes: reports
+  ## the running time, in which the one command held nothing up.
+  if not pressure.enabled or not pressure.granted:
+    return
+  discard session.reportPressure(PressureReportMessage(queueOnly: true,
+    wallMicros: micros(pressure.grantedAt, getMonoTime())))
