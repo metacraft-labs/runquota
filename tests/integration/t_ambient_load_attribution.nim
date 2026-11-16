@@ -106,6 +106,7 @@ import runquota_core
 import runquota_observation_store
 import daemon_binary
 import scratch_root
+import unwinding_require
 
 # ---------------------------------------------------------------------------
 # The synthetic load
@@ -607,7 +608,9 @@ suite "ambient_load_attribution":
       load.stopLoad()
     # Nothing below this line may run while a spinner is alive.
     check not load.running
-    require busyBefore <= maxBusyForMeasurement
+    requireUnwinding busyBefore <= maxBusyForMeasurement,
+      "CPU headroom precondition failed: busy=" & $busyBefore &
+      " exceeds ceiling=" & $maxBusyForMeasurement
     check inRange
     check onWindows.len == cpuCycles
     check offWindows.len == cpuCycles
@@ -952,7 +955,10 @@ suite "ambient_load_attribution":
       const declaredCpu = 7.5 + 2.25 + 0.25
       const declaredRss = 4_500_000_000'i64
       let hostMemoryBytes = readHostLoad().memTotalBytes
-      require hostMemoryBytes > 0
+      # Never `unittest.require` inside this `try`: its `quit(1)` skips the
+      # `finally` below and leaves the private daemon running.
+      requireUnwinding hostMemoryBytes > 0,
+        "host memory total unreadable: " & $hostMemoryBytes
 
       var leases: seq[RunQuotaLease] = @[]
       for i, figures in declared:
@@ -975,13 +981,10 @@ suite "ambient_load_attribution":
       let cores = max(1, cpuinfo.countProcessors())
       let busyNow = waitForHeadroom(30)
       check busyNow >= 0.0
-      # unittest.require calls quit(1), which skips this fixture's finally.
-      # Reject the same invalid measurement by unwinding its owned cleanup.
-      if not (busyNow <= maxBusyForMeasurement):
-        raise newException(ValueError,
-          "CPU headroom precondition failed: busy=" & $busyNow &
-          " exceeds ceiling=" & $maxBusyForMeasurement)
-      require busyNow <= maxBusyForMeasurement
+      # Fatal, and unwinding: the `finally` below still stops the daemon.
+      requireUnwinding busyNow <= maxBusyForMeasurement,
+        "CPU headroom precondition failed: busy=" & $busyNow &
+        " exceeds ceiling=" & $maxBusyForMeasurement
       # THE LOAD IS SIZED FOR WHAT THIS CASE NEEDS, which is to be larger
       # than everything the admitted executions declared -- so that `self`
       # staying at the declared figure is a statement about attribution
