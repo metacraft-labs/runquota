@@ -167,16 +167,17 @@ proc notImplemented(): seq[string] =
 proc capabilityRecords(): seq[JsonNode] =
   ## RQE-AREQ4: a measurement this OS cannot take is reported as such, in the
   ## report and on stderr, so a verdict for "all" is never read as covering
-  ## it. Today that is the CPU profile sampler, which reads `/proc` and has
-  ## no macOS reading yet (its switch is inert there): "all" on macOS
-  ## measures capture, ambient sampling, tree sampling and pressure reports.
-  when not defined(linux):
+  ## it. The CPU profile sampler reads the launcher's descendants from
+  ## `/proc` on Linux and through libproc on macOS; on any other OS its
+  ## switch is inert, so "all" there does not measure it.
+  when not (defined(linux) or defined(macosx)):
     result.add(%*{"measurement": "profiles", "os": hostOS,
       "status": "unavailable",
-      "reason": "CPU profiles are taken from /proc and are Linux-only; " &
-        "the switch is inert on this OS, so no cost was measured for it"})
+      "reason": "CPU profiles are taken from /proc (Linux) or libproc " &
+        "(macOS); the switch is inert on this OS, so no cost was measured " &
+        "for it"})
     stderr.writeLine "capability: profiles is unavailable on " & hostOS &
-      " (Linux-only); not covered by this verdict"
+      " (Linux and macOS only); not covered by this verdict"
 
 # ---------------------------------------------------------------------------
 # Synthetic case

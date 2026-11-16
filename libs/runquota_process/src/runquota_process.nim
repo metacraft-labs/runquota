@@ -1182,9 +1182,12 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     let measurements = clientMeasurements()
     let treeSampling = measureTreeSampling in measurements
     # PROFILES ONLY WHERE THE TREE CAN BE READ. On Linux the launcher reads
-    # its own descendants from `/proc`; elsewhere nothing here can, so the
-    # switch is inert rather than producing a profile of the root alone.
-    let profiles = measureProfiles in measurements and defined(linux)
+    # its own descendants from `/proc`, on macOS through libproc
+    # (`proc_listchildpids`, `proc_pid_rusage`); elsewhere nothing here can,
+    # so the switch is inert rather than producing a profile of the root
+    # alone.
+    let profiles = measureProfiles in measurements and
+      (defined(linux) or defined(macosx))
 
     # Everything the child needs between fork and exec is composed here, while
     # there is still a whole process to compose it in. After the fork the child

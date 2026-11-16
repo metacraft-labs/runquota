@@ -58,7 +58,7 @@ measurement has a name and a switch:
 | `capture` | the daemon: execution rows, extension rows and self-reports into this store | off by default: it costs more than the measurement budget allows |
 | `ambient-sampling` | the daemon: the host-wide load sampler | on by default; it writes into this store, so it samples only while `capture` is on |
 | `tree-sampling` | the launching client: samples of the child tree's resident memory and process count while it waits, which become the finish's summed peak memory | off by default: it costs more than the measurement budget allows |
-| `profiles` | the launching client: a CPU profile of the child tree (Linux), see "CPU totals and profiles" below | off by default |
+| `profiles` | the launching client: a CPU profile of the child tree (Linux and macOS), see "CPU totals and profiles" below | off by default |
 | `metrics-export` | the daemon: the [capacity figures text file](/usage_guide/daemon#exporting-capacity-figures-for-prometheus) | off unless `runquotad --metrics-textfile PATH` names a file; `metrics-export=on` without one is refused |
 | `pressure-reports` | the launching client: [build-wait pressure](/usage_guide/daemon#build-wait-pressure) reports (Reprobuild, `runquota run`, `runquota jobserver`) | off by default |
 | `sizing-data` | — | registered, not implemented yet: the switch is accepted and does nothing |
@@ -74,7 +74,8 @@ anyway. So `runquotad --measurement capture=on` together with
 `RUNQUOTA_MEASUREMENT=tree-sampling=on` in the launching client's environment
 records everything the store can hold. With `tree-sampling` off (the default)
 a finish carries no sampled peak; its peak memory is then the largest single
-process from the launcher's wait (`ru_maxrss`), which needs no sampling.
+process from the launcher's wait (`ru_maxrss`, converted to bytes on both Linux, where the kernel reports KiB,
+and macOS, where it reports bytes), which needs no sampling.
 
 ## CPU totals and profiles
 
@@ -89,8 +90,8 @@ than protocol minor 4 is sent the finish without them, and the row's CPU
 columns stay NULL.
 
 With `RUNQUOTA_MEASUREMENT=profiles=on` the launcher also records when the
-CPU was used. It reads its own descendants from `/proc` once per interval
-and sends CPU used per interval in milli-CPUs. The interval starts at one
+CPU was used. It reads its own descendants once per interval (from `/proc` on
+Linux, through libproc on macOS) and sends CPU used per interval in milli-CPUs. The interval starts at one
 second. When a run outgrows 256 samples, adjacent pairs merge and the
 interval doubles, so a profile never holds more than 256 samples and the
 reads get rarer as the run lengthens. The profile is stored in

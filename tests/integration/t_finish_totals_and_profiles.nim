@@ -50,7 +50,7 @@
 ## workload depends on nothing outside this file. NO MOCKS: the built
 ## `runquotad` and `runquota`, a real store, real processes.
 
-when defined(linux):
+when defined(linux) or defined(macosx):
   import std/[json, monotimes, options, os, osproc, strtabs, strutils, unittest]
   import std/posix
 
