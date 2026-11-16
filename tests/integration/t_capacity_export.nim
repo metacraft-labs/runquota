@@ -42,7 +42,7 @@
 ## NO MOCKS: the built `runquotad` and `runquota`, real sessions over real
 ## sockets, and the real `promtool`.
 
-when defined(linux):
+when defined(linux) or defined(macosx):
   import std/[algorithm, json, monotimes, os, osproc, streams,
     strutils, times, unittest]
 
@@ -252,6 +252,21 @@ when defined(linux):
         checkpoint output
         check code == 0
         check output.strip().len == 0
+        # Mode 0644 whatever the daemon's umask, and the temporary file is
+        # renamed away: only the finished file is left in the directory
+        # (no `.<name>.<pid>.tmp` stays behind once a write is over; the
+        # writer may be mid-write, so wait for a quiet moment).
+        check getFilePermissions(textfile) ==
+          {fpUserRead, fpUserWrite, fpGroupRead, fpOthersRead}
+        var leftovers = 1
+        for attempt in 0 ..< 50:
+          leftovers = 0
+          for kind, path in walkDir(root):
+            if kind == pcFile and path.extractFilename.endsWith(".tmp"):
+              inc leftovers
+          if leftovers == 0: break
+          sleep(20)
+        check leftovers == 0
         check "runquota_group_cpu_used_seconds_total{owner_uid=\"" in text
         check "group=\"quote\\\"d\"" in text
         check "group=\"back\\\\slash\"" in text
