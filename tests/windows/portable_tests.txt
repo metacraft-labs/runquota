@@ -34,9 +34,21 @@
 
 tests/compatibility/t_c_abi_layout.nim
 tests/compatibility/t_protocol_codec.nim
+# The build-wait pressure wire form: the finish's expected-duration ack, the
+# `PressureReport` round-trip, the bound on a report's waits, and the pressure
+# message kinds. Pure byte-string codec, no `when defined` guards, no daemon
+# and no sqlite3 -- the sibling of `t_protocol_codec` for this feature.
+tests/compatibility/t_pressure_codec.nim
 tests/unit/t_version.nim
 tests/unit/t_standalone_capture_rules.nim
 tests/unit/t_packaging_contract.nim
+# The daemon's build-wait pressure aggregation as pure functions of the reports
+# and an injected clock: clamping, the decaying averages, and how waits are
+# binned and counted as long. No `when defined` guards, no live daemon and no
+# sqlite3; the real daemon, real sockets and a real queued `runquota run` are
+# exercised on the platform-specific legs (Linux `t_build_wait_pressure`,
+# Windows `t_build_wait_pressure_windows`).
+libs/runquota_daemon/tests/t_pressure_metrics.nim
 # Windows-SPECIFIC rather than platform-neutral, and here because it needs
 # neither a daemon nor sqlite3: the host-state-directory DACL rule, row by
 # row, against real directories whose ACLs `icacls` writes. Nothing else on
