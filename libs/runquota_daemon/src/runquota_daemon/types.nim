@@ -99,6 +99,10 @@ type
     machines*: Table[string, MachineCapacity]
     cpuShareGroups*: Table[string, CpuShareGroup]
     namedPoolCaps*: Table[string, uint32]
+      ## The HOST-WIDE pools: those the host file's `[pools]` or a `--pool`
+      ## flag sizes (`recomputePoolCaps`). One pool per name for every owner
+      ## on the host. A pool only sessions declare is not here; it is in
+      ## `declaredPools`, once per owner.
     version*: string
     pressureSource*: PressureSourceKind
     pressureFile*: string
@@ -179,10 +183,14 @@ type
       ## The `[pools]` of the host file in force (the last one that parsed).
       ## Kept apart from `namedPoolCaps` so a pool declaration can recompute
       ## the caps without re-reading the file.
-    declaredPools*: Table[string, uint32]
-      ## The pools open sessions declared (`DeclarePools`), each at the
-      ## smallest capacity any of them declared. The bottom layer of the pool
-      ## caps: the file and the flags override it (`recomputePoolCaps`).
+    declaredPools*: Table[string, Table[string, uint32]]
+      ## Owner key (`ownerKeyOf`, from peer credentials) to the pools that
+      ## owner's open sessions declared (`DeclarePools`), each at the
+      ## smallest capacity any of those sessions declared. The bottom layer
+      ## of the pool caps, and SCOPED TO ITS OWNER: two owners that declare
+      ## one name have two pools. A name the file or a flag sizes is one
+      ## host-wide pool instead, and its entry here is ignored while that
+      ## lasts (`poolCapFor`).
     hostConfigSource*: string
       ## The file the budget in force was read from; empty when none existed.
       ## Set at start by `runquotad` and by every reload.
@@ -399,6 +407,15 @@ type
     identity*: PeerIdentity
     ownerName*: Option[string]
 
+  SessionPoolDeclaration* = object
+    ## What one session declared (`DeclarePools`): the owner it declared as,
+    ## read from the peer credentials of the connection that registered it,
+    ## and its pools. The owner is recorded with the pools rather than looked
+    ## up later, because the session row may already be gone when the
+    ## declaration is dropped.
+    owner*: string
+    pools*: Table[string, uint32]
+
   MachineUsage* = object
     cpu*: uint32
     memory*: uint64
@@ -561,10 +578,10 @@ type
       ## that the leak M11 recorded is actually closed rather than merely
       ## unreachable in the happy path.
     lostLeasesReaped*: uint64
-    sessionPools*: Table[uint64, Table[string, uint32]]
-      ## Session id to the pools that session declared (`DeclarePools`).
-      ## Removed with the session, orderly or not; `declaredPools` in the
-      ## config is recomputed from what remains.
+    sessionPools*: Table[uint64, SessionPoolDeclaration]
+      ## Session id to the pools that session declared (`DeclarePools`) and
+      ## the owner it declared them as. Removed with the session, orderly or
+      ## not; `declaredPools` in the config is recomputed from what remains.
     pendingDenials*: Table[uint64, seq[LeaseDecision]]
       ## Session id to the denials a reload decided for its queued leases,
       ## delivered on that session's next `GrantNext`. The leases themselves
@@ -595,6 +612,13 @@ type
     machineUsage*: Table[string, MachineUsage]
     cpuShareGroupUsage*: Table[string, uint32]
     namedPoolUsage*: Table[string, uint32]
+      ## Units held per pool name, over every owner: what a HOST-WIDE pool
+      ## (`namedPoolCaps`) is measured against.
+    ownerPoolUsage*: Table[string, uint32]
+      ## Units held per (owner, pool name), keyed `ownerPoolKey`: what a
+      ## DECLARED pool, which is its owner's alone, is measured against. Both
+      ## tables are kept for every lease, so a reload that moves a name
+      ## between the two scopes finds the right figure already counted.
     pressureFileCache*: PressureFileCache
     capacity*: CapacityLedger
       ## The per-host and per-session-group counters capacity tools read

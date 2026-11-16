@@ -641,6 +641,10 @@ type
     memoryBytes*: uint64      ## the local machine's memory budget
     cpuMilli*: uint32         ## the local machine's CPU budget
     pools*: seq[NamedPoolCapWire]
+      ## The pools in force for the owner that asked for the reload: the
+      ## HOST-WIDE ones (those the file or a flag sizes) and the ones that
+      ## owner's own open sessions declared. Another owner's declared pools
+      ## are not listed; the `topology` subject lists them, per owner.
     pinnedByFlags*: seq[string]
       ## Host-file keys a `runquotad` flag overrides for this launch, as
       ## `machine.memory_bytes` / `machine.cpu_milli` / `pools.NAME`, or

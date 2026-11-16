@@ -183,19 +183,39 @@ A declaration is the **lowest** layer of a pool's cap:
 
 1. a `--pool NAME=UNITS` flag (pins it);
 2. the host file's `[pools]` entry;
-3. what the open sessions declared — the smallest capacity, when several
-   declare one pool.
+3. what the open sessions of **the same user** declared — the smallest
+   capacity, when several of that user's sessions declare one pool.
+
+A pool that only sessions declare belongs to the user who declared it. The
+daemon reads the user from the connection's peer credentials (the uid on
+Linux and macOS, the account SID on Windows), never from anything the client
+sends. Two users whose builds both use a pool called `compile` or `serial` get
+two pools: one user's `compile = 1` does not throttle the other's compiles,
+and one user's declaration cannot shrink a pool in which another user's lease
+is waiting. One user's sessions share a pool, so a recipe's `serial = 1`
+still means "never two at once" for all of that user's work, including work
+that reprobuild runs on separate sessions.
+
+A pool that the host file or a flag sizes is a single pool for every user on
+the host. Name a resource that really is host-wide, such as a GPU, in the
+host file (`runquota config set pools.gpu 1`): what users declare for that
+name is then ignored. If the entry is removed (`unset`), each user's
+declaration applies again, separately.
 
 So `runquota config set pools.compile 4` overrides what builds declare, and
 `runquota config unset pools.compile` hands the pool back to them. A
 declaration leaves with its session; a pool nobody declares and nothing else
 sizes is gone, and a queued lease in it is denied as on a reload. `runquota
 config show` and `runquota topology --json` name each pool's source (`flag`,
-`host-file`, `declared`).
+`host-file`, `declared`). They list a declared pool once for each user that
+declares it, with that user's figure, and `topology` gives the user's owner
+id as `owner` (`null` for a connection that reported no credentials; all such
+connections count as one user).
 
 The host file's keys are bare TOML keys, so a pool whose name contains `.` or
 `/` (`nim_pty.pty-serial`, `host/linker`) cannot be written there; such a pool
-takes its declared capacity, or a flag.
+takes its declared capacity, which applies to each user separately, or a
+flag, which makes it host-wide.
 
 A daemon older than the message (RQSP minor 0) is never sent it, because it
 would close the connection and every session on it; the client warns instead,

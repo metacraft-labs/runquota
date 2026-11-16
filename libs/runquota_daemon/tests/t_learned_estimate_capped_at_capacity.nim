@@ -75,7 +75,7 @@ suite "learned estimates are capped at the machine memory budget":
       "repro provider compile edge", requested, ClientEstimate())
     check effective.memory.value == Budget
     var reason = ""
-    check daemon.possible(effective, reason)
+    check daemon.possible(effective, "?", reason)
     check reason == ""
 
   test "an estimate under the budget still raises the request unchanged":

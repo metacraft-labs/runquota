@@ -14,7 +14,9 @@
 ## * a declared pool is the BOTTOM layer: the host file overrides it, and a
 ##   flag overrides both;
 ## * `unset` of a pool in the file takes it back to the declared capacity;
-## * two open sessions declaring one pool share the SMALLEST capacity;
+## * two open sessions of one owner declaring one pool share the SMALLEST
+##   capacity (another owner's declaration is another pool:
+##   `t_declared_pools_are_scoped_to_their_owner.nim`);
 ## * a declaration leaves with its session, and a queued lease that can then
 ##   never be admitted is denied rather than left waiting.
 ##
@@ -82,7 +84,7 @@ proc admissible(daemon: RunQuotaDaemon; pool: string; units = 1'u32):
     tuple[ok: bool; reason: string] =
   ## What `RequestLease` asks first: could this ever be admitted?
   var reason = ""
-  result.ok = daemon.possible(poolDemand(pool, units), reason)
+  result.ok = daemon.possible(poolDemand(pool, units), "?", reason)
   result.reason = reason
 
 proc offer(daemon: var RunQuotaDaemon; session: uint64; pool: string):
@@ -101,7 +103,10 @@ proc declare(daemon: var RunQuotaDaemon; session: uint64;
   daemon.declarePools(sessionId(session), wire)
 
 proc cap(daemon: RunQuotaDaemon; pool: string): uint32 =
-  daemon.config.namedPoolCaps.getOrDefault(pool, 0'u32)
+  ## The cap these sessions see. They carry no peer credentials, so they are
+  ## all one owner (`?`): a declared pool is per owner
+  ## (`t_declared_pools_are_scoped_to_their_owner.nim`).
+  daemon.config.poolCapFor("?", pool)
 
 suite "pools a session declares":
 
@@ -144,7 +149,7 @@ suite "pools a session declares":
     writePools(root, "")
     discard daemon.reloadHostConfig()
     check daemon.cap("compile") == 8'u32
-    check daemon.config.poolCapSource("compile") == "declared"
+    check daemon.config.poolCapSource("compile", "?") == "declared"
     # A reload pins nothing: nothing in the reply claims a flag.
     check daemon.reloadHostConfig().pinnedByFlags.len == 0
 
@@ -185,7 +190,7 @@ suite "pools a session declares":
     check stranded.state == leaseStateQueued
     daemon.cleanupLostSession(sessionId(1'u64))
     check daemon.cap("serial") == 0'u32
-    check daemon.config.poolCapSource("serial") == ""
+    check daemon.config.poolCapSource("serial", "?") == ""
     check not daemon.leases.hasKey(stranded.id.value)
     let decisions = daemon.grantNextDecisions(sessionId(2'u64))
     check decisions.len == 1
@@ -209,7 +214,8 @@ suite "pools a session declares":
     discard daemon.declare(1, [("compile", 8'u32), ("serial", 1'u32)])
     let json = daemon.topologyJson()
     check "{\"name\":\"compile\",\"units\":4,\"source\":\"host-file\"}" in json
-    check "{\"name\":\"serial\",\"units\":1,\"source\":\"declared\"}" in json
+    check ("{\"name\":\"serial\",\"units\":1,\"source\":\"declared\"," &
+      "\"owner\":null}") in json
 
 suite "the DeclarePools wire":
 

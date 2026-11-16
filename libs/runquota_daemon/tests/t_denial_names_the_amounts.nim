@@ -102,7 +102,7 @@ proc refusal(daemon: RunQuotaDaemon; resources: ResourceVector): string =
   ## about a reason that was never produced, and continuing past that would
   ## compare two empty strings and pass.
   var reason = ""
-  doAssert not daemon.possible(resources, reason),
+  doAssert not daemon.possible(resources, "?", reason),
     "the daemon admitted a request this case requires it to refuse"
   reason
 
@@ -281,7 +281,7 @@ suite "a budget refusal names the amounts and the daemon":
     # The guard against a fix that formats its way into refusing everything.
     var daemon = testDaemon("admitted")
     var reason = "untouched"
-    check daemon.possible(asking(1000'u32, 1'u64 * GiB), reason)
+    check daemon.possible(asking(1000'u32, 1'u64 * GiB), "?", reason)
     check reason == "untouched"
 
 for root in scratchRoots:

@@ -213,6 +213,24 @@ proc recomputePoolCaps*(config: var DaemonConfig) =
   ## the `--pool` flags. Run by `resolveBudget` (start, reload) and whenever a
   ## declaration is added or leaves with its session.
   ##
+  ## `namedPoolCaps` holds the two HOST-WIDE layers only. A declared pool
+  ## stays in `declaredPools`, per owner, and `poolCapFor` reads the layers
+  ## for one owner: a name the file or a flag sizes is that one host-wide
+  ## figure for everybody, any other name is the owner's own declaration.
+  ##
+  ## WHY A DECLARATION IS ITS OWNER'S. The daemon serves the whole host, and
+  ## a pool name is a recipe's word, not a host resource: two users' builds
+  ## that both say `serial` or `compile` mean their own work. Kept host-wide,
+  ## any user who declared `compile = 1` throttled everyone's compiles, and a
+  ## declaration below another user's queued demand got that lease denied
+  ## (reprobuild-pm issue
+  ## `2026-11-12-declared-pools-are-one-host-global-namespace-that-any-session-can-shrink.md`).
+  ## The owner, not the session, is the scope because one build spreads its
+  ## pooled work over several sessions -- reprobuild's out-of-process helper
+  ## opens one per action -- and `serial = 1` must still serialise those. A
+  ## genuinely host-wide device (a GPU, the host's PTYs) is named in the host
+  ## file, which makes it one pool for every user.
+  ##
   ## A DECLARATION IS THE BOTTOM LAYER, NOT A FLAG. It is the client's account
   ## of the shape of its own work -- reprobuild declares the pools its build
   ## graph uses -- so the operator's file overrides it, a reload re-reads the
@@ -222,20 +240,35 @@ proc recomputePoolCaps*(config: var DaemonConfig) =
   ## `runquota config set pools.compile 4` used to do nothing to a daemon
   ## reprobuild had started with `--pool compile=8`.
   var pools = initTable[string, uint32]()
-  for name, units in config.declaredPools:
-    pools[name] = units
   for name, units in config.hostFilePools:
     pools[name] = units
   for name, units in config.budgetFlags.pools:
     pools[name] = units
   config.namedPoolCaps = pools
 
-proc poolCapSource*(config: DaemonConfig; name: string): string =
-  ## Which layer the cap in force for `name` comes from, in the spelling the
-  ## `topology` subject and `PoolsDeclared` use. Empty when no layer names it.
+proc isHostWidePool*(config: DaemonConfig; name: string): bool =
+  ## Does the host file or a `--pool` flag size `name`? Then it is one pool
+  ## for every owner on the host (`recomputePoolCaps`).
+  config.namedPoolCaps.hasKey(name)
+
+proc poolCapFor*(config: DaemonConfig; owner, name: string): uint32 =
+  ## The cap in force for `name` as `owner` sees it: the host-wide figure
+  ## when the file or a flag sizes it, otherwise the smallest capacity
+  ## `owner`'s own open sessions declared. Zero when neither names it.
+  if config.namedPoolCaps.hasKey(name):
+    return config.namedPoolCaps[name]
+  if config.declaredPools.hasKey(owner):
+    return config.declaredPools[owner].getOrDefault(name, 0'u32)
+  0'u32
+
+proc poolCapSource*(config: DaemonConfig; name: string; owner = ""): string =
+  ## Which layer the cap in force for `name`, as `owner` sees it, comes from,
+  ## in the spelling the `topology` subject and `PoolsDeclared` use. Empty
+  ## when no layer names it for that owner.
   if config.budgetFlags.pools.hasKey(name): "flag"
   elif config.hostFilePools.hasKey(name): "host-file"
-  elif config.declaredPools.hasKey(name): "declared"
+  elif config.declaredPools.hasKey(owner) and
+      config.declaredPools[owner].hasKey(name): "declared"
   else: ""
 
 proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
@@ -702,6 +735,7 @@ proc initDaemon*(config: DaemonConfig; deferCapture = false): RunQuotaDaemon =
     machineUsage: initTable[string, MachineUsage](),
     cpuShareGroupUsage: initTable[string, uint32](),
     namedPoolUsage: initTable[string, uint32](),
+    ownerPoolUsage: initTable[string, uint32](),
     pressureFileCache: PressureFileCache(
       path: "", mtimeUnix: 0, sizeBytes: 0, raw: ""
     ),
@@ -832,6 +866,19 @@ proc sessionGroupKey(peer: PeerIdentity; name: string): string =
   ## A group is the pair (owner, name). The owner key holds no `/`, so the
   ## first `/` separates the two whatever the name contains.
   ownerKeyOf(peer) & "/" & name
+
+proc ownerPoolKey(owner, name: string): string =
+  ## The (owner, pool) key of `ownerPoolUsage`. As in `sessionGroupKey`, the
+  ## owner key holds no `/`, so the first `/` separates the two.
+  owner & "/" & name
+
+proc poolUsedBy(daemon: RunQuotaDaemon; owner, name: string): uint32 =
+  ## The units held in `name` as `owner`'s cap counts them: every owner's
+  ## for a host-wide pool, `owner`'s alone for a declared one.
+  if daemon.config.isHostWidePool(name):
+    daemon.namedPoolUsage.getOrDefault(name, 0'u32)
+  else:
+    daemon.ownerPoolUsage.getOrDefault(ownerPoolKey(owner, name), 0'u32)
 
 proc groupFor(daemon: RunQuotaDaemon; key: string): SessionGroupRow =
   ## The group `key` names, or -- for a lease whose group has gone, or a
@@ -1006,9 +1053,13 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
     daemon.machineUsage[machine.id] = usage
     daemon.cpuShareGroupUsage[groupId] =
       daemon.cpuShareGroupUsage.getOrDefault(groupId, 0'u32) + cpuDelta
+    let owner = ownerKeyOf(lease.peer)
     for demand in lease.resources.namedPools:
       daemon.namedPoolUsage[demand.name] =
         daemon.namedPoolUsage.getOrDefault(demand.name, 0'u32) + demand.units
+      let key = ownerPoolKey(owner, demand.name)
+      daemon.ownerPoolUsage[key] =
+        daemon.ownerPoolUsage.getOrDefault(key, 0'u32) + demand.units
     inc daemon.activeLeaseCount
     if lease.purpose == leasePurposeBenchmark:
       inc daemon.activeBenchmarkCount
@@ -1024,10 +1075,19 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
     let prevGroup = daemon.cpuShareGroupUsage.getOrDefault(groupId, 0'u32)
     daemon.cpuShareGroupUsage[groupId] =
       if prevGroup >= cpuDelta: prevGroup - cpuDelta else: 0'u32
+    let owner = ownerKeyOf(lease.peer)
     for demand in lease.resources.namedPools:
       let prevPool = daemon.namedPoolUsage.getOrDefault(demand.name, 0'u32)
       daemon.namedPoolUsage[demand.name] =
         if prevPool >= demand.units: prevPool - demand.units else: 0'u32
+      let key = ownerPoolKey(owner, demand.name)
+      let prevOwned = daemon.ownerPoolUsage.getOrDefault(key, 0'u32)
+      if prevOwned > demand.units:
+        daemon.ownerPoolUsage[key] = prevOwned - demand.units
+      else:
+        # Dropped at zero, so the table holds one key per pool an owner is
+        # USING, not one per pool any owner ever used.
+        daemon.ownerPoolUsage.del(key)
     if daemon.activeLeaseCount > 0'u32:
       dec daemon.activeLeaseCount
     # The group was working until now: its idle time starts here.
@@ -1131,7 +1191,7 @@ proc countText(count: uint32; noun: string): string =
   $count & " " & noun & (if count == 1'u32: "" else: "s")
 
 proc possible(daemon: RunQuotaDaemon; resources: ResourceVector;
-    reason: var string): bool =
+    owner: string; reason: var string): bool =
   ## Can this request EVER fit the budget in force -- as opposed to fitting
   ## right now, which is `fitsNow` and a queue rather than a refusal.
   ##
@@ -1199,11 +1259,13 @@ proc possible(daemon: RunQuotaDaemon; resources: ResourceVector;
       # reader unable to tell which demand is at fault.
       reason = "named-pool demand must be non-zero: " & demand.name
       return false
-    let cap = daemon.config.namedPoolCaps.getOrDefault(demand.name, 0'u32)
+    # `owner`'s view of the pool: the host-wide figure, or what that owner's
+    # own sessions declared (`poolCapFor`).
+    let cap = daemon.config.poolCapFor(owner, demand.name)
     if cap == 0:
       # ITS OWN CLAUSE, because the remedy is a different one. A cap of zero
       # means NOTHING SIZES THE POOL -- neither the host file's `[pools]`,
-      # nor a `--pool` flag, nor an open session's declaration names it -- so
+      # nor a `--pool` flag, nor an open session of this owner declares it -- so
       # the fix is to name it in one of the three. `budget 0 units` would
       # read as a budget somebody set to zero on purpose and send the reader
       # to edit a number that does not exist.
@@ -1376,7 +1438,8 @@ proc pressureAllows(daemon: var RunQuotaDaemon; resources: ResourceVector;
     diagOut = okDiagnostic()
     true
 
-proc fitsNow(daemon: RunQuotaDaemon; resources: ResourceVector): bool =
+proc fitsNow(daemon: RunQuotaDaemon; resources: ResourceVector;
+             owner: string): bool =
   var machine: MachineCapacity
   if not daemon.machineFor(resources.resolvedMachineId(), machine):
     return false
@@ -1392,8 +1455,8 @@ proc fitsNow(daemon: RunQuotaDaemon; resources: ResourceVector): bool =
   if usage.ioSlots + resources.ioSlots(machine.ioSlots) > machine.ioSlots:
     return false
   for demand in resources.namedPools:
-    let cap = daemon.config.namedPoolCaps.getOrDefault(demand.name, 0'u32)
-    let used = daemon.namedPoolUsage.getOrDefault(demand.name, 0'u32)
+    let cap = daemon.config.poolCapFor(owner, demand.name)
+    let used = daemon.poolUsedBy(owner, demand.name)
     if used + demand.units > cap:
       return false
   true
@@ -1873,17 +1936,35 @@ proc topologyJson(daemon: RunQuotaDaemon): string =
   # WHERE THE BUDGET CAME FROM, beside the budget. A machine row alone does
   # not say whether 94 GiB is the operator's file, a flag, or the 75% default,
   # and that is the first question a refused lease raises.
-  var poolNames: seq[string] = @[]
+  #
+  # A HOST-WIDE pool (file or flag) is one row. A DECLARED pool is one row
+  # per owner that declares it, carrying `owner` -- the owner id from peer
+  # credentials, `null` for a transport that reported none -- because two
+  # owners' pools of one name are different pools with different caps. An
+  # owner's declaration of a name the file or a flag sizes is not listed:
+  # it is not in force while that lasts.
+  var pools: seq[tuple[name, owner: string; declared: bool]] = @[]
   for name in daemon.config.namedPoolCaps.keys:
-    poolNames.add(name)
-  poolNames.sort()
+    pools.add((name: name, owner: "", declared: false))
+  for owner, declared in daemon.config.declaredPools:
+    for name in declared.keys:
+      if not daemon.config.isHostWidePool(name):
+        pools.add((name: name, owner: owner, declared: true))
+  pools.sort(proc (a, b: tuple[name, owner: string; declared: bool]): int =
+    result = cmp(a.name, b.name)
+    if result == 0:
+      result = cmp(a.owner, b.owner))
   result.add("],\"pools\":[")
-  for i, name in poolNames:
+  for i, pool in pools:
     if i > 0:
       result.add(",")
-    result.add("{\"name\":" & jsonEscape(name) & ",\"units\":" &
-      $daemon.config.namedPoolCaps[name] & ",\"source\":" &
-      jsonEscape(daemon.config.poolCapSource(name)) & "}")
+    result.add("{\"name\":" & jsonEscape(pool.name) & ",\"units\":" &
+      $daemon.config.poolCapFor(pool.owner, pool.name) & ",\"source\":" &
+      jsonEscape(daemon.config.poolCapSource(pool.name, pool.owner)))
+    if pool.declared:
+      result.add(",\"owner\":" &
+        (if pool.owner == "?": "null" else: jsonEscape(pool.owner)))
+    result.add("}")
   result.add("],\"host_config\":{" &
     "\"path\":" & jsonEscape(daemon.config.hostConfigPath) & "," &
     "\"source\":" & jsonEscape(daemon.config.hostConfigSource) & "," &
@@ -3557,7 +3638,7 @@ proc narrowFor(daemon: var RunQuotaDaemon; waiterId: uint64) =
   let minimum = waiter.minimumResources()
   var withoutCpu = minimum
   withoutCpu.cpu = milliCpu(0)
-  if not daemon.fitsNow(withoutCpu):
+  if not daemon.fitsNow(withoutCpu, ownerKeyOf(waiter.peer)):
     # Memory, IO or a pool is what it waits for: CPU would not help.
     return
   let machineId = minimum.resolvedMachineId()
@@ -3690,7 +3771,7 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
       # on a condition no grant can change.
       continue
     let minimum = lease.minimumResources()
-    if daemon.fitsNow(minimum):
+    if daemon.fitsNow(minimum, ownerKeyOf(lease.peer)):
       # THE GRANT IS THE WIDEST VALUE IN THE RANGE THAT IS FREE, at least the
       # minimum (which fits). A request with one CPU value has both ends
       # equal to it, and is granted exactly that.
@@ -3746,12 +3827,14 @@ proc rebudgetQueuedLeases(daemon: var RunQuotaDaemon;
     # A queued sub-lease waits on its parent, which no budget change touches.
     if lease.state == leaseStateQueued and lease.parentLeaseId == 0'u64:
       var reason = ""
-      if not daemon.possible(lease.minimumResources(), reason):
+      if not daemon.possible(lease.minimumResources(),
+          ownerKeyOf(lease.peer), reason):
         doomed.add(id)
   for id in doomed:
     let lease = daemon.leases[id]
     var reason = ""
-    discard daemon.possible(lease.minimumResources(), reason)
+    discard daemon.possible(lease.minimumResources(), ownerKeyOf(lease.peer),
+      reason)
     # THE CAUSE AND THE DAEMON, both: they answer different questions --
     # WHY NOW (the budget changed under a lease that was already waiting)
     # and WHO (which daemon holds that budget) -- so the identity is
@@ -3763,19 +3846,28 @@ proc rebudgetQueuedLeases(daemon: var RunQuotaDaemon;
   daemon.tryPromoteQueued()
 
 proc refreshDeclaredPools(daemon: var RunQuotaDaemon): seq[uint64] =
-  ## Recompute the declared layer from the sessions still open -- each pool at
-  ## the SMALLEST capacity any of them declared -- and put the result in force.
+  ## Recompute the declared layer from the sessions still open -- per owner,
+  ## each pool at the SMALLEST capacity that owner's sessions declared -- and
+  ## put the result in force.
   ##
-  ## WHY THE SMALLEST. Two open sessions that declare the same pool with
-  ## different capacities share one host-wide cap, and only the smaller one
+  ## PER OWNER (`recomputePoolCaps` says why): another user's sessions are
+  ## not counted, so another user's declaration can neither shrink this
+  ## owner's pool nor strand a lease queued in it.
+  ##
+  ## WHY THE SMALLEST. Two open sessions of one owner that declare the same
+  ## pool with different capacities share one cap, and only the smaller one
   ## honours both: a recipe that declares `serial = 1` is saying "never two at
-  ## once", and the larger figure would break that for everyone. An operator
-  ## who wants another number writes it in the host file, which wins.
-  var declared = initTable[string, uint32]()
-  for _, pools in daemon.sessionPools:
-    for name, units in pools:
-      if not declared.hasKey(name) or units < declared[name]:
-        declared[name] = units
+  ## once", and the larger figure would break that for the owner's other
+  ## work. An operator who wants another number writes it in the host file,
+  ## which wins -- and makes the pool one pool for every owner.
+  var declared = initTable[string, Table[string, uint32]]()
+  for _, declaration in daemon.sessionPools:
+    var mine = declared.getOrDefault(declaration.owner,
+      initTable[string, uint32]())
+    for name, units in declaration.pools:
+      if not mine.hasKey(name) or units < mine[name]:
+        mine[name] = units
+    declared[declaration.owner] = mine
   daemon.config.declaredPools = declared
   daemon.config.recomputePoolCaps()
   daemon.rebudgetQueuedLeases(
@@ -3789,18 +3881,24 @@ proc declarePools*(daemon: var RunQuotaDaemon; sessionId: SessionId;
   ## the caps, and answer with the cap in force for each and where it comes
   ## from (reprobuild-specs/RunQuota-Host-Configuration.md, "Pools a build
   ## declares"). The caller has checked the session and the values.
+  ##
+  ## The declaration is the session's OWNER's, read from the peer
+  ## credentials of the connection that registered it, and every figure in
+  ## the answer is that owner's view: another owner's declaration of the
+  ## same name is a different pool.
+  let owner = ownerKeyOf(daemon.sessions[sessionId.value].peer)
   var mine = daemon.sessionPools.getOrDefault(sessionId.value,
-    initTable[string, uint32]())
+    SessionPoolDeclaration(owner: owner, pools: initTable[string, uint32]()))
   for pool in pools:
-    mine[pool.name] = pool.units
+    mine.pools[pool.name] = pool.units
   daemon.sessionPools[sessionId.value] = mine
   let promoted = daemon.refreshDeclaredPools()
   for pool in pools:
     result.pools.add(DeclaredPoolWire(
       name: pool.name,
-      declared: mine[pool.name],
-      inForce: daemon.config.namedPoolCaps.getOrDefault(pool.name, 0'u32),
-      source: daemon.config.poolCapSource(pool.name)))
+      declared: mine.pools[pool.name],
+      inForce: daemon.config.poolCapFor(mine.owner, pool.name),
+      source: daemon.config.poolCapSource(pool.name, mine.owner)))
   result.promotedLeases = uint32(promoted.len)
 
 proc forgetSessionPools(daemon: var RunQuotaDaemon; sessionId: SessionId) =
@@ -3810,10 +3908,17 @@ proc forgetSessionPools(daemon: var RunQuotaDaemon; sessionId: SessionId) =
     daemon.sessionPools.del(sessionId.value)
     discard daemon.refreshDeclaredPools()
 
-proc reloadHostConfig*(daemon: var RunQuotaDaemon): HostConfigReloadedMessage =
+proc reloadHostConfig*(daemon: var RunQuotaDaemon; owner = ""):
+    HostConfigReloadedMessage =
   ## Re-read the host budget file and put it in force, under a running
   ## daemon (`reprobuild-specs/RunQuota-Host-Configuration.md`, "Changing
   ## it under a running daemon").
+  ##
+  ## The answer's pools are the host-wide ones and `owner`'s own declared
+  ## ones -- the pools in force for the caller. `owner` is the reloading
+  ## connection's owner key from peer credentials (`ownerKeyOf`), so
+  ## `runquota config unset pools.NAME` shows the pool handed back to the
+  ## caller's declaration, and another owner's declarations are not listed.
   ##
   ## A FILE THAT DOES NOT PARSE CHANGES NOTHING: `readHostConfig` raises
   ## `HostConfigError` before any field is touched, and the caller answers
@@ -3874,10 +3979,14 @@ proc reloadHostConfig*(daemon: var RunQuotaDaemon): HostConfigReloadedMessage =
   var poolNames: seq[string] = @[]
   for name in daemon.config.namedPoolCaps.keys:
     poolNames.add(name)
+  if daemon.config.declaredPools.hasKey(owner):
+    for name in daemon.config.declaredPools[owner].keys:
+      if not daemon.config.isHostWidePool(name):
+        poolNames.add(name)
   poolNames.sort()
   for name in poolNames:
     pools.add(NamedPoolCapWire(name: name,
-      units: daemon.config.namedPoolCaps[name]))
+      units: daemon.config.poolCapFor(owner, name)))
   HostConfigReloadedMessage(
     configPath: daemon.config.hostConfigPath,
     sourcePath: host.sourcePath,
@@ -4407,7 +4516,10 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           diagnostic: diagnostic(diagInvalidArgument, malformed))))
       return
     var reason = ""
-    if not daemon.possible(effective.rangedResources(msg.width), reason):
+    # The owner of the SESSION, which is what the lease will be recorded as
+    # (`createQueuedLease` copies the session's peer).
+    if not daemon.possible(effective.rangedResources(msg.width),
+        ownerKeyOf(daemon.sessions[msg.sessionId.value].peer), reason):
       let denied = LeaseDeniedMessage(
         sessionId: msg.sessionId,
         diagnostic: diagnostic(diagDenied, reason, daemon.refusedByText())
@@ -4656,7 +4768,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           resources: effective,
           diagnostic: diagnostic(diagInvalidArgument, malformed)))
       elif not daemon.possible(effective.rangedResources(candidate.width),
-          reason):
+          ownerKeyOf(daemon.sessions[msg.sessionId.value].peer), reason):
         decisions.add(LeaseDecision(
           clientCandidateId: candidate.clientCandidateId,
           leaseId: leaseId(0),
@@ -4950,7 +5062,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           "ReloadHostConfig carries no payload"))
       return
     try:
-      let answer = daemon.reloadHostConfig()
+      let answer = daemon.reloadHostConfig(ownerKeyOf(context.peer))
       try:
         echo "runquotad: host configuration reloaded: " & reloadReport(answer)
       except CatchableError:

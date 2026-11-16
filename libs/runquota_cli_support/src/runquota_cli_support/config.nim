@@ -148,14 +148,21 @@ proc showDaemon(): int =
     if topology.hasKey("pools"):
       for pool in topology["pools"]:
         # Where the cap comes from: a flag, the file, or -- for a pool
-        # neither names -- the smallest capacity an open session declared.
+        # neither names -- the smallest capacity one owner's open sessions
+        # declared. A declared pool is that owner's alone, so it is printed
+        # once per owner, with the owner.
         let source = pool{"source"}.getStr
+        let owner =
+          if pool{"owner"}.isNil or pool{"owner"}.kind != JString:
+            "an owner without credentials"
+          else: "owner " & pool{"owner"}.getStr
         echo "  pools." & pool["name"].getStr & " = " &
           $pool["units"].getInt & (case source
             of "flag": " (pinned by a runquotad flag)"
             of "host-file": " (host file)"
-            of "declared": " (declared by open sessions; the host file " &
-              "overrides it)"
+            of "declared": " (declared by open sessions of " & owner &
+              ", for that owner's work alone; naming it in the host file " &
+              "overrides it and makes it one pool for every user)"
             else: "")
     if topology.hasKey("host_config"):
       let hostConfig = topology["host_config"]
