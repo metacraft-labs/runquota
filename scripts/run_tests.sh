@@ -42,6 +42,14 @@ fi
 
 mkdir -p build/test-bin build/nimcache
 
+# NO TEST WRITES THE USER'S REAL CGROUP ROOT. RunQuota's launchers place every
+# tree they start in `runquota.slice` below the user's systemd-delegated
+# subtree by default; that root is shared with every RunQuota launcher the
+# user runs while the suite runs. Placement is off for the suite unless the
+# caller set the variable, and the tests about placement name a root of their
+# own (`tests/support/cgroup_test_root.nim`).
+export RUNQUOTA_CGROUP_ROOT="${RUNQUOTA_CGROUP_ROOT:-off}"
+
 # ---------------------------------------------------------------------------
 # Build mode
 # ---------------------------------------------------------------------------

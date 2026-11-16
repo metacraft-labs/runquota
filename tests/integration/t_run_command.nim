@@ -20,12 +20,12 @@
 ## stopped (the daemon, through its `Process`). Nothing touches the host
 ## endpoint.
 ##
-## WHAT IS DELIBERATELY NOT HERE: on POSIX, `--cap` enforcement and the learned
-## width. Both wait on work outside this file; the learned-width case is written
-## as a visible pending test so it cannot be mistaken for a pass. `--cap` now
-## ships on WINDOWS (Job Object CPU rate control) and its end-to-end enforcement
-## is in `tests/integration/t_run_command_windows.nim`; it is still unavailable
-## on every other platform, which the `--cap is refused` case below asserts.
+## WHAT IS DELIBERATELY NOT HERE: `--cap` enforcement and the learned width.
+## On Linux `--cap` enforcement is in `t_priority_enforcement`, which needs a
+## cgroup root of its own; on Windows (Job Object CPU rate control) it is in
+## `tests/integration/t_run_command_windows.nim`. The learned width waits on
+## work outside this file and is written as a visible pending test so it
+## cannot be mistaken for a pass.
 
 when defined(posix):
   import std/[algorithm, os, osproc, streams, strtabs, strutils, unittest]
@@ -305,13 +305,21 @@ when defined(posix):
       check "exceeds machine CPU budget" in result.output
       check not fileExists(marker)
 
-    test "--cap is refused with exit 2 and runs nothing":
-      let marker = root / "cap-must-not-exist"
-      let result = runq(baseEnv, ["run", "--cap", "--", "sh", "-c",
+    test "--cap that cannot be enforced runs the command and says so":
+      # Placement off: the cap cannot be enforced, and the command must run
+      # anyway, with the gap on stderr. Enforcement itself is tested in
+      # `t_priority_enforcement`, on a cgroup root of its own.
+      let marker = root / "cap-ran"
+      var env = newStringTable(modeCaseSensitive)
+      for key, value in baseEnv.pairs: env[key] = value
+      env["RUNQUOTA_CGROUP_ROOT"] = "off"
+      let result = runq(env, ["run", "--cap", "--", "sh", "-c",
         "touch '" & marker & "'"])
-      check result.code == 2
-      check "--cap is not available yet" in result.output
-      check not fileExists(marker)
+      checkpoint result.output
+      check result.code == 0
+      check "--cap not enforced: " in result.output
+      check "RUNQUOTA_CGROUP_ROOT=off" in result.output
+      check fileExists(marker)
 
     test "bad arguments exit 2":
       check runq(baseEnv, ["run", "--width", "0", "--", "true"]).code == 2

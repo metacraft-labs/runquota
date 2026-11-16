@@ -15,9 +15,7 @@
 ## EXIT STATUS
 ##   the child's exit status when it ran;
 ##   128 + N when the child was killed by signal N (as `acquire` reports);
-##   2   bad arguments, or `--cap` where it is not available (every platform
-##       but Windows, where it enforces the grant through Job Object CPU rate
-##       control);
+##   2   bad arguments;
 ##   1   the daemon refused or lost the lease, so the command never ran;
 ##   127 the command could not be started.
 ## SIGTERM and SIGHUP sent to the wrapper are forwarded to the command;
@@ -25,6 +23,19 @@
 ## No daemon answering is NOT an error: the command runs unchanged and
 ## unbounded, as `acquire` does, because the absence of an authority is not a
 ## failure of the work.
+##
+## BELOW ADMISSION (Linux). The command's tree is created in its session
+## group's cgroup, whose `cpu.weight` follows the group's priority, or in the
+## reclaimed subtree for a reclaimed grant (`runquota_exec.treePlacement`),
+## so a tool that starts more processes than it was granted competes at its
+## group's priority. `--cap` gives the tree a leaf of its own whose
+## `cpu.max` is the granted width. On Windows `--cap` is a Job Object CPU
+## rate cap at the granted width instead. Where neither can be done (Linux
+## placement off or unavailable, macOS, or inside a parent lease's tree)
+## the command still runs, at the nice fallback, and an unenforced `--cap`
+## is reported on stderr: refusing would make `--cap` unusable in a command
+## line shared across operating systems, and the gap is in the capability
+## record.
 import std/[cpuinfo, options, os, strutils]
 when defined(posix):
   import std/posix
@@ -35,6 +46,7 @@ import runquota_exec
 import runquota_process
 import runquota_protocol
 import runquota_cli_support/run_adapters
+import runquota_daemon/host_config
 
 const
   RunLeaseMemoryBytes* = 128'u64 * 1024'u64 * 1024'u64
@@ -259,6 +271,19 @@ proc runUnleased(command: seq[string]; env: seq[string]): int =
       error.msg)
     127
 
+proc launcherCgroupRoot*(): CgroupRoot =
+  ## The cgroup root RunQuota's CLI launchers place trees under: the
+  ## variable, then the host file's `[enforcement] cgroups` (off when
+  ## absent). A host file that cannot be read or parsed leaves placement off
+  ## and says why: a launcher never fails over a setting it only consults.
+  var switchOn = false
+  var problem = ""
+  if getEnv(CgroupRootEnvVar).strip().len == 0:
+    switchOn = enforcementCgroupsOn(problem)
+  result = currentCgroupRoot(switchOn)
+  if problem.len > 0 and result.state == crsOff:
+    result.reason = "off: the host file could not be read (" & problem & ")"
+
 proc chooseAdapter(options: RunOptions): int =
   case options.adapter
   of "none": -1
@@ -278,16 +303,6 @@ proc runRun*(args: seq[string];
   if options.listAdapters:
     echo renderAdapterList()
     return 0
-  when not defined(windows):
-    if options.cap:
-      # `--cap` is enforcement of the grant through the kernel's CPU
-      # controller. On POSIX that belongs to the host cgroup enforcement work,
-      # not to this wrapper; accepting the flag and not enforcing would be a
-      # lie. Windows enforces it below, through Job Object CPU rate control.
-      stderr.writeLine("runquota run: --cap is not available yet " &
-        "(CPU-limit enforcement has not shipped)")
-      return 2
-
   let statsKey =
     if options.statsKey.len > 0: options.statsKey
     else: deriveStatsKey(options.command, getCurrentDir())
@@ -301,6 +316,10 @@ proc runRun*(args: seq[string];
     if options.verbose:
       stderr.writeLine("runquota run: no daemon reached (" & failure.msg &
         "); running the command unchanged")
+    if options.cap:
+      # No grant, so no width to cap at; never silently.
+      stderr.writeLine("runquota run: --cap not enforced: no daemon " &
+        "answered, so there is no granted width to cap at")
     return runUnleased(options.command, @[StatsKeyEnvVar & "=" & statsKey])
   defer: client.close()
 
@@ -367,6 +386,17 @@ proc runRun*(args: seq[string];
       (when defined(windows): (if options.cap: " (CPU cap " &
         $int(lease.resources.cpu.value) & " milli-CPU)" else: "") else: "") &
       ": " & command.join(" "))
+  # Where the tree runs below admission; with `--cap`, a leaf of its own at
+  # the granted width.
+  var placement: TreePlacement
+  try:
+    placement = session.treePlacement(lease,
+      capMilli = (if options.cap: uint64(lease.resources.cpu.value) else: 0'u64),
+      root = launcherCgroupRoot())
+  except RunQuotaClientError as failure:
+    stderr.writeLine("runquota run: " &
+      describeFailure(failure.msg, client.lastDiagnostic))
+    return 1
 
   var code = 0
   var ran = false
@@ -384,6 +414,7 @@ proc runRun*(args: seq[string];
           # The granted width in milli-CPU becomes a hard Job Object CPU-rate
           # cap on the tree (the same quantity `slots` rounds up from).
           spec.cpuRateCapMilli = uint32(lease.resources.cpu.value)
+      spec.applyPlacement(placement)
       child = launchProcess(spec)
     except CatchableError as failure:
       lease.finish(outcome = launchFailed())
@@ -394,6 +425,15 @@ proc runRun*(args: seq[string];
       return 127
     when defined(posix):
       forwardTarget = cint(child.info.processId)
+    when not defined(windows):
+      # (Windows enforces `--cap` through the Job Object's CPU rate above.)
+      if options.cap and child.info.cgroupPath.len == 0:
+        # Said as the command starts, never silently: the user asked for a
+        # cap this host cannot give.
+        stderr.writeLine("runquota run: --cap not enforced: " &
+          placement.placementNote(child.info))
+    if options.verbose:
+      stderr.writeLine("runquota run: " & placement.placementNote(child.info))
     lease.markRunning(childProcessId = child.info.processId)
     let completion = child.waitForCompletion()
     when defined(posix):

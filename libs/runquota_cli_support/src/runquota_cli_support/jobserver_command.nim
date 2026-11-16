@@ -895,6 +895,11 @@ proc runJobserver*(args: seq[string];
       # The bridge's whole width is out as tokens: a sub-lease of its lease
       # would count the same slots twice (see the module header).
       spec.unsetEnv = @[ParentLeaseEnvVar]
+      # Below admission: the tree runs in its session group's cgroup where
+      # this host allows it; a bridge inside a parent lease's tree stays
+      # where its parent put it (`runquota_exec.treePlacement`).
+      let placement = session.treePlacement(lease, root = launcherCgroupRoot())
+      spec.applyPlacement(placement)
       var child: LaunchedProcess
       try:
         child = launchProcess(spec)
@@ -905,6 +910,9 @@ proc runJobserver*(args: seq[string];
         stderr.writeLine("runquota jobserver: cannot start " & command[0] &
           ": " & failure.msg)
         return 127
+      if options.verbose:
+        stderr.writeLine("runquota jobserver: " &
+          placement.placementNote(child.info))
       let group = Pid(child.processGroupId)
       forwardGroup = cint(group)
       installGroupForwarding()

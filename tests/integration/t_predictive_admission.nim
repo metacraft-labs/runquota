@@ -11,7 +11,9 @@
 ##    is defined), and asks for exactly 3 CPUs. Under declared-width admission the second waits
 ##    for the first to end; with `admission.predictive = "on"` and the
 ##    shape learned from one earlier run, it starts in the first's tail, at
-##    its minimum width, marked reclaimed (its trees run at nice +10), and
+##    its minimum width, marked reclaimed (its trees run at nice +10 and,
+##    where the user has a delegated cgroup v2 subtree, in the reclaimed
+##    cgroup of a test-owned root while the first runs in its group's), and
 ##    the makespan of the pair is at least 20% shorter than under
 ##    declared-width admission measured in the same test. Mutation:
 ##    admitting by granted widths only (every lease predicted at its
@@ -96,6 +98,8 @@ when defined(linux):
 
   import runquota_client
   import runquota_core
+  import runquota_process
+  import cgroup_test_root
   import daemon_binary
   import private_daemon_fixture
 
@@ -106,11 +110,13 @@ when defined(linux):
 
   proc spin(seconds: float64; output: string) =
     ## Spin one CPU until `seconds` of WALL time have passed. Writes
-    ## `OUT.start` (start ns and the nice value it runs at) at once and
+    ## `OUT.start` (start ns, the nice value it runs at and its cgroup) at
+    ## once and
     ## `OUT` (start and end ns) at the end.
     let started = monoNs()
     let nice = getpriority(PRIO_PROCESS, Id(0))
-    writeFile(output & ".start", $started & " " & $nice & "\n")
+    writeFile(output & ".start", $started & " " & $nice & " " &
+      cgroupOfPid(getCurrentProcessId()) & "\n")
     let deadline = started + int64(seconds * 1e9)
     var x = 0'u64
     while monoNs() < deadline:
@@ -193,6 +199,7 @@ when defined(linux):
       wideEndNs: int64   ## the end of the wide phase
       endNs: int64       ## the end of the last burner
       nice: int
+      cgroup: string     ## the tail burner's cgroup
 
   proc jobScript(dir: string; wide, tail: float64): string =
     ## Three burners: two for `wide` seconds, one for `wide + tail`: 3 CPUs
@@ -210,6 +217,7 @@ when defined(linux):
     let first = readFile(dir / "t.start").splitWhitespace()
     result.startNs = parseBiggestInt(first[0])
     result.nice = parseInt(first[1])
+    if first.len >= 3: result.cgroup = first[2]
     for name in ["w1", "w2"]:
       if fileExists(dir / name & ".start"):
         result.startNs = min(result.startNs,
@@ -400,6 +408,17 @@ when defined(linux):
         daemon.startupContext("the daemon did not bind " & socket)
       prerequisite awaitCapture(socket), "capture never came on"
       let env = clientEnv(socket)
+      # Below admission (Linux cgroups): the trees are placed in a root of
+      # this test's own, so the reclaimed grant the DAEMON made is seen to
+      # land in the reclaimed subtree. Without a delegated subtree the rest
+      # of the case still runs, and only this check is reported skipped.
+      var cgroupReason = ""
+      let cgroupRoot = delegatedTestRoot(cgroupReason)
+      if cgroupRoot.len > 0:
+        env[CgroupRootEnvVar] = cgroupRoot
+      defer:
+        let problem = removeTestRoot(cgroupRoot)
+        check problem == ""
       train(socket, root, env, 4.0, 8.0)
       let run = pair(root, env, 4.0, 8.0)
       checkpoint run.outputs
@@ -418,6 +437,14 @@ when defined(linux):
       check run.second.nice == 10
       check run.first.nice == 0
       check reclaimedGranted(socket) == 1
+      if cgroupRoot.len > 0:
+        let relativeRoot = cgroupRoot[CgroupMountPoint.len .. ^1]
+        check run.second.cgroup == relativeRoot & "/" & ReclaimedDirName &
+          "/" & SharedLeafName
+        check run.first.cgroup.startsWith(relativeRoot & "/" & GroupDirPrefix)
+        check run.first.cgroup.endsWith("/" & SharedLeafName)
+      else:
+        echo "SKIPPED (the reclaimed cgroup check only): " & cgroupReason
       # The bound: at least 20% shorter than declared-width admission.
       checkpoint "makespan " & seconds(predictive) & " s vs declared " &
         seconds(declared) & " s"

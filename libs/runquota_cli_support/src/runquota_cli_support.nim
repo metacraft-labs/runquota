@@ -56,11 +56,13 @@ proc renderUsage*(programName: string): string =
     "    column is on the row, so jq does the ranking, percentiles and diffing.\n" &
     "    stats exit codes: 0 rows returned, 3 no answer (no-data/unknown-key/\n" &
     "    no-rows-in-scope), 4 no instrument (capture-off/daemon-unreachable/denied)\n" &
-    "  " & programName & " run [--width N|MIN:PREF] [--stats-key KEY] [--adapter NAME|none|list] [--verbose] -- COMMAND [ARG...]\n" &
+    "  " & programName & " run [--width N|MIN:PREF] [--stats-key KEY] [--adapter NAME|none|list] [--cap] [--verbose] -- COMMAND [ARG...]\n" &
     "    runs COMMAND under a CPU lease and passes the grant to it through an\n" &
     "    adapter (nim, go, nextest, nix, pnpm, yarn, playwright; --adapter list);\n" &
-    "    exits with the command's status, 2 on bad arguments or --cap (not yet\n" &
-    "    available), 1 when no lease was granted, 127 when it cannot start\n" &
+    "    --cap holds the tree to the granted width (Linux cgroup cpu.max; said\n" &
+    "    on stderr where it cannot be enforced). Exits with the command's\n" &
+    "    status, 2 on bad arguments, 1 when no lease was granted, 127 when it\n" &
+    "    cannot start\n" &
     "  " & programName & " jobserver [--width N|MIN:PREF] [--mem SIZE] [--stats-key KEY] [--verbose] -- COMMAND [ARG...]\n" &
     "    runs COMMAND under one lease and serves it a GNU make jobserver (FIFO)\n" &
     "    of N-1 tokens for an N-slot grant, through MAKEFLAGS/CARGO_MAKEFLAGS;\n" &
@@ -136,6 +138,20 @@ proc printSessionGroups(statusJson: string) =
       " oldest_queued_wait_millis=" &
         $group{"oldest_queued_wait_millis"}.getBiggestInt()
 
+proc withEnforcement(daemonJson: string; record: EnforcementRecord): string =
+  ## The daemon's status object with the client's enforcement record added
+  ## as `enforcement`. A daemon answer that is not a JSON object is wrapped
+  ## rather than lost.
+  try:
+    let parsed = parseJson(daemonJson)
+    if parsed.kind == JObject:
+      parsed["enforcement"] = parseJson(record.toJson())
+      return $parsed
+    return $(%*{"daemon": parsed, "enforcement": parseJson(record.toJson())})
+  except JsonParsingError:
+    return $(%*{"daemon": daemonJson,
+      "enforcement": parseJson(record.toJson())})
+
 proc printStatus(json: bool): int =
   var client = connectDefault()
   defer: client.close()
@@ -145,8 +161,14 @@ proc printStatus(json: bool): int =
   let statusJson =
     if client.supportsSessionGroups(): client.inspectionJson("status")
     else: ""
+  # THE ENFORCEMENT RECORD IS THIS CLIENT'S, not the daemon's: the cgroups
+  # belong to the launching client and its user (`runquota_process/
+  # enforcement`).
+  let enforcement = hostEnforcementRecord(launcherCgroupRoot())
   if json:
-    echo(if statusJson.len > 0: statusJson else: inspectionStatusJson(status))
+    let daemonJson =
+      if statusJson.len > 0: statusJson else: inspectionStatusJson(status)
+    echo withEnforcement(daemonJson, enforcement)
   else:
     echo "sessions: " & $status.activeSessions
     echo "leases: " & $status.activeLeases
@@ -172,6 +194,8 @@ proc printStatus(json: bool): int =
       echo "memory_pressure: " & client.inspectionJson("pressure")
     except CatchableError:
       discard
+    for line in enforcement.renderLines():
+      echo line
   0
 
 proc parseCacheDeadline(text: string; unixMillis: var uint64): bool =
@@ -267,6 +291,15 @@ proc runSessionSet(args: seq[string]): int =
   defer: client.close()
   try:
     let answer = client.updateSessionGroup(update)
+    if update.priorityPresent:
+      # The group's cgroup follows its priority (Linux): the weight of this
+      # user's directory for the group, when one exists, changes now rather
+      # than at the next tree placed in it.
+      let problem = rewriteGroupWeight(launcherCgroupRoot(), answer.group,
+        answer.priority)
+      if problem.len > 0:
+        stderr.writeLine("runquota session set: the priority is set, but " &
+          "the group's cgroup weight was not changed: " & problem)
     echo "session_group: " & answer.group & " priority=" &
       sessionPriorityName(answer.priority) & " cache_deadline=" &
       (if answer.cacheDeadlinePresent:
@@ -792,7 +825,7 @@ proc runDebugAcquire(args: seq[string]): int =
   try:
     if command.len > 0:
       let execution = session.runWithLease(request, command,
-          waitForQueued = benchmark)
+          waitForQueued = benchmark, cgroupRoot = launcherCgroupRoot())
       stdout.write(execution.process.stdout)
       stderr.write(execution.process.stderr)
       session.closeSession()

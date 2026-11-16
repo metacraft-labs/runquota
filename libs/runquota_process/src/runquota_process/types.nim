@@ -1,8 +1,9 @@
 import std/osproc
 
 import runquota_core/cpu_profile
+import runquota_process/cgroup_placement
 
-export cpu_profile
+export cpu_profile, cgroup_placement
 
 type
   LibraryInfo* = object
@@ -66,12 +67,28 @@ type
       ## the lease granted however many threads it spawns. Not applied on POSIX
       ## yet: cap enforcement there is cgroup work (`cpu.max`), out of scope
       ## for the Windows launcher.
+    cgroup*: CgroupTarget
+      ## Linux: the cgroup the child joins right after the fork, before it
+      ## does anything else (it writes itself into the leaf's
+      ## `cgroup.procs`), so its whole tree runs there. The launch prepares
+      ## the directories itself, again if another launcher removed them
+      ## meanwhile. Empty: not placed. Ignored elsewhere.
+    placementFallbackNice*: int
+      ## Added to the child's nice value INSTEAD of the cgroup when the child
+      ## was not placed (no target, or the placement failed): the weaker
+      ## stand-in for a lower weight. The larger of this and
+      ## `niceIncrement` applies.
 
   LaunchResult* = object
     processId*: uint64
     processGroupId*: uint64
     running*: bool
     backend*: ProcessBackendProfile
+    cgroupPath*: string
+      ## The leaf cgroup the child was created in, or "" when it was not
+      ## placed.
+    cgroupProblem*: string
+      ## Why a requested placement did not happen, or "".
 
   ProcessCompletion* = object
     processId*: uint64
@@ -178,3 +195,6 @@ type
     winStdoutClosed*: bool
     winStderrClosed*: bool
     temporaryLaunchFiles*: seq[string]
+    cgroupTarget*: CgroupTarget
+      ## The placement this launch made, released (its leaf and group
+      ## directory removed when empty) by `close`.

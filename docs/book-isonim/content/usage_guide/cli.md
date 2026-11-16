@@ -40,7 +40,7 @@ The `stats` verbs have a page of their own:
 
 | Command | What it tells you |
 |---|---|
-| `runquota status [--json]` | Live counters: sessions, leases, `supervisor_lost_leases`, finished and granted totals, the memory-pressure reading, the starvation bound, and one row per [session group](/getting_started/concepts#session-group) with its counters (below). `--json` also carries the capacity figures (below). |
+| `runquota status [--json]` | Live counters: sessions, leases, `supervisor_lost_leases`, finished and granted totals, the memory-pressure reading, the starvation bound, and one row per [session group](/getting_started/concepts#session-group) with its counters (below). `--json` also carries the capacity figures (below). Both end with what is enforced below admission on this host ([below](#priority-below-admission)). |
 | `runquota sessions --json` | The registered sessions. |
 | `runquota leases --json` | Every lease the daemon is tracking. |
 | `runquota topology --json` | The configured machines and CPU share groups — the budget, as the daemon sees it. |
@@ -211,7 +211,7 @@ runquota run --adapter list
 | `--stats-key KEY` | `run/<program>@<project>` | Keys the recorded row and the [estimate](/getting_started/concepts#estimate) lookup. The default is the program's base name plus the name of the nearest enclosing git checkout of the working directory (or of the directory itself). |
 | `--adapter NAME` | detected | `nim`, `go`, `nextest`, `nix`, `pnpm`, `yarn`, `playwright`, `npm`; `none` leaves the command line alone and only holds the lease; `list` prints the table and exits. |
 | `--verbose`, `-v` | off | Print the chosen width, what the adapter did and the final command line to stderr. |
-| `--cap` | off | **Windows:** enforces the grant as a hard ceiling. The command's whole process tree runs in a Job Object whose CPU-rate control is capped at the granted width, so however many threads or processes it spawns it cannot use more CPU than the lease bought. **Every other platform:** not available yet (CPU-limit enforcement is cgroup work that has not shipped); `--cap` there exits 2 without running the command. |
+| `--cap` | off | Hold the command's whole process tree to the granted width. **Linux:** a cgroup of its own whose `cpu.max` is the grant, when [placement](#priority-below-admission) is on. **Windows:** a Job Object whose CPU-rate control is capped at the granted width, so however many threads or processes the command spawns it cannot use more CPU than the lease bought. Where neither can be done (macOS, Linux with placement off or unavailable, or inside another lease's tree) the command still runs, uncapped, and `run` says `--cap not enforced: <why>` on stderr. |
 | `-- COMMAND [ARG...]` | required | Everything after `--` is the command. Its own flags are never read by `run`. |
 
 The command also gets two environment variables whatever the adapter:
@@ -246,16 +246,71 @@ no adapter recognises is run unchanged; the lease is still held for its
 duration.
 
 **Exit codes.** The command's exit code, or `128 + signal` if it was killed.
-**2** for bad arguments, and for `--cap` where it is not available (every
-platform but Windows); **1** when the daemon refused or lost the lease so the
-command never ran; **127** when the command could not be started. The lease is
-released when the command ends, whatever its status.
+**2** for bad arguments; **1** when the daemon refused or lost
+the lease so the command never ran; **127** when the command could not be
+started. The lease is released when the command ends, whatever its status.
 
 **With no daemon, it still runs your command**, unchanged and unbounded, as
 `acquire` does.
 
 The command's standard streams are the terminal's: its output is not captured
 and replayed, unlike `acquire`.
+
+## Priority below admission
+
+Admission decides how much CPU a command is granted; it cannot stop a tool
+that ignores its grant and starts a process per core. On Linux, RunQuota's
+launchers (`run`, `acquire -- CMD`, `jobserver`) therefore start each command's
+process tree inside a cgroup v2 directory of its
+[session group](/getting_started/concepts#session-group), so such a tool
+competes for CPU at its group's priority:
+
+| Directory (below the root) | `cpu.weight` | What runs there |
+|---|---|---|
+| `group-<name>/shared` | low 25, normal 100, high 400, urgent 1600 | every tree of the group |
+| `group-<name>/cap-<pid>-<n>` | the group's | one `run --cap` tree, with `cpu.max` at its grant |
+| `reclaimed/shared` | 1 | trees of a reclaimed grant (also at nice +10) |
+
+**Placement is off by default.** A host turns it on in its host file, which
+every user's `runquota` reads at each launch:
+
+```toml
+[enforcement]
+cgroups = "on"
+```
+
+(`runquota config set enforcement.cgroups on`). `RUNQUOTA_CGROUP_ROOT=off`
+turns it off for one user or shell, and `RUNQUOTA_CGROUP_ROOT=<path>` turns
+it on under another root ([environment variables](/reference/environment_variables)).
+The default root is `runquota.slice` below your own `user@<uid>.service`
+cgroup, the subtree systemd delegates to you with the `cpu` controller.
+`<name>` is the group name with every byte outside `[A-Za-z0-9_:@-]` written
+as `%XX`. The command is forked as usual and writes itself into its
+directory before it runs, so nothing it starts escapes; the last tree out of
+a directory removes it.
+`runquota session set --priority` also changes the weight of the group's
+directory when it exists. A launcher that itself runs inside a leased tree
+leaves its command where the outer launcher put it.
+
+With placement off, nothing below admission changes except that a
+reclaimed tree runs at nice +10, and `--cap` runs uncapped with a note on
+stderr. Where placement is on but unavailable (another OS, no delegated
+`cpu` controller, a process outside its user manager), nothing fails either:
+a reclaimed tree runs at nice +10, a `low` group's tree at nice +5, others
+unchanged. `runquota status` says which, one
+line per mechanism, and `status --json` carries the same as `enforcement`:
+
+```text
+enforcement_os: linux placement=on cgroup_root=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/runquota.slice
+enforcement: priority enforced (cgroup v2 cpu.weight of .../group-<group> ...)
+enforcement: reclaimed enforced (cgroup v2 cpu.weight 1 of .../reclaimed, and nice +10)
+enforcement: width-cap enforced (cgroup v2 cpu.max of the tree's own leaf (runquota run --cap))
+enforcement: memory-cap admission-only (admission (memory reservation)) gap: ...
+```
+
+The record is the client's: it describes the host and user of the `runquota`
+process that prints it, because the cgroups are the launcher's, not the
+daemon's.
 
 ## `runquota jobserver`
 

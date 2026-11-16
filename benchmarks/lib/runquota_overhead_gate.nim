@@ -49,10 +49,12 @@
 ## Linux is the platform this has run on. The macOS code paths compile but
 ## have not been run.
 
-import std/[cpuinfo, json, monotimes, os, posix, strutils, tempfiles, times]
+import std/[algorithm, cpuinfo, json, monotimes, os, posix, strutils, tempfiles, times]
 
 import runquota_client
 import runquota_core/measurement
+import runquota_core
+import runquota_process
 
 import runquota_overhead_gate/process_cost
 import runquota_overhead_gate/statistics
@@ -76,6 +78,12 @@ type
     policy*: GatePolicy
     maxSeconds*: float
     measure*: string            ## "all" or one measurement name
+    switch*: string
+      ## "" (the arms differ by measurements) or an ENFORCEMENT switch the
+      ## arms differ by instead (`cgroups`); the measurements are then the
+      ## baseline in both arms.
+    cliBin*: string
+      ## The `runquota` CLI, for the `run-64` case.
     baseline*: MeasurementSet
       ## Measurements on in BOTH arms (`--baseline`), so the one under test
       ## is judged on top of them. Needed for a measurement that only has
@@ -135,6 +143,15 @@ proc armMeasurements*(measure: string; arm: Arm;
     raise newException(CaseUnavailable, "measurement '" & measure &
       "' is not implemented yet, so it has no cost to measure")
   baseline + {m}
+
+proc armSwitchText*(cfg: GateConfig; arm: Arm): string =
+  ## The measurement switches of `arm`: the measurement under test on top
+  ## of the baseline in the ON arm, or, when the gate judges an
+  ## enforcement switch (`--switch`), the baseline in both arms.
+  if cfg.switch.len > 0:
+    formatMeasurementSwitches(cfg.baseline)
+  else:
+    formatMeasurementSwitches(armMeasurements(cfg.measure, arm, cfg.baseline))
 
 proc firstArm*(round: int): Arm =
   ## Which arm a round runs first: OFF in even rounds, ON in odd ones, so an
@@ -421,6 +438,13 @@ const fixtureActionCount = 64
   ## `benchmarks/fixtures/reprobuild-64-actions/repro.nim`'s `actionCount`.
 
 proc reprobuildCase(cfg: GateConfig; scratch: string): GateCase =
+  if cfg.switch.len > 0:
+    # Reprobuild's per-action launches do not place their trees, so both
+    # arms would run the same build and the gate would pass a cost it never
+    # measured.
+    raise newException(CaseUnavailable, "the reprobuild-64 case cannot " &
+      "judge --switch=" & cfg.switch & ": Reprobuild's actions are not " &
+      "placed in cgroups; use --case=run-64")
   for (label, path) in [("runquotad", cfg.daemonBin),
                         ("reprobuild engine", cfg.engineBin)]:
     if path.len == 0 or not fileExists(path):
@@ -498,6 +522,187 @@ proc reprobuildCase(cfg: GateConfig; scratch: string): GateCase =
   }
 
 # ---------------------------------------------------------------------------
+# run-64: the same 64 actions, each through `runquota run`
+# ---------------------------------------------------------------------------
+#
+# WHY. Cgroup placement is done by RunQuota's own launchers (`runquota run`,
+# `acquire -- CMD`, `jobserver`), not by Reprobuild's per-action launches,
+# so the Reprobuild case never exercises it. This case runs the Reprobuild
+# fixture's work -- 64 actions of the same shell loop -- with each action
+# launched by `runquota run`, all 64 started at once and queued by the arm's
+# daemon against the case's budget, so every action pays the whole launcher
+# path, placement included when it is on.
+
+const
+  run64ActionCount = 64
+  run64LoopTurns = 150_000
+    ## `benchmarks/fixtures/reprobuild-64-actions/repro.nim`'s `iterations`.
+  migrationProbeSamples = 300
+
+proc run64Script(cli: string): string =
+  ## The driver: start 64 `runquota run` processes, wait for each, fail if
+  ## any failed. Each action writes its loop count to `out-N.txt`, which the
+  ## case counts and removes after the run.
+  "fail=0; pids=''; i=0; while [ $i -lt " & $run64ActionCount & " ]; do " &
+    quoteShell(cli) & " run --width 1 --adapter none -- sh -c " &
+    quoteShell("j=0; while [ $j -lt " & $run64LoopTurns &
+      " ]; do j=$((j+1)); done; echo $j > out-$0.txt") & " $i & " &
+    "pids=\"$pids $!\"; i=$((i+1)); done; " &
+    "for p in $pids; do wait $p || fail=1; done; exit $fail"
+
+proc gateCgroupRoot(): string =
+  ## A gate-owned cgroup root below this user's delegated subtree, or "".
+  let own = try: readFile("/proc/self/cgroup") except IOError, OSError: ""
+  let default = resolveCgroupRoot("", own, int(getuid()), hostSwitchOn = true)
+  if not default.usable:
+    return ""
+  default.path.parentDir / ("runquota-gate-" & $getpid() & ".slice")
+
+proc removeGateCgroups(root: string) =
+  ## Remove the gate's root once its trees are gone, deepest first. Kills
+  ## nothing: every tree in it was this gate's and has exited.
+  if root.len == 0 or not dirExists(root):
+    return
+  var dirs: seq[string]
+  for path in walkDirRec(root, yieldFilter = {pcDir}, followFilter = {pcDir}):
+    dirs.add(path)
+  dirs.sort(proc (a, b: string): int = cmp(b.len, a.len))
+  dirs.add(root)
+  for dir in dirs:
+    for _ in 0 ..< 200:
+      if removeEmptyCgroup(dir): break
+      sleep(50)
+
+proc migrationProbe(root: string): JsonNode =
+  ## The migration alone: fork `migrationProbeSamples` children, one at a
+  ## time, each writing itself into a gate-owned leaf's `cgroup.procs` and
+  ## timing that one write (the step that takes the kernel's cgroup
+  ## threadgroup lock for writing), reported to the parent on a pipe.
+  let target = targetFor(CgroupRoot(state: crsExplicit, path: root),
+    "migration-probe", sessionPriorityNormal, reclaimed = false)
+  var problem = ""
+  if not prepareTarget(target, problem):
+    raise newException(OSError, "migration probe: " & problem)
+  var samples: seq[int64]
+  for i in 0 ..< migrationProbeSamples:
+    let fd = posix.open(cstring(target.leafPath / "cgroup.procs"),
+      O_WRONLY or O_CLOEXEC)
+    if fd < 0:
+      raise newException(OSError, "migration probe: cannot open the leaf")
+    var fds: array[0..1, cint]
+    if pipe(fds) != 0:
+      raise newException(OSError, "migration probe: pipe")
+    let pid = fork()
+    if pid == 0:
+      let t0 = getMonoTime().ticks
+      let ok = posix.write(fd, cstring("0"), 1) == 1
+      var elapsed = getMonoTime().ticks - t0
+      if not ok: elapsed = -1
+      discard posix.write(fds[1], addr elapsed, sizeof(elapsed))
+      exitnow(0)
+    discard posix.close(fds[1])
+    discard posix.close(fd)
+    var elapsed = -1'i64
+    discard posix.read(fds[0], addr elapsed, sizeof(elapsed))
+    discard posix.close(fds[0])
+    var status: cint
+    discard waitpid(pid, status, 0)
+    if elapsed < 0:
+      raise newException(OSError, "migration probe: a child could not join")
+    samples.add(elapsed)
+  discard removeEmptyCgroup(target.leafPath)
+  discard removeEmptyCgroup(target.dirPath)
+  samples.sort()
+  var total = 0'i64
+  for x in samples: total += x
+  proc at(q: float): int64 = samples[min(samples.high, int(q * float(samples.len)))]
+  %*{"samples": samples.len, "unit": "microseconds",
+     "mean": float(total) / float(samples.len) / 1000.0,
+     "median": float(at(0.5)) / 1000.0, "p90": float(at(0.9)) / 1000.0,
+     "p99": float(at(0.99)) / 1000.0, "max": float(samples[^1]) / 1000.0}
+
+proc runEnv(socket, switches, cgroupRoot: string): seq[string] =
+  ## A `runquota run` client's environment for one arm: the arm's daemon,
+  ## its measurement switches and its cgroup root; no session group or
+  ## parent lease inherited from whoever started the gate.
+  const dropped = ["RUNQUOTA_SOCKET", "RUNQUOTA_MEASUREMENT",
+    "RUNQUOTA_ENDPOINT_SCOPE", "RUNQUOTA_CGROUP_ROOT", "RUNQUOTA_SESSION",
+    "RUNQUOTA_SESSION_PRIORITY", "RUNQUOTA_SESSION_CACHE_TTL",
+    "RUNQUOTA_PARENT_LEASE"]
+  for key, value in envPairs():
+    if key notin dropped:
+      result.add(key & "=" & value)
+  result.add("RUNQUOTA_SOCKET=" & socket)
+  result.add("RUNQUOTA_ENDPOINT_SCOPE=private")
+  result.add("RUNQUOTA_MEASUREMENT=" & switches)
+  result.add("RUNQUOTA_CGROUP_ROOT=" & cgroupRoot)
+
+proc run64Case(cfg: GateConfig; scratch: string): GateCase =
+  for (label, path) in [("runquotad", cfg.daemonBin), ("runquota", cfg.cliBin)]:
+    if path.len == 0 or not fileExists(path):
+      raise newException(CaseUnavailable, "the " & label &
+        " binary is missing: '" & path & "'")
+  if cfg.switch.len > 0 and cfg.switch != "cgroups":
+    raise newException(ValueError, "unknown --switch: " & cfg.switch &
+      "; expected cgroups")
+  var cgroupRoots: array[Arm, string] = ["off", "off"]
+  var probe = newJNull()
+  let gateRoot = if cfg.switch == "cgroups": gateCgroupRoot() else: ""
+  if cfg.switch == "cgroups":
+    if gateRoot.len == 0:
+      raise newException(CaseUnavailable, "--switch=cgroups needs a " &
+        "delegated cgroup v2 subtree for this user, and there is none")
+    cgroupRoots[armOn] = gateRoot
+    probe = migrationProbe(gateRoot)
+  var daemons: array[Arm, PrivateDaemon]
+  var switches: array[Arm, string]
+  var dirs: array[Arm, string]
+  for arm in Arm:
+    switches[arm] = armSwitchText(cfg, arm)
+    daemons[arm] = startDaemon(cfg, scratch, arm, switches[arm])
+    dirs[arm] = scratch / $arm / "work"
+    createDir(dirs[arm])
+  let script = run64Script(cfg.cliBin)
+  result.name = "run-64"
+  result.run = proc (arm: Arm; round: int): RunCost =
+    let daemon = daemons[arm]
+    let before = processCpuSeconds(daemon.pid)
+    let log = scratch / $arm / "run.log"
+    result = runMeasured(["/bin/sh", "-c", script],
+      runEnv(daemon.socket, switches[arm], cgroupRoots[arm]), dirs[arm], log)
+    let after = settledDaemonCpuSeconds(daemon.pid)
+    result.daemonCpuSeconds = after - before
+    result.cpuSeconds += result.daemonCpuSeconds
+    var ran = 0
+    for kind, path in walkDir(dirs[arm]):
+      if kind == pcFile and path.extractFilename.startsWith("out-"):
+        if readFile(path).strip() == $run64LoopTurns: inc ran
+        removeFile(path)
+    if result.exitStatus != 0 or ran != run64ActionCount:
+      var tail = ""
+      try:
+        let lines = readFile(log).splitLines()
+        tail = lines[max(0, lines.len - 30) .. ^1].join("\n")
+      except IOError:
+        discard
+      raise newException(OSError, "the " & $arm & " run (round " & $round &
+        ") exited " & $result.exitStatus & " with " & $ran & " of " &
+        $run64ActionCount & " actions done; " & log & ":\n" & tail)
+  result.stop = proc () =
+    for arm in Arm:
+      stopDaemon(daemons[arm])
+    removeGateCgroups(gateRoot)
+  result.details = %*{
+    "cli": cfg.cliBin,
+    "daemon": cfg.daemonBin,
+    "actions": run64ActionCount,
+    "loop_turns_per_action": run64LoopTurns,
+    "cpu_milli": cfg.cpuMilli,
+    "cgroup_root": {"off": cgroupRoots[armOff], "on": cgroupRoots[armOn]},
+    "migration_probe": probe,
+  }
+
+# ---------------------------------------------------------------------------
 # The loop
 # ---------------------------------------------------------------------------
 
@@ -569,9 +774,10 @@ proc runGate*(cfg: GateConfig; gateCase: GateCase;
       "max_seconds": cfg.maxSeconds},
     "measure": cfg.measure,
     "baseline": formatMeasurementSwitches(cfg.baseline),
+    "switch": cfg.switch,
     "switches": {
-      "off": formatMeasurementSwitches(armMeasurements(cfg.measure, armOff, cfg.baseline)),
-      "on": formatMeasurementSwitches(armMeasurements(cfg.measure, armOn, cfg.baseline))},
+      "off": armSwitchText(cfg, armOff),
+      "on": armSwitchText(cfg, armOn)},
     "not_implemented_not_measured": notImplemented(),
     "capabilities": capabilityRecords(),
     "host": {"cpus": countProcessors(), "os": hostOS, "arch": hostCPU,
@@ -595,11 +801,14 @@ proc exitStatusFor*(verdict: GateVerdict): int =
 # ---------------------------------------------------------------------------
 
 const usageText = """
-runquota_overhead_gate --case=reprobuild-64|cargo-jobserver|synthetic [options]
+runquota_overhead_gate --case=reprobuild-64|run-64|cargo-jobserver|synthetic [options]
 
   --measure=all|NAME          ON arm: every implemented measurement, or one
   --baseline=NAME[,NAME...]   on in BOTH arms (e.g. capture, under which
                               ambient-sampling has a store to write to)
+  --switch=cgroups            judge an ENFORCEMENT switch instead: the arms
+                              differ only by the client's RUNQUOTA_CGROUP_ROOT
+                              (off / a gate-owned root); run-64 only
   --budget-percent=1          allowed overhead
   --precision-percent=0.5     required 95% interval half-width
   --min-rounds=10 --max-rounds=200 --max-minutes=90
@@ -609,6 +818,9 @@ runquota_overhead_gate --case=reprobuild-64|cargo-jobserver|synthetic [options]
   reprobuild-64:
     --daemon=PATH --engine=PATH --fixture=DIR
     --cpu-milli=4000 --memory-bytes=8589934592
+
+  run-64:
+    --daemon=PATH --cli=PATH --cpu-milli=4000 --memory-bytes=8589934592
 
   synthetic:
     --burn-iterations=N --inject-percent=0
@@ -629,6 +841,8 @@ proc parseGateArgs*(args: openArray[string]): GateConfig =
     case key
     of "--case": result.caseName = value
     of "--measure": result.measure = value
+    of "--switch": result.switch = value
+    of "--cli": result.cliBin = value
     of "--baseline":
       for name in value.split(','):
         var m: Measurement
@@ -667,6 +881,7 @@ proc makeCase*(cfg: GateConfig; scratch: string): GateCase =
   case cfg.caseName
   of "synthetic": syntheticCase(cfg, scratch)
   of "reprobuild-64": reprobuildCase(cfg, scratch)
+  of "run-64": run64Case(cfg, scratch)
   of "cargo-jobserver":
     # NOT YET, AND NEVER A PASS. The requirement names a wide cargo test
     # under `runquota jobserver`; until that command exists there is

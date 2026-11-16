@@ -242,5 +242,44 @@ suite "runquota config set for [admission]":
         discard editHostConfig(path, key, value, unset = false, changed)
     check not fileExists(path)
 
+suite "[enforcement] cgroups":
+  # Read by RunQuota's launchers, which place the trees they start in cgroups
+  # only when it is "on" (or when RUNQUOTA_CGROUP_ROOT names a root); the
+  # daemon validates it with the rest of the file. Mutation: accepting any
+  # other value, or defaulting an absent key to on.
+  test "on, off, absent, and everything else refused":
+    check parseHostConfig("[enforcement]\ncgroups = \"on\"\n",
+      "test.toml").enforcementCgroups == some(true)
+    check parseHostConfig("[enforcement]\ncgroups = \"off\"\n",
+      "test.toml").enforcementCgroups == some(false)
+    check parseHostConfig("", "test.toml").enforcementCgroups.isNone
+    check parseHostConfig("", "test.toml").enforcementCgroups.get(false) == false
+    for (text, needle) in [
+        ("[enforcement]\ncgroups = \"yes\"\n", "cgroups must be \"on\" or \"off\""),
+        ("[enforcement]\ncgroups = on\n", "double-quoted"),
+        ("[enforcement]\ncpu = \"on\"\n", "unknown key `cpu` in [enforcement]")]:
+      let message = refusal(text)
+      check needle in message
+      if needle notin message:
+        echo "  for ", text.escape, ": ", message
+
+  test "runquota config set writes it and refuses anything but on or off":
+    let root = scratch("enforcement")
+    let path = root / "runquotad.toml"
+    var changed = false
+    let text = editHostConfig(path, "enforcement.cgroups", "on",
+      unset = false, changed)
+    check changed
+    check "[enforcement]\ncgroups = \"on\"" in text
+    writeFile(path, text)
+    check readHostConfig(path).enforcementCgroups == some(true)
+    for value in ["yes", "1", "\"on\""]:
+      expect HostConfigError:
+        discard editHostConfig(path, "enforcement.cgroups", value,
+          unset = false, changed)
+    expect HostConfigError:
+      discard editHostConfig(path, "enforcement.memory", "on", unset = false,
+        changed)
+
 for root in scratchRoots:
   removeDir(root)

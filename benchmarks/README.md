@@ -42,8 +42,18 @@ Cases:
 | Case | Workload | Status |
 |---|---|---|
 | `reprobuild-64` (default) | `benchmarks/fixtures/reprobuild-64-actions`: 64 independent CPU-bound actions, Reprobuild in-process, against the arm's daemon | implemented; needs a `reprobuild` engine built against this checkout (`REPRO_ENGINE`, see `scripts/run-overhead-gate.sh`) |
+| `run-64` | the same 64 actions, each started by its own `runquota run --width 1` and queued by the arm's daemon | implemented; the case for `--switch=cgroups` (below) |
 | `cargo-jobserver` | a wide cargo test under `runquota jobserver` | unavailable until `runquota jobserver` exists; exits 4 |
 | `synthetic` | the gate's own instrument check: fixed CPU burns, with `--inject-percent` and a periodic `--disturbance-percent` | used by `tests/integration/t_overhead_gate_detects_overhead.nim` |
+
+**Enforcement switches.** `--switch=cgroups` judges cgroup placement
+instead of a measurement: the two arms run with the same measurement
+switches and differ only by the launching client's `RUNQUOTA_CGROUP_ROOT`
+(`off`, or a root the gate creates below your delegated cgroup subtree and
+removes at the end). Only `run-64` can judge it: Reprobuild's actions are not
+placed, so `reprobuild-64` refuses the switch. Before the rounds the gate
+also times the migration alone (300 children each writing themselves into a
+leaf's `cgroup.procs`) and reports it as `case_details.migration_probe`.
 
 Exit status: 0 pass, 1 fail, 2 usage, 3 inconclusive, 4 case unavailable,
 5 a run could not be measured. The JSON report goes to

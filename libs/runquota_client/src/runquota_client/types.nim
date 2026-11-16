@@ -48,6 +48,14 @@ type
     ## frames (which would buffer unbounded late responses).  ``0`` means
     ## "no GrantNext is currently outstanding".
     pendingGrantRequestId*: uint64
+    groupName*: string
+      ## The session group this session joined (`interactive` when it
+      ## named none).
+    declaredGroupPriority*: SessionPriority
+      ## The priority this session would have created its group with.
+    groupPriorityKnown*: bool
+    groupPriority*: SessionPriority
+      ## The group's priority in force, once `groupPriorityInForce` asked.
 
   RunQuotaLease* = object
     session*: ptr RunQuotaSession

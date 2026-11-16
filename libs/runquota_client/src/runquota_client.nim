@@ -338,7 +338,17 @@ proc registerSession*(client: var RunQuotaClient; name, version: string;
   if not decodeSessionRegistered(frame.payload, registered):
     client.lastDiagnostic = diagnostic(diagProtocol, "invalid SessionRegistered payload")
     raise newException(RunQuotaClientError, client.lastDiagnostic.message)
-  RunQuotaSession(client: addr client, id: registered.sessionId, active: true)
+  # The group this session is in, as far as this client can tell without
+  # asking: the name it declared (or `interactive`), and the priority it
+  # would start the group with. `groupPriorityInForce` asks for the real one.
+  let groupName =
+    if group.name.len > 0: group.name else: InteractiveSessionGroup
+  let declared =
+    if group.name.len == 0: sessionPriorityHigh
+    elif group.priorityPresent: group.priority
+    else: sessionPriorityNormal
+  RunQuotaSession(client: addr client, id: registered.sessionId, active: true,
+    groupName: groupName, declaredGroupPriority: declared)
 
 proc registerSession*(client: var RunQuotaClient; name,
     version: string): RunQuotaSession =
@@ -371,6 +381,29 @@ proc updateSessionGroup*(client: var RunQuotaClient;
     client.lastDiagnostic = diagnostic(diagProtocol,
       "invalid SessionGroupUpdated payload")
     raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+
+proc groupPriorityInForce*(session: var RunQuotaSession): SessionPriority =
+  ## The priority the daemon holds for this session's group now. A group
+  ## outlives its sessions and its launcher may have changed the priority
+  ## since this process's environment was written, so the declared value is
+  ## only the fallback. Asked once per session (an `UpdateSessionGroup` that
+  ## changes nothing answers with the attributes in force) and remembered.
+  ## A daemon that predates session groups, or a refusal, gives the
+  ## declared priority.
+  if session.groupPriorityKnown:
+    return session.groupPriority
+  result = session.declaredGroupPriority
+  if not session.client.isNil and session.client[].supportsSessionGroups():
+    try:
+      let answer = session.client[].updateSessionGroup(
+        UpdateSessionGroupMessage(group: session.groupName,
+          priority: sessionPriorityNormal,
+          cacheDeadlineChange: cacheDeadlineKeep))
+      result = answer.priority
+    except RunQuotaClientError:
+      discard
+  session.groupPriority = result
+  session.groupPriorityKnown = true
 
 proc closeSession*(session: var RunQuotaSession) =
   if not session.active:

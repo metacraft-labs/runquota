@@ -3,7 +3,7 @@
 # THE MEASUREMENT OVERHEAD GATE: does turning RunQuota's measurements on make
 # a build more than 1% slower, in wall time or CPU time?
 #
-#   scripts/run-overhead-gate.sh [reprobuild-64|cargo-jobserver|synthetic] [gate options]
+#   scripts/run-overhead-gate.sh [reprobuild-64|run-64|cargo-jobserver|synthetic] [gate options]
 #
 # See benchmarks/lib/runquota_overhead_gate.nim for what the gate does and
 # benchmarks/README.md for how to read its report. Exit status is the gate's:
@@ -81,11 +81,19 @@ case "${case_name}" in
       bash -c 'cd "$1" && shift && exec "$@"' overhead-gate "$(pwd)" \
       ${pin[@]+"${pin[@]}"} "${gate_abs}" "${args[@]}" "$@"
     ;;
+  run-64)
+    # The fixture's 64 actions, each through `runquota run`: the case that
+    # exercises RunQuota's own launchers (and their cgroup placement, with
+    # --switch=cgroups).
+    args+=("--daemon=$(pwd)/build/bin/runquotad"
+      "--cli=$(pwd)/build/bin/runquota")
+    run_gate ${pin[@]+"${pin[@]}"} "${gate_bin}" "${args[@]}" "$@"
+    ;;
   cargo-jobserver|synthetic)
     run_gate ${pin[@]+"${pin[@]}"} "${gate_bin}" "${args[@]}" "$@"
     ;;
   *)
-    echo "usage: $0 [reprobuild-64|cargo-jobserver|synthetic] [gate options]" >&2
+    echo "usage: $0 [reprobuild-64|run-64|cargo-jobserver|synthetic] [gate options]" >&2
     exit 2
     ;;
 esac

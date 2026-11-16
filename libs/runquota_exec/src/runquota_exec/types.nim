@@ -20,3 +20,7 @@ type
     leaseReleased*: bool
     stdoutBytes*: uint64
     stderrBytes*: uint64
+    cgroupPath*: string
+      ## The cgroup the tree ran in, or "" (`cgroupProblem` says why when a
+      ## placement was asked for).
+    cgroupProblem*: string

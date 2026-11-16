@@ -21,8 +21,9 @@ when defined(windows):
   # waitForCompletion can record peakResidentMemoryBytes on the ProcessCompletion.
   import runquota_host_windows
 import runquota_process/types as processTypes
+import runquota_process/enforcement
 
-export processTypes
+export processTypes, enforcement
 
 const libraryName* = "runquota_process"
 const DefaultOutputLimit* = 1_048_576
@@ -1155,6 +1156,22 @@ when defined(windows):
       temporaryLaunchFiles: prepared.temporaryFiles
     )
 
+when defined(linux):
+  proc readPlacementByte(fd: cint; value: var uint8): bool =
+    ## One byte of the placement handshake; false at end of input (the
+    ## other side closed or died) or on an error.
+    while true:
+      let got = posix.read(fd, addr value, 1)
+      if got == 1: return true
+      if got < 0 and errno == EINTR: continue
+      return false
+
+  proc writePlacementByte(fd: cint; value: uint8) =
+    var byteValue = value
+    while true:
+      let put = posix.write(fd, addr byteValue, 1)
+      if put == 1 or not (put < 0 and errno == EINTR): return
+
 proc launchProcess*(spec: CommandSpec): LaunchedProcess =
   when defined(posix):
     if spec.argv.len == 0:
@@ -1198,19 +1215,86 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     defer: deallocCStringArray(envp)
     let shellArgvC = allocCStringArray(shellArgv)
     defer: deallocCStringArray(shellArgvC)
-    let pid = fork()
+    # THE CHILD WRITES ITSELF INTO ITS CGROUP when the spec names one
+    # (Linux), right after an ordinary `fork` and before it does anything
+    # else, so no descendant can start outside the leaf. An ordinary fork
+    # keeps libc's fork handlers, which LD_PRELOAD shims that hook fork and
+    # execve rely on. The parent opens the leaf's `cgroup.procs` before the
+    # fork; the child writes "0" (itself) to it and reports the result on a
+    # pipe, then waits for the parent's verdict. If the leaf vanished in
+    # between (another launcher's clean-up removed it: ENOENT / ENODEV), the
+    # parent prepares it again and moves the waiting child itself, at most
+    # `PlacementAttempts` times. Any other failure leaves the child unplaced,
+    # and it then takes `placementFallbackNice`. Every variable the child
+    # touches is declared here, so the child runs no destructor (no `free`
+    # between fork and exec).
+    var pid: Pid = -1
+    var inCgroup = false
+    var placementProblem = ""
+    var joining = false
+    var procsFd: cint = -1
+    var statusPipe = [cint(-1), cint(-1)]
+    var verdictPipe = [cint(-1), cint(-1)]
+    # The root's SHARED lock, from preparing the leaf until the child is in
+    # it: no other launcher's clean-up can remove the leaf in between
+    # (`lockCgroupRoot`). Released before this launch's own clean-up below.
+    var rootLock: cint = -1
+    when defined(linux):
+      if spec.cgroup.placed:
+        rootLock = lockCgroupRoot(spec.cgroup.root, exclusive = false)
+        var tries = 0
+        var retryable = false
+        while tries < PlacementAttempts:
+          inc tries
+          procsFd = openPreparedProcs(spec.cgroup, placementProblem, retryable)
+          if procsFd >= 0 or not retryable:
+            break
+        if procsFd >= 0:
+          if createControlPipe(statusPipe) and createControlPipe(verdictPipe):
+            joining = true
+          else:
+            placementProblem = "cannot create the cgroup placement pipes"
+            for fd in [statusPipe[0], statusPipe[1], verdictPipe[0],
+                       verdictPipe[1], procsFd]:
+              if fd >= 0: discard posix.close(fd)
+            procsFd = -1
+    else:
+      if spec.cgroup.placed:
+        placementProblem = "cgroup placement is implemented on Linux only"
+    pid = fork()
+    when defined(linux):
+      if pid == 0 and joining:
+        # The child: one write, one report, one wait. Allocation-free.
+        # It first closes the parent's ends: holding the verdict pipe's
+        # write end itself, the child would never see end-of-input on it
+        # and would wait forever, never executing, if the parent died
+        # before it answered.
+        discard posix.close(statusPipe[0])
+        discard posix.close(verdictPipe[1])
+        var status = 0'u8
+        if posix.write(procsFd, cstring("0"), 1) != 1:
+          status = uint8(max(1, min(int(errno), 255)))
+        writePlacementByte(statusPipe[1], status)
+        var verdict = 1'u8
+        if readPlacementByte(verdictPipe[0], verdict) and verdict == 0'u8:
+          inCgroup = true
     if pid == 0:
       if spec.stdio == captureStdio:
         discard close(stdoutPipe[0])
         discard close(stderrPipe[0])
       if spec.createProcessGroup and setpgid(0, 0) != 0:
         childExit(126)
-      if spec.niceIncrement > 0:
+      # A child that is not in its cgroup takes the weaker stand-in for the
+      # lower weight the cgroup would have given it.
+      let niceWanted =
+        if inCgroup: spec.niceIncrement
+        else: max(spec.niceIncrement, spec.placementFallbackNice)
+      if niceWanted > 0:
         # Async-signal-safe in effect (two syscalls, no allocation). A nice
         # that fails leaves the child at its inherited weight: the grant is
         # still within what admission predicted, so failing the launch
         # would cost the work for nothing.
-        discard posix.nice(cint(spec.niceIncrement))
+        discard posix.nice(cint(niceWanted))
       if spec.cwd.len > 0 and chdir(cstring(spec.cwd)) != 0:
         childExit(126)
       if spec.stdio == captureStdio:
@@ -1231,6 +1315,41 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       # own stderr -- the stream the caller already captures -- before the 127.
       childReportExecFailure(cstring(execFailureText), errno)
       childExit(127)
+    when defined(linux):
+      if joining:
+        # The parent's half of the handshake (see above).
+        discard posix.close(procsFd)
+        discard posix.close(statusPipe[1])
+        discard posix.close(verdictPipe[0])
+        if pid > 0:
+          var status = 0'u8
+          var verdict = 1'u8
+          let leaf = spec.cgroup.leafPath
+          if not readPlacementByte(statusPipe[0], status):
+            placementProblem = "the child ended before it joined " & leaf
+          elif status == 0'u8:
+            verdict = 0'u8
+          elif cint(status) == ENOENT or cint(status) == ENODEV:
+            var tries = 1
+            placementProblem = "cgroup " & leaf & " vanished before the " &
+              "child joined it"
+            while tries < PlacementAttempts:
+              inc tries
+              if moveIntoTarget(spec.cgroup, int(pid), placementProblem):
+                verdict = 0'u8
+                break
+          else:
+            placementProblem = "the child could not join " & leaf & ": " &
+              $strerror(cint(status))
+          if verdict == 0'u8:
+            inCgroup = true
+            placementProblem = ""
+          writePlacementByte(verdictPipe[1], verdict)
+        discard posix.close(statusPipe[0])
+        discard posix.close(verdictPipe[1])
+      # The child is in its leaf (or will not be): the leaf may go now.
+      unlockCgroupRoot(rootLock)
+      rootLock = -1
     if pid < 0:
       if spec.stdio == captureStdio:
         discard close(stdoutPipe[0])
@@ -1247,6 +1366,15 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     if spec.createProcessGroup:
       discard setpgid(pid, pid)
     let pgid = if spec.createProcessGroup: int(pid) else: int(getpgid(pid))
+    var placedTarget = CgroupTarget()
+    var placedLeaf = ""
+    if inCgroup:
+      placedTarget = spec.cgroup
+      placedLeaf = spec.cgroup.leafPath
+    elif spec.cgroup.placed:
+      # Directories a failed attempt prepared are left empty; take them away
+      # unless another tree is in them.
+      releaseTarget(spec.cgroup)
     var sampler = initCpuProfileSampler()
     if profiles:
       # The profile's clock starts at 0, the launch.
@@ -1277,8 +1405,11 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         processId: uint64(pid),
         processGroupId: uint64(max(pgid, 0)),
         running: true,
-        backend: backendProfile()
-      )
+        backend: backendProfile(),
+        cgroupPath: placedLeaf,
+        cgroupProblem: placementProblem
+      ),
+      cgroupTarget: placedTarget
     )
   elif defined(windows):
     # Windows: delegate to the Job-Object-aware launcher above.
@@ -1780,6 +1911,11 @@ proc close*(child: var LaunchedProcess) =
   when defined(posix):
     closeFd(child.stdoutFd)
     closeFd(child.stderrFd)
+    # The tree's leaf and its group directory go when empty; a tree that
+    # left a process behind keeps them until that process ends (a later
+    # launch of the group, or of a cap, removes them then).
+    releaseTarget(child.cgroupTarget)
+    child.cgroupTarget = CgroupTarget()
   elif defined(windows):
     # Windows: release osproc resources and let the Job Object close. With
     # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set, closing the last handle reaps

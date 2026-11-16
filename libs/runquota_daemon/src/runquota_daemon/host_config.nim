@@ -133,6 +133,12 @@ type
       ## `[admission] predictive`, `"on"` or `"off"`.
     admissionHorizonMillis*: Option[int64]
       ## `[admission] horizon`, a positive duration.
+    enforcementCgroups*: Option[bool]
+      ## `[enforcement] cgroups`, `"on"` or `"off"`: whether RunQuota's
+      ## launchers on this host place the trees they start in cgroups (Linux).
+      ## Read by the LAUNCHING CLIENT, not by `runquotad`, which never touches
+      ## a cgroup; the daemon only validates it with the rest of the file. Off
+      ## when absent.
     pressureHighPct*: Option[float64]
     pressureLowPct*: Option[float64]
       ## `[admission] pressure-high` / `pressure-low`, percentages 0..100,
@@ -273,9 +279,10 @@ proc parseHostConfig*(text, path: string): HostConfig =
       if not line.endsWith("]") or line.startsWith("[["):
         fail(path, lineNo, "unsupported table header `" & line & "`")
       section = line[1 .. ^2].strip()
-      if section notin ["machine", "pools", "admission", "benchmark"]:
+      if section notin ["machine", "pools", "admission", "benchmark",
+          "enforcement"]:
         fail(path, lineNo, "unknown table `[" & section & "]`; expected " &
-          "[machine], [pools], [admission] or [benchmark]")
+          "[machine], [pools], [admission], [benchmark] or [enforcement]")
       continue
     let eq = line.find('=')
     if eq <= 0:
@@ -381,6 +388,19 @@ proc parseHostConfig*(text, path: string): HostConfig =
       else:
         fail(path, lineNo, "unknown key `" & key & "` in [benchmark]; " &
           "expected allowed-users, allowed-groups, max-queue-wait or max-hold")
+    of "enforcement":
+      case key
+      of "cgroups":
+        let raw = parseQuoted(value, path, lineNo)
+        case raw
+        of "on": result.enforcementCgroups = some(true)
+        of "off": result.enforcementCgroups = some(false)
+        else:
+          fail(path, lineNo, "cgroups must be \"on\" or \"off\", got " &
+            value)
+      else:
+        fail(path, lineNo, "unknown key `" & key & "` in [enforcement]; " &
+          "expected cgroups")
     else:
       discard
   # THE THRESHOLDS ARE JUDGED TOGETHER, after the defaults fill an absent
@@ -405,6 +425,20 @@ proc readHostConfig*(path = hostConfigPath): HostConfig =
       raise newException(HostConfigError,
         path & ": cannot read runquota host configuration: " & err.msg)
   parseHostConfig(text, path)
+
+proc enforcementCgroupsOn*(problem: var string;
+                           path = hostConfigPath): bool =
+  ## `[enforcement] cgroups` of the host file, for a LAUNCHING CLIENT
+  ## (RunQuota's CLI launchers, Reprobuild's build header): true only when
+  ## the file turns it on. A file that cannot be read or parsed answers
+  ## false with `problem` set: a launcher never fails over a setting it
+  ## only consults.
+  problem = ""
+  try:
+    readHostConfig(path).enforcementCgroups.get(false)
+  except CatchableError as failure:
+    problem = failure.msg
+    false
 
 proc defaultMemoryBudgetBytes*(physicalBytes: uint64): uint64 =
   ## `DefaultMemoryBudgetPercent` of `physicalBytes`, or
@@ -461,7 +495,7 @@ proc parseHostConfigKey*(key: string): HostConfigKey =
       "`; expected machine.memory_bytes, machine.cpu_milli, pools.NAME or " &
       "admission.order, admission.max-wait, admission.share-between-users, " &
       "admission.predictive, admission.horizon, admission.pressure-high, " &
-      "admission.pressure-low")
+      "admission.pressure-low, enforcement.cgroups")
   result = HostConfigKey(section: key[0 ..< dot], name: key[dot + 1 .. ^1])
   case result.section
   of "machine":
@@ -480,9 +514,13 @@ proc parseHostConfigKey*(key: string): HostConfigKey =
       raise newException(HostConfigError, "unknown key `" & key &
         "`; [admission] has order, max-wait, share-between-users, " &
         "predictive, horizon, pressure-high and pressure-low")
+  of "enforcement":
+    if result.name != "cgroups":
+      raise newException(HostConfigError, "unknown key `" & key &
+        "`; [enforcement] has cgroups")
   else:
     raise newException(HostConfigError, "unknown table `" & result.section &
-      "` in `" & key & "`; expected machine, pools or admission")
+      "` in `" & key & "`; expected machine, pools, admission or enforcement")
 
 proc `$`*(key: HostConfigKey): string = key.section & "." & key.name
 
@@ -575,7 +613,9 @@ proc renderAdmissionEntry(key: HostConfigKey; raw: string): string =
 
 proc hostConfigEntry*(key: HostConfigKey; raw: string): string =
   ## The `key = value` line `runquota config set KEY VALUE` writes.
-  if key.section == "admission":
+  if key.section in ["admission", "enforcement"]:
+    # `[enforcement] cgroups` is a quoted `on` / `off`, like
+    # `[admission] predictive`.
     renderAdmissionEntry(key, raw)
   else:
     renderEntry(key, parseHostConfigValue(key, raw))
