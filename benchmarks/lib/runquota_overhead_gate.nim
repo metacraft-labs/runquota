@@ -622,12 +622,14 @@ proc migrationProbe(root: string): JsonNode =
      "median": float(at(0.5)) / 1000.0, "p90": float(at(0.9)) / 1000.0,
      "p99": float(at(0.99)) / 1000.0, "max": float(samples[^1]) / 1000.0}
 
-proc runEnv(socket, switches, cgroupRoot: string): seq[string] =
+proc runEnv(socket, switches, cgroupRoot: string; qos = ""): seq[string] =
   ## A `runquota run` client's environment for one arm: the arm's daemon,
-  ## its measurement switches and its cgroup root; no session group or
-  ## parent lease inherited from whoever started the gate.
+  ## its measurement switches and its cgroup root, and, for `--switch=qos`,
+  ## the macOS priority-policy switch (`RUNQUOTA_QOS`: `off` / `on`); no
+  ## session group or parent lease inherited from whoever started the gate.
   const dropped = ["RUNQUOTA_SOCKET", "RUNQUOTA_MEASUREMENT",
-    "RUNQUOTA_ENDPOINT_SCOPE", "RUNQUOTA_CGROUP_ROOT", "RUNQUOTA_SESSION",
+    "RUNQUOTA_ENDPOINT_SCOPE", "RUNQUOTA_CGROUP_ROOT", "RUNQUOTA_QOS",
+    "RUNQUOTA_SESSION",
     "RUNQUOTA_SESSION_PRIORITY", "RUNQUOTA_SESSION_CACHE_TTL",
     "RUNQUOTA_PARENT_LEASE"]
   for key, value in envPairs():
@@ -637,15 +639,21 @@ proc runEnv(socket, switches, cgroupRoot: string): seq[string] =
   result.add("RUNQUOTA_ENDPOINT_SCOPE=private")
   result.add("RUNQUOTA_MEASUREMENT=" & switches)
   result.add("RUNQUOTA_CGROUP_ROOT=" & cgroupRoot)
+  if qos.len > 0:
+    result.add("RUNQUOTA_QOS=" & qos)
 
 proc run64Case(cfg: GateConfig; scratch: string): GateCase =
   for (label, path) in [("runquotad", cfg.daemonBin), ("runquota", cfg.cliBin)]:
     if path.len == 0 or not fileExists(path):
       raise newException(CaseUnavailable, "the " & label &
         " binary is missing: '" & path & "'")
-  if cfg.switch.len > 0 and cfg.switch != "cgroups":
+  if cfg.switch.len > 0 and cfg.switch notin ["cgroups", "qos"]:
     raise newException(ValueError, "unknown --switch: " & cfg.switch &
-      "; expected cgroups")
+      "; expected cgroups or qos")
+  when not defined(macosx):
+    if cfg.switch == "qos":
+      raise newException(CaseUnavailable, "--switch=qos judges the macOS " &
+        "priority policy and this is not macOS")
   var cgroupRoots: array[Arm, string] = ["off", "off"]
   var probe = newJNull()
   let gateRoot = if cfg.switch == "cgroups": gateCgroupRoot() else: ""
@@ -670,7 +678,9 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
     let before = processCpuSeconds(daemon.pid)
     let log = scratch / $arm / "run.log"
     result = runMeasured(["/bin/sh", "-c", script],
-      runEnv(daemon.socket, switches[arm], cgroupRoots[arm]), dirs[arm], log)
+      runEnv(daemon.socket, switches[arm], cgroupRoots[arm],
+        (if cfg.switch == "qos": (if arm == armOn: "on" else: "off") else: "")),
+      dirs[arm], log)
     let after = settledDaemonCpuSeconds(daemon.pid)
     result.daemonCpuSeconds = after - before
     result.cpuSeconds += result.daemonCpuSeconds
@@ -807,9 +817,10 @@ runquota_overhead_gate --case=reprobuild-64|run-64|cargo-jobserver|synthetic [op
   --measure=all|NAME          ON arm: every implemented measurement, or one
   --baseline=NAME[,NAME...]   on in BOTH arms (e.g. capture, under which
                               ambient-sampling has a store to write to)
-  --switch=cgroups            judge an ENFORCEMENT switch instead: the arms
+  --switch=cgroups|qos        judge an ENFORCEMENT switch instead: the arms
                               differ only by the client's RUNQUOTA_CGROUP_ROOT
-                              (off / a gate-owned root); run-64 only
+                              (off / a gate-owned root), or, for qos (macOS),
+                              by its RUNQUOTA_QOS (off / on); run-64 only
   --budget-percent=1          allowed overhead
   --precision-percent=0.5     required 95% interval half-width
   --min-rounds=10 --max-rounds=200 --max-minutes=90

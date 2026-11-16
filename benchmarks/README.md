@@ -46,7 +46,9 @@ Cases:
 | `cargo-jobserver` | a wide cargo test under `runquota jobserver` | unavailable until `runquota jobserver` exists; exits 4 |
 | `synthetic` | the gate's own instrument check: fixed CPU burns, with `--inject-percent` and a periodic `--disturbance-percent` | used by `tests/integration/t_overhead_gate_detects_overhead.nim` |
 
-**Enforcement switches.** `--switch=cgroups` judges cgroup placement
+**Enforcement switches.** `--switch=qos` (macOS) judges the priority policy
+the same way, the arms differing only by the client's `RUNQUOTA_QOS` (`off` /
+`on`); `run-64` only. `--switch=cgroups` judges cgroup placement
 instead of a measurement: the two arms run with the same measurement
 switches and differ only by the launching client's `RUNQUOTA_CGROUP_ROOT`
 (`off`, or a root the gate creates below your delegated cgroup subtree and
