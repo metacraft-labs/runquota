@@ -11,7 +11,7 @@
 ## registered in ``extension_registry`` (M12).
 
 const
-  spineSchemaVersion* = 7'i64
+  spineSchemaVersion* = 8'i64
     ## The schema version this build understands. A database whose
     ## ``user_version`` exceeds it is REFUSED, never degraded (see
     ## ``openObservationStore``).
@@ -19,6 +19,10 @@ const
   cpuProfileTable* = "execution_cpu_profiles"
     ## One optional CPU profile per execution (schema version 7), keyed and
     ## pruned with it. A spine table, not an extension: RunQuota reads it.
+
+  memoryProfileTable* = "execution_memory_profiles"
+    ## One optional memory profile per execution (schema version 8), with
+    ## the CPU profile's shape and rules. A spine table: sizing reads it.
 
   carriedExtensionTable* = "carried_extension_rows"
     ## Quarantine for extension rows a merge could not place, named here
@@ -34,7 +38,8 @@ const
     "extension_registry",
     carriedExtensionTable,
     "users",
-    cpuProfileTable
+    cpuProfileTable,
+    memoryProfileTable
   ]
 
   migrationV1 = """
@@ -365,8 +370,47 @@ begin
 end;
 """
 
+  # VERSION 8: SIZING DATA (what ``sizing_replay`` reads). Columns are ADDED, never rewritten: every
+  # existing row reads NULL in them, which says "not recorded" -- a zero
+  # request time or width would be a measurement nobody made -- and the
+  # migration costs the same on a store of any size. ``executions`` keeps
+  # its immutability trigger untouched: `alter table ... add column` is not
+  # an update. ``after_execution_ids`` is a comma-separated list of
+  # execution ids of the same run, '' for a declared empty list and NULL for
+  # none declared. The memory profile mirrors the CPU profile of version 7:
+  # MiB per interval, little-endian u16, at most 256 samples.
+  migrationV8 = """
+alter table runs add column project text;
+alter table runs add column entry_point text;
+alter table executions add column requested_at_unix_millis integer;
+alter table executions add column cpu_granted_milli integer
+  check (cpu_granted_milli is null or cpu_granted_milli >= 0);
+alter table executions add column after_execution_ids text;
+
+create index runs_by_project on runs(project);
+
+create table execution_memory_profiles (
+  host_id text not null,
+  execution_id text not null,
+  interval_ms integer not null check (interval_ms > 0),
+  samples blob not null
+    check (length(samples) between 2 and 512 and length(samples) % 2 = 0),
+  source text not null check (source in ('client-tree', 'client-self')),
+  primary key (host_id, execution_id),
+  foreign key (host_id, execution_id)
+    references executions(host_id, execution_id)
+);
+
+create trigger execution_memory_profiles_immutable
+before update on execution_memory_profiles
+begin
+  select raise(abort,
+    'runquota: execution_memory_profiles rows are immutable after write (OS-3)');
+end;
+"""
+
   migrations* = [migrationV1, migrationV2, migrationV3, migrationV4,
-                 migrationV5, migrationV6, migrationV7]
+                 migrationV5, migrationV6, migrationV7, migrationV8]
     ## Index ``i`` migrates ``user_version`` ``i`` to ``i + 1``.
 
 static:

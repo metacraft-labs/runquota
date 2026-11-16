@@ -47,6 +47,8 @@ The `stats` verbs have a page of their own:
 | `runquota observations --json` | The recording subsystem: whether capture is on, which store is open, and every counter about what has been accepted, refused, queued or dropped. |
 | `runquota explain SESSION_ID` | The leases belonging to one session. |
 | `runquota pressure [--group G] [--json]` | [Build-wait pressure](#build-wait-pressure) per host, session group and open session. |
+| `runquota profile [--project P] [--json]` | [Resource profiles](#resource-profiles-and-sizing) per project, entry point and host profile. |
+| `runquota sizing --project P --cpus N[,N...] [--json]` | How much memory N dedicated CPUs need for a project: its recorded runs [replayed](#resource-profiles-and-sizing) at N CPUs. |
 | `runquota daemon status` | Same as `status`. |
 
 > **`--json` is mandatory** on `sessions`, `leases`, `topology` and
@@ -426,3 +428,60 @@ up half of it. It exits 0 when the daemon answered, 1 when no daemon could be
 reached or it predates pressure reports, 2 on bad arguments. See
 [the daemon](/usage_guide/daemon#build-wait-pressure) for what is reported
 and how it is clamped.
+
+## Resource profiles and sizing
+
+These read the observation store, so they answer only on a host whose daemon
+captures (`runquotad --measurement capture=on`); otherwise they say
+`capture-off` and exit 4. Exit codes are those of `runquota stats`: 0 an
+answer, 3 no run of the project in scope, 4 no instrument, 2 bad arguments.
+Rows are your own unless you pass `--all-users`, and they come from this
+host's current hardware profile unless you pass `--host-profile all`.
+
+A session says which project it works for and through which entry point
+(`build`, `test`, a CI job name) from `RUNQUOTA_PROJECT` and
+`RUNQUOTA_ENTRY_POINT`, or from `--project` and `--entry-point` on
+`runquota run`, `runquota acquire` and `runquota jobserver`. With
+`RUNQUOTA_MEASUREMENT=sizing-data=on` the launching client also sends the
+tree's memory over time (so a job's peak is the sum of its processes, not
+its largest one), the bytes it read and wrote, and, for a build engine that
+knows its graph, which earlier jobs each one waited for. That measurement is
+off by default.
+
+```sh
+runquota profile --project myproject
+runquota sizing --project myproject --cpus 4,8,16 --quantile 0.99
+runquota observations export --format sizing --project myproject > sizing.ndjson
+node scripts/sizing-replay.mjs --cpus 4,8,16 sizing.ndjson
+```
+
+`profile` prints, per entry point, the quantile and maximum of each job's
+peak memory, duration, mean CPU, granted width and write rate. `sizing`
+replays every complete run of the project with N CPU tokens: a job becomes
+ready when the jobs it declared it waited for have finished (or at its
+recorded offset, shifted by how late the jobs that finished before it now
+finish), starts when its width fits, runs longer when it ran wider than N
+allows, and holds its recorded memory over time (or its peak throughout,
+which overestimates and is said). For each N it prints the quantile over
+runs of the peak concurrent memory, the maximum and the makespan, plus the
+baseline: other processes' memory (foreign RSS) sampled while the runs ran.
+Runs still open or with incomplete capture are left out and counted, and
+every gap in the data (no memory profile, no recorded width or request time)
+is named in a note. The host's `[machine] write_bytes_per_sec`, when the host
+file sets it, is shown beside the replayed write rate; it is not enforced.
+
+`observations export --format sizing` writes the records the replay reads as
+NDJSON (redacted by `--redact default|strict|none`, default `default`, which
+replaces command shapes, paths, and project and entry point names with
+tokens; ids, times and figures are never redacted), and
+`scripts/sizing-replay.mjs` replays them offline to the same figures.
+
+Each answer is bounded, because the daemon computes it while it is also
+admitting work: it reads at most the newest 1000 runs and 50,000 executions
+in scope (and says `read_truncated` when there were more), takes at most 16
+values of `--cpus`, and replays runs newest first within a fixed work budget
+(roughly the executions of a run squared, per N); runs the budget does not
+reach are counted under `over_budget` and named in a note. The offline
+script has no budget, so replaying an export gives the figures of every run
+it carries.
+

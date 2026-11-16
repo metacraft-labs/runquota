@@ -69,6 +69,11 @@ type
     preferredWidth*: int
       ## 0 until resolved: the default depends on the host.
     statsKey*: string
+    project*: string
+    entryPoint*: string
+      ## Sizing declarations for the session (`--project`,
+      ## `--entry-point`); empty leaves `RUNQUOTA_PROJECT` /
+      ## `RUNQUOTA_ENTRY_POINT` to the client library.
     adapter*: string ## "" = detect, "none" = no adaptation
     cap*: bool
     verbose*: bool
@@ -156,6 +161,18 @@ proc parseRunArgs*(args: seq[string]; options: var RunOptions;
         error = "--width takes N or MIN:PREF with whole numbers from 1 " &
           "(MIN <= PREF)"
         return false
+      i += 2
+    of "--project":
+      if i + 1 >= args.len or args[i + 1].len == 0:
+        error = "--project needs a value"
+        return false
+      options.project = args[i + 1]
+      i += 2
+    of "--entry-point":
+      if i + 1 >= args.len or args[i + 1].len == 0:
+        error = "--entry-point needs a value"
+        return false
+      options.entryPoint = args[i + 1]
       i += 2
     of "--stats-key":
       if i + 1 >= args.len or args[i + 1].len == 0:
@@ -340,7 +357,8 @@ proc runRun*(args: seq[string];
     return runUnleased(options.command, @[StatsKeyEnvVar & "=" & statsKey])
   defer: client.close()
 
-  var session = client.registerSession("runquota run", clientVersion)
+  var session = client.registerSession("runquota run", clientVersion,
+    options.project, options.entryPoint)
   # Build-wait pressure: the queue wait, reported at the grant
   # (`pressure-reports`, off by default).
   var pressure = startSingleCommandPressure()
@@ -464,7 +482,8 @@ proc runRun*(args: seq[string];
       peakMemoryBytes = completion.peakResidentMemoryBytes,
       processCount = completion.processCount,
       totals = completion.totals,
-      cpuProfile = completion.cpuProfile)
+      cpuProfile = completion.cpuProfile,
+      sizing = completion.finishSizing())
     code = exitCodeOf(completion)
     ran = true
     lease.release()

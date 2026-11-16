@@ -242,6 +242,10 @@ type
       ## `DefaultAdmissionOrder`. Never empty once `resolveBudget` ran.
     shareBetweenUsers*: ShareBetweenUsers
       ## The host file's `admission.share-between-users`, default `drf`.
+    writeBytesPerSec*: int64
+      ## `[machine] write_bytes_per_sec` of the host file, 0 when it sets
+      ## none. Reported (`status`, `profile`, `sizing`), never admitted
+      ## against.
     predictiveAdmission*: bool
       ## The host file's `admission.predictive`, off by default: admit a
       ## queued request's minimum width into CPU the running leases' learned
@@ -280,6 +284,10 @@ type
     pressure*: PressureFigures
       ## What this session (one invocation) reported, so its own figures are
       ## readable while it runs. Goes with the row.
+    project*: string
+    entryPoint*: string
+      ## Sizing declarations from `RegisterSession` (`SizingMinor`); empty
+      ## when none was made. Written into the session's `runs` row.
 
   SessionGroupRow* = object
     ## A session group: every session that named it (or, for the per-user
@@ -375,6 +383,9 @@ type
       ## Monotonic milliseconds (`monoMillis`) at which the request was queued
       ## and granted; what the starvation bound and the group counters are
       ## measured from.
+    requestedAtUnixMillis*: int64
+      ## When the daemon received the request (Unix ms): the execution's
+      ## ready time for sizing replay. 0 when unknown.
     startedAtUnixMillis*: int64
       ## When the client reported the lease as starting. Observation only:
       ## the daemon does not watch the process tree, so this is the lease

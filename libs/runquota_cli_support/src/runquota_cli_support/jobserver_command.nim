@@ -110,6 +110,11 @@ type
     memoryBytes*: uint64 ## 0 = the default for the lease kind
     memoryGiven*: bool
     statsKey*: string
+    project*: string
+    entryPoint*: string
+      ## Sizing declarations for the session (`--project`,
+      ## `--entry-point`); empty leaves `RUNQUOTA_PROJECT` /
+      ## `RUNQUOTA_ENTRY_POINT` to the client library.
     verbose*: bool
     command*: seq[string]
 
@@ -285,6 +290,18 @@ proc parseJobserverArgs*(args: seq[string]; options: var JobserverOptions;
           "suffix, above 0"
         return false
       options.memoryGiven = true
+      i += 2
+    of "--project":
+      if i + 1 >= args.len or args[i + 1].len == 0:
+        error = "--project needs a value"
+        return false
+      options.project = args[i + 1]
+      i += 2
+    of "--entry-point":
+      if i + 1 >= args.len or args[i + 1].len == 0:
+        error = "--entry-point needs a value"
+        return false
+      options.entryPoint = args[i + 1]
       i += 2
     of "--stats-key":
       if i + 1 >= args.len or args[i + 1].len == 0:
@@ -848,7 +865,8 @@ proc runJobserver*(args: seq[string];
     var resizable = false
     var pressure: SingleCommandPressure
     try:
-      session = client.registerSession("runquota jobserver", clientVersion)
+      session = client.registerSession("runquota jobserver", clientVersion,
+        options.project, options.entryPoint)
       # Build-wait pressure: the queue wait, reported at the grant
       # (`pressure-reports`, off by default).
       pressure = startSingleCommandPressure()
@@ -940,7 +958,8 @@ proc runJobserver*(args: seq[string];
         peakMemoryBytes = completion.peakResidentMemoryBytes,
         processCount = completion.processCount,
         totals = completion.totals,
-        cpuProfile = completion.cpuProfile)
+        cpuProfile = completion.cpuProfile,
+        sizing = completion.finishSizing())
       code = exitCodeOf(completion)
       ran = true
       lease.release()
@@ -986,7 +1005,8 @@ proc runJobserver*(args: seq[string];
     var resizable = false
     var pressure: SingleCommandPressure
     try:
-      session = client.registerSession("runquota jobserver", clientVersion)
+      session = client.registerSession("runquota jobserver", clientVersion,
+        options.project, options.entryPoint)
       pressure = startSingleCommandPressure()
       pressure.noteRequested()
       if not acquireBridgeLease(session, client, options, statsKey,
@@ -1070,7 +1090,8 @@ proc runJobserver*(args: seq[string];
         peakMemoryBytes = completion.peakResidentMemoryBytes,
         processCount = completion.processCount,
         totals = completion.totals,
-        cpuProfile = completion.cpuProfile)
+        cpuProfile = completion.cpuProfile,
+        sizing = completion.finishSizing())
       code = exitCodeOf(completion)
       ran = true
       lease.release()

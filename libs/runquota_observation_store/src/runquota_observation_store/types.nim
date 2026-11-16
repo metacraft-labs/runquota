@@ -112,6 +112,10 @@ type
     gitBranch*: Option[string]
     captureCompleteness*: CaptureCompleteness
     droppedObservations*: int64
+    project*: Option[string]
+    entryPoint*: Option[string]
+      ## Sizing declarations of the session (schema 8). ``none``: not
+      ## declared.
 
   ExecutionRow* = object
     executionId*: string
@@ -148,6 +152,18 @@ type
       ## sample interval, 0 when the execution has no profile.
     cpuProfileSamples*: seq[uint16]
       ## Milli-CPUs per interval, at most 256.
+    requestedAtUnixMillis*: Option[int64]
+      ## When the daemon received the lease request (schema 8).
+    cpuGrantedMilli*: Option[int64]
+      ## The lease's CPU width at its finish (schema 8).
+    afterExecutionIds*: Option[seq[string]]
+      ## Execution ids of the same run this one declared it waited on
+      ## (schema 8). ``none``: not declared; ``some(@[])``: declared empty.
+    memoryProfileIntervalMillis*: int64
+      ## The execution's memory profile (``execution_memory_profiles``): the
+      ## interval, 0 when it has none.
+    memoryProfileSamples*: seq[uint16]
+      ## MiB per interval, at most 256.
 
   CpuProfileRow* = object
     ## One row of ``execution_cpu_profiles``, as read back.

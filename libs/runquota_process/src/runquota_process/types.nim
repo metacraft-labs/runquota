@@ -156,7 +156,15 @@ type
     memoryProfileMiB*: seq[uint16]
       ## The largest summed resident set per profile interval, in MiB, on
       ## `cpuProfile`'s intervals. Taken by the same tree readings, so it
-      ## costs nothing extra; not yet sent anywhere.
+      ## costs nothing extra; sent as `memoryProfile` when `sizing-data` is
+      ## on.
+    memoryProfile*: MemoryProfile
+      ## The tree's summed resident set per interval (`sizing-data`, Linux),
+      ## sent with the finish for sizing replay. Absent otherwise.
+    io*: IoTotals
+      ## The tree's storage read and write bytes, read from the root's
+      ## `/proc/<pid>/io` after it exited and before it was reaped
+      ## (`sizing-data`, Linux). Not known otherwise.
 
   LaunchedProcess* = object
     pid*: int
@@ -194,7 +202,15 @@ type
       ## Whether this launch takes a CPU profile of its tree: the `profiles`
       ## measurement switch, read once at launch, and only where the tree
       ## can be read (Linux `/proc`).
+    sizingData*: bool
+      ## Whether this launch takes the `sizing-data` figures: a memory
+      ## profile (the tree read at the profile cadence, with or without
+      ## `profiles`), the tree's summed peak memory, and the root's IO
+      ## counters at exit. Read once at launch; Linux only.
     profileSampler*: CpuProfileSampler
+      ## Running when `profiles` or `sizingData` is on.
+    ioTotals*: IoTotals
+      ## Read at the root's exit, before the reap (`sizingData`).
     treeWalks*: uint32
       ## How many times this launch has read its process tree while waiting
       ## (POSIX). The cost of `tree-sampling` and `profiles` is this count

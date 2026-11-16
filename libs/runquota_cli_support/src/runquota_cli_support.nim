@@ -15,6 +15,7 @@ import runquota_cli_support/stats
 import runquota_cli_support/config
 import runquota_cli_support/run_command
 import runquota_cli_support/jobserver_command
+import runquota_cli_support/sizing_command
 
 proc wantsVersion*(args: openArray[string]): bool =
   args.len == 1 and args[0] in ["--version", "-V"]
@@ -47,6 +48,17 @@ proc renderUsage*(programName: string): string =
     "  " & programName & " pressure [--group GROUP] [--json]\n" &
     "    build-wait pressure per host, session group and open session (exit 1\n" &
     "    when the daemon cannot be reached or predates it, 2 on bad arguments)\n" &
+    "  " & programName & " profile [--project P] [--entry-point E] [--quantile Q] [--since 30d] [--host-profile current|all] [--all-users] [--json]\n" &
+    "    per project, entry point and host profile: peak memory per job, CPU,\n" &
+    "    duration, width and write rate from the observation store\n" &
+    "  " & programName & " sizing --project P --cpus N[,N...] [--entry-point E] [--quantile Q] [--since 30d] [--host-profile current|all] [--all-users] [--json]\n" &
+    "    replays the project's recorded runs at N CPUs: the memory N CPUs need\n" &
+    "    (a quantile over runs of the peak concurrent memory) plus the baseline\n" &
+    "    not attributable to leases; caveats say what data was missing\n" &
+    "  " & programName & " observations export --format sizing --project P [--entry-point E] [--since 30d] [--host-profile current|all] [--all-users] [--redact default|strict|none]\n" &
+    "    the records sizing replays, as NDJSON on stdout (redacted, default\n" &
+    "    policy 'default'); scripts/sizing-replay.mjs replays them offline.\n" &
+    "    profile/sizing/export exit codes are those of stats\n" &
     "  " & programName & " stats-table [KEY]\n" &
     "  " & programName & " stats capture [--json]\n" &
     "  " & programName & " stats top [KEY] [--limit N] [--all-users] [--all-profiles] [--json]\n" &
@@ -56,19 +68,21 @@ proc renderUsage*(programName: string): string =
     "    column is on the row, so jq does the ranking, percentiles and diffing.\n" &
     "    stats exit codes: 0 rows returned, 3 no answer (no-data/unknown-key/\n" &
     "    no-rows-in-scope), 4 no instrument (capture-off/daemon-unreachable/denied)\n" &
-    "  " & programName & " run [--width N|MIN:PREF] [--stats-key KEY] [--adapter NAME|none|list] [--cap] [--verbose] -- COMMAND [ARG...]\n" &
+    "  " & programName & " run [--width N|MIN:PREF] [--stats-key KEY] [--project P] [--entry-point E] [--adapter NAME|none|list] [--cap] [--verbose] -- COMMAND [ARG...]\n" &
     "    runs COMMAND under a CPU lease and passes the grant to it through an\n" &
     "    adapter (nim, go, nextest, nix, pnpm, yarn, playwright; --adapter list);\n" &
     "    --cap holds the tree to the granted width (Linux cgroup cpu.max; said\n" &
     "    on stderr where it cannot be enforced). Exits with the command's\n" &
     "    status, 2 on bad arguments, 1 when no lease was granted, 127 when it\n" &
     "    cannot start\n" &
-    "  " & programName & " jobserver [--width N|MIN:PREF] [--mem SIZE] [--stats-key KEY] [--verbose] -- COMMAND [ARG...]\n" &
+    "  " & programName & " jobserver [--width N|MIN:PREF] [--mem SIZE] [--stats-key KEY] [--project P] [--entry-point E] [--verbose] -- COMMAND [ARG...]\n" &
     "    runs COMMAND under one lease and serves it a GNU make jobserver (FIFO)\n" &
     "    of N-1 tokens for an N-slot grant, through MAKEFLAGS/CARGO_MAKEFLAGS;\n" &
     "    with RUNQUOTA_PARENT_LEASE set the lease is a sub-lease of that parent.\n" &
     "    Exit statuses as for run\n" &
-    "  " & programName & " acquire --cpu MILLI --mem SIZE [--label TEXT] [--machine ID] [--stats-key KEY] [--benchmark] [-- COMMAND [ARG...]]"
+    "  " & programName & " acquire --cpu MILLI --mem SIZE [--label TEXT] [--machine ID] [--stats-key KEY] [--project P] [--entry-point E] [--benchmark] [-- COMMAND [ARG...]]\n" &
+    "    --project/--entry-point declare what the session works for (sizing);\n" &
+    "    they override RUNQUOTA_PROJECT/RUNQUOTA_ENTRY_POINT"
 
 proc parseMemory(value: string): uint64 =
   let lower = value.toLowerAscii()
@@ -737,6 +751,8 @@ proc runDebugAcquire(args: seq[string]): int =
   var machineId = ""
   var statsKey = ""
   var benchmark = false
+  var project = ""
+  var entryPoint = ""
   var command: seq[string] = @[]
   var i = 0
   while i < args.len:
@@ -764,6 +780,14 @@ proc runDebugAcquire(args: seq[string]): int =
     of "--benchmark":
       benchmark = true
       i += 1
+    of "--project":
+      if i + 1 >= args.len: return 2
+      project = args[i + 1]
+      i += 2
+    of "--entry-point":
+      if i + 1 >= args.len: return 2
+      entryPoint = args[i + 1]
+      i += 2
     of "--":
       if i + 1 >= args.len:
         echo "missing command after --"
@@ -790,7 +814,8 @@ proc runDebugAcquire(args: seq[string]): int =
         defaultEndpoint().path & ": " & error.msg)
     return runStandaloneAcquire(label, statsKey, command)
   defer: client.close()
-  var session = client.registerSession("runquota acquire", versionString())
+  var session = client.registerSession("runquota acquire", versionString(),
+    project, entryPoint)
   var request = resourceRequest(label, milliCpu(cpu), bytes(memory))
   if machineId.len > 0:
     request = request.forMachine(machineId)
@@ -1147,6 +1172,13 @@ proc runThinApp*(programName: string): int =
         # cannot tell a deliberate decision from a broken host.
         if args.len == 2 and args[1] == "--json":
           return printInspection("observations")
+        if args.len >= 2 and args[1] == "export":
+          # `--format sizing`: the sizing records, NDJSON on stdout.
+          return runSizingVerb("export", args[2 .. ^1])
+      of "profile":
+        return runSizingVerb("profile", args[1 .. ^1])
+      of "sizing":
+        return runSizingVerb("sizing", args[1 .. ^1])
       of "explain":
         if args.len == 2:
           return printInspection("explain", sessionId(parseUInt(args[1])))

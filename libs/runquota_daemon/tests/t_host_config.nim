@@ -48,6 +48,22 @@ suite "host config":
     check host.pools["fetch"] == 2'u32
     check host.sourcePath == "host.toml"
 
+  test "a write-bandwidth figure is read, reported in config, and optional":
+    # `[machine] write_bytes_per_sec`: reported beside measured write rates,
+    # never admitted against, so it only has to read back and recompute.
+    let host = parseHostConfig("schema = \"runquota.host-config.v1\"\n" &
+      "[machine]\nwrite_bytes_per_sec = 500_000_000\n", "host.toml")
+    check host.writeBytesPerSec == some(500_000_000'u64)
+    var config = defaultDaemonConfig()
+    config.resolveBudget(host)
+    check config.writeBytesPerSec == 500_000_000'i64
+    config.resolveBudget(parseHostConfig(
+      "schema = \"runquota.host-config.v1\"\n", "host.toml"))
+    check config.writeBytesPerSec == 0'i64
+    check refusal("[machine]\nwrite_bytes_per_sec = 0\n").contains("positive")
+    let key = parseHostConfigKey("machine.write_bytes_per_sec")
+    check parseHostConfigValue(key, "500MB") == 500_000_000'u64
+
   test "every key is optional":
     let host = parseHostConfig("schema = \"runquota.host-config.v1\"\n",
       "host.toml")

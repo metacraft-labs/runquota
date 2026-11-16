@@ -7,7 +7,7 @@ export protocolTypes
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 2'u16
-const RqspProtocolMinor* = 8'u16
+const RqspProtocolMinor* = 9'u16
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -95,6 +95,15 @@ const ReclaimedGrantsMinor* = 8'u16
   ## writes only when a decision in them IS reclaimed -- and it reclaims
   ## only for a request that set the bit, so an older client never meets
   ## either.
+const SizingMinor* = 9'u16
+  ## The first daemon minor that understands SIZING: the trailing sizing
+  ## block of `RegisterSession` (project and entry point), bits 3-5 of the
+  ## `LeaseFinished` totals block (memory profile, IO bytes, `after` lease
+  ## ids), and `QuerySizing` / `SizingAnswer`. MINOR 9 ANNOUNCES THEM,
+  ## additively: an older daemon refuses trailing bytes, unknown presence
+  ## bits and unknown message kinds, so a client sends none of them below
+  ## this minor and the declarations and figures are dropped there, never
+  ## the session or the finish.
 const MaxPressureWaitsPerReport* = 64
   ## The most waits one `PressureReport` carries. A client with more keeps
   ## the rest for its next report; the daemon refuses a longer list, so a
@@ -335,12 +344,21 @@ proc encodeRegisterSession*(msg: RegisterSessionMessage): string =
   # are then exactly what a client from before session groups sends, which is
   # what lets one sentence -- "no group means the interactive group" -- cover
   # both, and what lets this encoder talk to an older daemon at all.
-  if msg.group.name.len > 0:
+  # THE SIZING BLOCK FOLLOWS THE GROUP BLOCK, so a registration that
+  # declares a project but names no group writes the group block with an
+  # empty name. Only a minor-9 daemon is ever sent the sizing block (the
+  # client checks), and it reads an empty group name followed by more bytes
+  # as "no group".
+  let sizing = msg.project.len > 0 or msg.entryPoint.len > 0
+  if msg.group.name.len > 0 or sizing:
     w.writeString(msg.group.name)
     w.writeBool(msg.group.priorityPresent)
     w.writeU32(uint32(ord(msg.group.priority)))
     w.writeBool(msg.group.cacheDeadlinePresent)
     w.writeU64(msg.group.cacheDeadlineUnixMillis)
+  if sizing:
+    w.writeString(msg.project)
+    w.writeString(msg.entryPoint)
   w.data
 
 proc decodeRegisterSession*(payload: string;
@@ -353,18 +371,33 @@ proc decodeRegisterSession*(payload: string;
   if not r.readString(version): return false
   if not r.readMetadata(metadata): return false
   var group = SessionGroupDeclaration(priority: sessionPriorityNormal)
+  var project = ""
+  var entryPoint = ""
   if r.remaining != 0:
     if not r.readString(group.name): return false
-    # A block that names no group is not something the encoder writes, so it
-    # is a malformed frame rather than a roundabout "no group".
-    if group.name.len == 0: return false
     if not r.readBool(group.priorityPresent): return false
     if not r.readSessionPriority(group.priority): return false
     if not r.readBool(group.cacheDeadlinePresent): return false
     if not r.readU64(group.cacheDeadlineUnixMillis): return false
+    if r.remaining != 0:
+      if not r.readString(project): return false
+      if not r.readString(entryPoint): return false
+      if project.len > MaxSizingDeclarationBytes or
+          entryPoint.len > MaxSizingDeclarationBytes:
+        return false
+      # A sizing block that declares nothing is not something the encoder
+      # writes.
+      if project.len == 0 and entryPoint.len == 0: return false
+    elif group.name.len == 0:
+      # A group block that names no group and carries no sizing block after
+      # it is not something the encoder writes, so it is a malformed frame
+      # rather than a roundabout "no group".
+      return false
+    if group.name.len == 0:
+      group = SessionGroupDeclaration(priority: sessionPriorityNormal)
   if r.remaining != 0: return false
   msg = RegisterSessionMessage(name: name, version: version, metadata: metadata,
-    group: group)
+    group: group, project: project, entryPoint: entryPoint)
   true
 
 proc encodeUpdateSessionGroup*(msg: UpdateSessionGroupMessage): string =
@@ -1058,11 +1091,19 @@ const
   finishBlockWantExpected = 4'u32
     ## No fields: asks for the expected uncontended duration in the
     ## acknowledgement (`PressureMinor`).
+  finishBlockMemoryProfile = 8'u32
+    ## The tree's memory profile (`SizingMinor`).
+  finishBlockIo = 16'u32
+    ## The tree's read and written bytes (`SizingMinor`).
+  finishBlockAfter = 32'u32
+    ## The lease ids this execution declared it waited on (`SizingMinor`).
   finishBlockKnownBits = finishBlockTotals or finishBlockProfile or
-    finishBlockWantExpected
+    finishBlockWantExpected or finishBlockMemoryProfile or finishBlockIo or
+    finishBlockAfter
 
 proc writeFinishTotalsBlock(w: var BinaryWriter; totals: FinishTotals;
-                            profile: CpuProfile; wantExpected: bool) =
+                            profile: CpuProfile; wantExpected: bool;
+                            sizing: FinishSizing) =
   ## The optional trailing block of `LeaseFinished` (`FinishTotalsMinor`):
   ## a u32 of presence bits, then the totals (bit 0) and the profile
   ## (bit 1). Written only when there is something in it, so a finish with
@@ -1073,6 +1114,12 @@ proc writeFinishTotalsBlock(w: var BinaryWriter; totals: FinishTotals;
   if totals.known: bits = bits or finishBlockTotals
   if profile.present: bits = bits or finishBlockProfile
   if wantExpected: bits = bits or finishBlockWantExpected
+  if sizing.memoryProfile.present: bits = bits or finishBlockMemoryProfile
+  if sizing.io.known: bits = bits or finishBlockIo
+  # A longer list is not sent at all (see `MaxAfterLeases`).
+  let sendsAfter = sizing.afterKnown and
+    sizing.afterLeases.len <= MaxAfterLeases
+  if sendsAfter: bits = bits or finishBlockAfter
   if bits == 0'u32:
     return
   w.writeU32(bits)
@@ -1088,10 +1135,26 @@ proc writeFinishTotalsBlock(w: var BinaryWriter; totals: FinishTotals;
     w.writeU16(uint16(count))
     for i in 0 ..< count:
       w.writeU16(profile.samples[i])
+  # THE SIZING FIELDS FOLLOW, in bit order, so a reader that knows only the
+  # bits below them still reads the frame position-correctly up to here.
+  if sizing.memoryProfile.present:
+    let count = min(sizing.memoryProfile.samplesMiB.len, MaxCpuProfileSamples)
+    w.writeU32(sizing.memoryProfile.intervalMillis)
+    w.writeU16(uint16(count))
+    for i in 0 ..< count:
+      w.writeU16(sizing.memoryProfile.samplesMiB[i])
+  if sizing.io.known:
+    w.writeU64(sizing.io.readBytes)
+    w.writeU64(sizing.io.writeBytes)
+  if sendsAfter:
+    w.writeU16(uint16(sizing.afterLeases.len))
+    for id in sizing.afterLeases:
+      w.writeU64(id)
 
 proc readFinishTotalsBlock(r: var BinaryReader; totals: var FinishTotals;
                            profile: var CpuProfile;
-                           wantExpected: var bool): bool =
+                           wantExpected: var bool;
+                           sizing: var FinishSizing): bool =
   ## Reads the block `writeFinishTotalsBlock` wrote. Refuses unknown
   ## presence bits, a profile with a zero interval, and a profile longer
   ## than `MaxCpuProfileSamples`: a bound the sender is required to keep is
@@ -1122,6 +1185,34 @@ proc readFinishTotalsBlock(r: var BinaryReader; totals: var FinishTotals;
       var value: uint16
       if not r.readU16(value): return false
       profile.samples.add(value)
+  if (bits and finishBlockMemoryProfile) != 0'u32:
+    var interval: uint32
+    var count: uint16
+    if not r.readU32(interval): return false
+    if not r.readU16(count): return false
+    if interval == 0'u32 or count == 0'u16 or
+        int(count) > MaxCpuProfileSamples:
+      return false
+    sizing.memoryProfile = MemoryProfile(intervalMillis: interval,
+      samplesMiB: @[])
+    for i in 0 ..< int(count):
+      var value: uint16
+      if not r.readU16(value): return false
+      sizing.memoryProfile.samplesMiB.add(value)
+  if (bits and finishBlockIo) != 0'u32:
+    sizing.io.known = true
+    if not r.readU64(sizing.io.readBytes): return false
+    if not r.readU64(sizing.io.writeBytes): return false
+  if (bits and finishBlockAfter) != 0'u32:
+    var count: uint16
+    if not r.readU16(count): return false
+    if int(count) > MaxAfterLeases: return false
+    sizing.afterKnown = true
+    sizing.afterLeases = @[]
+    for i in 0 ..< int(count):
+      var id: uint64
+      if not r.readU64(id): return false
+      sizing.afterLeases.add(id)
   true
 
 type LeaseFinishedDecode* = enum
@@ -1153,7 +1244,7 @@ proc encodeLeaseFinished*(msg: LeaseFinishedMessage): string =
   w.writeU32(msg.pressureEvents)
   w.writeDiagnostic(msg.diagnostic)
   w.writeFinishTotalsBlock(msg.totals, msg.cpuProfile,
-    msg.wantExpectedDuration)
+    msg.wantExpectedDuration, msg.sizing)
   w.data
 
 proc decodeLeaseFinished*(payload: string;
@@ -1184,8 +1275,9 @@ proc decodeLeaseFinished*(payload: string;
   var totals = FinishTotals(known: false)
   var profile = noCpuProfile()
   var wantExpected = false
+  var sizing = noFinishSizing()
   if r.remaining != 0:
-    if not r.readFinishTotalsBlock(totals, profile, wantExpected):
+    if not r.readFinishTotalsBlock(totals, profile, wantExpected, sizing):
       return lfdMalformedPayload
   if r.remaining != 0: return lfdMalformedPayload
   var finish: LeaseFinish
@@ -1202,6 +1294,7 @@ proc decodeLeaseFinished*(payload: string;
     diagnostic: diagnostic,
     totals: totals,
     cpuProfile: profile,
+    sizing: sizing,
     wantExpectedDuration: wantExpected
   )
   lfdOk
@@ -2256,3 +2349,68 @@ proc decodePressureAnswer*(payload: string;
   if r.remaining != 0: return false
   msg = PressureAnswerMessage(json: json)
   true
+
+proc encodeQuerySizing*(msg: QuerySizingMessage): string =
+  var w = writer()
+  w.writeU8(uint8(ord(msg.what)))
+  w.writeString(msg.project)
+  w.writeString(msg.entryPoint)
+  let count = min(msg.cpus.len, MaxSizingCpuCounts)
+  w.writeU16(uint16(count))
+  for i in 0 ..< count:
+    w.writeU32(msg.cpus[i])
+  w.writeU32(msg.quantilePpm)
+  w.writeU64(msg.sinceMillis)
+  var flags = 0'u8
+  if msg.allProfiles: flags = flags or 1'u8
+  if msg.allUsers: flags = flags or 2'u8
+  w.writeU8(flags)
+  w.writeU8(uint8(ord(msg.redaction)))
+  w.writeU32(msg.offset)
+  w.data
+
+proc decodeQuerySizing*(payload: string; msg: var QuerySizingMessage): bool =
+  ## Structural only: whether a project was named where one is needed, and
+  ## whether each N is usable, is the daemon's to answer with a diagnostic.
+  var r = reader(payload)
+  var decoded: QuerySizingMessage
+  var whatRaw, flags, redactionRaw: uint8
+  var count: uint16
+  if not r.readU8(whatRaw): return false
+  if whatRaw > uint8(ord(high(SizingWhat))): return false
+  decoded.what = SizingWhat(int(whatRaw))
+  if not r.readString(decoded.project): return false
+  if not r.readString(decoded.entryPoint): return false
+  if decoded.project.len > MaxSizingDeclarationBytes or
+      decoded.entryPoint.len > MaxSizingDeclarationBytes:
+    return false
+  if not r.readU16(count): return false
+  if int(count) > MaxSizingCpuCounts: return false
+  for _ in 0 ..< int(count):
+    var n: uint32
+    if not r.readU32(n): return false
+    decoded.cpus.add(n)
+  if not r.readU32(decoded.quantilePpm): return false
+  if decoded.quantilePpm > 1_000_000'u32: return false
+  if not r.readU64(decoded.sinceMillis): return false
+  if not r.readU8(flags): return false
+  if (flags and not 3'u8) != 0'u8: return false
+  decoded.allProfiles = (flags and 1'u8) != 0'u8
+  decoded.allUsers = (flags and 2'u8) != 0'u8
+  if not r.readU8(redactionRaw): return false
+  if redactionRaw > uint8(ord(high(SizingRedaction))): return false
+  decoded.redaction = SizingRedaction(int(redactionRaw))
+  if not r.readU32(decoded.offset): return false
+  if r.remaining != 0: return false
+  msg = decoded
+  true
+
+proc encodeSizingAnswer*(msg: SizingAnswerMessage): string =
+  var w = writer()
+  w.writeString(msg.json)
+  w.data
+
+proc decodeSizingAnswer*(payload: string; msg: var SizingAnswerMessage): bool =
+  var r = reader(payload)
+  if not r.readString(msg.json): return false
+  r.remaining == 0

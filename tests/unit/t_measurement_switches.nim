@@ -93,9 +93,11 @@ suite "measurement switch parser":
   test "the registry says which measurements exist and where they are taken":
     check measurementRegistry[measureCapture].side == measuredByDaemon
     check measurementRegistry[measureTreeSampling].side == measuredByClient
-    check not measurementRegistry[measureSizingData].implemented
-    # Not implemented, so not on by default: a measurement is on by
-    # default only once it has passed the overhead gate.
+    # Sizing data exists (Linux), is taken by the launching client, and is
+    # off by default: a measurement is on by default only once it has
+    # passed the overhead gate.
+    check measurementRegistry[measureSizingData].implemented
+    check measurementRegistry[measureSizingData].side == measuredByClient
     check not measurementRegistry[measureSizingData].defaultOn
     # Build-wait pressure reports exist, are taken by the launching client,
     # and stay off by default until the overhead gate passes with them on.
@@ -110,7 +112,8 @@ suite "measurement switch parser":
     check measureProfiles notin defaultMeasurements()
     check implementedMeasurements() ==
       {measureCapture, measureAmbientSampling, measureTreeSampling,
-       measureProfiles, measurePressureReports, measureMetricsExport}
+       measureProfiles, measurePressureReports, measureSizingData,
+       measureMetricsExport}
     check not measurementRegistry[measureMetricsExport].defaultOn
 
   test "capture and tree-sampling are off by default, ambient sampling on":

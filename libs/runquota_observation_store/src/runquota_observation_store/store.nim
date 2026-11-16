@@ -26,7 +26,7 @@ export types
 export ids
 export hardware
 export schema.spineSchemaVersion, schema.spineTableNames,
-  schema.cpuProfileTable
+  schema.cpuProfileTable, schema.memoryProfileTable
 
 const libraryName* = "runquota_observation_store"
 
@@ -297,7 +297,7 @@ const
     "run_id", "host_id", "tool", "tool_version", "invocation_kind",
     "started_at_unix_millis", "finished_at_unix_millis", "exit_status",
     "workspace_id", "profile", "git_commit", "git_branch",
-    "capture_completeness", "dropped_observations"]
+    "capture_completeness", "dropped_observations", "project", "entry_point"]
 
   executionColumns = [
     "execution_id", "host_id", "host_profile_id", "run_id",
@@ -306,7 +306,8 @@ const
     "termination", "attempt", "retry_of", "peak_rss_bytes",
     "cpu_user_millis", "cpu_sys_millis", "max_processes",
     "major_page_faults", "io_read_bytes", "io_write_bytes",
-    "capture_completeness", "dropped_observations", "owner_uid"]
+    "capture_completeness", "dropped_observations", "owner_uid",
+    "requested_at_unix_millis", "cpu_granted_milli", "after_execution_ids"]
 
   ambientColumns = [
     "host_id", "sampled_at_unix_millis", "cpu_busy_pct",
@@ -355,7 +356,23 @@ proc runValues(row: RunRow): seq[SqlValue] =
     optInt(row.finishedAtUnixMillis), optInt(row.exitStatus),
     optText(row.workspaceId), optText(row.profile),
     optText(row.gitCommit), optText(row.gitBranch),
-    sqlText($row.captureCompleteness), sqlInt(row.droppedObservations)]
+    sqlText($row.captureCompleteness), sqlInt(row.droppedObservations),
+    optText(row.project), optText(row.entryPoint)]
+
+proc afterText*(ids: Option[seq[string]]): Option[string] =
+  ## ``executions.after_execution_ids``: comma-separated, '' for a declared
+  ## empty list, NULL for none declared. Execution ids are opaque and never
+  ## contain a comma (``ids.opaqueId``).
+  if ids.isNone: none(string) else: some(ids.get.join(","))
+
+proc parseAfterText*(text: Option[string]): Option[seq[string]] =
+  if text.isNone:
+    return none(seq[string])
+  var ids: seq[string] = @[]
+  for part in text.get.split(','):
+    if part.len > 0:
+      ids.add(part)
+  some(ids)
 
 proc executionValues(row: ExecutionRow): seq[SqlValue] =
   @[sqlText(row.executionId), sqlText(row.hostId),
@@ -369,7 +386,8 @@ proc executionValues(row: ExecutionRow): seq[SqlValue] =
     sqlInt(row.maxProcesses), sqlInt(row.majorPageFaults),
     optInt(row.ioReadBytes), optInt(row.ioWriteBytes),
     sqlText($row.captureCompleteness), sqlInt(row.droppedObservations),
-    optInt(row.ownerUid)]
+    optInt(row.ownerUid), optInt(row.requestedAtUnixMillis),
+    optInt(row.cpuGrantedMilli), optText(afterText(row.afterExecutionIds))]
 
 proc ambientValues(row: AmbientSampleRow): seq[SqlValue] =
   @[sqlText(row.hostId), sqlInt(row.sampledAtUnixMillis),
@@ -463,6 +481,14 @@ proc executionInsertStatement*(row: ExecutionRow): string =
       [sqlText(row.hostId), sqlText(row.executionId),
        sqlInt(row.cpuProfileIntervalMillis),
        sqlBlob(cpuProfileBytes(row.cpuProfileSamples)),
+       sqlText("client-tree")]))
+  # THE MEMORY PROFILE IN THE SAME ENTRY, for the same reason (schema 8).
+  if row.memoryProfileIntervalMillis > 0 and row.memoryProfileSamples.len > 0:
+    result.add(insertStatement(memoryProfileTable,
+      ["host_id", "execution_id", "interval_ms", "samples", "source"],
+      [sqlText(row.hostId), sqlText(row.executionId),
+       sqlInt(row.memoryProfileIntervalMillis),
+       sqlBlob(cpuProfileBytes(row.memoryProfileSamples)),
        sqlText("client-tree")]))
 
 proc batchStatement*(runs: openArray[RunRow];
@@ -624,7 +650,8 @@ proc readRuns*(store: ObservationStore): seq[RunRow] =
     selectInt("finished_at_unix_millis"), selectInt("exit_status"),
     selectText("workspace_id"), selectText("profile"),
     selectText("git_commit"), selectText("git_branch"),
-    selectText("capture_completeness"), selectInt("dropped_observations")
+    selectText("capture_completeness"), selectInt("dropped_observations"),
+    selectText("project"), selectText("entry_point")
   ].join(" || '|' || ") & " from runs order by host_id, run_id;"
   for row in store.query(sql):
     result.add(RunRow(
@@ -641,7 +668,9 @@ proc readRuns*(store: ObservationStore): seq[RunRow] =
       gitCommit: decodeOptText(row[10]),
       gitBranch: decodeOptText(row[11]),
       captureCompleteness: parseEnum[CaptureCompleteness](decodeText(row[12])),
-      droppedObservations: parseBiggestInt(row[13])))
+      droppedObservations: parseBiggestInt(row[13]),
+      project: decodeOptText(row[14]),
+      entryPoint: decodeOptText(row[15])))
 
 proc readExecutions*(store: ObservationStore): seq[ExecutionRow] =
   let sql = "select " & [
@@ -656,7 +685,9 @@ proc readExecutions*(store: ObservationStore): seq[ExecutionRow] =
     selectInt("cpu_sys_millis"), selectInt("max_processes"),
     selectInt("major_page_faults"), selectInt("io_read_bytes"),
     selectInt("io_write_bytes"), selectText("capture_completeness"),
-    selectInt("dropped_observations"), selectInt("owner_uid")
+    selectInt("dropped_observations"), selectInt("owner_uid"),
+    selectInt("requested_at_unix_millis"), selectInt("cpu_granted_milli"),
+    selectText("after_execution_ids")
   ].join(" || '|' || ") & " from executions order by host_id, execution_id;"
   for row in store.query(sql):
     result.add(ExecutionRow(
@@ -682,7 +713,10 @@ proc readExecutions*(store: ObservationStore): seq[ExecutionRow] =
       ioWriteBytes: decodeOptInt(row[19]),
       captureCompleteness: parseEnum[CaptureCompleteness](decodeText(row[20])),
       droppedObservations: parseBiggestInt(row[21]),
-      ownerUid: decodeOptInt(row[22])))
+      ownerUid: decodeOptInt(row[22]),
+      requestedAtUnixMillis: decodeOptInt(row[23]),
+      cpuGrantedMilli: decodeOptInt(row[24]),
+      afterExecutionIds: parseAfterText(decodeOptText(row[25]))))
 
 proc readCpuProfiles*(store: ObservationStore): seq[CpuProfileRow] =
   ## Every stored CPU profile, decoded. For tests and inspection; admission
@@ -704,6 +738,28 @@ proc readCpuProfiles*(store: ObservationStore): seq[CpuProfileRow] =
     result.add(CpuProfileRow(hostId: decodeText(row[0]),
       executionId: decodeText(row[1]), intervalMillis: parseBiggestInt(row[2]),
       samples: samples, source: decodeText(row[4])))
+
+proc decodeU16Hex*(hex: string): seq[uint16] =
+  ## A ``samples`` blob read back as ``hex(samples)``.
+  var i = 0
+  while i + 3 < hex.len:
+    let lo = uint16(parseHexInt(hex[i .. i + 1]))
+    let hi = uint16(parseHexInt(hex[i + 2 .. i + 3]))
+    result.add(lo or (hi shl 8))
+    i += 4
+
+proc readMemoryProfiles*(store: ObservationStore): seq[CpuProfileRow] =
+  ## Every stored memory profile, decoded (MiB per interval), in the CPU
+  ## profile's row type. For tests and inspection.
+  let sql = "select " & [
+    selectText("host_id"), selectText("execution_id"),
+    selectInt("interval_ms"), "hex(samples)", selectText("source")
+  ].join(" || '|' || ") & " from " & memoryProfileTable &
+    " order by host_id, execution_id;"
+  for row in store.query(sql):
+    result.add(CpuProfileRow(hostId: decodeText(row[0]),
+      executionId: decodeText(row[1]), intervalMillis: parseBiggestInt(row[2]),
+      samples: decodeU16Hex(row[3]), source: decodeText(row[4])))
 
 proc readAmbientSamples*(store: ObservationStore): seq[AmbientSampleRow] =
   let sql = "select " & [

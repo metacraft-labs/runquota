@@ -78,7 +78,7 @@ when defined(posix):
       check measurements["tree-sampling"].getStr == "client"
       check measurements["profiles"].getStr == "client"
       check measurements["pressure-reports"].getStr == "client"
-      check measurements["sizing-data"].getStr == "not-implemented"
+      check measurements["sizing-data"].getStr == "client"
       # No --metrics-textfile: nothing to write.
       check measurements["metrics-export"].getStr == "off"
       check observations["ambient_sampling"]["interval_millis"].getInt == 0

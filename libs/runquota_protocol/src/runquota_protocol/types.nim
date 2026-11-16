@@ -111,6 +111,13 @@ type
     rqPressureAnswer = 47
       ## Both are sent only to a daemon whose `HelloOk` reports protocol
       ## minor >= `PressureMinor`, for the reason `rqDeclarePools` gives.
+    rqQuerySizing = 48
+      ## Ask for per-project resource profiles, a sizing replay at N CPUs,
+      ## or a page of the sizing export (`QuerySizingMessage.what`).
+      ## Answered with `rqSizingAnswer`. Read-only, any connection.
+    rqSizingAnswer = 49
+      ## Both are sent only to a daemon whose `HelloOk` reports protocol
+      ## minor >= `SizingMinor`, for the reason `rqDeclarePools` gives.
 
   MessageKind* = RqspMessageKind
 
@@ -179,6 +186,12 @@ type
       ## Travels as an OPTIONAL TRAILING BLOCK, written only when ``name`` is
       ## not empty and only to a daemon at ``SessionGroupsMinor`` or above:
       ## an older daemon refuses a RegisterSession with trailing bytes.
+    project*: string
+    entryPoint*: string
+      ## Sizing declarations (`SizingMinor`): what project this session works
+      ## for and through which entry point (`build`, `test`, a CI job name).
+      ## Empty means not declared. Travel as a trailing block after the
+      ## group block, written only to a daemon at `SizingMinor` or above.
 
   SessionRegisteredMessage* = object
     sessionId*: SessionId
@@ -450,6 +463,10 @@ type
       ## as not known and the spine stores NULL CPU, never zero.
     cpuProfile*: CpuProfile
       ## Optional CPU profile of the tree (`profiles` measurement).
+    sizing*: FinishSizing
+      ## Optional sizing figures (`sizing-data` measurement, protocol minor
+      ## `SizingMinor`): memory profile (bit 3 of the totals block), IO bytes
+      ## (bit 4) and the declared `after` lease ids (bit 5).
     wantExpectedDuration*: bool
       ## Ask for the expected uncontended duration in the acknowledgement
       ## (presence bit 2 of the totals block, protocol minor
@@ -1170,3 +1187,52 @@ proc exitStatus*(finish: LeaseFinish): uint32 =
     else:
       finish.kill.exitCode
   of lfCancelled, lfLaunchFailed: 0'u32
+
+type
+  SizingWhat* = enum
+    ## What a `QuerySizing` asks for.
+    swProfile = 0
+      ## `runquota profile`: per project, entry point and host profile.
+    swSizing = 1
+      ## `runquota sizing`: the replay at each asked N.
+    swExport = 2
+      ## `runquota observations export --format sizing`: one page of the
+      ## NDJSON records.
+
+  SizingRedaction* = enum
+    ## The export's redaction policy. The first is the default, and it is
+    ## the safe member of the set: an export nobody chose a policy for is the
+    ## one that crosses a trust boundary by accident.
+    srDefault = 0
+    srStrict = 1
+    srNone = 2
+
+  QuerySizingMessage* = object
+    what*: SizingWhat
+    project*: string
+      ## Empty: every project (`profile`), required for `sizing`/`export`.
+    entryPoint*: string
+      ## Empty: every entry point.
+    cpus*: seq[uint32]
+      ## The N to replay at (`sizing`), at most `MaxSizingCpuCounts`.
+    quantilePpm*: uint32
+      ## The quantile in parts per million; 0 asks for the default 0.99.
+    sinceMillis*: uint64
+      ## How far back runs are taken from; 0 asks for the default 30 days.
+    allProfiles*: bool
+      ## Every host profile, listed, instead of the current one only.
+    allUsers*: bool
+      ## Every owner's rows instead of the caller's.
+    redaction*: SizingRedaction
+    offset*: uint32
+      ## Export only: the first record of the page.
+
+  SizingAnswerMessage* = object
+    json*: string
+
+const
+  MaxSizingCpuCounts* = 16
+    ## The most N one `QuerySizing` asks for. The replay costs the daemon
+    ## work per N on its request path, so the list is short.
+  MaxSizingDeclarationBytes* = 128
+    ## The longest project or entry point a session may declare.

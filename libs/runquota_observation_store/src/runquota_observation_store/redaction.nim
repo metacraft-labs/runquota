@@ -181,6 +181,14 @@ type
     rcOwnerName = "owner-name"
       ## ``users.name``: an account's display name (``DOMAIN\user``, or a
       ## login name). It names a person, which no other spine column does.
+    rcProject = "project"
+      ## ``runs.project`` / ``runs.entry_point`` (schema 8): the names of a
+      ## project and of the entry point a session ran under, replaced whole
+      ## by ``default`` and ``strict``. A project name is usually a
+      ## directory or repository name and an entry point can be a CI job
+      ## name: they disclose project structure as a workspace id does, and
+      ## the replay reads neither (it keys on run and execution ids), so the
+      ## safe default costs the export nothing.
     rcExtension = "extension"
       ## A text value in a product-owned or carried row, replaced whole
       ## because RunQuota may not read it (OS-5).
@@ -255,13 +263,15 @@ const
     ## and an extension row that cannot be joined is a row the receiver
     ## cannot use for anything at all.
 
-  spineColumnCategories*: array[6, (string, string, RedactionCategory)] = [
+  spineColumnCategories*: array[8, (string, string, RedactionCategory)] = [
     ("runs", "workspace_id", rcWorkspace),
     ("runs", "git_branch", rcBranch),
     ("runs", "git_commit", rcRevision),
     ("runs", "profile", rcProfile),
     ("executions", "command_stats_id", rcCommand),
-    ("users", "name", rcOwnerName)
+    ("users", "name", rcOwnerName),
+    ("runs", "project", rcProject),
+    ("runs", "entry_point", rcProject)
   ]
     ## ``users.principal`` IS DELIBERATELY ABSENT, and that is a limit, not
     ## an oversight. It is the preimage of ``owner_uid`` -- the uid, or the
@@ -279,10 +289,10 @@ proc activeCategories*(policy: RedactionPolicy): set[RedactionCategory] =
   of rpNone:
     {}
   of rpDefault:
-    {rcPath, rcBranch, rcWorkspace, rcCommand, rcOwnerName}
+    {rcPath, rcBranch, rcWorkspace, rcCommand, rcOwnerName, rcProject}
   of rpStrict:
     {rcPath, rcRelativePath, rcBranch, rcWorkspace, rcCommand, rcRevision,
-     rcProfile, rcOwnerName, rcExtension}
+     rcProfile, rcOwnerName, rcProject, rcExtension}
 
 proc parseRedactionPolicy*(text: string): Option[RedactionPolicy] =
   for policy in RedactionPolicy:

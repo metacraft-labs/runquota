@@ -121,6 +121,11 @@ type
   HostConfig* = object
     memoryBytes*: Option[uint64]
     cpuMilli*: Option[uint64]
+    writeBytesPerSec*: Option[uint64]
+      ## `[machine] write_bytes_per_sec`: what this host's storage sustains,
+      ## in bytes per second. REPORTED, NOT ENFORCED: `status`, `profile` and
+      ## `sizing` show it beside the measured write rates, and admission
+      ## does not read it.
     pools*: OrderedTable[string, uint32]
     admissionOrder*: Option[seq[string]]
       ## `[admission] order`, validated: each key one of
@@ -317,9 +322,16 @@ proc parseHostConfig*(text, path: string): HostConfig =
         if v > uint64(high(uint32)):
           fail(path, lineNo, "cpu_milli out of range: " & $v)
         result.cpuMilli = some(v)
+      of "write_bytes_per_sec":
+        let v = parseInteger(value, path, lineNo)
+        if v == 0:
+          fail(path, lineNo, "write_bytes_per_sec must be positive")
+        if v > uint64(high(int64)):
+          fail(path, lineNo, "write_bytes_per_sec out of range: " & $v)
+        result.writeBytesPerSec = some(v)
       else:
         fail(path, lineNo, "unknown key `" & key & "` in [machine]; " &
-          "expected memory_bytes or cpu_milli")
+          "expected memory_bytes, cpu_milli or write_bytes_per_sec")
     of "pools":
       let v = parseInteger(value, path, lineNo)
       # A zero cap admits nothing: `possible` refuses every lease in a pool
@@ -528,9 +540,9 @@ proc parseHostConfigKey*(key: string): HostConfigKey =
   result = HostConfigKey(section: key[0 ..< dot], name: key[dot + 1 .. ^1])
   case result.section
   of "machine":
-    if result.name notin ["memory_bytes", "cpu_milli"]:
+    if result.name notin ["memory_bytes", "cpu_milli", "write_bytes_per_sec"]:
       raise newException(HostConfigError, "unknown key `" & key &
-        "`; [machine] has memory_bytes and cpu_milli")
+        "`; [machine] has memory_bytes, cpu_milli and write_bytes_per_sec")
   of "pools":
     # A pool name is a bare TOML key. Anything else would need quoting, and
     # the reader does not model quoted keys.
@@ -561,7 +573,8 @@ proc parseHostConfigValue*(key: HostConfigKey; raw: string): uint64 =
   let text = raw.strip().replace("_", "")
   var digits = text
   var multiplier = 1'u64
-  if key.section == "machine" and key.name == "memory_bytes":
+  if key.section == "machine" and
+      key.name in ["memory_bytes", "write_bytes_per_sec"]:
     let lower = text.toLowerAscii()
     for (suffix, factor) in [("gib", 1024'u64 * 1024'u64 * 1024'u64),
                              ("mib", 1024'u64 * 1024'u64),

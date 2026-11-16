@@ -688,6 +688,10 @@ proc pruneExecutions*(store: ObservationStore; hostId: string;
   sql.add("delete from " & cpuProfileTable & " where (host_id, " &
     "execution_id) in (select host_id, execution_id from executions where " &
     clause & ");\n")
+  # Memory profiles (schema 8): the same rule as CPU profiles.
+  sql.add("delete from " & memoryProfileTable & " where (host_id, " &
+    "execution_id) in (select host_id, execution_id from executions where " &
+    clause & ");\n")
 
   sql.add("delete from executions where " & clause & ";\n")
   sql.add("commit;\n")

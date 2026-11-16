@@ -254,3 +254,76 @@ proc profileCpuMicros*(profile: CpuProfile): uint64 =
   ## compare a profile with the totals beside it.
   for value in profile.samples:
     result += uint64(value) * uint64(profile.intervalMillis)
+
+# ---------------------------------------------------------------------------
+# SIZING FIGURES. What a finish carries for sizing replay, besides the totals
+# and the CPU profile: the tree's memory over time, its IO bytes, and the
+# leases it waited on. All three are optional and every one of them is
+# reported as absent, never as zero, when it was not measured or declared.
+# ---------------------------------------------------------------------------
+
+const
+  MaxAfterLeases* = 1024
+    ## The most lease ids one finish declares it waited on. A client with
+    ## more sends none: the replay then falls back to the recorded offset,
+    ## which is a weaker statement, whereas a truncated list would be a
+    ## wrong one (the dropped predecessors would read as "not waited on").
+
+type
+  MemoryProfile* = object
+    ## The tree's summed resident set per interval, in MiB, saturating at
+    ## 65535, on the CPU profile's intervals. ``intervalMillis == 0`` means
+    ## no profile was taken.
+    intervalMillis*: uint32
+    samplesMiB*: seq[uint16]
+
+  IoTotals* = object
+    ## Bytes the tree caused to be read from and written to storage
+    ## (Linux ``/proc/<pid>/io`` ``read_bytes`` / ``write_bytes`` of the
+    ## root, which include its waited-for descendants).
+    known*: bool
+    readBytes*: uint64
+    writeBytes*: uint64
+
+  FinishSizing* = object
+    ## Everything a finish carries for sizing (`sizing-data`).
+    memoryProfile*: MemoryProfile
+    io*: IoTotals
+    afterKnown*: bool
+      ## Whether the client declared what this execution waited on. A
+      ## declared empty list (a root of the graph) is different from no
+      ## declaration.
+    afterLeases*: seq[uint64]
+      ## Lease ids of the same session, at most ``MaxAfterLeases``.
+
+proc noMemoryProfile*(): MemoryProfile =
+  MemoryProfile(intervalMillis: 0'u32, samplesMiB: @[])
+
+proc present*(profile: MemoryProfile): bool =
+  profile.intervalMillis > 0'u32 and profile.samplesMiB.len > 0
+
+proc peakBytes*(profile: MemoryProfile): uint64 =
+  ## The largest sample, in bytes.
+  for value in profile.samplesMiB:
+    result = max(result, uint64(value) * 1024'u64 * 1024'u64)
+
+proc noFinishSizing*(): FinishSizing =
+  FinishSizing(memoryProfile: noMemoryProfile(), io: IoTotals(known: false),
+    afterKnown: false, afterLeases: @[])
+
+proc any*(sizing: FinishSizing): bool =
+  ## Whether a finish has any sizing figure to carry.
+  sizing.memoryProfile.present or sizing.io.known or sizing.afterKnown
+
+proc memoryProfile*(sampler: CpuProfileSampler): MemoryProfile =
+  ## The sampler's memory readings as a profile, on its intervals. No
+  ## profile when no memory reading was supplied at all: a profile of zeros
+  ## would claim a tree that used no memory.
+  let samples = sampler.memoryProfileMiB()
+  var anyReading = false
+  for value in sampler.peakRssBytes:
+    if value > 0'u64:
+      anyReading = true
+  if samples.len == 0 or not anyReading:
+    return noMemoryProfile()
+  MemoryProfile(intervalMillis: sampler.intervalMillis, samplesMiB: samples)

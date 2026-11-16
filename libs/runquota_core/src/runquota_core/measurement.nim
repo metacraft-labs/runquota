@@ -57,7 +57,9 @@ type
     measurePressureReports = "pressure-reports"
       ## Client: build-wait pressure counters, sent to the daemon.
     measureSizingData = "sizing-data"
-      ## Client: the memory profile and declarations sizing replay needs.
+      ## Client: the memory profile, the tree's IO bytes and the `after`
+      ## declarations sizing replay needs. Project and entry point are
+      ## declarations made once per session and are not behind it.
     measureMetricsExport = "metrics-export"
       ## Daemon: the periodic metrics text file for capacity tools.
 
@@ -106,8 +108,12 @@ const
     # (Reprobuild's engine, `runquota run`, `runquota jobserver`).
     measurePressureReports: MeasurementInfo(side: measuredByClient,
       implemented: true, defaultOn: false),
+    # IMPLEMENTED (Linux), AND OFF BY DEFAULT until the overhead gate passes
+    # with it on: the launcher reads its tree at the profile cadence for a
+    # memory profile, reads the root's IO counters once at its exit, and
+    # Reprobuild sends each action's `after` list.
     measureSizingData: MeasurementInfo(side: measuredByClient,
-      implemented: false, defaultOn: false),
+      implemented: true, defaultOn: false),
     # IMPLEMENTED, AND OFF BY DEFAULT: the daemon writes the file only
     # where `runquotad --metrics-textfile PATH` names one.
     measureMetricsExport: MeasurementInfo(side: measuredByDaemon,

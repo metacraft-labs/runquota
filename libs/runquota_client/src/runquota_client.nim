@@ -238,6 +238,11 @@ proc close*(client: var RunQuotaClient) =
   client.state = csClosed
 
 const
+  ProjectEnvVar* = "RUNQUOTA_PROJECT"
+    ## The project this process's sessions work for, declared for sizing
+    ## (`runquota profile`, `runquota sizing`). Unset: not declared.
+  EntryPointEnvVar* = "RUNQUOTA_ENTRY_POINT"
+    ## The entry point (`build`, `test`, a CI job name) they run under.
   SessionGroupEnvVar* = "RUNQUOTA_SESSION"
     ## The session group this process's sessions join: the handle
     ## `<host>:<window>` of the agent session it runs under, exported
@@ -271,6 +276,22 @@ proc forDaemon(client: RunQuotaClient; width: WidthRange;
                resources: var ResourceVector): WidthRange =
   widthForPeer(width, client.capabilities.protocolMinor,
     client.capabilities.cpuSlots.value, resources)
+
+proc supportsSizing*(client: RunQuotaClient): bool =
+  ## Whether the daemon understands sizing (`SizingMinor`): the sizing block
+  ## of `RegisterSession`, the sizing bits of the finish and `QuerySizing`.
+  client.capabilities.protocolMinor >= SizingMinor
+
+proc sizingDeclaration(value: string): string =
+  ## A declared project or entry point, bounded so the daemon cannot refuse
+  ## the registration over it: cut at `MaxSizingDeclarationBytes`, at a
+  ## character boundary.
+  if value.len <= MaxSizingDeclarationBytes:
+    return value
+  var cut = MaxSizingDeclarationBytes
+  while cut > 0 and (ord(value[cut]) and 0xC0) == 0x80:
+    dec cut
+  value[0 ..< cut]
 
 proc supportsSessionGroups*(client: RunQuotaClient): bool =
   ## Whether the daemon understands session groups: its `HelloOk` reported
@@ -311,7 +332,8 @@ proc sessionGroupFromEnvironment*(): SessionGroupDeclaration =
       discard
 
 proc registerSession*(client: var RunQuotaClient; name, version: string;
-                      group: SessionGroupDeclaration): RunQuotaSession =
+                      group: SessionGroupDeclaration;
+                      project = ""; entryPoint = ""): RunQuotaSession =
   ## Register a session in `group` (`sessionGroupFromEnvironment` for the one
   ## the launcher exported; a declaration with an empty name for the user's
   ## interactive group).
@@ -329,6 +351,14 @@ proc registerSession*(client: var RunQuotaClient; name, version: string;
       metadata: metadataNone())
   if client.supportsSessionGroups():
     msg.group = group
+  # THE SIZING DECLARATIONS: the caller's, else the launcher's variables.
+  # Not a measurement (one pair of strings per session) and so not behind
+  # `sizing-data`; sent only to a daemon that reads them.
+  if client.supportsSizing():
+    msg.project = sizingDeclaration(
+      if project.len > 0: project else: getEnv(ProjectEnvVar, ""))
+    msg.entryPoint = sizingDeclaration(
+      if entryPoint.len > 0: entryPoint else: getEnv(EntryPointEnvVar, ""))
   let requestId = client.requestFrame(rqRegisterSession, encodeRegisterSession(msg), handshakeTimeoutMs())
   let frame = client.readResponse(requestId, handshakeTimeoutMs())
   if frame.header.messageKind != rqSessionRegistered:
@@ -351,11 +381,13 @@ proc registerSession*(client: var RunQuotaClient; name, version: string;
     groupName: groupName, declaredGroupPriority: declared)
 
 proc registerSession*(client: var RunQuotaClient; name,
-    version: string): RunQuotaSession =
+    version: string; project = ""; entryPoint = ""): RunQuotaSession =
   ## Register a session in the group the launcher exported
   ## (`RUNQUOTA_SESSION`), or the user's interactive group when it exported
-  ## none.
-  client.registerSession(name, version, sessionGroupFromEnvironment())
+  ## none. ``project`` / ``entryPoint`` override `RUNQUOTA_PROJECT` /
+  ## `RUNQUOTA_ENTRY_POINT`.
+  client.registerSession(name, version, sessionGroupFromEnvironment(),
+    project, entryPoint)
 
 proc updateSessionGroup*(client: var RunQuotaClient;
                          update: UpdateSessionGroupMessage):
@@ -1157,6 +1189,28 @@ proc queryPressure*(client: var RunQuotaClient; scope = psAll;
     raise newException(RunQuotaClientError, client.lastDiagnostic.message)
   answer.json
 
+proc querySizing*(client: var RunQuotaClient; query: QuerySizingMessage;
+                  timeoutMs = 0): string =
+  ## The daemon's sizing answer as JSON (`QuerySizing`): profiles, a replay
+  ## at N CPUs, or one page of the sizing export. Raises
+  ## ``RunQuotaClientError`` for a daemon below ``SizingMinor`` or a
+  ## refusal (the diagnostic says why).
+  if not client.supportsSizing():
+    client.lastDiagnostic = diagnostic(diagUnsupportedVersion,
+      "the RunQuota daemon predates sizing (protocol minor " &
+      $client.capabilities.protocolMinor & ", needs " & $SizingMinor & ")")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  let requestId = client.requestFrame(rqQuerySizing,
+    encodeQuerySizing(query), timeoutMs)
+  let frame = client.readResponse(requestId, timeoutMs)
+  var answer: SizingAnswerMessage
+  if frame.header.messageKind != rqSizingAnswer or
+      not decodeSizingAnswer(frame.payload, answer):
+    client.lastDiagnostic = diagnostic(diagProtocol,
+      "invalid SizingAnswer payload")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  answer.json
+
 proc supportsFinishTotals*(client: RunQuotaClient): bool =
   ## Whether the daemon reads the totals block of `LeaseFinished`: its
   ## `HelloOk` reported protocol minor `FinishTotalsMinor` or later.
@@ -1168,7 +1222,8 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
              majorPageFaults = 0'u64; pressureEvents = 0'u32;
              totals = FinishTotals(known: false);
              cpuProfile = noCpuProfile();
-             askExpectedDuration = false) =
+             askExpectedDuration = false;
+             sizing = noFinishSizing()) =
   ## Report how this execution ended, and free what it held.
   ##
   ## ONE PARAMETER SAYS WHY IT ENDED, and it is a ``LeaseFinish``. It used
@@ -1185,6 +1240,10 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
   ## not sent, to a daemon older than ``FinishTotalsMinor``, which would
   ## refuse the whole finish as malformed: losing a measurement is always
   ## preferable to losing the record of the execution.
+  ##
+  ## ``sizing`` (memory profile, IO bytes, the leases this execution waited
+  ## on) is dropped, not sent, to a daemon older than ``SizingMinor``, for
+  ## the same reason.
   ##
   ## ``askExpectedDuration`` asks the daemon for its expected uncontended
   ## duration of the command (build-wait pressure needs it to tell a slowed
@@ -1208,6 +1267,8 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
     diagnostic: finishDiagnostic,
     totals: (if carriesTotals: totals else: FinishTotals(known: false)),
     cpuProfile: (if carriesTotals: cpuProfile else: noCpuProfile()),
+    sizing: (if lease.session[].client[].supportsSizing(): sizing
+             else: noFinishSizing()),
     wantExpectedDuration: asks
   )
   let requestId = lease.session[].client[].requestFrame(rqLeaseFinished,

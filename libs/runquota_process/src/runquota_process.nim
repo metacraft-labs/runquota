@@ -886,6 +886,40 @@ when defined(posix):
     uint64(max(0'i64, int64(value.tv_sec))) * 1_000_000'u64 +
       uint64(max(0'i64, int64(value.tv_usec)))
 
+  when defined(linux):
+    const pPid = cint(1)
+      ## `P_PID` of `idtype_t` (<sys/wait.h>); std/posix does not define it
+      ## for Linux.
+
+    proc readExitedRootIo(pid: int): IoTotals =
+      ## The root's `/proc/<pid>/io`, read while it is a zombie: after it
+      ## has exited and before it is reaped, so `read_bytes` / `write_bytes`
+      ## are final and include every descendant it waited for (the kernel
+      ## folds a reaped child's IO accounting into its parent's, as it does
+      ## its CPU time). Not known when the file cannot be read or parsed.
+      var text = ""
+      try:
+        text = readFile("/proc/" & $pid & "/io")
+      except CatchableError:
+        return IoTotals(known: false)
+      var readSeen, writeSeen = false
+      for line in text.splitLines():
+        let colon = line.find(':')
+        if colon <= 0:
+          continue
+        let name = line[0 ..< colon]
+        let value = line[colon + 1 .. ^1].strip()
+        try:
+          if name == "read_bytes":
+            result.readBytes = parseBiggestUInt(value).uint64
+            readSeen = true
+          elif name == "write_bytes":
+            result.writeBytes = parseBiggestUInt(value).uint64
+            writeSeen = true
+        except ValueError:
+          return IoTotals(known: false)
+      result.known = readSeen and writeSeen
+
   proc reapChild(child: var LaunchedProcess; status: var cint;
                  options: cint): Pid =
     ## `waitpid` that also keeps what the kernel says the reaped tree used.
@@ -898,6 +932,24 @@ when defined(posix):
     ## children at once (a build engine) cannot attribute it to one of them.
     ## What neither can see is a descendant re-parented away before it was
     ## waited for; see `runquota_core/cpu_profile`.
+    when defined(linux):
+      # `sizing-data`: LOOK AT THE EXIT WITHOUT CONSUMING IT, read the
+      # zombie's IO counters, then reap it below as always. `waitid` with
+      # `WNOWAIT` leaves the child waitable, so the `wait4` that follows
+      # returns at once with the same status and the rusage. A `waitid` that
+      # fails, or reports no exit yet under `WNOHANG`, changes nothing:
+      # `wait4` below gives the same answer it always did.
+      if child.sizingData and not child.ioTotals.known:
+        var info: SigInfo
+        zeroMem(addr info, sizeof(info))
+        let flags = WEXITED or WNOWAIT or (options and WNOHANG)
+        if waitid(pPid, Id(child.pid), info, flags) == 0 and
+            info.si_pid == Pid(child.pid):
+          child.ioTotals = readExitedRootIo(child.pid)
+        elif (options and WNOHANG) != 0:
+          # Not exited yet (or the probe failed): `wait4` with WNOHANG
+          # answers the same, so nothing is lost by asking it.
+          discard
     var usage: Rusage
     result = wait4(Pid(child.pid), addr status, options, addr usage)
     if result == Pid(child.pid):
@@ -942,12 +994,17 @@ when defined(posix):
         majorPageFaults: child.rusageMajorFaults,
         durationMillis: uint64(max(0'i64,
           child.reapMonoMillis - child.launchMonoMillis)))
-      if child.profiles:
+      if child.profiles or child.sizingData:
         var sampler = child.profileSampler
         sampler.finish(child.reapMonoMillis - child.launchMonoMillis,
           result.totals.totalCpuMicros)
-        result.cpuProfile = sampler.profile()
+        if child.profiles:
+          result.cpuProfile = sampler.profile()
         result.memoryProfileMiB = sampler.memoryProfileMiB()
+        if child.sizingData:
+          result.memoryProfile = sampler.memoryProfile()
+    if child.sizingData:
+      result.io = child.ioTotals
     if not timedOut:
       if WIFEXITED(status):
         result.exited = true
@@ -1278,6 +1335,10 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     # alone.
     let profiles = measureProfiles in measurements and
       (defined(linux) or defined(macosx))
+    # SIZING DATA ON LINUX ONLY: the memory profile needs the tree reader
+    # (which macOS has too, but its leg is not done), and the IO counters
+    # are `/proc/<pid>/io`.
+    let sizingData = measureSizingData in measurements and defined(linux)
 
     # Everything the child needs between fork and exec is composed here, while
     # there is still a whole process to compose it in. After the fork the child
@@ -1482,7 +1543,7 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       # unless another tree is in them.
       releaseTarget(target)
     var sampler = initCpuProfileSampler()
-    if profiles:
+    if profiles or sizingData:
       # The profile's clock starts at 0, the launch.
       sampler.start(0'i64)
     LaunchedProcess(
@@ -1505,6 +1566,7 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       lastTelemetrySampleSeconds: 0.0,
       treeSampling: treeSampling,
       profiles: profiles,
+      sizingData: sizingData,
       profileSampler: sampler,
       launchMonoMillis: getMonoTime().ticks div 1_000_000,
       info: LaunchResult(
@@ -1637,7 +1699,8 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
       # costs one walk of the tree per interval and nothing in between.
       let sinceLaunch = getMonoTime().ticks div 1_000_000 -
         child.launchMonoMillis
-      let profileDue = child.profiles and child.profileSampler.due(sinceLaunch)
+      let profileDue = (child.profiles or child.sizingData) and
+        child.profileSampler.due(sinceLaunch)
       if treeDue or profileDue:
         inc child.treeWalks
         let sample =
@@ -1653,10 +1716,17 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
               child.peakResidentMemoryBytes = sample.residentMemoryBytes
             if sample.processCount > child.processCount:
               child.processCount = sample.processCount
-        if child.profiles and sample.diagnostic.code == diagOk and
-            sample.cumulativeCpuKnown:
+        if (child.profiles or child.sizingData) and
+            sample.diagnostic.code == diagOk and sample.cumulativeCpuKnown:
           child.profileSampler.observe(sinceLaunch,
             sample.cumulativeCpuTimeMicros, sample.residentMemoryBytes)
+        # A JOB'S PEAK IS ITS TREE'S SUM. With `sizing-data` on, every walk
+        # the memory profile takes also raises the finish's peak, so sizing
+        # sees four 1-GiB processes running together as 4 GiB even with
+        # `tree-sampling` off (whose own walks do the same).
+        if child.sizingData and sample.diagnostic.code == diagOk and
+            sample.residentMemoryBytes > child.peakResidentMemoryBytes:
+          child.peakResidentMemoryBytes = sample.residentMemoryBytes
       var status: cint = 0
       let waited = child.reapChild(status, WNOHANG)
       if waited == Pid(child.pid):
@@ -2039,3 +2109,11 @@ proc close*(child: var LaunchedProcess) =
       except CatchableError:
         discard
     child.temporaryLaunchFiles.setLen(0)
+
+proc finishSizing*(completion: ProcessCompletion): FinishSizing =
+  ## The sizing figures a finish carries for this completion: the memory
+  ## profile and the IO bytes when the launch took them (`sizing-data`),
+  ## absent otherwise. ``after`` is the caller's to declare: only a client
+  ## that knows its graph can.
+  FinishSizing(memoryProfile: completion.memoryProfile, io: completion.io,
+    afterKnown: false, afterLeases: @[])

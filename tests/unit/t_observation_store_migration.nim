@@ -263,3 +263,132 @@ suite "observation_store_migration":
     check store.status == ssOpen
     check store.schemaVersion == spineSchemaVersion
     check schemaFingerprint(path) == fingerprintBefore
+
+  test "a version-7 store with rows migrates to 8 and keeps every row":
+    # Schema 8 (sizing data) ADDS columns and a table; every row a version-7
+    # daemon wrote must read back unchanged, with NULL -- "not recorded" --
+    # in each new column, and the migrated store must accept sizing rows.
+    # The version-7 store is built from the SHIPPED steps 1-7 (which no
+    # later change may edit) and filled the way a version-7 daemon fills
+    # it: a host and its profile, an owner, a run, an execution with
+    # totals, and its CPU profile.
+    let dir = scratchDir("v7")
+    defer: removeDir(dir)
+    let path = dir / "observations.sqlite"
+    var ladder = ""
+    for i in 0 ..< 7:
+      ladder.add(migrations[i] & "\n")
+    let created = runSqlite(path, ladder & """
+insert into hosts values ('host-7', 1000, 'boot-7');
+insert into host_profiles values ('host-7', 'prof-7', 'hash', 1000, null,
+  'cpu', 8, 16, 34359738368, 0, 'nvme', 'ext4', 'x86_64', 'linux', '6',
+  '6.1', 'bare-metal', 'local');
+insert into users values (1000, 'uid', '1000', 'someone', 1000, 1000);
+insert into runs (run_id, host_id, tool, tool_version, invocation_kind,
+  started_at_unix_millis, capture_completeness, dropped_observations)
+  values ('run-7', 'host-7', 'repro-build', '1', 'lease-session', 2000,
+  'complete', 0);
+insert into executions (execution_id, host_id, host_profile_id, run_id,
+  command_stats_id, lease_id, started_at_unix_millis,
+  finished_at_unix_millis, duration_millis, exit_status, termination,
+  attempt, peak_rss_bytes, cpu_user_millis, cpu_sys_millis, max_processes,
+  major_page_faults, capture_completeness, dropped_observations, owner_uid)
+  values ('exec-7', 'host-7', 'prof-7', 'run-7', 'key-7', 3, 2100, 4100,
+  2000, 0, 'exited', 1, 536870912, 1500, 100, 1, 0, 'complete', 0, 1000);
+insert into execution_cpu_profiles values ('host-7', 'exec-7', 1000,
+  x'e803e803', 'client-tree');
+pragma user_version = 7;
+""")
+    check created.ok
+    check userVersion(path) == 7
+
+    let store = openObservationStore(path)
+    check store.status == ssOpen
+    check userVersion(path) == 8
+
+    let runs = store.readRuns()
+    check runs.len == 1
+    check runs[0].project.isNone
+    check runs[0].entryPoint.isNone
+    let executions = store.readExecutions()
+    check executions.len == 1
+    let e = executions[0]
+    check e.executionId == "exec-7"
+    check e.peakRssBytes == 536870912
+    check e.cpuUserMillis == some(1500'i64)
+    check e.ownerUid == some(1000'i64)
+    check e.requestedAtUnixMillis.isNone
+    check e.cpuGrantedMilli.isNone
+    check e.afterExecutionIds.isNone
+    check store.readCpuProfiles().len == 1
+    check store.readMemoryProfiles().len == 0
+    # Still immutable after the migration.
+    check not runSqlite(path,
+      "update executions set duration_millis = 1;").ok
+
+    # Sizing rows are accepted beside the old ones.
+    check store.insertRun(RunRow(runId: "run-8", hostId: "host-7",
+      tool: "repro-build", toolVersion: "2", invocationKind: "build",
+      startedAtUnixMillis: 5000, captureCompleteness: ccComplete,
+      project: some("p"), entryPoint: some("build")))
+    let row = ExecutionRow(executionId: "exec-8", hostId: "host-7",
+      hostProfileId: some("prof-7"), runId: "run-8", commandStatsId: "k",
+      startedAtUnixMillis: 5100, finishedAtUnixMillis: 6100,
+      durationMillis: 1000, termination: tExited, attempt: 1,
+      peakRssBytes: 1, captureCompleteness: ccComplete,
+      requestedAtUnixMillis: some(5050'i64), cpuGrantedMilli: some(2000'i64),
+      afterExecutionIds: some(@["exec-7"]),
+      memoryProfileIntervalMillis: 1000, memoryProfileSamples: @[7'u16, 9])
+    check store.appendBatch(newSeq[RunRow](), [row])
+    let after = store.readExecutions()
+    check after.len == 2
+    for r in after:
+      if r.executionId == "exec-8":
+        check r.afterExecutionIds == some(@["exec-7"])
+        check r.cpuGrantedMilli == some(2000'i64)
+    check store.readMemoryProfiles().len == 1
+
+    # And the legacy rows replay, with the gaps counted.
+    let sizingRuns = store.readSizingRuns(SizingQuery(sinceUnixMillis: 0,
+      allUsers: true, allProfiles: true)).runs
+    check sizingRuns.len == 2
+    let figures = computeSizing(sizingRuns, @[], @[2], 0.99, "prof-7", true)
+    check figures.exclusions[exIncluded] == 2
+    check figures.counts.readyTimeUnknown == 1
+    check figures.counts.widthUnknown == 1
+
+  test "an interrupted migration to 8 leaves the store at 7, and a retry completes it":
+    # The step runs in ONE transaction with its `user_version` bump, so a
+    # failure part-way (here: the table it creates already exists, after the
+    # `alter table`s have run) must leave none of it behind -- no added
+    # column, version still 7 -- and the store must migrate cleanly once the
+    # obstacle is gone. Falsifying mutation: running the step without
+    # `begin immediate` leaves the columns added at version 7, and the
+    # retry then fails on a duplicate column.
+    let dir = scratchDir("v7int")
+    defer: removeDir(dir)
+    let path = dir / "observations.sqlite"
+    var ladder = ""
+    for i in 0 ..< 7:
+      ladder.add(migrations[i] & "\n")
+    check runSqlite(path, ladder & """
+create table execution_memory_profiles (blocker integer);
+pragma user_version = 7;
+""").ok
+    block:
+      let store = openObservationStore(path)
+      check store.status != ssOpen
+    check userVersion(path) == 7
+    let columns = runSqlite(path,
+      "select name from pragma_table_info('runs') where name = 'project';")
+    check columns.ok
+    check columns.output.strip() == ""
+    check runSqlite(path, "drop table execution_memory_profiles;").ok
+    let store = openObservationStore(path)
+    check store.status == ssOpen
+    check userVersion(path) == 8
+    # And opening the migrated store again changes nothing.
+    let fingerprint = schemaFingerprint(path)
+    let again = openObservationStore(path)
+    check again.status == ssOpen
+    check schemaFingerprint(path) == fingerprint

@@ -930,6 +930,15 @@ proc flushAmbientQueue() {.gcsafe.} =
     finally:
       release(samplerLock)
 
+proc flushAmbientSamples*() =
+  ## Writes the samples queued so far, on the CALLER's thread. For the read
+  ## path only (a sizing query reads the samples of runs that may have just
+  ## finished), never for the sampling path. A batch the sampler's own
+  ## thread has already taken is not waited for: a query can miss the last
+  ## few hundred milliseconds of samples, which only narrows a baseline it
+  ## reports with its sample count.
+  flushAmbientQueue()
+
 proc takeAmbientSample(previous: var HostLoadReading) {.gcsafe.} =
   {.cast(gcsafe).}:
     # THE READING AND THE SELF FIGURES ARE ONE OBSERVATION, so they are

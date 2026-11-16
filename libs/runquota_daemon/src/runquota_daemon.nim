@@ -211,6 +211,9 @@ proc applyPredictiveKeys(config: var DaemonConfig; host: HostConfig) =
   ## the file's value or the default, recomputed whole on every reload so
   ## an unset key goes back to its default. No flag names them.
   config.predictiveAdmission = host.admissionPredictive.get(false)
+  # Recomputed with the other file-only keys, so an unset key goes back to
+  # "none" on reload.
+  config.writeBytesPerSec = int64(host.writeBytesPerSec.get(0'u64))
   config.admissionHorizonMillis =
     host.admissionHorizonMillis.get(DefaultAdmissionHorizonMillis)
   config.pressureHighPct = host.pressureHighPct.get(DefaultPressureHighPct)
@@ -1910,7 +1913,11 @@ proc statusJson(daemon: RunQuotaDaemon): string =
     ",\"capacity\":" & capacityJson(capacitySnapshot(daemon.capacityCopy()),
       metricsTextfileJson(daemon.config)) &
     ",\"pressure\":" & daemon.pressureJson(psAll, "") &
-    ",\"admission_prediction\":" & daemon.admissionPredictionJson() & "}"
+    ",\"admission_prediction\":" & daemon.admissionPredictionJson() &
+    # `[machine] write_bytes_per_sec`: reported, never admitted against.
+    ",\"write_bytes_per_sec\":" &
+      (if daemon.config.writeBytesPerSec > 0: $daemon.config.writeBytesPerSec
+       else: "null") & "}"
 
 proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
   var ids: seq[uint64] = @[]
@@ -2514,6 +2521,123 @@ proc statsOwnerUid(context: ConnectionContext): Option[int64] =
   ## holds for that user's rows.
   ownerIdOf(context.peer)
 
+const
+  DefaultSizingSinceMillis = 30'i64 * 24 * 3600 * 1000
+    ## `--since 30d`, the specification's default window.
+  SizingExportPageBytes = 768 * 1024
+    ## How much of the sizing export one answer carries. Below the 1 MiB
+    ## frame limit with room for the envelope; a larger export is read in
+    ## pages (`offset`).
+
+proc sizingAnswer(daemon: var RunQuotaDaemon; context: ConnectionContext;
+                  msg: QuerySizingMessage; refusal: var string): string =
+  ## Answers `QuerySizing` (the replay is ``sizing_replay``'s numbered
+  ## definition). ``refusal`` is set, and nothing answered,
+  ## for a query the daemon cannot answer as asked (no project for a
+  ## replay, an N of 0).
+  if msg.what in {swSizing, swExport} and msg.project.len == 0:
+    refusal = "a sizing replay or export needs --project"
+    return ""
+  if msg.what == swSizing:
+    if msg.cpus.len == 0:
+      refusal = "a sizing replay needs --cpus N[,N...]"
+      return ""
+    for n in msg.cpus:
+      if n == 0'u32 or n > 1_000_000'u32:
+        refusal = "--cpus takes counts from 1 to 1000000, got " & $n
+        return ""
+  let q =
+    if msg.quantilePpm == 0'u32: DefaultSizingQuantile
+    else: float64(msg.quantilePpm) / 1_000_000.0
+  let now = unixMillisNow()
+  let since =
+    if msg.sinceMillis == 0'u64: DefaultSizingSinceMillis
+    else: int64(min(msg.sinceMillis, uint64(high(int64) div 2)))
+  var openRuns = initHashSet[string]()
+  for id in daemon.sessions.keys:
+    if daemon.observationRunIds.hasKey(id):
+      openRuns.incl(daemon.observationRunIds[id])
+  let query = SizingQuery(project: msg.project, entryPoint: msg.entryPoint,
+    sinceUnixMillis: max(0'i64, now - since), allUsers: msg.allUsers,
+    ownerUid: statsOwnerUid(context), allProfiles: msg.allProfiles,
+    currentProfile: daemon.observationProfileId, openRunIds: openRuns)
+  let hostWrite =
+    if daemon.config.writeBytesPerSec > 0: some(daemon.config.writeBytesPerSec)
+    else: none(int64)
+  # A query sees what has been recorded: drain the writer first, as `stats`
+  # does, and the ambient samples the baseline is read from.
+  flushObservationWriter()
+  flushAmbientSamples()
+  let capture = daemon.observationCaptureEnabled()
+  # BOUNDED WORK ON THE REQUEST PATH: the read keeps at most
+  # `MaxSizingRuns` runs and `MaxSizingExecutions` executions (the newest),
+  # the replay spends at most `DefaultReplayWorkBudget`, and each answer
+  # says when either cut something (`read_truncated`, `over_budget`).
+  let read =
+    if capture: daemon.observationStore.readSizingRuns(query)
+    else: SizingRead()
+  let runs = read.runs
+  var ambientTruncated = false
+  case msg.what
+  of swProfile:
+    let status =
+      if not capture: sasCaptureOff
+      elif runs.len == 0: sasNoRuns
+      else: sasOk
+    profileAnswerJson(runs, status, query, q, hostWrite, read.truncated)
+  of swSizing:
+    var cpus: seq[int] = @[]
+    for n in msg.cpus:
+      cpus.add(int(n))
+    let ambient = daemon.observationStore.readAmbientPoints(runs,
+      ambientTruncated)
+    let figures = computeSizing(runs, ambient, cpus, q,
+      daemon.observationProfileId, msg.allProfiles)
+    let status =
+      if not capture: sasCaptureOff
+      elif figures.exclusions[exIncluded] == 0: sasNoRuns
+      else: sasOk
+    var extra: seq[string] = @[]
+    if not capture:
+      extra.add("capture is OFF on this daemon: nothing has been recorded " &
+        "and nothing will be. 'runquotad --measurement capture=on' turns " &
+        "it on.")
+    sizingAnswerJson(figures, status, query, q, hostWrite, extra,
+      read.truncated or ambientTruncated)
+  of swExport:
+    let ambient = daemon.observationStore.readAmbientPoints(runs,
+      ambientTruncated)
+    let policy =
+      case msg.redaction
+      of srDefault: rpDefault
+      of srStrict: rpStrict
+      of srNone: rpNone
+    # Every page re-reads the same bounded set, so a page costs at most
+    # what one answer costs, however far into the export it asks.
+    let lines = sizingExportLines(runs, ambient, query, policy, now,
+      read.truncated or ambientTruncated)
+    var page: seq[string] = @[]
+    var size = 0
+    var next = int(msg.offset)
+    while next < lines.len:
+      # Measured as it will travel: escaped, inside the envelope.
+      let escaped = jsonString(lines[next])
+      if page.len > 0 and size + escaped.len > SizingExportPageBytes:
+        break
+      size += escaped.len + 1
+      page.add(escaped)
+      inc next
+    var body = "{\"status\":" & jsonString($(
+      if not capture: sasCaptureOff
+      elif runs.len == 0: sasNoRuns
+      else: sasOk)) & ",\"total\":" & $lines.len &
+      ",\"next\":" & (if next < lines.len: $next else: "null") &
+      ",\"lines\":["
+    for i, line in page:
+      if i > 0: body.add(",")
+      body.add(line)
+    body & "]}"
+
 proc exportRowJson(columns: seq[ExportColumn];
                    cells: seq[ExportCell]): string =
   ## One execution as one JSON object.
@@ -2871,7 +2995,8 @@ proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
     pressureEvents: 0'u32,
     queueDiagnostic: okDiagnostic(),
     groupKey: session.groupKey,
-    queuedAtMillis: monoMillis()
+    queuedAtMillis: monoMillis(),
+    requestedAtUnixMillis: unixMillisNow()
   )
   daemon.leases[id.value] = result
   daemon.capacity.touchGroup(session.groupKey, result.queuedAtMillis)
@@ -3089,7 +3214,14 @@ proc openObservationRun(daemon: var RunQuotaDaemon; session: SessionRow) =
     gitCommit: none(string),
     gitBranch: none(string),
     captureCompleteness: ccComplete,
-    droppedObservations: 0
+    droppedObservations: 0,
+    # SIZING DECLARATIONS (schema 8): what the session said it works for.
+    # NULL, not "", when it said nothing.
+    project:
+      if session.project.len > 0: some(session.project) else: none(string),
+    entryPoint:
+      if session.entryPoint.len > 0: some(session.entryPoint)
+      else: none(string)
   ))
 
 proc selfReportExecutionKey(id: LeaseId): string =
@@ -3202,6 +3334,25 @@ const MaxRememberedExecutions = 4096
   ## sizes and evidence counts -- still finds them, small enough that a
   ## client which never sends any costs a bounded amount.
 
+proc afterExecutionIds(daemon: RunQuotaDaemon; lease: LeaseRow;
+                       sizing: FinishSizing): Option[seq[string]] =
+  ## The client's `after` list (lease ids of its own session) as the
+  ## execution ids this daemon recorded for those leases. A lease of
+  ## another session, one that never finished, or one evicted from
+  ## ``observationExecutionIds`` is dropped: the list may only name
+  ## executions of the same run, and the daemon cannot vouch for one it no
+  ## longer remembers. Declared-but-empty stays declared (``some(@[])``).
+  if not sizing.afterKnown:
+    return none(seq[string])
+  var ids: seq[string] = @[]
+  for raw in sizing.afterLeases:
+    if daemon.observationExecutionIds.hasKey(raw):
+      let entry = daemon.observationExecutionIds[raw]
+      if entry.sessionId == lease.sessionId.value and
+          entry.executionId notin ids:
+        ids.add(entry.executionId)
+  some(ids)
+
 proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
                         finish: LeaseFinishedMessage) =
   ## Appends one immutable execution row. In-memory only: the enqueue takes
@@ -3282,8 +3433,6 @@ proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
     maxProcesses: int64(finish.processCount),
     majorPageFaults: clientInt64(max(finish.majorPageFaults,
       finish.totals.majorPageFaults)),
-    ioReadBytes: none(int64),
-    ioWriteBytes: none(int64),
     captureCompleteness: ccComplete,
     droppedObservations: 0,
     # FROM PEER CREDENTIALS, never from the client. `lease.peer` was filled
@@ -3299,7 +3448,26 @@ proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
     cpuProfileIntervalMillis:
       if finish.cpuProfile.present: int64(finish.cpuProfile.intervalMillis)
       else: 0'i64,
-    cpuProfileSamples: finish.cpuProfile.samples
+    cpuProfileSamples: finish.cpuProfile.samples,
+    # SIZING (schema 8). The request time and width are the daemon's own;
+    # the rest is what the launcher measured or declared, NULL when it did
+    # not (an older client, `sizing-data` off).
+    requestedAtUnixMillis:
+      if lease.requestedAtUnixMillis > 0: some(lease.requestedAtUnixMillis)
+      else: none(int64),
+    cpuGrantedMilli: some(int64(lease.resources.cpu.value)),
+    afterExecutionIds: daemon.afterExecutionIds(lease, finish.sizing),
+    memoryProfileIntervalMillis:
+      if finish.sizing.memoryProfile.present:
+        int64(finish.sizing.memoryProfile.intervalMillis)
+      else: 0'i64,
+    memoryProfileSamples: finish.sizing.memoryProfile.samplesMiB,
+    ioReadBytes:
+      if finish.sizing.io.known: some(clientInt64(finish.sizing.io.readBytes))
+      else: none(int64),
+    ioWriteBytes:
+      if finish.sizing.io.known: some(clientInt64(finish.sizing.io.writeBytes))
+      else: none(int64)
   ))
 
 proc declareClientExtension(daemon: var RunQuotaDaemon;
@@ -4779,7 +4947,9 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       supervisorUserId: context.supervisorUserId,
       peer: context.peer,
       groupKey: groupKey,
-      registeredAtMillis: monoMillis()
+      registeredAtMillis: monoMillis(),
+      project: msg.project,
+      entryPoint: msg.entryPoint
     )
     context.sessionIds.add(id)
     daemon.openObservationRun(daemon.sessions[id.value])
@@ -4946,6 +5116,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
         queueDiagnostic: okDiagnostic(),
         groupKey: session.groupKey,
         queuedAtMillis: monoMillis(),
+        requestedAtUnixMillis: unixMillisNow(),
         parentLeaseId: msg.parentLeaseId.value,
         subCpuMinMilli: msg.cpuMinMilli)
       discard daemon.tryPromoteQueued(
@@ -5336,6 +5507,25 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
   of rqPressureAnswer:
     connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
         "PressureAnswer is the daemon's answer, not a request"))
+  of rqQuerySizing:
+    # Read-only and answered on any connection, as `stats` is; the rows are
+    # scoped to the caller's owner id unless the query asks for every user.
+    var msg: QuerySizingMessage
+    if not decodeQuerySizing(frame.payload, msg):
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "invalid QuerySizing payload"))
+      return
+    var refusal = ""
+    let json = daemon.sizingAnswer(context, msg, refusal)
+    if refusal.len > 0:
+      connection.sendError(frame.header.requestId, diagnostic(
+        diagInvalidArgument, refusal))
+      return
+    connection.sendResponse(rqSizingAnswer, frame.header.requestId,
+      encodeSizingAnswer(SizingAnswerMessage(json: json)))
+  of rqSizingAnswer:
+    connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+        "SizingAnswer is the daemon's answer, not a request"))
   of rqDeferredObservations:
     # ONE-WAY, for the same reason ``rqLeaseObservation`` is: the client
     # sending this is EXITING. A reply is something it would have to stay
