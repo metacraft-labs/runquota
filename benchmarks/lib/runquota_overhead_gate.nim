@@ -147,6 +147,20 @@ proc notImplemented(): seq[string] =
     if not measurementRegistry[m].implemented:
       result.add($m)
 
+proc capabilityRecords(): seq[JsonNode] =
+  ## RQE-AREQ4: a measurement this OS cannot take is reported as such, in the
+  ## report and on stderr, so a verdict for "all" is never read as covering
+  ## it. Today that is the CPU profile sampler, which reads `/proc` and has
+  ## no macOS reading yet (its switch is inert there): "all" on macOS
+  ## measures capture, ambient sampling, tree sampling and pressure reports.
+  when not defined(linux):
+    result.add(%*{"measurement": "profiles", "os": hostOS,
+      "status": "unavailable",
+      "reason": "CPU profiles are taken from /proc and are Linux-only; " &
+        "the switch is inert on this OS, so no cost was measured for it"})
+    stderr.writeLine "capability: profiles is unavailable on " & hostOS &
+      " (Linux-only); not covered by this verdict"
+
 # ---------------------------------------------------------------------------
 # Synthetic case
 # ---------------------------------------------------------------------------
@@ -559,6 +573,7 @@ proc runGate*(cfg: GateConfig; gateCase: GateCase;
       "off": formatMeasurementSwitches(armMeasurements(cfg.measure, armOff, cfg.baseline)),
       "on": formatMeasurementSwitches(armMeasurements(cfg.measure, armOn, cfg.baseline))},
     "not_implemented_not_measured": notImplemented(),
+    "capabilities": capabilityRecords(),
     "host": {"cpus": countProcessors(), "os": hostOS, "arch": hostCPU,
       "load_start": loadStart, "load_end": loadAverage(),
       "cpu_psi_some_avg10_start": psiStart,

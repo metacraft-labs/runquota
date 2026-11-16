@@ -17,8 +17,8 @@
 ## ticks:
 ## https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html). macOS reads
 ## `proc_pid_rusage(2)` (`RUSAGE_INFO_V1`: own and child user and system
-## time, in Mach absolute time units, scaled by `mach_timebase_info`). The macOS path has not been
-## run yet; the Linux one has.
+## time, in Mach absolute time units, scaled by `mach_timebase_info`). Both
+## paths have been run: the daemon's counter is non-zero and grows with its work.
 
 import std/[monotimes, os, posix, strutils, times]
 
