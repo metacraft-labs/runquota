@@ -631,7 +631,38 @@ when defined(posix):
       let subGid = subordinateGidStart()
       let uid = int64(getuid())
       let gid = int64(getgid())
-      if unshareExe.len == 0 or nsenterExe.len == 0 or subUid < 0 or
+      if defined(macosx):
+        # CAPABILITY RECORD, not a pass for the second uid. macOS has no user
+        # namespaces: a connection from another kernel uid needs root, which
+        # this test does not assume. What IS measured here, through a real
+        # daemon: the owner uid the daemon reads with `getpeereid`, and the
+        # owner's own change through the shipped CLI. The daemon's refusal of
+        # another uid is pinned by
+        # `libs/runquota_daemon/tests/t_update_session_group_owner.nim`, which
+        # hand-builds the caller's `PeerIdentity`.
+        echo "  CAPABILITY: second-uid-connection = unavailable on macOS " &
+          "(no user namespaces; a second uid needs root). The refusal for " &
+          "another uid is covered by t_update_session_group_owner (daemon " &
+          "owner decision, constructed PeerIdentity), not by a real " &
+          "second-uid connection."
+        var fixture = startFixture("sgauid")
+        defer: stopFixture(fixture)
+        let deadline = unixMillisNow() + 600_000'u64
+        let owner = fixture.party("owner", group("sga-owned",
+          sessionPriorityNormal, deadline))
+        defer: owner.close()
+        let before = fixture.statusJson().groupNamed("sga-owned")
+        check before != nil
+        check before["owner_uid"].getBiggestInt() == uid
+        check before["priority"].getStr() == "normal"
+        let (setCode, setOutput) = cli(fixture.env, ["session", "set",
+          "sga-owned", "--priority", "urgent", "--cache-deadline", "none"])
+        check setCode == 0
+        check "priority=urgent" in setOutput
+        let changed = fixture.statusJson().groupNamed("sga-owned")
+        check changed["priority"].getStr() == "urgent"
+        check changed["cache_deadline_unix_millis"].kind == JNull
+      elif unshareExe.len == 0 or nsenterExe.len == 0 or subUid < 0 or
           subGid < 0 or findExe("newuidmap").len == 0:
         echo "  NOT RUN: a second uid needs unshare, nsenter, newuidmap and " &
           "a subordinate uid and gid range for this user (found unshare=" &

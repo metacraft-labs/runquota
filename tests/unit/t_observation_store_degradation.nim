@@ -222,14 +222,21 @@ suite "observation_store_degradation":
     # the child then calls a nil function pointer and dies.
     let dir = scratchDir("notsqlite")
     defer: removeDir(dir)
+    # The C library's name is per-OS: `libc.so.6` is a glibc soname and does
+    # not load on macOS, where the always-present non-SQLite library is
+    # libSystem. The case needs one that LOADS and lacks the bindings.
+    when defined(macosx):
+      const notSqlite = "/usr/lib/libSystem.B.dylib"
+    else:
+      const notSqlite = "libc.so.6"
     let (text, code) = execCmdEx(quoteShell(getAppFilename()) & " " &
       noLibraryFlag & " " & quoteShell(dir / "observations.sqlite"),
-      env = noLibraryEnv("libc.so.6"))
+      env = noLibraryEnv(notSqlite))
     checkpoint text
     check code == 0
     check "available=false" in text
     check "capture=false" in text
-    check "libc.so.6: has no sqlite3_" in text
+    check (notSqlite & ": has no sqlite3_") in text
     check not fileExists(dir / "observations.sqlite")
 
   test "the library in use is reported with its version":
