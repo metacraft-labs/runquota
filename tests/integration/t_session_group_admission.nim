@@ -76,6 +76,25 @@
 ## connection.
 ##
 ## POSIX only: the private endpoint, `unshare` and `nsenter` are POSIX.
+##
+## THE WINDOWS ARM is the parallel block at the foot of this file. The
+## scheduling and aggregation it exercises are the same cross-platform Nim; what
+## differs is the transport -- a named pipe under `host` scope, isolated by
+## `tests/support/windows_daemon_fixture` with a pipe name no concurrent run
+## collides with, since Windows has neither a Unix socket nor the daemon's
+## `private` endpoint scope. Every case here is ported there EXCEPT
+## `update_refused_for_other_uid`: Windows names a connection's principal from
+## the client process's token user SID (`GetNamedPipeClientProcessId`), a single
+## caller identity with no equivalent of `unshare --user`/`nsenter`, so that
+## case becomes a CAPABILITY RECORD -- the same shape as the macOS branch above.
+## A connection from a different Windows identity needs a second real local
+## account, which this host does not provision (an elevated token is the SAME
+## identity with more privilege, not another principal), so the daemon's refusal
+## of another owner is pinned by
+## `libs/runquota_daemon/tests/t_update_session_group_owner.nim` (a constructed
+## `PeerIdentity`), while the Windows case still measures what a single identity
+## can: the owner id the daemon read from the connection, and that owner's own
+## change through the shipped CLI.
 
 when defined(posix):
   import std/[json, monotimes, net, os, osproc, posix, streams, strtabs, strutils,
@@ -986,6 +1005,794 @@ when defined(posix):
       writeHostConfig(fixture.root,
         "order = [\"starvation\", \"fair-share\", \"arrival\"]\n")
       let (reloadCode, reloadOutput) = cli(fixture.env, ["config", "reload"])
+      if reloadCode != 0: echo reloadOutput
+      check reloadCode == 0
+      proc heldBy(name: string): int =
+        let row = fixture.statusJson().groupNamed(name)
+        if row == nil: -1 else: row["held_cpu_milli"].getInt()
+      # Wide keeps wanting the host: every lease it ends is offered again.
+      var wideGrants = 0
+      var narrowGrants = 0
+      var wideSum = 0
+      var narrowSum = 0
+      for round in 0 ..< 12:
+        if round mod 2 == 0:
+          wide.releaseOne()
+          if not wide.offer(2):
+            discard
+          else:
+            inc wideGrants
+        else:
+          narrow.releaseOne()
+          if narrow.offer():
+            inc narrowGrants
+        wideGrants += wide.collect()
+        narrowGrants += narrow.collect()
+        if round >= 4:
+          wideSum += heldBy("sga-size-wide")
+          narrowSum += heldBy("sga-size-narrow")
+      echo "  unequal sizes: held-cpu samples wide " & $wideSum & ", narrow " &
+        $narrowSum & "; grants wide " & $wideGrants & ", narrow " &
+        $narrowGrants
+      check heldBy("sga-size-wide") == (Slots div 2) * SlotMilli
+      check heldBy("sga-size-narrow") == (Slots div 2) * SlotMilli
+      let mean = (wideSum + narrowSum) / 2
+      check mean > 0
+      check abs(float(wideSum) - mean) <= 0.10 * mean
+      check abs(float(narrowSum) - mean) <= 0.10 * mean
+
+# ---------------------------------------------------------------------------
+# The Windows arm: the same cases over a named pipe under `host` scope.
+# ---------------------------------------------------------------------------
+
+when defined(windows):
+  import std/[json, monotimes, options, os, osproc, strtabs, strutils, times,
+    unittest]
+
+  import runquota_client
+  import runquota_codec
+  import runquota_core
+  import runquota_ipc
+  import runquota_protocol
+  import daemon_binary
+  import windows_daemon_fixture
+  from runquota_core/child_process import readToEnd
+
+  const
+    MiB = 1024'u64 * 1024'u64
+    SlotMilli = 1000
+    HostSlots = 4
+    GroupEnvKeys = [SessionGroupEnvVar, SessionPriorityEnvVar,
+      SessionCacheTtlEnvVar]
+
+  # -------------------------------------------------------------------------
+  # Fixture
+  # -------------------------------------------------------------------------
+
+  type
+    Party = ref object
+      ## One client connection with one session, in one group. A ref so the
+      ## session's pointer to its client stays valid.
+      client: RunQuotaClient
+      session: RunQuotaSession
+      held: seq[RunQuotaLease]
+        ## Leases granted to this party and not yet released.
+      nextCandidate: uint64
+
+    Fixture = object
+      ## A private `runquotad` on its own named pipe (`windows_daemon_fixture`),
+      ## with the test process's group environment saved and cleared so nothing
+      ## an in-process client registers inherits a stray `RUNQUOTA_SESSION`.
+      daemon: Daemon
+      saved: seq[tuple[key: string, had: bool, value: string]]
+
+  proc saveAndSet(fixture: var Fixture; key, value: string) =
+    fixture.saved.add((key, existsEnv(key), getEnv(key)))
+    if value.len > 0: putEnv(key, value) else: delEnv(key)
+
+  proc restoreEnv(fixture: var Fixture) =
+    for i in countdown(fixture.saved.high, 0):
+      let entry = fixture.saved[i]
+      if entry.had: putEnv(entry.key, entry.value) else: delEnv(entry.key)
+    fixture.saved.setLen(0)
+
+  proc cleanGroupEnv(env: StringTableRef) =
+    ## This suite may itself run under a launcher that exported a session
+    ## group; nothing it starts may inherit that.
+    for key in GroupEnvKeys:
+      if env.hasKey(key): env.del(key)
+
+  const HostConfigHead = "schema = \"runquota.host-config.v1\"\n"
+
+  proc writeHostConfig(root, admission: string) =
+    ## The private daemon's host file (`--host-config root/host.toml`, from
+    ## `daemonArgs`): the schema line and, when given, an `[admission]` table.
+    writeFile(root / "host.toml", HostConfigHead &
+      (if admission.len > 0: "[admission]\n" & admission else: ""))
+
+  proc startFixture(tag: string; extra: openArray[string] = [];
+                    slots = HostSlots; admission = ""): Fixture =
+    ## A private daemon with a `slots`-slot CPU budget (4 by default).
+    ## `admission`, when given, is the body of the host file's `[admission]`
+    ## table, read at start.
+    result.daemon.root = scratchDir(tag)
+    result.daemon.pipe = uniquePipe()
+    result.daemon.env = hostEnv(result.daemon.pipe)
+    cleanGroupEnv(result.daemon.env)
+    if admission.len > 0:
+      writeHostConfig(result.daemon.root, admission)
+    let args = daemonArgs(result.daemon.root, result.daemon.pipe,
+      @["--cpu-milli", $(slots * SlotMilli),
+        "--memory-bytes", $(4096'u64 * MiB)] & @extra)
+    result.daemon.process = startProcess(daemonPath(), env = result.daemon.env,
+      args = args, options = {poStdErrToStdOut})
+    prerequisite awaitDaemon(result.daemon),
+      "the private daemon did not serve " & result.daemon.pipe
+    # The in-process clients read `RUNQUOTA_SESSION` and its attributes from
+    # THIS process's environment at `registerSession`; clear it so a declared
+    # group is the only group, and each case sets its own.
+    for key in GroupEnvKeys:
+      result.saveAndSet(key, "")
+
+  proc stopFixture(fixture: var Fixture) =
+    fixture.restoreEnv()
+    fixture.daemon.stop()
+
+  proc party(fixture: Fixture; name: string;
+             group: SessionGroupDeclaration): Party =
+    result = Party(nextCandidate: 1'u64)
+    result.client = connect(namedPipeEndpoint(fixture.daemon.pipe), name)
+    result.session = result.client.registerSession(name, "0", group)
+
+  proc partyFromEnvironment(fixture: Fixture; name: string): Party =
+    ## A session registered through the library's default path, which reads
+    ## `RUNQUOTA_SESSION` and its attributes from the environment.
+    result = Party(nextCandidate: 1'u64)
+    result.client = connect(namedPipeEndpoint(fixture.daemon.pipe), name)
+    result.session = result.client.registerSession(name, "0")
+
+  proc group(name: string; priority = sessionPriorityNormal;
+             deadline = 0'u64): SessionGroupDeclaration =
+    SessionGroupDeclaration(name: name, priorityPresent: true,
+      priority: priority, cacheDeadlinePresent: deadline != 0'u64,
+      cacheDeadlineUnixMillis: deadline)
+
+  proc offer(p: Party; slots = 1): bool =
+    ## Offer one request of `slots` CPU slots. True when it was granted at
+    ## once; a queued one is collected later by `collect`.
+    let id = p.nextCandidate
+    inc p.nextCandidate
+    let request = resourceRequest("sga-" & $id,
+      milliCpu(slots * SlotMilli), bytes(64'u64 * MiB))
+    let decisions = p.session.offerCandidates([toCandidate(id, request)])
+    doAssert decisions.len == 1
+    doAssert decisions[0].lease.active,
+      "the daemon refused a request outright: " & decisions[0].diagnostic.message
+    if not decisions[0].queued:
+      p.held.add(decisions[0].lease)
+      return true
+    false
+
+  proc collect(p: Party): int =
+    ## Take every grant the daemon has made to this party and not delivered.
+    ## `GrantNext` delivers at most one per call, so ask until it has none.
+    while true:
+      let decisions = p.session.pollNextGrant()
+      var got = false
+      for decision in decisions:
+        if not decision.queued and decision.lease.active:
+          p.held.add(decision.lease)
+          inc result
+          got = true
+      if not got:
+        return
+
+  proc releaseOne(p: Party) =
+    var lease = p.held[0]
+    p.held.delete(0)
+    lease.release()
+
+  proc releaseAll(p: Party) =
+    while p.held.len > 0:
+      p.releaseOne()
+
+  proc close(p: Party) =
+    try:
+      p.releaseAll()
+      p.session.closeSession()
+    except CatchableError:
+      discard
+    p.client.close()
+
+  proc statusJson(fixture: Fixture): JsonNode =
+    ## `runquota status --json`, through the shipped CLI.
+    let (code, output) = runq(fixture.daemon.env, ["status", "--json"])
+    doAssert code == 0, "runquota status --json failed: " & output
+    parseJson(output.strip().splitLines()[^1])
+
+  proc groupNamed(status: JsonNode; name: string): JsonNode =
+    for entry in status["session_groups"]:
+      if entry["name"].getStr() == name:
+        return entry
+    nil
+
+  proc unixMillisNow(): uint64 = uint64(epochTime() * 1000.0)
+
+  # -------------------------------------------------------------------------
+  # Cases
+  # -------------------------------------------------------------------------
+
+  suite "session_group_admission (windows)":
+    test "default_order_whole_machine":
+      # Two groups of equal priority each want the whole host. The one that
+      # arrived first gets all of it; the other waits until slots free.
+      var fixture = startFixture("sgafcfs")
+      defer: stopFixture(fixture)
+      let blocker = fixture.party("blocker", group("sga-blocker"))
+      let first = fixture.party("first", group("sga-first"))
+      let second = fixture.party("second", group("sga-second"))
+      defer:
+        blocker.close()
+        first.close()
+        second.close()
+      for _ in 0 ..< HostSlots:
+        check blocker.offer()
+      # Both groups queue the whole machine while the blocker holds it. The
+      # first offers its work in two installments, the second group's whole
+      # request arriving between them, as a build that offers a few
+      # candidates at a time does: the first group keeps the place it took
+      # with its first request.
+      for _ in 0 ..< HostSlots div 2:
+        check not first.offer()
+      for _ in 0 ..< HostSlots:
+        check not second.offer()
+      for _ in HostSlots div 2 ..< HostSlots:
+        check not first.offer()
+      blocker.releaseAll()
+      check first.collect() == HostSlots
+      check second.collect() == 0
+      let busy = fixture.statusJson()
+      let firstRow = busy.groupNamed("sga-first")
+      let secondRow = busy.groupNamed("sga-second")
+      check firstRow != nil and secondRow != nil
+      if firstRow != nil and secondRow != nil:
+        check firstRow["held_cpu_milli"].getInt() == HostSlots * SlotMilli
+        check firstRow["grants_total"].getInt() == HostSlots
+        check secondRow["held_cpu_milli"].getInt() == 0
+        check secondRow["queued_leases"].getInt() == HostSlots
+        check secondRow["oldest_queued_wait_millis"].getInt() >= 0
+      # As the first group's slots free, the second group gets them.
+      first.releaseOne()
+      check second.collect() == 1
+      first.releaseAll()
+      check second.collect() == HostSlots - 1
+      let after = fixture.statusJson().groupNamed("sga-second")
+      check after != nil
+      if after != nil:
+        check after["grants_total"].getInt() == HostSlots
+        check after["held_cpu_milli"].getInt() == HostSlots * SlotMilli
+        check after["wait_max_millis"].getInt() >= 0
+
+    test "priority_goes_first":
+      # A low-priority group queues first; a high-priority group queues
+      # later and is granted the next free slots. The priorities arrive the
+      # way a launcher sets them: RUNQUOTA_SESSION and
+      # RUNQUOTA_SESSION_PRIORITY in the environment of the client.
+      var fixture = startFixture("sgaprio")
+      defer: stopFixture(fixture)
+      let blocker = fixture.party("blocker", group("sga-blocker"))
+      putEnv(SessionGroupEnvVar, "sga-low")
+      putEnv(SessionPriorityEnvVar, "low")
+      let low = fixture.partyFromEnvironment("low")
+      putEnv(SessionGroupEnvVar, "sga-high")
+      putEnv(SessionPriorityEnvVar, "high")
+      let high = fixture.partyFromEnvironment("high")
+      delEnv(SessionGroupEnvVar)
+      delEnv(SessionPriorityEnvVar)
+      defer:
+        blocker.close()
+        low.close()
+        high.close()
+      let declared = fixture.statusJson()
+      check declared.groupNamed("sga-low") != nil and
+        declared.groupNamed("sga-low")["priority"].getStr() == "low"
+      check declared.groupNamed("sga-high") != nil and
+        declared.groupNamed("sga-high")["priority"].getStr() == "high"
+      for _ in 0 ..< HostSlots:
+        check blocker.offer()
+      for _ in 0 ..< HostSlots:
+        check not low.offer()
+      for _ in 0 ..< HostSlots:
+        check not high.offer()
+      blocker.releaseOne()
+      check high.collect() == 1
+      check low.collect() == 0
+      blocker.releaseAll()
+      check high.collect() == HostSlots - 1
+      check low.collect() == 0
+
+    test "cache_deadline_breaks_ties":
+      # Three groups of equal priority, each wanting the whole machine,
+      # queue in the order: no deadline, the later deadline, the earlier
+      # deadline. They are served earliest deadline first, and the group
+      # with no deadline last. The deadlines arrive as a launcher sets them:
+      # RUNQUOTA_SESSION_CACHE_TTL.
+      var fixture = startFixture("sgattl")
+      defer: stopFixture(fixture)
+      let blocker = fixture.party("blocker", group("sga-blocker"))
+      putEnv(SessionGroupEnvVar, "sga-none")
+      let cold = fixture.partyFromEnvironment("none")
+      putEnv(SessionGroupEnvVar, "sga-late")
+      putEnv(SessionCacheTtlEnvVar, "600")
+      let late = fixture.partyFromEnvironment("late")
+      putEnv(SessionGroupEnvVar, "sga-early")
+      putEnv(SessionCacheTtlEnvVar, "300")
+      let early = fixture.partyFromEnvironment("early")
+      delEnv(SessionGroupEnvVar)
+      delEnv(SessionCacheTtlEnvVar)
+      defer:
+        blocker.close()
+        cold.close()
+        late.close()
+        early.close()
+      let declared = fixture.statusJson()
+      let now = unixMillisNow()
+      check declared.groupNamed("sga-none")["cache_deadline_unix_millis"].kind == JNull
+      let lateDeadline = declared.groupNamed("sga-late")["cache_deadline_unix_millis"].getBiggestInt()
+      let earlyDeadline = declared.groupNamed("sga-early")["cache_deadline_unix_millis"].getBiggestInt()
+      check earlyDeadline < lateDeadline
+      check uint64(earlyDeadline) > now + 200_000'u64
+      check blocker.offer(HostSlots)
+      check not cold.offer(HostSlots)
+      check not late.offer(HostSlots)
+      check not early.offer(HostSlots)
+      blocker.releaseAll()
+      check early.collect() == 1
+      check late.collect() == 0
+      check cold.collect() == 0
+      early.releaseAll()
+      check late.collect() == 1
+      check cold.collect() == 0
+      late.releaseAll()
+      check cold.collect() == 1
+
+    test "starvation_bound":
+      # A low-priority request queues behind a high-priority group that
+      # keeps the host full and always has more queued. Without a bound it
+      # would never run; with one it receives its slot within the bound plus
+      # one admission cycle (here, one release of the stream).
+      const
+        MaxWaitMillis = 1500
+        CycleMillis = 100
+        BudgetMillis = 10_000
+        SlackMillis = 300
+          ## Scheduling jitter of a shared host, on top of the one cycle.
+      var fixture = startFixture("sgastarve",
+        ["--admission-max-wait-millis", $MaxWaitMillis])
+      defer: stopFixture(fixture)
+      let stream = fixture.party("stream", group("sga-stream",
+        sessionPriorityHigh))
+      let starved = fixture.party("starved", group("sga-starved",
+        sessionPriorityLow))
+      defer:
+        stream.close()
+        starved.close()
+      for _ in 0 ..< HostSlots:
+        check stream.offer()
+      check not stream.offer()
+      check not stream.offer()
+      let queuedAt = getMonoTime()
+      check not starved.offer()
+      var waited = -1'i64
+      while waited < 0 and
+          (getMonoTime() - queuedAt).inMilliseconds < BudgetMillis:
+        sleep(CycleMillis)
+        # One turn of the stream: release the oldest lease (the daemon
+        # grants the freed slot at once), keep two requests queued.
+        discard stream.collect()
+        if stream.held.len > 0:
+          stream.releaseOne()
+        discard stream.offer()
+        if starved.collect() > 0:
+          waited = (getMonoTime() - queuedAt).inMilliseconds
+      echo "  low-priority request granted after " & $waited & " ms (bound " &
+        $MaxWaitMillis & " ms)"
+      check waited >= 0
+      # Granted by the bound, not by a lull in the stream: not before it.
+      check waited >= MaxWaitMillis - CycleMillis
+      check waited <= MaxWaitMillis + CycleMillis + SlackMillis
+      let status = fixture.statusJson()
+      check status["admission_max_wait_millis"].getInt() == MaxWaitMillis
+
+    test "starvation_holds_slots":
+      # Backfill never delays a request held under the bound. A low-priority
+      # request for TWO slots waits behind a high-priority stream of
+      # one-slot requests that keeps the host full and keeps two young
+      # requests queued. Once the two-slot request has waited out the bound,
+      # a freed slot is not handed to the stream: it is held until a second
+      # one frees, and the starved request gets both.
+      const
+        MaxWaitMillis = 1000
+        MarginMillis = 250
+        QuietMillis = 300
+        CycleMillis = 100
+        BudgetMillis = 10_000
+      var fixture = startFixture("sgahold",
+        ["--admission-max-wait-millis", $MaxWaitMillis])
+      defer: stopFixture(fixture)
+      let stream = fixture.party("stream", group("sga-stream",
+        sessionPriorityHigh))
+      let starved = fixture.party("starved", group("sga-starved",
+        sessionPriorityLow))
+      defer:
+        stream.close()
+        starved.close()
+      for _ in 0 ..< HostSlots:
+        check stream.offer()
+      check not stream.offer()
+      check not stream.offer()
+      let queuedAt = getMonoTime()
+      check not starved.offer(2)
+      # Until shortly before the bound, the stream turns over: each freed
+      # slot goes to its oldest queued request (the two-slot request does not
+      # fit in one -- backfill), and a new request takes that one's place.
+      # Its queued requests therefore stay younger than the bound and are
+      # never starved themselves when the checks below run.
+      var turned = 0
+      while (getMonoTime() - queuedAt).inMilliseconds <
+          MaxWaitMillis - QuietMillis:
+        sleep(CycleMillis)
+        stream.releaseOne()
+        turned += stream.collect()
+        discard stream.offer()
+      check turned > 0
+      check starved.collect() == 0
+      check stream.held.len == HostSlots
+      # Then quiet until the bound has passed. `queuedAt` is read before the
+      # request is sent, so the daemon's own clock for it starts a little
+      # later; the margin keeps this side from acting before the daemon
+      # counts it as starved.
+      while (getMonoTime() - queuedAt).inMilliseconds <=
+          MaxWaitMillis + MarginMillis:
+        sleep(CycleMillis div 2)
+      # Past the bound: the first freed slot is held, not granted to the
+      # stream's queued requests ...
+      stream.releaseOne()
+      check stream.collect() == 0
+      check starved.collect() == 0
+      let held = fixture.statusJson().groupNamed("sga-stream")
+      check held != nil
+      if held != nil:
+        check held["held_cpu_milli"].getInt() == (HostSlots - 1) * SlotMilli
+        check held["queued_leases"].getInt() == 2
+      # ... and when the second one frees, the starved request gets both.
+      stream.releaseOne()
+      check starved.collect() == 1
+      check stream.collect() == 0
+      check (getMonoTime() - queuedAt).inMilliseconds < BudgetMillis
+      let after = fixture.statusJson().groupNamed("sga-starved")
+      check after != nil
+      if after != nil:
+        check after["held_cpu_milli"].getInt() == 2 * SlotMilli
+
+    test "update_refused_for_other_uid":
+      # The owner's group cannot be changed from a connection whose peer
+      # credentials name another identity, and its attributes are unchanged.
+      #
+      # CAPABILITY RECORD, not a pass for a second identity. Windows names a
+      # connection's principal from the client process's token user SID
+      # (`GetNamedPipeClientProcessId` -> the owner id in
+      # `runquota_core/owner_id`): one caller identity, with no equivalent of
+      # the POSIX `unshare --user`/`nsenter` dance -- the same shape as the
+      # macOS branch of the POSIX case above. A connection from a DIFFERENT
+      # Windows identity needs a second real local account, which this host
+      # does not provision; an elevated token is the SAME identity with more
+      # privilege, so running as Administrator would not exercise the owner
+      # check at all. The daemon's refusal of another owner is pinned by
+      # `libs/runquota_daemon/tests/t_update_session_group_owner.nim`, which
+      # hand-builds the caller's `PeerIdentity`. What a single identity CAN
+      # show, through a real daemon over the named pipe, is measured here: the
+      # owner id the daemon read from the connection equals this process's,
+      # and that owner changes its own group through the shipped CLI.
+      let owner = currentProcessOwnerId()
+      prerequisite owner.isSome,
+        "this process's token user SID is unreadable"
+      echo "  CAPABILITY: second-uid-connection = unavailable on Windows " &
+        "(a different connection identity needs a second real local account, " &
+        "absent on this host; an elevated token is the same identity). The " &
+        "refusal for another owner is covered by t_update_session_group_owner " &
+        "(daemon owner decision, constructed PeerIdentity), not by a real " &
+        "second-identity connection."
+      var fixture = startFixture("sgauid")
+      defer: stopFixture(fixture)
+      let deadline = unixMillisNow() + 600_000'u64
+      let ownerParty = fixture.party("owner", group("sga-owned",
+        sessionPriorityNormal, deadline))
+      defer: ownerParty.close()
+      let before = fixture.statusJson().groupNamed("sga-owned")
+      check before != nil
+      # The daemon recorded the owner from the connection, not from anything
+      # the client declared: it matches this process's own owner id.
+      check before["owner_uid"].getBiggestInt() == owner.get
+      check before["priority"].getStr() == "normal"
+      check before["cache_deadline_unix_millis"].getBiggestInt() ==
+        int64(deadline)
+      # The owner may: the change through the shipped CLI (a child process
+      # with the same token, so the same owner) succeeds.
+      let (setCode, setOutput) = runq(fixture.daemon.env, ["session", "set",
+        "sga-owned", "--priority", "urgent", "--cache-deadline", "none"])
+      check setCode == 0
+      check "priority=urgent" in setOutput
+      let changed = fixture.statusJson().groupNamed("sga-owned")
+      check changed["priority"].getStr() == "urgent"
+      check changed["cache_deadline_unix_millis"].kind == JNull
+
+    test "missing_session_group_is_interactive":
+      # A client from before session groups sends a RegisterSession with no
+      # group block at all. It is admitted in its user's interactive group,
+      # at high priority: ahead of a normal-priority group that queued first.
+      let owner = currentProcessOwnerId()
+      prerequisite owner.isSome,
+        "this process's token user SID is unreadable"
+      var fixture = startFixture("sgaold")
+      defer: stopFixture(fixture)
+      let blocker = fixture.party("blocker", group("sga-blocker"))
+      let agent = fixture.party("agent", group("sga-agent"))
+      defer:
+        blocker.close()
+        agent.close()
+      # The old client: a real connection, and the RegisterSession payload
+      # written field by field the way a client before groups wrote it.
+      let old = Party(nextCandidate: 1'u64)
+      old.client = connect(namedPipeEndpoint(fixture.daemon.pipe), "old-client")
+      defer: old.close()
+      var payload = writer()
+      payload.writeString("old-client")
+      payload.writeString("0")
+      payload.writeMetadata(metadataNone())
+      old.client.connection.sendFrame(encodeFrame(rqRegisterSession,
+        FrameFlagRequest, 900'u64, payload.data))
+      var frame: RqspFrame
+      check old.client.connection.receiveFrame(frame)
+      check frame.header.messageKind == rqSessionRegistered
+      var registered: SessionRegisteredMessage
+      check decodeSessionRegistered(frame.payload, registered)
+      old.session = RunQuotaSession(client: addr old.client,
+        id: registered.sessionId, active: true)
+
+      let interactive = fixture.statusJson().groupNamed(InteractiveSessionGroup)
+      check interactive != nil
+      check interactive["owner_uid"].getBiggestInt() == owner.get
+      check interactive["priority"].getStr() == "high"
+      check interactive["sessions"].getInt() == 1
+
+      for _ in 0 ..< HostSlots:
+        check blocker.offer()
+      for _ in 0 ..< HostSlots:
+        check not agent.offer()
+      for _ in 0 ..< HostSlots:
+        check not old.offer()
+      blocker.releaseAll()
+      check old.collect() == HostSlots
+      check agent.collect() == 0
+
+    test "fair_share_order":
+      # The host file asks for equal shares: order = [starvation, fair-share,
+      # arrival]. Three groups of equal priority each want the whole host
+      # (six slots) and keep wanting it. They hold equal shares, within 10%,
+      # while their leases turn over. Then the file goes back to the default
+      # order and the daemon is only asked to reload: from the next freed
+      # slot on, the group that became busy first is served first again.
+      const
+        Slots = 6
+        Rounds = 12
+        FairOrder = "order = [\"starvation\", \"fair-share\", \"arrival\"]\n"
+      var fixture = startFixture("sgafair", slots = Slots,
+        admission = FairOrder)
+      defer: stopFixture(fixture)
+      let configured = fixture.statusJson()
+      check configured["admission_order"] == %["starvation", "fair-share",
+        "arrival"]
+      let blocker = fixture.party("blocker", group("sga-blocker"))
+      let parties = [fixture.party("a", group("sga-fair-a")),
+        fixture.party("b", group("sga-fair-b")),
+        fixture.party("c", group("sga-fair-c"))]
+      let names = ["sga-fair-a", "sga-fair-b", "sga-fair-c"]
+      defer:
+        blocker.close()
+        for p in parties:
+          p.close()
+      for _ in 0 ..< Slots:
+        check blocker.offer()
+      for p in parties:
+        for _ in 0 ..< Slots:
+          check not p.offer()
+      # The whole host frees at once: ONE admission pass spreads it.
+      blocker.releaseAll()
+      var held: array[3, int]
+      for i, p in parties:
+        held[i] = p.collect()
+      echo "  after the blocker: held " & $held
+      check held == [2, 2, 2]
+
+      # Turnover: in each round every group releases its oldest lease and
+      # offers another, so each keeps wanting the whole host. The held CPU
+      # each group's status row reports is sampled after every release, and
+      # summed: the share each group held over the run.
+      var heldSum: array[3, int]
+      var grants: array[3, int]
+      for i in 0 ..< 3:
+        grants[i] = held[i]
+      for round in 0 ..< Rounds:
+        for turn in 0 ..< 3:
+          # Rotate who releases first, so no group is always first to ask.
+          let i = (round + turn) mod 3
+          parties[i].releaseOne()
+          discard parties[i].offer()
+          for j, p in parties:
+            grants[j] += p.collect()
+          let status = fixture.statusJson()
+          for j, name in names:
+            let row = status.groupNamed(name)
+            check row != nil
+            if row != nil:
+              heldSum[j] += row["held_cpu_milli"].getInt()
+      echo "  fair-share turnover: grants " & $grants & ", held-cpu samples " &
+        $heldSum
+      let meanHeld = (heldSum[0] + heldSum[1] + heldSum[2]) / 3
+      let meanGrants = (grants[0] + grants[1] + grants[2]) / 3
+      check meanHeld > 0
+      for j in 0 ..< 3:
+        check abs(float(heldSum[j]) - meanHeld) <= 0.10 * meanHeld
+        check abs(float(grants[j]) - meanGrants) <= 0.10 * meanGrants
+      let busy = fixture.statusJson()
+      for name in names:
+        let row = busy.groupNamed(name)
+        check row != nil and row["held_cpu_milli"].getInt() == 2 * SlotMilli
+        # The decayed figure the order uses is reported, and grows with use.
+        check row != nil and row["recent_cpu_milli_seconds"].getInt() >= 0
+
+      # Back to the default order: the file loses its [admission] table, and
+      # the running daemon is asked to reload it. Nothing else changes.
+      writeHostConfig(fixture.daemon.root, "")
+      let (reloadCode, reloadOutput) = runq(fixture.daemon.env,
+        ["config", "reload"])
+      check reloadCode == 0
+      check "runquotad reloaded its host configuration" in reloadOutput
+      let reloaded = fixture.statusJson()
+      check reloaded["admission_order"] == %["starvation", "priority",
+        "cache-deadline", "arrival"]
+      # Default order: group a became busy first and still wants the whole
+      # host, so every slot b and c free goes to a. (Under fair-share each
+      # freed slot went back to the group that freed it.)
+      for _ in 0 ..< 2:
+        for i in 1 .. 2:
+          parties[i].releaseOne()
+          discard parties[i].offer()
+          check parties[i].collect() == 0
+          check parties[0].collect() == 1
+      let after = fixture.statusJson()
+      check after.groupNamed("sga-fair-a")["held_cpu_milli"].getInt() ==
+        Slots * SlotMilli
+      check after.groupNamed("sga-fair-b")["held_cpu_milli"].getInt() == 0
+      check after.groupNamed("sga-fair-c")["held_cpu_milli"].getInt() == 0
+
+    test "max_wait_flag_over_host_file":
+      # The host file says 45 s; the flag says 1.5 s. The flag wins, on start
+      # and after a reload that changes the file, and the reload says it
+      # pinned the key. Without the flag the file's bound is in force.
+      var pinned = startFixture("sgawaitflag",
+        ["--admission-max-wait-millis", "1500"],
+        admission = "max-wait = \"45s\"\n")
+      defer: stopFixture(pinned)
+      check pinned.statusJson()["admission_max_wait_millis"].getInt() == 1500
+      writeHostConfig(pinned.daemon.root, "max-wait = \"10s\"\n")
+      let (code, output) = runq(pinned.daemon.env, ["config", "reload"])
+      check code == 0
+      check "admission.max-wait" in output
+      check pinned.statusJson()["admission_max_wait_millis"].getInt() == 1500
+      let (topoCode, topoOutput) = runq(pinned.daemon.env, ["topology", "--json"])
+      check topoCode == 0
+      check "\"admission.max-wait\"" in topoOutput
+
+      var fromFile = startFixture("sgawaitfile",
+        admission = "max-wait = \"45s\"\n")
+      defer: stopFixture(fromFile)
+      check fromFile.statusJson()["admission_max_wait_millis"].getInt() ==
+        45_000
+      writeHostConfig(fromFile.daemon.root, "max-wait = \"10s\"\n")
+      check runq(fromFile.daemon.env, ["config", "reload"]).code == 0
+      check fromFile.statusJson()["admission_max_wait_millis"].getInt() ==
+        10_000
+
+    test "invalid_order_refused":
+      # A repeated key stops the daemon at start, with the file and line.
+      let root = scratchDir("sgabadorder")
+      let pipe = uniquePipe()
+      writeHostConfig(root, "order = [\"priority\", \"priority\"]\n")
+      var env = hostEnv(pipe)
+      cleanGroupEnv(env)
+      var refused = startProcess(daemonPath(), env = env,
+        args = daemonArgs(root, pipe, ["--cpu-milli", $(HostSlots * SlotMilli)]),
+        options = {poStdErrToStdOut})
+      let said = refused.outputStream.readToEnd()
+      let code = refused.waitForExit(30_000)
+      refused.close()
+      removeDir(root)
+      check code == 2
+      check "host.toml:3: admission order lists `priority` twice" in said
+
+      # Under a running daemon, an unknown key is refused by the reload and
+      # the order in force is unchanged.
+      var fixture = startFixture("sgabadreload",
+        admission = "order = [\"fair-share\", \"arrival\"]\n")
+      defer: stopFixture(fixture)
+      # The refused file also changes the bound and the division; neither
+      # may take effect, because the file as a whole did not parse.
+      writeHostConfig(fixture.daemon.root, "order = [\"fairshare\"]\n" &
+        "max-wait = \"10s\"\nshare-between-users = \"none\"\n")
+      let (reloadCode, reloadOutput) = runq(fixture.daemon.env,
+        ["config", "reload"])
+      check reloadCode == 1
+      check "unknown admission order key `fairshare`" in reloadOutput
+      let kept = fixture.statusJson()
+      check kept["admission_order"] == %["fair-share", "arrival"]
+      check kept["admission_max_wait_millis"].getInt() == 120_000
+      check kept["admission_share_between_users"].getStr() == "drf"
+      # An empty order is refused the same way.
+      writeHostConfig(fixture.daemon.root, "order = []\n")
+      let (emptyCode, emptyOutput) = runq(fixture.daemon.env,
+        ["config", "reload"])
+      check emptyCode == 1
+      check "admission order is empty" in emptyOutput
+      check fixture.statusJson()["admission_order"] == %["fair-share",
+        "arrival"]
+      # And the order still in force is the one ADMISSION uses, not only the
+      # one status prints: two busy groups wanting the whole host split it
+      # (fair-share). Had the refused reload put the default in force, the
+      # group that queued first would take all of it.
+      let blocker = fixture.party("blocker", group("sga-blocker"))
+      let first = fixture.party("first", group("sga-kept-a"))
+      let second = fixture.party("second", group("sga-kept-b"))
+      defer:
+        blocker.close()
+        first.close()
+        second.close()
+      for _ in 0 ..< HostSlots:
+        check blocker.offer()
+      for _ in 0 ..< HostSlots:
+        check not first.offer()
+      for _ in 0 ..< HostSlots:
+        check not second.offer()
+      blocker.releaseAll()
+      check first.collect() == HostSlots div 2
+      check second.collect() == HostSlots div 2
+
+    test "fair_share_unequal_sizes":
+      # Two busy groups whose requests differ in width: "wide" asks for two
+      # slots at a time, "narrow" for one. Under the default order wide,
+      # which became busy first, takes the whole host. A reload to
+      # [starvation, fair-share, arrival] -- nothing else -- moves the host
+      # to equal CPU as wide's leases end, and keeps it there while both
+      # turn their leases over. Ignoring the reload leaves wide with three
+      # quarters (six slots to narrow's two).
+      const Slots = 8
+      var fixture = startFixture("sgafairsize", slots = Slots)
+      defer: stopFixture(fixture)
+      let wide = fixture.party("wide", group("sga-size-wide"))
+      let narrow = fixture.party("narrow", group("sga-size-narrow"))
+      defer:
+        wide.close()
+        narrow.close()
+      for _ in 0 ..< Slots div 2:
+        check wide.offer(2)
+      for _ in 0 ..< Slots:
+        check not narrow.offer()
+      check narrow.collect() == 0
+      writeHostConfig(fixture.daemon.root,
+        "order = [\"starvation\", \"fair-share\", \"arrival\"]\n")
+      let (reloadCode, reloadOutput) = runq(fixture.daemon.env,
+        ["config", "reload"])
       if reloadCode != 0: echo reloadOutput
       check reloadCode == 0
       proc heldBy(name: string): int =

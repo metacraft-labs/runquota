@@ -90,3 +90,33 @@ tests/unit/t_jobserver_bridge_windows.nim
 # ITS OWN binary as the worker, so no shell, no daemon and no sqlite3; the cap
 # case skips on a host with fewer than three cores.
 tests/integration/t_windows_job_object_cpu.nim
+# The admission order as pure functions of a simulated clock: the priority,
+# cache-deadline, starvation and arrival keys, fair-share with a decaying
+# per-group CPU figure, and DRF (and `share-between-users = none`) across
+# owners. No `when defined` guards, no live daemon and no sqlite3; the real
+# daemon, real named pipe and a real queued admission are exercised on the
+# Windows integration leg (`t_session_group_admission` Windows arm).
+libs/runquota_admission/tests/t_admission_order.nim
+# The daemon's owner decision for `UpdateSessionGroup`: a group's attributes
+# change only for the owner the daemon read from the connection, two owners may
+# hold the same group name independently, and a connection with no credentials
+# owns nothing. A real `RunQuotaDaemon` object with a hand-built `PeerIdentity`
+# (the only stand-in -- a test process cannot connect as a second identity),
+# no live daemon and no sqlite3. This is the whole of the owner-check coverage
+# on Windows, where the integration case (`t_session_group_admission`'s
+# `update_refused_for_other_uid`) is a capability record, not a real
+# second-identity connection, for the same reason it is one on macOS.
+libs/runquota_daemon/tests/t_update_session_group_owner.nim
+# The host file's `[admission]` table as pure functions of `runquota_daemon`'s
+# internals (`{.all.}`): the `order`, `max-wait` and `share-between-users` keys
+# validated and put in force, the `--admission-max-wait-millis` flag winning
+# over the file across reloads, a file that does not parse changing nothing,
+# and `runquota config set` writing the three keys. No live daemon, no socket
+# and no sqlite3.
+libs/runquota_daemon/tests/t_host_config_admission.nim
+# The host-config reload as pure functions of `runquota_daemon`'s internals
+# (`{.all.}`): a reload promotes what now fits in the pass itself, a shrink
+# never revokes a granted lease, a file that does not parse changes nothing,
+# removing the file returns to the built-in defaults, and a flag still wins
+# after a reload. No live daemon, no socket and no sqlite3.
+libs/runquota_daemon/tests/t_host_config_reload.nim
