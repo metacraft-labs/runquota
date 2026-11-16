@@ -211,7 +211,7 @@ runquota run --adapter list
 | `--stats-key KEY` | `run/<program>@<project>` | Keys the recorded row and the [estimate](/getting_started/concepts#estimate) lookup. The default is the program's base name plus the name of the nearest enclosing git checkout of the working directory (or of the directory itself). |
 | `--adapter NAME` | detected | `nim`, `go`, `nextest`, `nix`, `pnpm`, `yarn`, `playwright`, `npm`; `none` leaves the command line alone and only holds the lease; `list` prints the table and exits. |
 | `--verbose`, `-v` | off | Print the chosen width, what the adapter did and the final command line to stderr. |
-| `--cap` | | Not available yet: exits 2 without running the command. |
+| `--cap` | off | **Windows:** enforces the grant as a hard ceiling. The command's whole process tree runs in a Job Object whose CPU-rate control is capped at the granted width, so however many threads or processes it spawns it cannot use more CPU than the lease bought. **Every other platform:** not available yet (CPU-limit enforcement is cgroup work that has not shipped); `--cap` there exits 2 without running the command. |
 | `-- COMMAND [ARG...]` | required | Everything after `--` is the command. Its own flags are never read by `run`. |
 
 The command also gets two environment variables whatever the adapter:
@@ -246,9 +246,10 @@ no adapter recognises is run unchanged; the lease is still held for its
 duration.
 
 **Exit codes.** The command's exit code, or `128 + signal` if it was killed.
-**2** for bad arguments and for `--cap`; **1** when the daemon refused or lost
-the lease so the command never ran; **127** when the command could not be
-started. The lease is released when the command ends, whatever its status.
+**2** for bad arguments, and for `--cap` where it is not available (every
+platform but Windows); **1** when the daemon refused or lost the lease so the
+command never ran; **127** when the command could not be started. The lease is
+released when the command ends, whatever its status.
 
 **With no daemon, it still runs your command**, unchanged and unbounded, as
 `acquire` does.

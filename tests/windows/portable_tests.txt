@@ -66,3 +66,15 @@ tests/unit/t_child_watchdog.nim
 # per call. The pre-fix drain (4bf105c) grew 164,528 B per call and failed.
 libs/runquota_core/tests/t_child_process_partial_reads.nim
 libs/runquota_core/tests/t_child_process_capture_memory.nim
+# The pure parts and the named-semaphore token bookkeeping of the Windows
+# `runquota jobserver` bridge: `MAKEFLAGS` composition, joining an inherited
+# bridge, and widening/narrowing a real semaphore. Needs neither a daemon nor
+# sqlite3; the POSIX sibling (`t_jobserver_bridge.nim`) drives the FIFO instead
+# and is excluded here.
+tests/unit/t_jobserver_bridge_windows.nim
+# Windows Job Object CPU accounting and the `--cap` CPU-rate ceiling at the
+# `runquota_process` launcher level: a grandchild's CPU counted against the
+# tree, and a one-core cap holding a multi-burner tree near one core. Launches
+# ITS OWN binary as the worker, so no shell, no daemon and no sqlite3; the cap
+# case skips on a host with fewer than three cores.
+tests/integration/t_windows_job_object_cpu.nim

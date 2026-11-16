@@ -24,6 +24,18 @@
 ## for the command's whole life (so token writes never block and a reader
 ## never sees end-of-file), and removes it when the command ends.
 ##
+## ON WINDOWS the transport is a named semaphore instead, the form GNU make
+## 4.4 and cargo's `jobserver` crate both use there: `--jobserver-auth=NAME`
+## with no `fifo:`/`sem:` prefix, NAME created with `CreateSemaphoreA` and
+## joined by a client with `OpenSemaphoreA`. A token is a unit of the
+## semaphore's count; acquiring is `WaitForSingleObject` and returning is
+## `ReleaseSemaphore`. A semaphore's maximum count is fixed at creation, so
+## the bridge creates it with a generous ceiling and keeps its own handle open
+## for the command's whole life; the semaphore is destroyed once the last
+## handle (the bridge's and the command tree's) closes. The platform
+## differences in leftover cleanup, terminal handling and nested joining are
+## noted at the Windows procs below.
+##
 ## NESTING. With `RUNQUOTA_PARENT_LEASE` set (by `runquota acquire`,
 ## `runquota run` or another supervising client), the lease is a SUB-LEASE of
 ## that parent: its slots come out of the parent's grant and never from the
@@ -52,6 +64,8 @@
 import std/[monotimes, options, os, strutils, times]
 when defined(posix):
   import std/posix
+when defined(windows):
+  import std/winlean
 
 import runquota_client
 import runquota_core
@@ -65,6 +79,10 @@ const
     ## Exported to the command: the bridge's FIFO. A nested
     ## `runquota jobserver` that finds it, and finds `MAKEFLAGS` still naming
     ## it, joins this jobserver instead of taking a lease of its own.
+  JobserverSemaphoreEnvVar* = "RUNQUOTA_JOBSERVER_SEMAPHORE"
+    ## The Windows sibling of `JobserverFifoEnvVar`: the bridge's semaphore
+    ## name. A nested `runquota jobserver` that finds it, and finds `MAKEFLAGS`
+    ## still naming it, joins this jobserver instead of taking its own lease.
   DefaultMemoryPerSlot* = 512'u64 * 1024'u64 * 1024'u64
     ## What a host lease reserves per granted slot when `--mem` is not
     ## given. A nominal figure: the bridge cannot know the tool's footprint,
@@ -165,6 +183,49 @@ proc joinsInheritedBridge*(makeflags, bridgeFifo: string): bool =
   ## tool in between may have started its own jobserver, and then that one
   ## is what this process's implicit token belongs to.
   bridgeFifo.len > 0 and fifoNamedByMakeflags(makeflags) == bridgeFifo
+
+proc bridgeMakeflagsWindows*(inherited: string; slots: int; semName: string):
+    string =
+  ## The Windows sibling of `bridgeMakeflags`: the inherited words that are not
+  ## about jobs, then ` -j --jobserver-fds=NAME --jobserver-auth=NAME`. This is
+  ## exactly what cargo's `jobserver` crate emits on Windows
+  ## (`mflags_env`): a BARE `-j` with no number, both flag spellings, and the
+  ## BARE semaphore name with no `fifo:`/`sem:` prefix.
+  ##
+  ## The `-j` carries NO number on purpose. On Windows cargo treats a numeric
+  ## `-jN` as an additional hard cap, so a `-jN` equal to the grant would make
+  ## the jobserver redundant and mask the token count; a bare `-j` leaves the
+  ## semaphore the sole authority over parallelism, as the protocol intends and
+  ## as `slots` is otherwise unused here (it stays in the signature to mirror
+  ## the POSIX `bridgeMakeflags`). GNU make 4.4 reads the same spelling.
+  discard slots
+  var kept: seq[string] = @[]
+  for word in inherited.splitWhitespace():
+    if not isJobserverWord(word):
+      kept.add word
+  result = (if kept.len > 0: " " & kept.join(" ") else: "")
+  result.add " -j --jobserver-fds=" & semName & " --jobserver-auth=" & semName
+
+proc semaphoreNamedByMakeflags*(makeflags: string): string =
+  ## The semaphore a `MAKEFLAGS` names (its last `--jobserver-auth=` word), or
+  ## "". The bare name after `=`, with no `fifo:` prefix to strip -- a value
+  ## that still carries the POSIX `fifo:` form is not a Windows semaphore name
+  ## and is rejected, so an inherited POSIX `MAKEFLAGS` cannot be mistaken for
+  ## one of ours.
+  for word in makeflags.splitWhitespace():
+    const prefix = "--jobserver-auth="
+    if word.startsWith(prefix):
+      let value = word[prefix.len .. ^1]
+      result = if value.startsWith("fifo:"): "" else: value
+
+proc joinsInheritedBridgeWindows*(makeflags, bridgeSemaphore: string): bool =
+  ## The Windows sibling of `joinsInheritedBridge`: the bridge's marker names
+  ## a semaphore and the `MAKEFLAGS` the tools below it pass on still names the
+  ## same one. A marker alone is not enough -- a tool in between may have
+  ## started its own jobserver, and then that one owns this process's implicit
+  ## token.
+  bridgeSemaphore.len > 0 and
+    semaphoreNamedByMakeflags(makeflags) == bridgeSemaphore
 
 proc isWidthFlagProgram*(program: string): bool =
   ## The jobserver clients whose explicit width flag OVERRIDES an inherited
@@ -352,6 +413,113 @@ when defined(posix):
     if got > 0:
       fifo.served -= got
       result = got
+
+# ---------------------------------------------------------------------------
+# The semaphore (Windows)
+# ---------------------------------------------------------------------------
+
+const JobserverSemaphoreCeiling* = 1024
+  ## The fixed maximum count a bridge semaphore is created with. A semaphore
+  ## cannot be released past the maximum set at creation, and the jobserver
+  ## has to WIDEN past its initial grant when a resizable lease is negotiated
+  ## upward, so the ceiling must sit above any width a single lease could ever
+  ## reach on this host. A single lease is at most the host's CPU budget, and
+  ## 1024 is far above any core count a single machine grants one lease today;
+  ## the cost of the headroom is nil (a semaphore reserves nothing per unit of
+  ## unused count), so it is set generously rather than tuned.
+
+when defined(windows):
+  type
+    JobserverSemaphore* = object
+      name*: string
+      handle*: Handle
+      served*: int
+
+  proc createSemaphoreA(lpAttributes: pointer; lInitialCount, lMaximumCount: int32;
+                        lpName: cstring): Handle {.
+    stdcall, dynlib: "kernel32", importc: "CreateSemaphoreA".}
+
+  proc openSemaphoreA(dwDesiredAccess: uint32; bInheritHandle: WINBOOL;
+                      lpName: cstring): Handle {.
+    stdcall, dynlib: "kernel32", importc: "OpenSemaphoreA".}
+
+  proc releaseSemaphore(hSemaphore: Handle; lReleaseCount: int32;
+                        lpPreviousCount: ptr int32): WINBOOL {.
+    stdcall, dynlib: "kernel32", importc: "ReleaseSemaphore".}
+
+  const WaitObject0 = 0'i32
+    ## `WAIT_OBJECT_0`: `waitForSingleObject` acquired the token.
+
+  var semaphoreCounter {.global.}: int
+
+  proc uniqueSemaphoreName(): string =
+    ## A name no concurrent bridge can collide with: this process's id, a
+    ## per-process counter, and the low bits of the monotonic clock. Not the
+    ## `jobserver` crate's literal scheme -- only the wire FORM has to match
+    ## (a bare name created with `CreateSemaphoreA`), not the name itself.
+    inc semaphoreCounter
+    "runquota-jobserver-" & $getCurrentProcessId() & "-" & $semaphoreCounter &
+      "-" & $(getMonoTime().ticks and 0x7fffffff)
+
+  proc openJobserverSemaphore*(tokens: int): JobserverSemaphore =
+    ## A fresh named semaphore holding `tokens` available units, created with
+    ## the fixed ceiling so a later widening has room, and kept open by this
+    ## process (the handle keeps the semaphore alive between its clients'
+    ## waits). The command opens it by name through `--jobserver-auth=`.
+    result.name = uniqueSemaphoreName()
+    result.handle = 0
+    let initial = max(0, tokens)
+    result.handle = createSemaphoreA(nil, int32(initial),
+      int32(JobserverSemaphoreCeiling), result.name.cstring)
+    if result.handle == 0:
+      raise newException(OSError, "cannot create the jobserver semaphore: " &
+        $osLastError().int)
+    result.served = initial
+
+  proc drainTokens*(sem: JobserverSemaphore): int =
+    ## How many tokens are back in the semaphore. Read once the command's tree
+    ## is gone: every token a process still held went with it, unreturned, so
+    ## this counts only the ones handed back. Acquired without waiting and not
+    ## released again -- the handle is about to close.
+    while waitForSingleObject(sem.handle, 0) == WaitObject0:
+      inc result
+
+  proc closeJobserverSemaphore*(sem: var JobserverSemaphore) =
+    ## Drops this process's handle. The kernel destroys the semaphore once the
+    ## last handle (this one and any the command tree still holds) is gone, so
+    ## no new client can open it by name afterwards. Idempotent.
+    if sem.handle != 0:
+      discard closeHandle(sem.handle)
+      sem.handle = 0
+
+  proc issueTokens*(sem: var JobserverSemaphore; count: int): int =
+    ## Puts `count` more tokens into circulation (widening): one
+    ## `ReleaseSemaphore` of `count`, which the fixed ceiling leaves room for.
+    ## Answers how many went in.
+    if count <= 0:
+      return 0
+    if releaseSemaphore(sem.handle, int32(count), nil) != 0:
+      sem.served += count
+      result = count
+
+  proc withholdTokens*(sem: var JobserverSemaphore; count: int;
+                       waitMillis = 0): int =
+    ## Takes up to `count` tokens out of circulation (narrowing), from those
+    ## the command has RETURNED: each is acquired with a non-blocking wait and
+    ## simply kept, so a token a running process holds is not in the semaphore
+    ## and cannot be taken. With `waitMillis` > 0 the bridge first waits that
+    ## long for one to come back, reading a returned token as promptly as the
+    ## tool itself would. No process is signalled. Answers how many it took.
+    if count <= 0:
+      return 0
+    var taken = 0
+    if waitMillis > 0 and
+        waitForSingleObject(sem.handle, int32(waitMillis)) == WaitObject0:
+      inc taken
+    while taken < count and waitForSingleObject(sem.handle, 0) == WaitObject0:
+      inc taken
+    sem.served -= taken
+    result = taken
 
 proc slotsForTarget*(targetMilli: uint32): int =
   ## The whole slots a target asks for: never more than it allows (a token
@@ -598,6 +766,45 @@ when defined(posix):
       if fifo.served + 1 <= target:
         sleep(OwedPollMillis * 4)
 
+when defined(windows):
+  proc followLeaseWidth(child: var LaunchedProcess; lease: var RunQuotaLease;
+                        sem: var JobserverSemaphore; grantedSlots: int;
+                        verbose: bool) =
+    ## The Windows sibling of the FIFO `followLeaseWidth`: identical loop over
+    ## the semaphore. Keep the tokens in circulation equal to the lease's
+    ## target, report the width held (`LeaseResized`) every `ResizePollMillis`
+    ## and whenever it changes, and follow each answer -- widening releases the
+    ## extra tokens at once, narrowing keeps the tokens the command returns.
+    var target = grantedSlots
+    var lastReported = -1
+    var nextReport = getMonoTime()
+    var daemonLost = false
+    while not child.pollCompletion():
+      let held = sem.served + 1
+      if held < target:
+        discard sem.issueTokens(target - held)
+      elif held > target:
+        discard sem.withholdTokens(held - target, OwedPollMillis)
+      let now = getMonoTime()
+      let width = sem.served + 1
+      if not daemonLost and (width != lastReported or now >= nextReport):
+        try:
+          let answer = lease.reportResized(milliCpu(uint32(width) * 1000'u32))
+          let wanted = slotsForTarget(answer.cpuTargetMilli)
+          if verbose and wanted != target:
+            stderr.writeLine("runquota jobserver: lease " & $lease.id.value &
+              " target " & $wanted & " (holding " & $width & ")")
+          target = wanted
+          lastReported = width
+        except RunQuotaClientError as failure:
+          daemonLost = true
+          if verbose:
+            stderr.writeLine("runquota jobserver: cannot report the width (" &
+              failure.msg & "); keeping " & $width)
+        nextReport = now + initDuration(milliseconds = ResizePollMillis)
+      if sem.served + 1 <= target:
+        sleep(OwedPollMillis * 4)
+
 proc runJobserver*(args: seq[string];
                    describeFailure: proc(message: string;
                      last: Diagnostic): string;
@@ -614,11 +821,7 @@ proc runJobserver*(args: seq[string];
     stderr.writeLine("runquota jobserver: removed " & removed.join(" ") &
       " from the command line: an explicit width overrides the jobserver")
 
-  when not defined(posix):
-    stderr.writeLine("runquota jobserver: not available on this platform " &
-      "yet (the named-semaphore jobserver has not shipped)")
-    return 2
-  else:
+  when defined(posix):
     if joinsInheritedBridge(getEnv("MAKEFLAGS"),
         getEnv(JobserverFifoEnvVar)):
       if options.verbose:
@@ -741,3 +944,135 @@ proc runJobserver*(args: seq[string];
         describeFailure(failure.msg, client.lastDiagnostic))
       if not ran: code = 1
     code
+  elif defined(windows):
+    if joinsInheritedBridgeWindows(getEnv("MAKEFLAGS"),
+        getEnv(JobserverSemaphoreEnvVar)):
+      if options.verbose:
+        stderr.writeLine("runquota jobserver: joining the jobserver at " &
+          getEnv(JobserverSemaphoreEnvVar))
+      # POSIX replaces this process with the command (`execvp`) so there is no
+      # extra layer; Windows has no such primitive, so the command runs as a
+      # normal child and this process exits with its exact status. One more
+      # process in the tree, but the OBSERVABLE behaviour is identical: no new
+      # lease is taken and the inherited semaphore (named in `MAKEFLAGS`) is
+      # the one used.
+      return runUnbridged(command)
+
+    let statsKey =
+      if options.statsKey.len > 0: options.statsKey
+      else: deriveStatsKey(command, getCurrentDir())
+
+    var client: RunQuotaClient
+    try:
+      client = connectDefault()
+    except CatchableError as failure:
+      if options.verbose:
+        stderr.writeLine("runquota jobserver: no daemon reached (" &
+          failure.msg & "); running the command unchanged")
+      return runUnbridged(command)
+    defer: client.close()
+
+    var session: RunQuotaSession
+    var lease: RunQuotaLease
+    var resizable = false
+    var pressure: SingleCommandPressure
+    try:
+      session = client.registerSession("runquota jobserver", clientVersion)
+      pressure = startSingleCommandPressure()
+      pressure.noteRequested()
+      if not acquireBridgeLease(session, client, options, statsKey,
+          describeFailure, lease, resizable, error):
+        stderr.writeLine("runquota jobserver: " & error)
+        return 1
+      pressure.reportGranted(session)
+    except RunQuotaClientError as failure:
+      stderr.writeLine("runquota jobserver: " &
+        describeFailure(failure.msg, client.lastDiagnostic))
+      return 1
+
+    let slots = lease.slotsOf()
+    var sem: JobserverSemaphore
+    try:
+      sem = openJobserverSemaphore(tokensForSlots(slots))
+    except OSError as failure:
+      stderr.writeLine("runquota jobserver: " & failure.msg)
+      try:
+        lease.release()
+        session.closeSession()
+      except RunQuotaClientError:
+        discard
+      return 1
+    defer: sem.closeJobserverSemaphore()
+
+    let makeflags = bridgeMakeflagsWindows(getEnv("MAKEFLAGS"), slots, sem.name)
+    let env = @["MAKEFLAGS=" & makeflags, "CARGO_MAKEFLAGS=" & makeflags,
+      JobserverSemaphoreEnvVar & "=" & sem.name,
+      WidthEnvVar & "=" & $slots, StatsKeyEnvVar & "=" & statsKey]
+    if options.verbose:
+      stderr.writeLine("runquota jobserver: lease " & $lease.id.value &
+        " width " & $slots & ", " & $sem.served & " tokens via semaphore " &
+        sem.name & ": " & command.join(" "))
+
+    var code = 0
+    var ran = false
+    try:
+      lease.markStarting()
+      # Windows `CreateProcess` without `CREATE_NEW_CONSOLE` /
+      # `CREATE_NEW_PROCESS_GROUP` already shares the parent's console, so the
+      # command reaches the terminal with no explicit handoff (the POSIX
+      # `handTerminalTo` has nothing to do here). There is likewise no
+      # process-group signal forwarding: Windows has no SIGTERM/SIGINT to a
+      # group to forward, and a console Ctrl+C already reaches the shared
+      # console's processes, so there is no reasonable equivalent to wire up.
+      var spec = commandSpec(command, env = env, stdio = inheritStdio,
+        createProcessGroup = false)
+      # The bridge's whole width is out as tokens: a sub-lease of its lease
+      # would count the same slots twice (see the module header).
+      spec.unsetEnv = @[ParentLeaseEnvVar]
+      var child: LaunchedProcess
+      try:
+        child = launchProcess(spec)
+      except CatchableError as failure:
+        lease.finish(outcome = launchFailed())
+        lease.release()
+        session.closeSession()
+        stderr.writeLine("runquota jobserver: cannot start " & command[0] &
+          ": " & failure.msg)
+        return 127
+      lease.markRunning(childProcessId = child.info.processId,
+        processGroupId = child.info.processGroupId)
+      if resizable:
+        followLeaseWidth(child, lease, sem, slots, options.verbose)
+      let completion = child.waitForCompletion()
+      # What the command left running in its Job Object is ended before the
+      # tokens go back, as on POSIX.
+      let leftovers = endJobLeftovers(child)
+      child.close()
+      let returned = sem.drainTokens()
+      if options.verbose:
+        stderr.writeLine("runquota jobserver: returned " & $returned & " of " &
+          $sem.served & " tokens" &
+          (if leftovers: "; ended what the command left in its job" else: ""))
+      # The semaphore handle goes before the finish and the release, in the
+      # order the specification gives: nothing may find it once the slots are
+      # back.
+      sem.closeJobserverSemaphore()
+      lease.finish(outcome = finishOutcome(completion),
+        peakMemoryBytes = completion.peakResidentMemoryBytes,
+        processCount = completion.processCount,
+        totals = completion.totals,
+        cpuProfile = completion.cpuProfile)
+      code = exitCodeOf(completion)
+      ran = true
+      lease.release()
+      pressure.reportEnded(session)
+      session.closeSession()
+    except RunQuotaClientError as failure:
+      stderr.writeLine("runquota jobserver: " &
+        describeFailure(failure.msg, client.lastDiagnostic))
+      if not ran: code = 1
+    code
+  else:
+    stderr.writeLine("runquota jobserver: not available on this platform " &
+      "yet (the named-semaphore jobserver has not shipped)")
+    return 2

@@ -20,9 +20,12 @@
 ## stopped (the daemon, through its `Process`). Nothing touches the host
 ## endpoint.
 ##
-## WHAT IS DELIBERATELY NOT HERE: `--cap` enforcement and the learned width.
-## Both wait on work outside this file; the learned-width case is written as
-## a visible pending test so it cannot be mistaken for a pass.
+## WHAT IS DELIBERATELY NOT HERE: on POSIX, `--cap` enforcement and the learned
+## width. Both wait on work outside this file; the learned-width case is written
+## as a visible pending test so it cannot be mistaken for a pass. `--cap` now
+## ships on WINDOWS (Job Object CPU rate control) and its end-to-end enforcement
+## is in `tests/integration/t_run_command_windows.nim`; it is still unavailable
+## on every other platform, which the `--cap is refused` case below asserts.
 
 when defined(posix):
   import std/[algorithm, os, osproc, streams, strtabs, strutils, unittest]

@@ -59,6 +59,13 @@ type
       ## admitted into predicted slack), which must yield to the work it
       ## was admitted beside. Not applied on Windows yet: a Windows
       ## launcher does not accept reclaimed grants.
+    cpuRateCapMilli*: uint32
+      ## 0 = no cap. The grant's CPU budget in milli-cores (1000 = one core
+      ## busy). The Windows launcher turns this into a hard Job Object CPU-rate
+      ## cap on the child's whole tree, so the tree cannot use more CPU than
+      ## the lease granted however many threads it spawns. Not applied on POSIX
+      ## yet: cap enforcement there is cgroup work (`cpu.max`), out of scope
+      ## for the Windows launcher.
 
   LaunchResult* = object
     processId*: uint64

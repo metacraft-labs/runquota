@@ -15,7 +15,9 @@
 ## EXIT STATUS
 ##   the child's exit status when it ran;
 ##   128 + N when the child was killed by signal N (as `acquire` reports);
-##   2   bad arguments, or `--cap` (not available yet);
+##   2   bad arguments, or `--cap` where it is not available (every platform
+##       but Windows, where it enforces the grant through Job Object CPU rate
+##       control);
 ##   1   the daemon refused or lost the lease, so the command never ran;
 ##   127 the command could not be started.
 ## SIGTERM and SIGHUP sent to the wrapper are forwarded to the command;
@@ -276,13 +278,15 @@ proc runRun*(args: seq[string];
   if options.listAdapters:
     echo renderAdapterList()
     return 0
-  if options.cap:
-    # `--cap` is enforcement of the grant through the kernel's CPU
-    # controller. That belongs to the host enforcement work, not to this
-    # wrapper; accepting the flag and not enforcing would be a lie.
-    stderr.writeLine("runquota run: --cap is not available yet " &
-      "(CPU-limit enforcement has not shipped)")
-    return 2
+  when not defined(windows):
+    if options.cap:
+      # `--cap` is enforcement of the grant through the kernel's CPU
+      # controller. On POSIX that belongs to the host cgroup enforcement work,
+      # not to this wrapper; accepting the flag and not enforcing would be a
+      # lie. Windows enforces it below, through Job Object CPU rate control.
+      stderr.writeLine("runquota run: --cap is not available yet " &
+        "(CPU-limit enforcement has not shipped)")
+      return 2
 
   let statsKey =
     if options.statsKey.len > 0: options.statsKey
@@ -359,7 +363,10 @@ proc runRun*(args: seq[string];
   if options.verbose:
     stderr.writeLine("runquota run: lease " & $lease.id & " width " &
       $slots & (if lease.reclaimed: " (reclaimed, nice +" &
-        $lease.reclaimedNice() & ")" else: "") & ": " & command.join(" "))
+        $lease.reclaimedNice() & ")" else: "") &
+      (when defined(windows): (if options.cap: " (CPU cap " &
+        $int(lease.resources.cpu.value) & " milli-CPU)" else: "") else: "") &
+      ": " & command.join(" "))
 
   var code = 0
   var ran = false
@@ -372,6 +379,11 @@ proc runRun*(args: seq[string];
       var spec = commandSpec(command, env = env,
         stdio = inheritStdio, createProcessGroup = false)
       spec.niceIncrement = lease.reclaimedNice()
+      when defined(windows):
+        if options.cap:
+          # The granted width in milli-CPU becomes a hard Job Object CPU-rate
+          # cap on the tree (the same quantity `slots` rounds up from).
+          spec.cpuRateCapMilli = uint32(lease.resources.cpu.value)
       child = launchProcess(spec)
     except CatchableError as failure:
       lease.finish(outcome = launchFailed())

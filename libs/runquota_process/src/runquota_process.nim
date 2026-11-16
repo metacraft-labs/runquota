@@ -362,15 +362,29 @@ when defined(windows):
       BasicInfo: JobBasicAccountingW
       IoInfo: IoCountersW
 
+    JobCpuRateControlW = object
+      ## JOBOBJECT_CPU_RATE_CONTROL_INFORMATION. The second field is a union
+      ## in the SDK (CpuRate / Weight / {MinRate, MaxRate}); for the hard-cap
+      ## case it is the CpuRate DWORD, which is all this launcher sets, so the
+      ## 8-byte struct is modelled as the two DWORDs the cap path uses.
+      ControlFlags: uint32
+      CpuRate: uint32
+
   const
     # Windows: JobObjectExtendedLimitInformation = 9,
-    # JobObjectBasicAndIoAccountingInformation = 8.
+    # JobObjectBasicAndIoAccountingInformation = 8,
+    # JobObjectCpuRateControlInformation = 15.
     JobObjectExtendedLimitInformation = 9'i32
     JobObjectBasicAndIoAccountingInformation = 8'i32
+    JobObjectCpuRateControlInformation = 15'i32
     # Windows: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000 so when the daemon
     # drops its handle the child tree is reaped automatically. We don't set
     # JOB_OBJECT_LIMIT_BREAKAWAY_OK; child processes inherit job membership.
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000'i32
+    # Windows: a hard CPU-rate cap enables rate control (0x1) and makes it a
+    # ceiling the tree cannot exceed (0x4) rather than a weight-based share.
+    JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x00000001'u32
+    JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x00000004'u32
 
   proc createJobObjectW(
     lpJobAttributes: pointer, lpName: WideCString
@@ -422,7 +436,32 @@ when defined(windows):
       int32(sizeof(JobExtendedLimitW))
     )
 
-  proc readJobAccounting(job: Handle; cpuMicros: var uint64;
+  proc applyCpuRateCap(job: Handle; capMilli: uint32) =
+    ## Caps the whole tree in `job` at `capMilli` milli-cores of CPU, as a hard
+    ## Job Object CPU-rate ceiling. The kernel's `CpuRate` is a fraction of the
+    ## TOTAL system CPU in 1/100 of a percent (10000 = every core busy), not a
+    ## per-core figure, so a cap of `capMilli` milli-cores on a host of
+    ## `countProcessors()` cores is `capMilli / (cores * 1000)` of the whole,
+    ## i.e. `capMilli * 10 / cores` hundredths of a percent. Rounded, and
+    ## clamped to [1, 10000]: the kernel rejects 0 and anything above 10000.
+    if capMilli == 0'u32:
+      return
+    let cores = max(1, countProcessors())
+    var rate = (int64(capMilli) * 10'i64 + int64(cores) div 2) div int64(cores)
+    if rate < 1: rate = 1
+    if rate > 10000: rate = 10000
+    var info = JobCpuRateControlW(
+      ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE or
+        JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+      CpuRate: uint32(rate))
+    discard setInformationJobObject(
+      job,
+      JobObjectCpuRateControlInformation,
+      addr info,
+      int32(sizeof(JobCpuRateControlW))
+    )
+
+  proc readJobAccounting(job: Handle; userMicros, kernelMicros: var uint64;
                          processCount: var uint32) =
     var info: JobBasicAndIoAccountingW
     var ret: int32 = 0
@@ -432,11 +471,14 @@ when defined(windows):
       addr info,
       int32(sizeof(JobBasicAndIoAccountingW)),
       addr ret) != 0:
-      # Windows: TotalUserTime + TotalKernelTime are 100ns ticks. Divide by 10
-      # to get microseconds.
-      let totalTicks = info.BasicInfo.TotalUserTime + info.BasicInfo.TotalKernelTime
-      if totalTicks > 0:
-        cpuMicros = uint64(totalTicks div 10)
+      # Windows: TotalUserTime and TotalKernelTime are 100ns ticks. Divide by
+      # 10 to get microseconds. These are the WHOLE tree's totals -- the Job
+      # Object counts every process spawned inside it, so a grandchild's CPU
+      # is accounted here just as a direct child's is.
+      if info.BasicInfo.TotalUserTime > 0:
+        userMicros = uint64(info.BasicInfo.TotalUserTime div 10)
+      if info.BasicInfo.TotalKernelTime > 0:
+        kernelMicros = uint64(info.BasicInfo.TotalKernelTime div 10)
       processCount = uint32(max(int32(0), info.BasicInfo.TotalProcesses))
 
 proc shellScriptDir*(): string =
@@ -1072,6 +1114,11 @@ when defined(windows):
         discard closeHandle(processHandle)
       if assigned:
         applyKillOnJobClose(job)
+        # A granted CPU cap (`runquota run --cap`) becomes a hard Job Object
+        # CPU-rate ceiling on the whole tree. Only when the child really is in
+        # the job: a cap on a job the child escaped would bound nothing.
+        if spec.cpuRateCapMilli > 0'u32:
+          applyCpuRateCap(job, spec.cpuRateCapMilli)
       else:
         discard closeHandle(job)
         job = 0
@@ -1302,6 +1349,17 @@ proc buildCompletion(child: LaunchedProcess; timedOut: bool): ProcessCompletion 
       processCount: child.processCount,
       telemetrySource: child.telemetrySource
     )
+    # The tree's CPU totals from Job Object accounting (`readJobAccounting`,
+    # stored on the child before this is built). The Job Object sums every
+    # descendant, so these are the whole tree's figures, not the leader's
+    # alone -- the same contract the POSIX `rusage` totals carry.
+    if child.rusageKnown:
+      result.totals = FinishTotals(known: true,
+        cpuUserMicros: child.rusageUserMicros,
+        cpuSysMicros: child.rusageSysMicros,
+        maxRssBytes: child.peakResidentMemoryBytes,
+        majorPageFaults: 0'u64,
+        durationMillis: result.elapsedMillis)
     if not timedOut and child.waitStatus >= 0:
       result.exited = true
       result.exitCode = child.waitStatus
@@ -1449,9 +1507,14 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
       if not child.winOutputSettled():
         return false
       if child.winJobHandle != 0:
-        var cpuMicros = 0'u64
+        var userMicros = 0'u64
+        var kernelMicros = 0'u64
         var jobProcessCount = 0'u32
-        readJobAccounting(Handle(child.winJobHandle), cpuMicros, jobProcessCount)
+        readJobAccounting(Handle(child.winJobHandle), userMicros, kernelMicros,
+          jobProcessCount)
+        child.rusageKnown = true
+        child.rusageUserMicros = userMicros
+        child.rusageSysMicros = kernelMicros
         # Windows: prefer the Job Object's TotalProcesses (counts every process
         # the tree ever spawned) over the live toolhelp32 count.
         if jobProcessCount > child.processCount:
@@ -1478,6 +1541,43 @@ when defined(windows):
     if handle != 0:
       discard terminateProcess(handle, int(windowsCancelledExitCode))
       discard closeHandle(handle)
+
+  proc jobActiveProcesses(job: Handle): int32 =
+    ## How many processes are still alive in `job`. `ActiveProcesses` is a live
+    ## count (unlike `TotalProcesses`, which only grows), so this reads 0 once
+    ## the tree is gone.
+    var info: JobBasicAndIoAccountingW
+    var ret: int32 = 0
+    if queryInformationJobObject(job, JobObjectBasicAndIoAccountingInformation,
+        addr info, int32(sizeof(JobBasicAndIoAccountingW)), addr ret) != 0:
+      result = info.BasicInfo.ActiveProcesses
+
+proc endJobLeftovers*(child: LaunchedProcess;
+                      exitCode = windowsCancelledExitCode): bool =
+  ## Ends what the command left running in its Job Object once the command's
+  ## own process has been waited for. The Job Object holds every descendant
+  ## the tree spawned (nothing breaks away), so a build tool whose recipes
+  ## outlived it is still a live member here; if any member is alive the whole
+  ## job is terminated. Answers whether anything was left. The Windows analog
+  ## of the POSIX process-group leftover sweep.
+  ##
+  ## THERE IS NO SIGTERM-THEN-GRACE-THEN-SIGKILL on Windows: `TerminateJobObject`
+  ## is unconditional, so there is no gentle phase to wait out and no grace
+  ## period to honour -- a POSIX-style delay here would accomplish nothing, so
+  ## there is none. (`close` would also reap the tree through
+  ## `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; this makes the sweep observable and
+  ## bounds it to the leftovers rather than to releasing handles.)
+  when defined(windows):
+    if child.winJobHandle == 0:
+      return false
+    if jobActiveProcesses(Handle(child.winJobHandle)) <= 0:
+      return false
+    result = true
+    discard terminateJobObject(Handle(child.winJobHandle), exitCode)
+  else:
+    discard child
+    discard exitCode
+    false
 
 proc terminate*(child: var LaunchedProcess) =
   when defined(posix):
@@ -1639,9 +1739,14 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
             break
           sleep(5)
         if child.winJobHandle != 0:
-          var cpuMicros = 0'u64
+          var userMicros = 0'u64
+          var kernelMicros = 0'u64
           var jobProcessCount = 0'u32
-          readJobAccounting(Handle(child.winJobHandle), cpuMicros, jobProcessCount)
+          readJobAccounting(Handle(child.winJobHandle), userMicros,
+            kernelMicros, jobProcessCount)
+          child.rusageKnown = true
+          child.rusageUserMicros = userMicros
+          child.rusageSysMicros = kernelMicros
           if jobProcessCount > child.processCount:
             child.processCount = jobProcessCount
         break
