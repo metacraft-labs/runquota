@@ -382,28 +382,48 @@ proc updateSessionGroup*(client: var RunQuotaClient;
       "invalid SessionGroupUpdated payload")
     raise newException(RunQuotaClientError, client.lastDiagnostic.message)
 
-proc groupPriorityInForce*(session: var RunQuotaSession): SessionPriority =
-  ## The priority the daemon holds for this session's group now. A group
-  ## outlives its sessions and its launcher may have changed the priority
-  ## since this process's environment was written, so the declared value is
-  ## only the fallback. Asked once per session (an `UpdateSessionGroup` that
-  ## changes nothing answers with the attributes in force) and remembered.
-  ## A daemon that predates session groups, or a refusal, gives the
-  ## declared priority.
-  if session.groupPriorityKnown:
-    return session.groupPriority
-  result = session.declaredGroupPriority
-  if not session.client.isNil and session.client[].supportsSessionGroups():
-    try:
-      let answer = session.client[].updateSessionGroup(
-        UpdateSessionGroupMessage(group: session.groupName,
-          priority: sessionPriorityNormal,
-          cacheDeadlineChange: cacheDeadlineKeep))
-      result = answer.priority
-    except RunQuotaClientError:
-      discard
+proc currentGroupPriority*(client: var RunQuotaClient; group: string;
+                           priority: var SessionPriority): bool =
+  ## The priority the daemon holds for `group` (a group this process's user
+  ## owns) at this moment, asked with an `UpdateSessionGroup` that changes
+  ## nothing (its answer carries the attributes in force). False, leaving
+  ## `priority` alone, when the daemon predates session groups or refuses.
+  if not client.supportsSessionGroups():
+    return false
+  try:
+    let answer = client.updateSessionGroup(UpdateSessionGroupMessage(
+      group: group, priority: sessionPriorityNormal,
+      cacheDeadlineChange: cacheDeadlineKeep))
+    priority = answer.priority
+    true
+  except RunQuotaClientError:
+    false
+
+proc groupPriorityNow*(session: var RunQuotaSession): SessionPriority =
+  ## The priority the daemon holds for this session's group now, asked
+  ## every time (one round trip), and remembered for
+  ## `groupPriorityInForce`. A daemon that predates session groups, or a
+  ## refusal, gives the last one known, else the declared priority.
+  result =
+    if session.groupPriorityKnown: session.groupPriority
+    else: session.declaredGroupPriority
+  if not session.client.isNil:
+    var answer = result
+    if session.client[].currentGroupPriority(session.groupName, answer):
+      result = answer
   session.groupPriority = result
   session.groupPriorityKnown = true
+
+proc groupPriorityInForce*(session: var RunQuotaSession): SessionPriority =
+  ## The priority the daemon holds for this session's group. A group
+  ## outlives its sessions and its launcher may have changed the priority
+  ## since this process's environment was written, so the declared value is
+  ## only the fallback. Asked once per session (`groupPriorityNow`) and
+  ## remembered: for what must be current at a given moment (a cgroup
+  ## weight a launcher writes), ask `groupPriorityNow` instead.
+  if session.groupPriorityKnown:
+    return session.groupPriority
+  session.groupPriorityNow()
 
 proc closeSession*(session: var RunQuotaSession) =
   if not session.active:

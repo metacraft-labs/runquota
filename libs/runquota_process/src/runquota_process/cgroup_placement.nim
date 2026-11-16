@@ -120,6 +120,38 @@ type
     cpuMax*: string
       ## "" for an uncapped leaf; otherwise the `cpu.max` text of a cap leaf.
 
+  GroupPriorityRead* = proc (context: pointer;
+                             priority: var SessionPriority): bool {.
+    nimcall, raises: [].}
+    ## Asks whoever holds the group's priority (the daemon) for the one in
+    ## force NOW. False when it cannot answer; the caller then keeps the
+    ## weight it already had. Must not raise.
+
+  GroupPrioritySource* = object
+    ## Where the priority of a group's weight is read at the moment the
+    ## weight is written. A launcher calls it while it holds the root's
+    ## SHARED lock, between taking the lock and writing the weight; `session
+    ## set --priority` calls it while it holds the lock EXCLUSIVE. That is
+    ## what makes the last weight written always the priority in force (see
+    ## `lockCgroupRoot`). Plain data, so it can ride on a launch spec of
+    ## this static-helper library: a procedure and an untyped context the
+    ## procedure alone interprets, which must stay valid for as long as the
+    ## source can be called (the caller's launch).
+    read*: GroupPriorityRead
+    context*: pointer
+
+proc available*(source: GroupPrioritySource): bool =
+  ## Whether `source` names a reader at all.
+  not source.read.isNil
+
+proc readNow*(source: GroupPrioritySource;
+              priority: var SessionPriority): bool =
+  ## The priority in force through `source`, or false when there is no
+  ## reader or it could not answer.
+  if source.read.isNil:
+    return false
+  source.read(source.context, priority)
+
 proc placed*(target: CgroupTarget): bool =
   ## Whether `target` asks for any placement at all.
   target.root.len > 0
@@ -487,22 +519,34 @@ when defined(linux):
     LOCK_SH {.importc, header: "<sys/file.h>".}: cint
     LOCK_EX {.importc, header: "<sys/file.h>".}: cint
 
-proc lockCgroupRoot*(root: string; exclusive: bool): cint =
-  ## Hold the root's lock: SHARED by a launcher from preparing its leaf until
-  ## its child is in it, EXCLUSIVE by a clean-up while it removes empty
-  ## directories. So a clean-up never removes a directory between another
-  ## launcher's preparation and its child's join (the group's `shared` leaf
-  ## is used by every tree of the group, and empties whenever one ends), and
-  ## launchers never wait for each other. A `flock(2)` on the root
-  ## directory, which is never removed; it is created here if missing.
-  ## Returns the descriptor to pass to `unlockCgroupRoot`, or -1 when the
-  ## root cannot be opened or locked: the caller goes on unlocked, and a
-  ## directory removed under it is then retried (`openPreparedProcs`).
+proc lockCgroupRoot*(root: string; exclusive: bool; create = true): cint =
+  ## Hold the root's lock: SHARED by a launcher from reading its group's
+  ## priority and preparing its leaf until its child is in it, EXCLUSIVE by
+  ## a clean-up while it removes empty directories and by `session set
+  ## --priority` while it rewrites a group's weight.
+  ##
+  ## So a clean-up never removes a directory between another launcher's
+  ## preparation and its child's join (the group's `shared` leaf is used by
+  ## every tree of the group, and empties whenever one ends), and launchers
+  ## never wait for each other. And a weight is never overwritten by an
+  ## older priority: a launcher reads the priority and writes the weight
+  ## inside one shared hold, and `session set` writes only after the daemon
+  ## has taken the new priority and only inside an exclusive hold, so any
+  ## launcher that read the old priority has written it before the set's
+  ## write, and any launcher that reads afterwards reads the new one
+  ## (`rewriteGroupWeight`).
+  ##
+  ## A `flock(2)` on the root directory, which is never removed; it is
+  ## created here if missing, unless `create` is false. Returns the
+  ## descriptor to pass to `unlockCgroupRoot`, or -1 when the root cannot be
+  ## opened or locked: the caller goes on unlocked, and a directory removed
+  ## under it is then retried (`openPreparedProcs`).
   ## https://man7.org/linux/man-pages/man2/flock.2.html
   when defined(linux):
     if root.len == 0:
       return -1
-    discard posix.mkdir(cstring(root), 0o755)
+    if create:
+      discard posix.mkdir(cstring(root), 0o755)
     let fd = posix.open(cstring(root), O_RDONLY or O_CLOEXEC)
     if fd < 0:
       return -1
@@ -608,20 +652,40 @@ proc probeRoot*(root: CgroupRoot): string =
     "cgroups exist only on Linux"
 
 proc rewriteGroupWeight*(root: CgroupRoot; group: string;
-                         priority: SessionPriority): string =
-  ## After a group's priority changed (`runquota session set --priority`):
-  ## write the new weight to its directory, if this user has one now. A
-  ## group with no running placed tree has no directory, and the next tree
-  ## writes the weight in force when it prepares one, so "absent" is not a
-  ## problem. Returns "" when written or absent, otherwise why not.
+                         priority: SessionPriority;
+                         current = GroupPrioritySource()): string =
+  ## After a group's priority changed (`runquota session set --priority`),
+  ## and only after the daemon has taken the change: write the weight in
+  ## force to the group's directory, if this user has one now. A group with
+  ## no running placed tree has no directory, and the next tree writes the
+  ## weight in force when it prepares one, so "absent" is not a problem.
+  ## Returns "" when written or absent, otherwise why not.
+  ##
+  ## UNDER THE ROOT'S EXCLUSIVE LOCK (`lockCgroupRoot`), so it waits for
+  ## every launcher between its priority read and its weight write: one
+  ## that read the old priority has written it by then, and this write
+  ## lands after it. The priority written is read AGAIN under the lock from
+  ## `current` (the daemon), falling back to `priority` (the caller's own
+  ## update's answer) only when that read fails: of two sets racing to the
+  ## lock, the one that wins it second may hold the OLDER answer, and must
+  ## still write what the daemon holds now. The root is not created: with
+  ## no root there is no directory, and a launcher that creates one later
+  ## reads the priority under the lock after this set's update.
   if not root.usable:
     return ""
   let dir = root.path / groupDirName(group)
   when defined(linux):
+    if not dirExists(root.path):
+      return ""
+    let lock = lockCgroupRoot(root.path, exclusive = true, create = false)
+    defer: unlockCgroupRoot(lock)
     if not dirExists(dir):
       return ""
+    var inForce = priority
+    if not current.readNow(inForce):
+      inForce = priority
     var problem = ""
-    if not writeCgroupFile(dir / "cpu.weight", $cpuWeightFor(priority),
+    if not writeCgroupFile(dir / "cpu.weight", $cpuWeightFor(inForce),
         problem):
       return problem
     ""

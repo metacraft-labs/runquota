@@ -1175,7 +1175,8 @@ when defined(windows):
         processId: processId,
         processGroupId: processId,
         running: true,
-        backend: backendProfile()
+        backend: backendProfile(),
+        fallbackNice: spec.placementFallbackNice
       ),
       winStdoutClosed: spec.stdio == inheritStdio,
       winStderrClosed: spec.stdio == inheritStdio,
@@ -1270,14 +1271,27 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     # it: no other launcher's clean-up can remove the leaf in between
     # (`lockCgroupRoot`). Released before this launch's own clean-up below.
     var rootLock: cint = -1
+    # The target and the fallback nice may still change below (the priority
+    # in force, read under the lock), so the launch works on its own copies.
+    var target = spec.cgroup
+    var fallbackNiceWanted = spec.placementFallbackNice
     when defined(linux):
-      if spec.cgroup.placed:
-        rootLock = lockCgroupRoot(spec.cgroup.root, exclusive = false)
+      if target.placed:
+        rootLock = lockCgroupRoot(target.root, exclusive = false)
+        # THE PRIORITY IS READ UNDER THE SHARED LOCK, and the weight below is
+        # written before the lock is released: a `session set --priority`
+        # rewrites the weight only under the exclusive lock, after the daemon
+        # took its change, so it either lands after this launch's write or
+        # this read already sees its priority (`lockCgroupRoot`).
+        var inForce: SessionPriority
+        if spec.cgroupPriority.readNow(inForce):
+          target.cpuWeight = cpuWeightFor(inForce)
+          fallbackNiceWanted = fallbackNice(inForce, reclaimed = false)
         var tries = 0
         var retryable = false
         while tries < PlacementAttempts:
           inc tries
-          procsFd = openPreparedProcs(spec.cgroup, placementProblem, retryable)
+          procsFd = openPreparedProcs(target, placementProblem, retryable)
           if procsFd >= 0 or not retryable:
             break
         if procsFd >= 0:
@@ -1290,7 +1304,7 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
               if fd >= 0: discard posix.close(fd)
             procsFd = -1
     else:
-      if spec.cgroup.placed:
+      if target.placed:
         placementProblem = "cgroup placement is implemented on Linux only"
     pid = fork()
     when defined(linux):
@@ -1319,7 +1333,7 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       # lower weight the cgroup would have given it.
       let niceWanted =
         if inCgroup: spec.niceIncrement
-        else: max(spec.niceIncrement, spec.placementFallbackNice)
+        else: max(spec.niceIncrement, fallbackNiceWanted)
       if niceWanted > 0:
         # Async-signal-safe in effect (two syscalls, no allocation). A nice
         # that fails leaves the child at its inherited weight: the grant is
@@ -1355,7 +1369,7 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         if pid > 0:
           var status = 0'u8
           var verdict = 1'u8
-          let leaf = spec.cgroup.leafPath
+          let leaf = target.leafPath
           if not readPlacementByte(statusPipe[0], status):
             placementProblem = "the child ended before it joined " & leaf
           elif status == 0'u8:
@@ -1366,7 +1380,7 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
               "child joined it"
             while tries < PlacementAttempts:
               inc tries
-              if moveIntoTarget(spec.cgroup, int(pid), placementProblem):
+              if moveIntoTarget(target, int(pid), placementProblem):
                 verdict = 0'u8
                 break
           else:
@@ -1400,12 +1414,12 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     var placedTarget = CgroupTarget()
     var placedLeaf = ""
     if inCgroup:
-      placedTarget = spec.cgroup
-      placedLeaf = spec.cgroup.leafPath
-    elif spec.cgroup.placed:
+      placedTarget = target
+      placedLeaf = target.leafPath
+    elif target.placed:
       # Directories a failed attempt prepared are left empty; take them away
       # unless another tree is in them.
-      releaseTarget(spec.cgroup)
+      releaseTarget(target)
     var sampler = initCpuProfileSampler()
     if profiles:
       # The profile's clock starts at 0, the launch.
@@ -1438,7 +1452,8 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         running: true,
         backend: backendProfile(),
         cgroupPath: placedLeaf,
-        cgroupProblem: placementProblem
+        cgroupProblem: placementProblem,
+        fallbackNice: fallbackNiceWanted
       ),
       cgroupTarget: placedTarget
     )

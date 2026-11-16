@@ -294,9 +294,14 @@ proc runSessionSet(args: seq[string]): int =
     if update.priorityPresent:
       # The group's cgroup follows its priority (Linux): the weight of this
       # user's directory for the group, when one exists, changes now rather
-      # than at the next tree placed in it.
+      # than at the next tree placed in it. Only now that the daemon holds
+      # the change, and under the cgroup root's exclusive lock, with the
+      # priority read again there (`rewriteGroupWeight`), so neither a
+      # launcher that read the older priority nor a concurrent set can
+      # leave the older weight behind.
+      var query = GroupPriorityQuery(client: addr client, group: answer.group)
       let problem = rewriteGroupWeight(launcherCgroupRoot(), answer.group,
-        answer.priority)
+        answer.priority, query.groupPrioritySource())
       if problem.len > 0:
         stderr.writeLine("runquota session set: the priority is set, but " &
           "the group's cgroup weight was not changed: " & problem)

@@ -80,6 +80,16 @@ type
       ## was not placed (no target, or the placement failed): the weaker
       ## stand-in for a lower weight. The larger of this and
       ## `niceIncrement` applies.
+    cgroupPriority*: GroupPrioritySource
+      ## Linux, a group target only: where the launch reads the group's
+      ## priority in force while it holds the cgroup root's shared lock, and
+      ## from it the `cpu.weight` it writes (replacing `cgroup.cpuWeight`)
+      ## and the fallback nice (replacing `placementFallbackNice`). Reading
+      ## it there, not before the launch, is what keeps a concurrent
+      ## `session set --priority` from being overwritten by an older
+      ## priority (`lockCgroupRoot`). Not set: the target's weight and the
+      ## fallback nice are used as given. The source's context must stay
+      ## valid until `launchProcess` returns.
 
   LaunchResult* = object
     processId*: uint64
@@ -91,6 +101,10 @@ type
       ## placed.
     cgroupProblem*: string
       ## Why a requested placement did not happen, or "".
+    fallbackNice*: int
+      ## The nice the child took in place of its cgroup when it was not
+      ## placed (`CommandSpec.placementFallbackNice`, or the one the launch
+      ## derived from the priority it read through `cgroupPriority`).
 
   ProcessCompletion* = object
     processId*: uint64

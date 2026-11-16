@@ -38,7 +38,10 @@
 ##    set --priority urgent` rewrites the weight of a group's directory while
 ##    a tree runs in it, and a tree started afterwards by a client whose
 ##    environment still says `low` keeps the in-force weight. Mutation:
-##    `treePlacement` using the declared priority.
+##    the launch ignoring the priority source it reads under the root's lock
+##    (`CommandSpec.cgroupPriority`), so the weight is the one placement
+##    chose from the declared priority. (The interleavings of a launch and
+##    `session set` are `t_group_weight_race`'s subject.)
 ## 6. The outermost launcher places: `runquota run` inside a `runquota run`
 ##    tree leaves its tree in its parent's cgroup.
 ## 7. Nothing is left behind: once the trees end, their group directories

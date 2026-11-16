@@ -30,6 +30,60 @@ type
       ## The nice the tree takes if it is not placed after all.
     rootProblem*: string
       ## Why there is no target: placement off or unavailable on this host.
+    prioritySource*: GroupPrioritySource
+      ## For a group target: where the launch reads the group's priority in
+      ## force, under the cgroup root's lock, for the weight it writes and
+      ## the fallback nice (`CommandSpec.cgroupPriority`). It points at the
+      ## session `treePlacement` was called on, which must outlive the
+      ## launch.
+
+proc readSessionGroupPriority(context: pointer;
+                              priority: var SessionPriority): bool {.
+    nimcall, raises: [].} =
+  ## `GroupPrioritySource.read` over a `RunQuotaSession` (the context): the
+  ## group's priority asked from the daemon now. Never raises: a daemon that
+  ## cannot answer leaves the launch with the weight it already chose
+  ## (nothing here may fail a launch).
+  if context.isNil:
+    return false
+  try:
+    priority = cast[ptr RunQuotaSession](context)[].groupPriorityNow()
+    true
+  except CatchableError:
+    false
+
+proc groupPrioritySource*(session: var RunQuotaSession): GroupPrioritySource =
+  ## The source of the priority in force of `session`'s group, for a launch
+  ## (or a weight rewrite) to read at the moment it writes the weight. Valid
+  ## for as long as `session` is.
+  GroupPrioritySource(read: readSessionGroupPriority,
+    context: cast[pointer](addr session))
+
+type
+  GroupPriorityQuery* = object
+    ## A group named without a session (`runquota session set` holds none):
+    ## the client to ask through and the group's name.
+    client*: ptr RunQuotaClient
+    group*: string
+
+proc readQueriedGroupPriority(context: pointer;
+                              priority: var SessionPriority): bool {.
+    nimcall, raises: [].} =
+  if context.isNil:
+    return false
+  let query = cast[ptr GroupPriorityQuery](context)
+  if query[].client.isNil:
+    return false
+  try:
+    query[].client[].currentGroupPriority(query[].group, priority)
+  except CatchableError:
+    false
+
+proc groupPrioritySource*(query: var GroupPriorityQuery): GroupPrioritySource =
+  ## The source of the priority in force of `query.group`. Valid for as long
+  ## as `query` and its client are.
+  GroupPrioritySource(read: readQueriedGroupPriority,
+    context: cast[pointer](addr query))
 
 proc treePlacement*(session: var RunQuotaSession; lease: RunQuotaLease;
                     capMilli = 0'u64;
@@ -39,9 +93,19 @@ proc treePlacement*(session: var RunQuotaSession; lease: RunQuotaLease;
   ## cgroup with the weight of the group's priority in force, or the
   ## reclaimed subtree for a reclaimed grant; with `capMilli > 0` a leaf of
   ## its own whose `cpu.max` is that width (named after this process and
-  ## the lease, which the daemon numbers uniquely). Asks the daemon for the
-  ## group's priority the first time (`groupPriorityInForce`); the nice
-  ## fallback needs it too.
+  ## the lease, which the daemon numbers uniquely).
+  ##
+  ## THE PRIORITY IS READ BY THE LAUNCH, NOT HERE. For a group target the
+  ## placement carries a source of the group's priority (`prioritySource`,
+  ## over `session`), and the launch reads it while it holds the cgroup
+  ## root's shared lock, right before it writes the weight; the weight and
+  ## fallback nice set here (from the priority last known, else the declared
+  ## one) are what the launch keeps only if the daemon cannot answer then.
+  ## Read here, a `session set --priority` landing between this call and the
+  ## launch's weight write would be overwritten by the older value. A
+  ## reclaimed target needs no priority (weight 1, nice +10) and asks
+  ## nothing. Where placement is unavailable the daemon is asked here once
+  ## per session (`groupPriorityInForce`) for the fallback nice.
   ##
   ## THE OUTERMOST LAUNCHER PLACES. A launcher that itself runs inside a
   ## leased tree (`RUNQUOTA_PARENT_LEASE` set: a `runquota jobserver` under
@@ -58,14 +122,20 @@ proc treePlacement*(session: var RunQuotaSession; lease: RunQuotaLease;
     # asked for the group's priority.
     result.rootProblem = root.reason
     return
-  let priority = session.groupPriorityInForce()
-  result.fallbackNice = fallbackNice(priority, lease.reclaimed)
   if not root.usable:
+    result.fallbackNice = fallbackNice(session.groupPriorityInForce(),
+      lease.reclaimed)
     result.rootProblem = root.reason
     return
-  result.target = targetFor(root, session.groupName, priority,
+  let known =
+    if session.groupPriorityKnown: session.groupPriority
+    else: session.declaredGroupPriority
+  result.fallbackNice = fallbackNice(known, lease.reclaimed)
+  result.target = targetFor(root, session.groupName, known,
     lease.reclaimed, capMilli, launcherPid = getCurrentProcessId(),
     capSequence = int(lease.id.value))
+  if not lease.reclaimed:
+    result.prioritySource = session.groupPrioritySource()
 
 proc applyPlacement*(spec: var CommandSpec; placement: TreePlacement) =
   ## Put `placement` on a launch: the cgroup, and the nice to take instead
@@ -73,6 +143,7 @@ proc applyPlacement*(spec: var CommandSpec; placement: TreePlacement) =
   ## empty cap leaves of launchers that are gone.
   spec.cgroup = placement.target
   spec.placementFallbackNice = placement.fallbackNice
+  spec.cgroupPriority = placement.prioritySource
   if placement.target.isCapLeaf:
     sweepStaleCapLeaves(placement.target)
 
@@ -86,7 +157,7 @@ proc placementNote*(placement: TreePlacement; launch: LaunchResult): string =
       if launch.cgroupProblem.len > 0: launch.cgroupProblem
       elif placement.rootProblem.len > 0: placement.rootProblem
       else: "no cgroup"
-    "not in a cgroup (" & why & "), nice +" & $placement.fallbackNice
+    "not in a cgroup (" & why & "), nice +" & $launch.fallbackNice
 
 proc libraryInfo*(): execTypes.LibraryInfo =
   execTypes.LibraryInfo(name: libraryName)
