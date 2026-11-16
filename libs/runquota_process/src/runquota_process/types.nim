@@ -58,8 +58,10 @@ type
       ## the whole tree it starts inherits the lower scheduling weight. 0
       ## leaves it unchanged. A launcher sets it for a RECLAIMED grant (CPU
       ## admitted into predicted slack), which must yield to the work it
-      ## was admitted beside. Not applied on Windows yet: a Windows
-      ## launcher does not accept reclaimed grants.
+      ## was admitted beside. On Windows any positive value lowers the child
+      ## (and so the tree it spawns) to `BELOW_NORMAL_PRIORITY_CLASS`, the
+      ## platform's realization of the same lower weight; the Windows
+      ## launcher does not read the magnitude, only that it is positive.
     cpuRateCapMilli*: uint32
       ## 0 = no cap. The grant's CPU budget in milli-cores (1000 = one core
       ## busy). The Windows launcher turns this into a hard Job Object CPU-rate

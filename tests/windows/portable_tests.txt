@@ -90,6 +90,22 @@ tests/unit/t_jobserver_bridge_windows.nim
 # ITS OWN binary as the worker, so no shell, no daemon and no sqlite3; the cap
 # case skips on a host with fewer than three cores.
 tests/integration/t_windows_job_object_cpu.nim
+# The lower scheduling weight a reclaimed grant runs at on Windows, at the
+# `runquota_process` launcher level: a reclaimed grant's child and the
+# grandchild it spawns run at BELOW_NORMAL_PRIORITY_CLASS, a non-reclaimed
+# grant at normal. Launches ITS OWN binary as the worker (and spawns the
+# grandchild through a bare CreateProcessW so the OS priority inheritance
+# applies), so no shell, no daemon and no sqlite3. The pressure-gate half of
+# the same feature needs a live daemon and is on the integration leg
+# (`t_negotiated_widths_windows`).
+tests/integration/t_windows_reclaimed_priority.nim
+# The Windows CPU pressure reader: a `--cpu-pressure-file` override is read as
+# PSI text here as on every platform, and with no override the native
+# `\System\Processor Queue Length` reader (PDH) answers in range. Pure reads of
+# a file and of the host counter: no live daemon and no sqlite3. The reader's
+# effect on admission is exercised on the integration leg
+# (`t_negotiated_widths_windows`).
+libs/runquota_daemon/tests/t_cpu_pressure_windows.nim
 # The admission order as pure functions of a simulated clock: the priority,
 # cache-deadline, starvation and arrival keys, fair-share with a decaying
 # per-group CPU figure, and DRF (and `share-between-users = none`) across

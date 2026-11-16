@@ -410,6 +410,19 @@ when defined(windows):
     hJob: Handle, uExitCode: uint32
   ): WINBOOL {.stdcall, dynlib: "kernel32.dll", importc: "TerminateJobObject".}
 
+  proc setPriorityClass(
+    hProcess: Handle, dwPriorityClass: uint32
+  ): WINBOOL {.stdcall, dynlib: "kernel32.dll", importc: "SetPriorityClass".}
+
+  const
+    # Windows: the lower scheduling weight a RECLAIMED grant's tree runs at.
+    # A process in this class is inherited by the children it spawns, so the
+    # whole tree runs below normal, mirroring how POSIX `nice` is inherited
+    # through `fork`. Unlike a Job Object CPU-rate cap it is a priority, not a
+    # ceiling: the tree may use all free CPU when nothing contends, and only
+    # loses contests when the work it was admitted beside wants the processor.
+    BELOW_NORMAL_PRIORITY_CLASS = 0x00004000'u32
+
   proc winOpenForJob(p: Process): Handle =
     ## A handle to the child with the rights `AssignProcessToJobObject`
     ## needs, opened by pid.
@@ -424,8 +437,13 @@ when defined(windows):
       ProcessSetQuota = 0x0100'i32
       ProcessTerminate = 0x0001'i32
       ProcessQueryLimitedInformation = 0x1000'i32
+      # `SetPriorityClass` needs PROCESS_SET_INFORMATION; the same handle then
+      # serves both the Job Object assignment and lowering a reclaimed tree's
+      # scheduling weight.
+      ProcessSetInformation = 0x0200'i32
     Handle(openProcess(ProcessSetQuota or ProcessTerminate or
-      ProcessQueryLimitedInformation, 0'i32, int32(p.processID)))
+      ProcessQueryLimitedInformation or ProcessSetInformation, 0'i32,
+      int32(p.processID)))
 
   proc applyKillOnJobClose(job: Handle) =
     var info: JobExtendedLimitW
@@ -1109,6 +1127,16 @@ when defined(windows):
       # `killNow` fall back to terminating the process itself when there is
       # no job, and a kept empty job would make them terminate nothing.
       let processHandle = winOpenForJob(process)
+      # A RECLAIMED grant runs its whole tree at a lower scheduling weight
+      # (`spec.niceIncrement > 0`, set by the launcher for a reclaimed lease,
+      # the Windows realization of POSIX `nice`). Below-normal priority is
+      # inherited by the children the child spawns, so the tree yields the CPU
+      # to the work it was admitted beside, but keeps all of it when nothing
+      # contends. Best effort, like the job assignment: a child that already
+      # spawned a grandchild loses that race, which is the same race the job
+      # assignment accepts.
+      if processHandle != 0 and spec.niceIncrement > 0:
+        discard setPriorityClass(processHandle, BELOW_NORMAL_PRIORITY_CLASS)
       let assigned = processHandle != 0 and
         assignProcessToJobObject(job, processHandle) != 0
       if processHandle != 0:
