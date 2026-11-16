@@ -27,4 +27,4 @@ type
 proc requireUnwinding*(condition: bool; message: string) =
   ## Fail the current test fatally, unwinding owned cleanup first.
   if not condition:
-    echo message
+    raise newException(RequirementFailed, message)
