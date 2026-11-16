@@ -37,7 +37,7 @@
 ## NO MOCKS: the built `runquotad` and `runquota`, real sessions, the real
 ## `promtool`.
 
-when defined(linux):
+when defined(linux) or defined(macosx):
   import std/[json, monotimes, os, osproc, streams, strtabs, strutils, times,
     unittest]
 
@@ -66,6 +66,28 @@ when defined(linux):
   proc useDaemon(socket: string) =
     putEnv("RUNQUOTA_ENDPOINT_SCOPE", "private")
     putEnv("RUNQUOTA_SOCKET", socket)
+
+  proc awaitStatus(socket, what: string; ready: proc (status: JsonNode): bool):
+      bool =
+    ## Poll `runquota status --json` until `ready` holds (30 s bound).
+    ## The tests below time their windows from an observed event, not from
+    ## a process start: on a loaded host a freshly started `runquota run`
+    ## or daemon sampler can need seconds before it does anything, and a
+    ## window timed from the start would then measure the host's load.
+    let deadline = getMonoTime() + initDuration(seconds = 30)
+    while getMonoTime() < deadline:
+      let (code, text) = cli(privateEnv(socket), ["status", "--json"])
+      if code == 0 and ready(parseJson(text)):
+        return true
+      sleep(20)
+    checkpoint "never observed: " & what
+    false
+
+  proc hasPendingRequest(status: JsonNode): bool =
+    status["capacity"]["host"]["pending_requests"].getInt > 0
+
+  proc hasAmbientReading(status: JsonNode): bool =
+    status["capacity"]["host"]["ambient_reading_unix_millis"].kind == JInt
 
   proc groupOf(answer: JsonNode; name: string): JsonNode =
     for group in answer["groups"]:
@@ -185,6 +207,10 @@ when defined(linux):
         args = ["run", "--width", "1", "--", "true"],
         options = {poStdErrToStdOut})
       defer: run.close()
+      # Time the hold from the moment the run's request is queued, so the
+      # run's wait is at least the hold however long its start-up took.
+      prerequisite awaitStatus(socket, "the run's request queued",
+        hasPendingRequest), "the run never queued behind the holder"
       sleep(2500)
       held.release()
       let code = run.waitForExit(30_000)
@@ -231,6 +257,11 @@ when defined(linux):
       useDaemon(socket)
       var client = connectDefault()
       defer: client.close()
+      # The first finish is judged against the ambient samples of its run's
+      # window; none yet (the sampler's first readings still pending) makes
+      # it unjudged and it would learn nothing.
+      prerequisite awaitStatus(socket, "an ambient reading",
+        hasAmbientReading), "the ambient sampler took no reading"
       var session = client.registerSession("pressure", "0.1.0")
       var learned: seq[uint64]
       for i in 0 ..< 2:
