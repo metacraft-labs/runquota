@@ -106,6 +106,34 @@ suite "cgroup placement rules":
     check fallbackNice(sessionPriorityHigh, reclaimed = false) == 0
     check fallbackNice(sessionPriorityUrgent, reclaimed = false) == 0
 
+  test "Windows: priority to Job Object class, and the switch resolution":
+    # The five classes below realtime, lowest to highest, no collision, each
+    # one step above the one below -- the Windows analogue of the cpu.weight
+    # tiers. Mutation: any other mapping, e.g. normal for every tier.
+    check jobPriorityClassFor(sessionPriorityLow, false) == BelowNormalPriorityClass
+    check jobPriorityClassFor(sessionPriorityNormal, false) == NormalPriorityClass
+    check jobPriorityClassFor(sessionPriorityHigh, false) == AboveNormalPriorityClass
+    check jobPriorityClassFor(sessionPriorityUrgent, false) == HighPriorityClass
+    # A reclaimed grant goes to idle whatever its group.
+    for p in SessionPriority:
+      check jobPriorityClassFor(p, reclaimed = true) == IdlePriorityClass
+    # No two tiers share a class.
+    var seen: HashSet[uint32]
+    for p in SessionPriority:
+      seen.incl jobPriorityClassFor(p, false)
+    seen.incl IdlePriorityClass
+    check seen.len == 5
+    # The switch: the variable's `off` wins; `on` turns it on; empty and any
+    # other value defer to the host switch. Mutation: ignoring the `off`
+    # override, or defaulting an empty value to on.
+    check resolveJobPriority("off", hostSwitchOn = true) == false
+    check resolveJobPriority("on", hostSwitchOn = false) == true
+    check resolveJobPriority("", hostSwitchOn = false) == false
+    check resolveJobPriority("", hostSwitchOn = true) == true
+    check resolveJobPriority("  off  ", hostSwitchOn = true) == false
+    check resolveJobPriority("garbage", hostSwitchOn = true) == true
+    check resolveJobPriority("garbage", hostSwitchOn = false) == false
+
   test "a group name cannot leave its directory":
     let root = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/runquota.slice"
     let hostile = ["..", ".", "../..", "a/../../b", "/etc", "x/", "cgroup.procs",
@@ -233,10 +261,11 @@ suite "capability records":
     check "off by default" in turnedOff.entries[0].gap
 
   test "macOS and Windows name what they lack":
-    # macOS enforces nothing below admission; Windows enforces only the
-    # width cap (Job Object CPU rate control).
+    # macOS enforces nothing below admission; Windows (job-priority OFF by
+    # default) enforces the width cap (Job Object CPU rate control) and the
+    # reclaimed tree's unconditional below-normal class.
     for (os, enforced) in [("macos", newSeq[string]()),
-                           ("windows", @["width-cap"])]:
+                           ("windows", @["width-cap", "reclaimed"])]:
       let record = enforcementRecordFor(os)
       check record.gaps.len == 4 - enforced.len
       let parsed = parseJson(record.toJson())
@@ -253,6 +282,44 @@ suite "capability records":
     check "macOS has no hard CPU cap" in enforcementRecordFor("macos").summaryLine
     check "width-cap=enforced" in enforcementRecordFor("windows").summaryLine
     check "no backend for plan9" in enforcementRecordFor("plan9").summaryLine
+
+  test "Windows job-priority switch: off is admission-only, on enforces the lower tiers and flags the urgent gap":
+    # OFF (default): priority between a user's groups is admission-only, the
+    # reclaimed tree keeps its unconditional below-normal class, the width cap
+    # is enforced. Mutation: windowsRecord's off branch claiming priority is
+    # enforced would make the gap checks below fail.
+    let off = enforcementRecordFor("windows")
+    check off.entries[0].mechanism == emPriority
+    check off.entries[0].level == elAdmissionOnly
+    check "job priority off:" in off.entries[0].gap
+    check "off by default" in off.entries[0].gap
+    check off.entries[1].mechanism == emReclaimed
+    check off.entries[1].level == elEnforced
+    check "below-normal" in off.entries[1].how
+    check off.entries[2].level == elEnforced          # width-cap
+    check off.gaps.len == 2                            # priority, memory-cap
+    # ON: the lower tiers (idle/below-normal/normal/above-normal, i.e.
+    # reclaimed/low/normal/high) are enforced by a Job Object priority class
+    # per group and the reclaimed tree is forced all the way to idle; but the
+    # urgent tier's high priority class needs a privilege an ordinary launcher
+    # lacks, so priority is DEGRADED with that caveat as a structural gap, not
+    # a bare "enforced". Mutation: marking priority enforced with no gap (or
+    # dropping the on branch) fails here.
+    let on = enforcementRecordFor("windows", jobPriorityOn = true)
+    check on.entries[0].mechanism == emPriority
+    check on.entries[0].level == elDegraded
+    check "priority class" in on.entries[0].how
+    check "urgent tier" in on.entries[0].gap
+    check "SeIncreaseBasePriorityPrivilege" in on.entries[0].gap
+    check on.entries[1].level == elEnforced
+    check "idle" in on.entries[1].how
+    check on.gaps.len == 2
+    check on.gaps[0].mechanism == emPriority
+    check on.gaps[1].mechanism == emMemoryCap
+    # A reason the resolver supplies for the off state reaches the gap text.
+    let offReason = enforcementRecordFor("windows", jobPriorityOn = false,
+      jobPriorityProblem = "turned off by RUNQUOTA_JOB_PRIORITY=off")
+    check "turned off by RUNQUOTA_JOB_PRIORITY=off" in offReason.entries[0].gap
 
   test "the JSON is valid with hostile text":
     var record = enforcementRecordFor("linux", CgroupRoot(state: crsUnavailable,

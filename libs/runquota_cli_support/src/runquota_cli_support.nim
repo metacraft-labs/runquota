@@ -164,7 +164,8 @@ proc printStatus(json: bool): int =
   # THE ENFORCEMENT RECORD IS THIS CLIENT'S, not the daemon's: the cgroups
   # belong to the launching client and its user (`runquota_process/
   # enforcement`).
-  let enforcement = hostEnforcementRecord(launcherCgroupRoot())
+  let enforcement = hostEnforcementRecord(launcherCgroupRoot(),
+    jobPriorityOn = launcherJobPriorityOn())
   if json:
     let daemonJson =
       if statusJson.len > 0: statusJson else: inspectionStatusJson(status)
@@ -830,7 +831,8 @@ proc runDebugAcquire(args: seq[string]): int =
   try:
     if command.len > 0:
       let execution = session.runWithLease(request, command,
-          waitForQueued = benchmark, cgroupRoot = launcherCgroupRoot())
+          waitForQueued = benchmark, cgroupRoot = launcherCgroupRoot(),
+          jobPriorityOn = launcherJobPriorityOn())
       stdout.write(execution.process.stdout)
       stderr.write(execution.process.stderr)
       session.closeSession()

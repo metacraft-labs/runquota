@@ -81,15 +81,35 @@ type
       ## stand-in for a lower weight. The larger of this and
       ## `niceIncrement` applies.
     cgroupPriority*: GroupPrioritySource
-      ## Linux, a group target only: where the launch reads the group's
-      ## priority in force while it holds the cgroup root's shared lock, and
-      ## from it the `cpu.weight` it writes (replacing `cgroup.cpuWeight`)
-      ## and the fallback nice (replacing `placementFallbackNice`). Reading
-      ## it there, not before the launch, is what keeps a concurrent
-      ## `session set --priority` from being overwritten by an older
-      ## priority (`lockCgroupRoot`). Not set: the target's weight and the
-      ## fallback nice are used as given. The source's context must stay
-      ## valid until `launchProcess` returns.
+      ## Where the launch reads the group's priority in force at the last
+      ## instant before it is used, instead of before the launch: on Linux a
+      ## group target reads it while it holds the cgroup root's shared lock,
+      ## for the `cpu.weight` it writes (replacing `cgroup.cpuWeight`) and the
+      ## fallback nice (replacing `placementFallbackNice`); on WINDOWS the
+      ## same source is read right before the Job Object priority-class limit
+      ## is set, for the class a non-reclaimed tree takes (replacing the
+      ## placement-time `jobPriorityClass`). Reading it there, not before the
+      ## launch, is what keeps a concurrent `session set --priority` from
+      ## being overwritten by an older priority (on Linux under
+      ## `lockCgroupRoot`; on Windows a single `SetInformationJobObject` call
+      ## has no critical section for a set to land inside, so it needs no
+      ## lock). Not set: the target's weight / `jobPriorityClass` are used as
+      ## given. The source's context must stay valid until `launchProcess`
+      ## returns.
+    jobPriorityClass*: uint32
+      ## Windows: the Win32 priority class the launcher forces on the child's
+      ## whole tree through a Job Object priority-class LIMIT, below admission
+      ## (`runquota_process/job_priority.jobPriorityClassFor`). 0 = no limit
+      ## (the switchable layer off): the tree keeps its unconditional class
+      ## (`BELOW_NORMAL_PRIORITY_CLASS` for a reclaimed grant, normal
+      ## otherwise). The class resolved at PLACEMENT time from the priority
+      ## then known: for a reclaimed tree it is idle and final (reclaimed asks
+      ## no priority, so `cgroupPriority` is unset); for a non-reclaimed tree
+      ## it is the FALLBACK the launch keeps only if the last-instant read
+      ## through `cgroupPriority` cannot answer. A Job Object limit, unlike a
+      ## per-process `SetPriorityClass` a child could override, forces every
+      ## process in the tree, now and every one it later spawns. Ignored off
+      ## Windows.
 
   LaunchResult* = object
     processId*: uint64

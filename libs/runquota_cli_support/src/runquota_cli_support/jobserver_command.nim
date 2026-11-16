@@ -898,7 +898,8 @@ proc runJobserver*(args: seq[string];
       # Below admission: the tree runs in its session group's cgroup where
       # this host allows it; a bridge inside a parent lease's tree stays
       # where its parent put it (`runquota_exec.treePlacement`).
-      let placement = session.treePlacement(lease, root = launcherCgroupRoot())
+      let placement = session.treePlacement(lease, root = launcherCgroupRoot(),
+        jobPriorityOn = launcherJobPriorityOn())
       spec.applyPlacement(placement)
       var child: LaunchedProcess
       try:

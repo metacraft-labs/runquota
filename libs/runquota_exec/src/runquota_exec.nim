@@ -28,6 +28,12 @@ type
       ## The cgroup to create the tree in; empty when there is none.
     fallbackNice*: int
       ## The nice the tree takes if it is not placed after all.
+    jobPriorityClass*: uint32
+      ## Windows: the Win32 priority class to force on the tree's Job Object
+      ## below admission (`runquota_process/job_priority`), when job-priority
+      ## enforcement is on. 0 = off (the switchable layer does nothing; the
+      ## tree keeps its unconditional class). Independent of `target`: Windows
+      ## has no cgroups, so `target` is always empty there.
     rootProblem*: string
       ## Why there is no target: placement off or unavailable on this host.
     prioritySource*: GroupPrioritySource
@@ -88,7 +94,8 @@ proc groupPrioritySource*(query: var GroupPriorityQuery): GroupPrioritySource =
 proc treePlacement*(session: var RunQuotaSession; lease: RunQuotaLease;
                     capMilli = 0'u64;
                     root = currentCgroupRoot();
-                    parent = parentLeaseFromEnvironment()): TreePlacement =
+                    parent = parentLeaseFromEnvironment();
+                    jobPriorityOn = false): TreePlacement =
   ## The placement of a tree started under `lease`: its session group's
   ## cgroup with the weight of the group's priority in force, or the
   ## reclaimed subtree for a reclaimed grant; with `capMilli > 0` a leaf of
@@ -107,19 +114,48 @@ proc treePlacement*(session: var RunQuotaSession; lease: RunQuotaLease;
   ## nothing. Where placement is unavailable the daemon is asked here once
   ## per session (`groupPriorityInForce`) for the fallback nice.
   ##
+  ## WINDOWS (`jobPriorityOn`) is the same late-binding read on the other
+  ## layer: a non-reclaimed tree carries the SAME `prioritySource`, and the
+  ## launch reads it right before it sets the Job Object priority-class limit
+  ## (`SetInformationJobObject`), mapping the priority in force onto the class
+  ## (`jobPriorityClassFor`). The class set here, from the priority last known
+  ## (else declared), is the fallback the launch keeps only if the daemon
+  ## cannot answer then; a reclaimed grant is idle whatever its group and asks
+  ## nothing. No lock: a single `SetInformationJobObject` call has no critical
+  ## section a concurrent set can land inside.
+  ##
   ## THE OUTERMOST LAUNCHER PLACES. A launcher that itself runs inside a
   ## leased tree (`RUNQUOTA_PARENT_LEASE` set: a `runquota jobserver` under
-  ## `runquota run`, say) leaves its tree where its parent put it. Moving
-  ## it to a group cgroup would take it out of the parent's, and out of a
-  ## parent's cap with it.
+  ## `runquota run`, say) leaves its tree where its parent put it -- for both
+  ## layers. Moving it to a group cgroup would take it out of the parent's,
+  ## and out of a parent's cap with it; forcing its priority class would do
+  ## the same below admission.
   if parent.isSome:
     result.rootProblem = "inside the tree of lease " & $parent.get.value &
       ", which its own launcher placed"
     return
-  if root.state == crsOff:
-    # Placement off: nothing below admission changes (a reclaimed tree
-    # keeps its nice +10 through `reclaimedNice`), and the daemon is not
-    # asked for the group's priority.
+  let cgroupOff = root.state == crsOff
+  if cgroupOff and not jobPriorityOn:
+    # Both layers off: nothing below admission changes (a reclaimed tree
+    # keeps its nice +10 / unconditional below-normal class through
+    # `reclaimedNice`), and the daemon is not asked for the group's priority.
+    result.rootProblem = root.reason
+    return
+  if jobPriorityOn:
+    # Windows: the switchable layer forces the tree's Job Object to the class
+    # of the group's priority. Like the Linux weight, the class is read AT THE
+    # LAST INSTANT by the launch through `prioritySource`
+    # (`CommandSpec.cgroupPriority`), right before the `SetInformationJobObject`
+    # call; the class set here, from the priority last known (else declared),
+    # is the fallback the launch keeps only if the daemon cannot answer then.
+    # A reclaimed grant is idle whatever its group and asks nothing.
+    let known =
+      if session.groupPriorityKnown: session.groupPriority
+      else: session.declaredGroupPriority
+    result.jobPriorityClass = jobPriorityClassFor(known, lease.reclaimed)
+    if not lease.reclaimed:
+      result.prioritySource = session.groupPrioritySource()
+  if cgroupOff:
     result.rootProblem = root.reason
     return
   if not root.usable:
@@ -144,6 +180,7 @@ proc applyPlacement*(spec: var CommandSpec; placement: TreePlacement) =
   spec.cgroup = placement.target
   spec.placementFallbackNice = placement.fallbackNice
   spec.cgroupPriority = placement.prioritySource
+  spec.jobPriorityClass = placement.jobPriorityClass
   if placement.target.isCapLeaf:
     sweepStaleCapLeaves(placement.target)
 
@@ -208,7 +245,9 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
                    waitForQueued = false;
                    exportParentLease = true;
                    placeTree = true;
-                   cgroupRoot = currentCgroupRoot()): LeaseExecutionResult =
+                   cgroupRoot = currentCgroupRoot();
+                   jobPriorityOn = currentJobPriorityOn()):
+    LeaseExecutionResult =
   ## `exportParentLease` gives the child `RUNQUOTA_PARENT_LEASE` naming the
   ## lease it runs under. It is layered over `command.env`, so it also
   ## replaces a value the launcher itself inherited: the nearest supervisor
@@ -236,7 +275,8 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
     # A reclaimed grant runs at the lower weight, whatever the caller asked.
     spec.niceIncrement = max(spec.niceIncrement, lease.reclaimedNice())
     if placeTree:
-      spec.applyPlacement(session.treePlacement(lease, root = cgroupRoot))
+      spec.applyPlacement(session.treePlacement(lease, root = cgroupRoot,
+        jobPriorityOn = jobPriorityOn))
     if exportParentLease:
       spec.env.add(lease.parentLeaseEnvEntry())
     var child = launchProcess(spec)
@@ -280,7 +320,9 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
                    stdoutLimit = DefaultOutputLimit;
                    stderrLimit = DefaultOutputLimit;
                    waitForQueued = false;
-                   cgroupRoot = currentCgroupRoot()): LeaseExecutionResult =
+                   cgroupRoot = currentCgroupRoot();
+                   jobPriorityOn = currentJobPriorityOn()):
+    LeaseExecutionResult =
   session.runWithLease(
     request,
     commandSpec(
@@ -291,5 +333,6 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
       stderrLimit = stderrLimit
     ),
     waitForQueued = waitForQueued,
-    cgroupRoot = cgroupRoot
+    cgroupRoot = cgroupRoot,
+    jobPriorityOn = jobPriorityOn
   )

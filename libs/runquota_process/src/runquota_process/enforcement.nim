@@ -23,6 +23,7 @@
 import std/strutils
 
 import runquota_process/cgroup_placement
+import runquota_process/job_priority
 
 type
   EnforcementMechanism* = enum
@@ -139,32 +140,67 @@ proc macosRecord(): EnforcementRecord =
       "macOS has no hard memory cap for a process tree"),
   ]
 
-proc windowsRecord(): EnforcementRecord =
+const WindowsWidthCapHow = "Job Object CPU rate control, a hard cap at the " &
+  "granted width (runquota run --cap)"
+
+proc windowsRecord(jobPriorityOn: bool; problem = ""): EnforcementRecord =
+  ## Two layers, as on Linux. The RECLAIMED tree always runs at least at
+  ## `BELOW_NORMAL_PRIORITY_CLASS` (unconditional, like Linux's nice +10), so
+  ## `reclaimed` is enforced whether or not the switch is on. PRIORITY between
+  ## a user's groups needs the switchable Job Object priority-class limit: it
+  ## is enforced when `job-priority` is on (degraded only for the urgent tier,
+  ## whose high priority class an unprivileged launcher cannot set), and
+  ## admission-only when off.
   result.os = "windows"
   result.placement = "n/a"
-  result.entries = @[
-    entry(emPriority, elAdmissionOnly, "admission",
-      "Job Object priority classes per group are not implemented yet"),
-    entry(emReclaimed, elAdmissionOnly,
-      "admission (Windows launchers accept no reclaimed grants)",
-      "a below-normal priority class for reclaimed trees is not " &
-      "implemented yet, so no reclaimed grant is made"),
-    entry(emWidthCap, elEnforced, "Job Object CPU rate control, a hard " &
-      "cap at the granted width (runquota run --cap)"),
-    entry(emMemoryCap, elAdmissionOnly, "admission (memory reservation)",
-      "Job Object memory limits are not set by RunQuota launchers yet"),
-  ]
+  if jobPriorityOn:
+    result.entries = @[
+      entry(emPriority, elDegraded,
+        "Job Object priority class of each tree (idle for reclaimed, " &
+        "below-normal/normal/above-normal/high for low/normal/high/urgent)",
+        "only the urgent tier's high priority class needs " &
+        "SeIncreaseBasePriorityPrivilege enabled, which the Job Object path " &
+        "requires and an ordinary launcher does not hold, so an urgent " &
+        "group's tree is held at normal; the idle, below-normal, normal and " &
+        "above-normal tiers (reclaimed, low, normal, high) all take with no " &
+        "privilege"),
+      entry(emReclaimed, elEnforced,
+        "Job Object priority-class limit of idle, below the unconditional " &
+        "below-normal class a reclaimed tree already runs at"),
+      entry(emWidthCap, elEnforced, WindowsWidthCapHow),
+      entry(emMemoryCap, elAdmissionOnly, "admission (memory reservation)",
+        "Job Object memory limits are not set by RunQuota launchers yet"),
+    ]
+  else:
+    let reason = if problem.len > 0: problem
+      else: "off by default (the host file does not set [enforcement] " &
+        "job-priority = \"on\")"
+    result.placementProblem = reason
+    let gap = "job priority off: " & reason
+    result.entries = @[
+      entry(emPriority, elAdmissionOnly, "admission", gap),
+      entry(emReclaimed, elEnforced,
+        "below-normal priority class of the whole tree (inherited by every " &
+        "process it spawns)"),
+      entry(emWidthCap, elEnforced, WindowsWidthCapHow),
+      entry(emMemoryCap, elAdmissionOnly, "admission (memory reservation)",
+        "Job Object memory limits are not set by RunQuota launchers yet"),
+    ]
 
 proc enforcementRecordFor*(os: string; root = CgroupRoot();
-                           probeProblem = ""): EnforcementRecord =
+                           probeProblem = "";
+                           jobPriorityOn = false;
+                           jobPriorityProblem = ""): EnforcementRecord =
   ## The record for `os` (`linux`, `macos`, `windows`). On Linux `root` is
   ## the resolved cgroup root and `probeProblem` what probing it found ("" =
-  ## trees can be placed there). Any other OS is recorded as enforcing
+  ## trees can be placed there). On Windows `jobPriorityOn` is the
+  ## `[enforcement] job-priority` switch in force and `jobPriorityProblem`
+  ## why it is off (for the gap text). Any other OS is recorded as enforcing
   ## nothing below admission.
   case os
   of "linux": linuxRecord(root, probeProblem)
   of "macos": macosRecord()
-  of "windows": windowsRecord()
+  of "windows": windowsRecord(jobPriorityOn, jobPriorityProblem)
   else:
     EnforcementRecord(os: os, placement: "n/a", entries: @[
       entry(emPriority, elAdmissionOnly, "admission", "no backend for " & os),
@@ -178,11 +214,17 @@ proc hostOsName*(): string =
   elif defined(windows): "windows"
   else: hostOS
 
-proc hostEnforcementRecord*(root = currentCgroupRoot()): EnforcementRecord =
-  ## This process's record for the cgroup root its launchers would use (a
-  ## launcher that reads the host file passes the root resolved with its
-  ## switch); on Linux the root is probed without creating anything.
-  enforcementRecordFor(hostOsName(), root, probeRoot(root))
+proc hostEnforcementRecord*(root = currentCgroupRoot();
+                            jobPriorityOn = currentJobPriorityOn();
+                            jobPriorityProblem = jobPriorityOffReason(false)):
+    EnforcementRecord =
+  ## This process's record for the enforcement its launchers would use (a
+  ## launcher that reads the host file passes the root and the switch it
+  ## resolved with it); on Linux the cgroup root is probed without creating
+  ## anything, on Windows `jobPriorityOn` is the job-priority switch. The
+  ## defaults read only the environment, as `currentCgroupRoot` does.
+  enforcementRecordFor(hostOsName(), root, probeRoot(root),
+    jobPriorityOn, jobPriorityProblem)
 
 proc gaps*(record: EnforcementRecord): seq[EnforcementEntry] =
   for item in record.entries:

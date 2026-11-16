@@ -312,6 +312,29 @@ The record is the client's: it describes the host and user of the `runquota`
 process that prints it, because the cgroups are the launcher's, not the
 daemon's.
 
+**On Windows** there are no cgroups; the equivalent is a process priority
+class, forced on a whole tree by a Job Object limit. A reclaimed grant's tree
+always runs at `BELOW_NORMAL_PRIORITY_CLASS` (the base, like nice +10). The
+switchable layer holds each tree to the class of its group's priority — idle
+for reclaimed, below-normal/normal/above-normal/high for
+low/normal/high/urgent — when the host turns it on:
+
+```toml
+[enforcement]
+job-priority = "on"
+```
+
+(`runquota config set enforcement.job-priority on`). `RUNQUOTA_JOB_PRIORITY=off`
+turns it off for one user or shell and `=on` turns it on. Off by default, like
+cgroup placement, until an overhead gate passes it. The idle, below-normal,
+normal and above-normal classes (reclaimed, low, normal, high) all take with no
+privilege; only the urgent tier's `HIGH_PRIORITY_CLASS` needs
+`SeIncreaseBasePriorityPrivilege` enabled, which the Job Object path requires
+and an ordinary launcher does not hold, so an urgent group's tree is held at
+normal. Because of that `runquota status` reports priority as `degraded` on
+Windows with the switch on, naming the urgent-tier gap, with
+`enforcement_os: windows`.
+
 ## `runquota jobserver`
 
 Run a command that speaks the GNU make jobserver protocol under one lease, and

@@ -22,8 +22,9 @@ when defined(windows):
   import runquota_host_windows
 import runquota_process/types as processTypes
 import runquota_process/enforcement
+import runquota_process/job_priority
 
-export processTypes, enforcement
+export processTypes, enforcement, job_priority
 
 const libraryName* = "runquota_process"
 const DefaultOutputLimit* = 1_048_576
@@ -382,6 +383,13 @@ when defined(windows):
     # drops its handle the child tree is reaped automatically. We don't set
     # JOB_OBJECT_LIMIT_BREAKAWAY_OK; child processes inherit job membership.
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000'i32
+    # Windows: JOB_OBJECT_LIMIT_PRIORITY_CLASS forces every process in the job
+    # -- now and every one it later spawns -- to the job's PriorityClass. It
+    # shares the one LimitFlags of the job's basic limits with
+    # KILL_ON_JOB_CLOSE above (both live in JOBOBJECT_BASIC_LIMIT_INFORMATION),
+    # so a set of the basic limits replaces the whole LimitFlags: a
+    # priority-class set must re-assert KILL_ON_JOB_CLOSE or it would clear it.
+    JOB_OBJECT_LIMIT_PRIORITY_CLASS = 0x00000020'i32
     # Windows: a hard CPU-rate cap enables rate control (0x1) and makes it a
     # ceiling the tree cannot exceed (0x4) rather than a weight-based share.
     JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x00000001'u32
@@ -448,6 +456,35 @@ when defined(windows):
   proc applyKillOnJobClose(job: Handle) =
     var info: JobExtendedLimitW
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    discard setInformationJobObject(
+      job,
+      JobObjectExtendedLimitInformation,
+      addr info,
+      int32(sizeof(JobExtendedLimitW))
+    )
+
+  proc applyJobPriorityClass(job: Handle; priorityClass: uint32) =
+    ## Forces every process in `job` -- now and every one it later spawns --
+    ## to `priorityClass`, the switchable below-admission tiering layered on
+    ## top of the unconditional `BELOW_NORMAL_PRIORITY_CLASS` a reclaimed tree
+    ## already runs at (`runquota_process/job_priority`). A Job Object
+    ## PriorityClass LIMIT, unlike the per-process `SetPriorityClass` the base
+    ## mechanism uses, a child cannot override for itself: it holds the whole
+    ## tree to its group's priority below admission.
+    ##
+    ## KILL_ON_JOB_CLOSE is re-asserted here (and the same extended struct and
+    ## info class `applyKillOnJobClose` uses): both flags share the one
+    ## LimitFlags of the job's basic limits, so a set that named only
+    ## PRIORITY_CLASS would clear the kill-on-close that reaps the tree. This
+    ## is independent of the `--cap` CPU-rate control, which is a different
+    ## info class (`JobObjectCpuRateControlInformation`) and does not touch
+    ## these limits.
+    if priorityClass == 0'u32:
+      return
+    var info: JobExtendedLimitW
+    info.BasicLimitInformation.LimitFlags =
+      JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE or JOB_OBJECT_LIMIT_PRIORITY_CLASS
+    info.BasicLimitInformation.PriorityClass = int32(priorityClass)
     discard setInformationJobObject(
       job,
       JobObjectExtendedLimitInformation,
@@ -1148,6 +1185,30 @@ when defined(windows):
         # the job: a cap on a job the child escaped would bound nothing.
         if spec.cpuRateCapMilli > 0'u32:
           applyCpuRateCap(job, spec.cpuRateCapMilli)
+        # Enforcement below admission, the switchable layer: when job-priority
+        # enforcement is on, the whole tree is forced to its group's priority
+        # class (idle for a reclaimed grant), a Job Object limit no child can
+        # escape. Off (`jobPriorityClass == 0`) nothing here runs and the tree
+        # keeps the unconditional class set above. Independent of the CPU-rate
+        # cap (a different info class), so a reclaimed `run --cap` gets both.
+        #
+        # THE CLASS IS READ AT THE LAST INSTANT, right here before the limit is
+        # set, through the same `GroupPrioritySource` the Linux weight uses
+        # (`cgroupPriority`): a `session set --priority` that lands between the
+        # placement decision and this call is seen, not overwritten by the
+        # stale class. On a read failure (the daemon could not answer under the
+        # client's bound) the class keeps `spec.jobPriorityClass`, the fallback
+        # resolved at placement from the priority last known, and the launch
+        # still proceeds -- as the Linux weight write does. A reclaimed tree
+        # carries idle and no source, so it stays idle. No lock is needed: a
+        # single `SetInformationJobObject` call has no critical section a
+        # concurrent set can land inside (unlike Linux's prepare-then-write).
+        if spec.jobPriorityClass != 0'u32:
+          var priorityClass = spec.jobPriorityClass
+          var inForce: SessionPriority
+          if spec.cgroupPriority.readNow(inForce):
+            priorityClass = jobPriorityClassFor(inForce, reclaimed = false)
+          applyJobPriorityClass(job, priorityClass)
       else:
         discard closeHandle(job)
         job = 0

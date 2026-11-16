@@ -281,5 +281,48 @@ suite "[enforcement] cgroups":
       discard editHostConfig(path, "enforcement.memory", "on", unset = false,
         changed)
 
+suite "[enforcement] job-priority":
+  # Read by RunQuota's Windows launchers, which force each leased tree's Job
+  # Object to its group's priority class only when it is "on" (or when
+  # RUNQUOTA_JOB_PRIORITY names on); the daemon validates it with the rest of
+  # the file. Mutation: accepting any other value, or defaulting absent to on.
+  test "on, off, absent, and everything else refused":
+    check parseHostConfig("[enforcement]\njob-priority = \"on\"\n",
+      "test.toml").enforcementJobPriority == some(true)
+    check parseHostConfig("[enforcement]\njob-priority = \"off\"\n",
+      "test.toml").enforcementJobPriority == some(false)
+    check parseHostConfig("", "test.toml").enforcementJobPriority.isNone
+    check parseHostConfig("", "test.toml").enforcementJobPriority.get(false) == false
+    for (text, needle) in [
+        ("[enforcement]\njob-priority = \"yes\"\n",
+         "job-priority must be \"on\" or \"off\""),
+        ("[enforcement]\njob-priority = on\n", "double-quoted"),
+        ("[enforcement]\nweight = \"on\"\n", "unknown key `weight` in [enforcement]")]:
+      let message = refusal(text)
+      check needle in message
+      if needle notin message:
+        echo "  for ", text.escape, ": ", message
+
+  test "cgroups and job-priority coexist in [enforcement]":
+    let config = parseHostConfig(
+      "[enforcement]\ncgroups = \"off\"\njob-priority = \"on\"\n", "test.toml")
+    check config.enforcementCgroups == some(false)
+    check config.enforcementJobPriority == some(true)
+
+  test "runquota config set writes it and refuses anything but on or off":
+    let root = scratch("enforcement-jobpriority")
+    let path = root / "runquotad.toml"
+    var changed = false
+    let text = editHostConfig(path, "enforcement.job-priority", "on",
+      unset = false, changed)
+    check changed
+    check "[enforcement]\njob-priority = \"on\"" in text
+    writeFile(path, text)
+    check readHostConfig(path).enforcementJobPriority == some(true)
+    for value in ["yes", "1", "\"on\""]:
+      expect HostConfigError:
+        discard editHostConfig(path, "enforcement.job-priority", value,
+          unset = false, changed)
+
 for root in scratchRoots:
   removeDir(root)

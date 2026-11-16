@@ -511,11 +511,24 @@ when defined(linux):
       check "reclaimed" in macGaps
       check "not enforced: " in mac.summaryLine
       check "width-cap: macOS has no hard CPU cap" in mac.summaryLine
+      # Windows, job-priority OFF by default: the reclaimed tree's below-normal
+      # class and the width cap are enforced; priority between groups is
+      # admission-only until the switch is on.
       let win = enforcementRecordFor("windows")
-      check win.gaps.len == 3
+      check win.gaps.len == 2
       check "width-cap=enforced" in win.summaryLine
-      check "priority: Job Object priority classes per group are not " &
-        "implemented yet" in win.summaryLine
+      check "reclaimed=enforced" in win.summaryLine
+      check "priority: job priority off:" in win.summaryLine
+      # With the switch ON the lower priority tiers are enforced (a Job Object
+      # priority class per group), but the urgent tier needs a privilege an
+      # ordinary launcher lacks, so priority is degraded with that caveat as a
+      # gap alongside the memory cap.
+      let winOn = enforcementRecordFor("windows", jobPriorityOn = true)
+      check winOn.gaps.len == 2
+      check winOn.gaps[0].mechanism == emPriority
+      check winOn.gaps[1].mechanism == emMemoryCap
+      check "priority=degraded" in winOn.summaryLine
+      check "urgent tier" in winOn.summaryLine
       for record in [mac, win]:
         let parsed = parseJson(record.toJson())
         check parsed["mechanisms"].len == 4

@@ -284,6 +284,23 @@ proc launcherCgroupRoot*(): CgroupRoot =
   if problem.len > 0 and result.state == crsOff:
     result.reason = "off: the host file could not be read (" & problem & ")"
 
+proc launcherJobPriorityOn*(): bool =
+  ## Windows: whether RunQuota's CLI launchers force each leased tree's Job
+  ## Object to its group's priority class below admission -- the variable
+  ## `RUNQUOTA_JOB_PRIORITY`, then the host file's `[enforcement] job-priority`
+  ## (off when absent). A host file that cannot be read or parsed leaves it
+  ## off: a launcher never fails over a setting it only consults. Always off
+  ## off Windows, where the launcher has no Job Objects to limit (and reads no
+  ## host file for this).
+  when defined(windows):
+    var switchOn = false
+    if getEnv(JobPriorityEnvVar).strip().len == 0:
+      var problem = ""
+      switchOn = enforcementJobPriorityOn(problem)
+    currentJobPriorityOn(switchOn)
+  else:
+    false
+
 proc chooseAdapter(options: RunOptions): int =
   case options.adapter
   of "none": -1
@@ -392,7 +409,8 @@ proc runRun*(args: seq[string];
   try:
     placement = session.treePlacement(lease,
       capMilli = (if options.cap: uint64(lease.resources.cpu.value) else: 0'u64),
-      root = launcherCgroupRoot())
+      root = launcherCgroupRoot(),
+      jobPriorityOn = launcherJobPriorityOn())
   except RunQuotaClientError as failure:
     stderr.writeLine("runquota run: " &
       describeFailure(failure.msg, client.lastDiagnostic))

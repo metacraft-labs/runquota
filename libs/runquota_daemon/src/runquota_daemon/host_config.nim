@@ -139,6 +139,13 @@ type
       ## Read by the LAUNCHING CLIENT, not by `runquotad`, which never touches
       ## a cgroup; the daemon only validates it with the rest of the file. Off
       ## when absent.
+    enforcementJobPriority*: Option[bool]
+      ## `[enforcement] job-priority`, `"on"` or `"off"`: whether RunQuota's
+      ## launchers on this host force each leased tree's Job Object to its
+      ## group's priority class below admission (Windows). Read by the
+      ## LAUNCHING CLIENT, not by `runquotad`, which spawns no trees; the
+      ## daemon only validates it. Off when absent (the Windows analogue of
+      ## `[enforcement] cgroups`, off until the overhead gate passes it).
     pressureHighPct*: Option[float64]
     pressureLowPct*: Option[float64]
       ## `[admission] pressure-high` / `pressure-low`, percentages 0..100,
@@ -398,9 +405,17 @@ proc parseHostConfig*(text, path: string): HostConfig =
         else:
           fail(path, lineNo, "cgroups must be \"on\" or \"off\", got " &
             value)
+      of "job-priority":
+        let raw = parseQuoted(value, path, lineNo)
+        case raw
+        of "on": result.enforcementJobPriority = some(true)
+        of "off": result.enforcementJobPriority = some(false)
+        else:
+          fail(path, lineNo, "job-priority must be \"on\" or \"off\", got " &
+            value)
       else:
         fail(path, lineNo, "unknown key `" & key & "` in [enforcement]; " &
-          "expected cgroups")
+          "expected cgroups or job-priority")
     else:
       discard
   # THE THRESHOLDS ARE JUDGED TOGETHER, after the defaults fill an absent
@@ -436,6 +451,20 @@ proc enforcementCgroupsOn*(problem: var string;
   problem = ""
   try:
     readHostConfig(path).enforcementCgroups.get(false)
+  except CatchableError as failure:
+    problem = failure.msg
+    false
+
+proc enforcementJobPriorityOn*(problem: var string;
+                               path = hostConfigPath): bool =
+  ## `[enforcement] job-priority` of the host file, for a LAUNCHING CLIENT
+  ## (RunQuota's CLI launchers on Windows): true only when the file turns it
+  ## on. A file that cannot be read or parsed answers false with `problem`
+  ## set: a launcher never fails over a setting it only consults. Mirrors
+  ## `enforcementCgroupsOn`.
+  problem = ""
+  try:
+    readHostConfig(path).enforcementJobPriority.get(false)
   except CatchableError as failure:
     problem = failure.msg
     false
@@ -495,7 +524,7 @@ proc parseHostConfigKey*(key: string): HostConfigKey =
       "`; expected machine.memory_bytes, machine.cpu_milli, pools.NAME or " &
       "admission.order, admission.max-wait, admission.share-between-users, " &
       "admission.predictive, admission.horizon, admission.pressure-high, " &
-      "admission.pressure-low, enforcement.cgroups")
+      "admission.pressure-low, enforcement.cgroups, enforcement.job-priority")
   result = HostConfigKey(section: key[0 ..< dot], name: key[dot + 1 .. ^1])
   case result.section
   of "machine":
@@ -515,9 +544,9 @@ proc parseHostConfigKey*(key: string): HostConfigKey =
         "`; [admission] has order, max-wait, share-between-users, " &
         "predictive, horizon, pressure-high and pressure-low")
   of "enforcement":
-    if result.name != "cgroups":
+    if result.name notin ["cgroups", "job-priority"]:
       raise newException(HostConfigError, "unknown key `" & key &
-        "`; [enforcement] has cgroups")
+        "`; [enforcement] has cgroups and job-priority")
   else:
     raise newException(HostConfigError, "unknown table `" & result.section &
       "` in `" & key & "`; expected machine, pools, admission or enforcement")
