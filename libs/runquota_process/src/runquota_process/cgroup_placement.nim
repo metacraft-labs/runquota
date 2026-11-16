@@ -122,10 +122,13 @@ type
 
   GroupPriorityRead* = proc (context: pointer;
                              priority: var SessionPriority): bool {.
-    nimcall, raises: [].}
+    nimcall, gcsafe, raises: [].}
     ## Asks whoever holds the group's priority (the daemon) for the one in
     ## force NOW. False when it cannot answer; the caller then keeps the
-    ## weight it already had. Must not raise.
+    ## weight it already had. Must not raise, and must be GC-safe:
+    ## `launchProcess` calls it, and a launcher that is itself called from
+    ## GC-safe code (a thread procedure, a `{.gcsafe.}` callback in a
+    ## consumer) stops compiling if one indirect call here is not.
 
   GroupPrioritySource* = object
     ## Where the priority of a group's weight is read at the moment the

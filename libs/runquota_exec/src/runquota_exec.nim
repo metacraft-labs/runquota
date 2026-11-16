@@ -51,7 +51,7 @@ type
 
 proc readSessionGroupPriority(context: pointer;
                               priority: var SessionPriority): bool {.
-    nimcall, raises: [].} =
+    nimcall, gcsafe, raises: [].} =
   ## `GroupPrioritySource.read` over a `RunQuotaSession` (the context): the
   ## group's priority asked from the daemon now. Never raises: a daemon that
   ## cannot answer leaves the launch with the weight it already chose
@@ -80,7 +80,7 @@ type
 
 proc readQueriedGroupPriority(context: pointer;
                               priority: var SessionPriority): bool {.
-    nimcall, raises: [].} =
+    nimcall, gcsafe, raises: [].} =
   if context.isNil:
     return false
   let query = cast[ptr GroupPriorityQuery](context)

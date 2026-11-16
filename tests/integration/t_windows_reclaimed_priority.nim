@@ -55,7 +55,7 @@ when defined(windows):
     AboveNormalPriorityClass = 0x00008000'u32
 
   proc readFixedHigh(context: pointer; priority: var SessionPriority): bool
-      {.nimcall, raises: [].} =
+      {.nimcall, gcsafe, raises: [].} =
     ## A `GroupPrioritySource.read` that answers `high` -- the test's stand-in
     ## for a `runquota session set --priority high` the daemon has taken by the
     ## time the launch reads the priority in force, after the placement decided

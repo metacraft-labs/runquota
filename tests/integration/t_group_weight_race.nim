@@ -194,7 +194,7 @@ when defined(linux):
   var injection: Injection
 
   proc injectingRead(context: pointer; priority: var SessionPriority): bool {.
-      nimcall, raises: [].} =
+      nimcall, gcsafe, raises: [].} =
     ## The production read, then (once) a real `session set --priority
     ## urgent` that is let run up to its weight write before the launcher
     ## goes on to write the weight of the priority it read.
@@ -203,14 +203,21 @@ when defined(linux):
     if state[].injected:
       return
     state[].injected = true
-    try:
-      state[].setter = startSet(state[].group, "urgent")
-      state[].problem = awaitAcceptedAndParked(state[].setter, state[].group,
-        sessionPriorityUrgent)
-    except Exception as error:
-      # `Exception`, not only `CatchableError`: osproc's effects say
-      # `Exception`, and a read source must not raise at all.
-      state[].problem = "injection failed: " & error.msg
+    # GC-SAFE BY CONSTRUCTION, NOT BY INFERENCE. A read source must be
+    # `gcsafe` (the launcher is called from GC-safe code), and the injection
+    # starts a process through test helpers the compiler cannot prove
+    # GC-safe. This read runs on the launching thread of a single-threaded
+    # test, touching only the `Injection` it was handed, so no heap is
+    # shared across threads.
+    {.cast(gcsafe).}:
+      try:
+        state[].setter = startSet(state[].group, "urgent")
+        state[].problem = awaitAcceptedAndParked(state[].setter,
+          state[].group, sessionPriorityUrgent)
+      except Exception as error:
+        # `Exception`, not only `CatchableError`: osproc's effects say
+        # `Exception`, and a read source must not raise at all.
+        state[].problem = "injection failed: " & error.msg
 
   template needRoot(): bool =
     if testRoot.len == 0:
