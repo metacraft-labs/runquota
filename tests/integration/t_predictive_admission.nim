@@ -92,14 +92,27 @@
 ## file. NO MOCKS beyond the two files above: the built `runquotad` and
 ## `runquota`, a real store, real processes.
 
-when defined(linux):
+## PLATFORMS. Linux and macOS (the file compiled to nothing on macOS before
+## the macOS port of predictive admission: its guard said Linux only, for
+## want of a reason -- the launcher's nice, the profiles and the daemon are all POSIX, and profiles
+## work on macOS). The one Linux-only check is that the
+## reclaimed tree runs in the reclaimed cgroup of a test-owned root; on macOS
+## the case prints the host's enforcement record instead and requires that it
+## names the mechanism that IS used (nice +10), so the missing mechanism is a
+## visible capability record, never a silent pass. The lower weight on macOS
+## is `nice` (`setpriority` through `nice(2)` in the child before `exec`,
+## inherited by the tree): the second job's own `getpriority` reads 10.
+## Background QoS for reclaimed trees is not implemented yet, so not used here.
+
+when defined(linux) or defined(macosx):
   import std/[json, monotimes, os, osproc, streams, strtabs, strutils, unittest]
   import std/posix
 
   import runquota_client
   import runquota_core
   import runquota_process
-  import cgroup_test_root
+  when defined(linux):
+    import cgroup_test_root
   import daemon_binary
   import private_daemon_fixture
 
@@ -115,8 +128,10 @@ when defined(linux):
     ## `OUT` (start and end ns) at the end.
     let started = monoNs()
     let nice = getpriority(PRIO_PROCESS, Id(0))
-    writeFile(output & ".start", $started & " " & $nice & " " &
-      cgroupOfPid(getCurrentProcessId()) & "\n")
+    let cgroup =
+      when defined(linux): cgroupOfPid(getCurrentProcessId())
+      else: "-"
+    writeFile(output & ".start", $started & " " & $nice & " " & cgroup & "\n")
     let deadline = started + int64(seconds * 1e9)
     var x = 0'u64
     while monoNs() < deadline:
@@ -412,13 +427,14 @@ when defined(linux):
       # this test's own, so the reclaimed grant the DAEMON made is seen to
       # land in the reclaimed subtree. Without a delegated subtree the rest
       # of the case still runs, and only this check is reported skipped.
-      var cgroupReason = ""
-      let cgroupRoot = delegatedTestRoot(cgroupReason)
-      if cgroupRoot.len > 0:
-        env[CgroupRootEnvVar] = cgroupRoot
-      defer:
-        let problem = removeTestRoot(cgroupRoot)
-        check problem == ""
+      when defined(linux):
+        var cgroupReason = ""
+        let cgroupRoot = delegatedTestRoot(cgroupReason)
+        if cgroupRoot.len > 0:
+          env[CgroupRootEnvVar] = cgroupRoot
+        defer:
+          let problem = removeTestRoot(cgroupRoot)
+          check problem == ""
       train(socket, root, env, 4.0, 8.0)
       let run = pair(root, env, 4.0, 8.0)
       checkpoint run.outputs
@@ -437,14 +453,33 @@ when defined(linux):
       check run.second.nice == 10
       check run.first.nice == 0
       check reclaimedGranted(socket) == 1
-      if cgroupRoot.len > 0:
-        let relativeRoot = cgroupRoot[CgroupMountPoint.len .. ^1]
-        check run.second.cgroup == relativeRoot & "/" & ReclaimedDirName &
-          "/" & SharedLeafName
-        check run.first.cgroup.startsWith(relativeRoot & "/" & GroupDirPrefix)
-        check run.first.cgroup.endsWith("/" & SharedLeafName)
+      when defined(linux):
+        if cgroupRoot.len > 0:
+          let relativeRoot = cgroupRoot[CgroupMountPoint.len .. ^1]
+          check run.second.cgroup == relativeRoot & "/" & ReclaimedDirName &
+            "/" & SharedLeafName
+          check run.first.cgroup.startsWith(relativeRoot & "/" & GroupDirPrefix)
+          check run.first.cgroup.endsWith("/" & SharedLeafName)
+        else:
+          echo "SKIPPED (the reclaimed cgroup check only): " & cgroupReason
       else:
-        echo "SKIPPED (the reclaimed cgroup check only): " & cgroupReason
+        # CAPABILITY RECORD (RQE-AREQ4): no cgroups here. The record the
+        # host publishes must say the lower weight is nice, at a degraded
+        # level, and the nice reading above already proved it applied.
+        let record = hostEnforcementRecord()
+        for line in record.renderLines:
+          echo "CAPABILITY RECORD: " & line
+        var reclaimedHow = ""
+        var reclaimedLevel = elEnforced
+        for item in record.entries:
+          if item.mechanism == emReclaimed:
+            reclaimedHow = item.how
+            reclaimedLevel = item.level
+        check record.os == "macos"
+        check reclaimedHow == "nice +" & $ReclaimedNiceIncrement
+        check reclaimedLevel == elDegraded
+        echo "NOT CHECKED on macOS: the reclaimed tree's cgroup (no cgroups); " &
+          "the reclaimed weight is nice +10, read from the tree itself above"
       # The bound: at least 20% shorter than declared-width admission.
       checkpoint "makespan " & seconds(predictive) & " s vs declared " &
         seconds(declared) & " s"

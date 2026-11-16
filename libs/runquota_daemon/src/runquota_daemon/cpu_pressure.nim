@@ -27,17 +27,33 @@
 ## MACOS AND WINDOWS. There is no ``/proc/pressure/cpu`` there. A file named
 ## with ``--cpu-pressure-file`` is read on every platform (the parse is pure,
 ## portable text; it is how tests hold the signal). With no such override the
-## macOS reader still answers unavailable until its run-queue reading arrives,
+## macOS reader derives a run-queue length from ``getloadavg(3)`` (below),
 ## while WINDOWS reads the Performance Data Helper counter ``\System\Processor
 ## Queue Length`` -- the threads ready to run but waiting for a processor, the
 ## signal Task Manager reads for CPU contention. That count is normalized to
 ## the gate's 0..100 scale (``WindowsQueuePressureScale``) so a value in the
-## same units reaches the same gate, the way the macOS run-queue reading will:
+## same units reaches the same gate, as does the macOS run-queue reading:
 ## nothing above the reader changes by platform. The Windows reading is an
 ## APPROXIMATION of PSI, not the same measurement -- it is an instantaneous
 ## queue sample, where PSI's ``avg10`` is a ten-second time average -- so it
 ## is noisier and carries no history; the gate's hysteresis and its read
 ## cadence stand in for the averaging.
+##
+## The macOS reading is the 1-minute load average from ``getloadavg(3)``
+## (the kernel's own exponentially averaged count of threads running or
+## ready to run, sampled every five seconds: macOS has no cheaper
+## per-instant run-queue figure that needs no entitlement). The load counts
+## the threads that are RUNNING as well as the ones waiting, so the waiting
+## part -- the run queue proper -- is estimated as ``load - logicalProcessors``
+## (floored at 0): a host running exactly as many threads as it has cores has
+## an empty queue. That queue length is normalized exactly as Windows'
+## (``QueuePressureScale``, ten units per waiting thread per logical
+## processor), so the shared defaults mean the same physical thing on both.
+## It is an APPROXIMATION of PSI and slower than Windows' instantaneous
+## count (a one-minute average rises over tens of seconds and decays as
+## slowly), which makes the gate's closing late and its reopening later: it
+## errs toward not admitting reclaimed work and not widening just after a
+## burst, never toward admitting into a host that is saturated now.
 ##
 ## The gate and the parser are pure; only ``readCpuPressure`` (and, on
 ## Windows, the PDH query it makes when no file overrides it) touches the
@@ -45,8 +61,12 @@
 
 import std/strutils
 
-when defined(windows):
+when defined(windows) or defined(macosx):
   import std/cpuinfo
+
+when defined(macosx):
+  proc getloadavg(loadavg: ptr cdouble; nelem: cint): cint
+    {.importc: "getloadavg", header: "<stdlib.h>".}
 
 const
   DefaultCpuPressureFile* = "/proc/pressure/cpu"
@@ -67,6 +87,10 @@ const
     ## queued as it has cores -- and half that reads 5, the default reopen
     ## point. The shared thresholds therefore keep a defensible physical
     ## meaning on Windows without a platform-specific default.
+
+  QueuePressureScale* = WindowsQueuePressureScale
+    ## The same normalization scale, named for the platforms that read a run
+    ## queue (macOS as well as Windows).
 
 type
   CpuPressureSample* = object
@@ -188,12 +212,44 @@ when defined(windows):
     if pct > 100.0: pct = 100.0
     CpuPressureSample(available: true, someAvg10Pct: pct)
 
+proc queuePressureFromLoad*(load: float64; logicalProcessors: int):
+    CpuPressureSample =
+  ## The macOS normalization, pure so it is tested without a loaded host:
+  ## the waiting threads are ``load - logicalProcessors`` (floored at 0),
+  ## and the pressure is ``min(100, waiting / logicalProcessors * scale)``.
+  ## A negative, NaN or infinite load, or no processors, is unavailable.
+  if logicalProcessors < 1:
+    return CpuPressureSample(available: false,
+      detail: "no logical processors")
+  if load != load or load < 0.0 or load > 1.0e12:
+    return CpuPressureSample(available: false,
+      detail: "load average out of range")
+  let cores = float64(logicalProcessors)
+  var pct = max(0.0, load - cores) / cores * QueuePressureScale
+  if pct > 100.0: pct = 100.0
+  CpuPressureSample(available: true, someAvg10Pct: pct)
+
+when defined(macosx):
+  proc readMacosRunQueuePressure(): CpuPressureSample =
+    ## The production default on macOS: the 1-minute load average.
+    var avg: array[3, cdouble]
+    if getloadavg(addr avg[0], 1) < 1:
+      return CpuPressureSample(available: false,
+        detail: "getloadavg failed")
+    queuePressureFromLoad(float64(avg[0]), countProcessors())
+
 proc readCpuPressure*(path: string): CpuPressureSample =
   ## Read the CPU pressure signal. A ``--cpu-pressure-file`` override (any
   ## path but the default) is read as a PSI-format file on every platform;
   ## with no override, Linux reads the default PSI file, Windows the native
-  ## PDH queue-length reader, and macOS answers unavailable for now.
-  when defined(windows):
+  ## PDH queue-length reader, and macOS the run queue estimated from the
+  ## load average.
+  when defined(macosx):
+    if path == DefaultCpuPressureFile:
+      readMacosRunQueuePressure()
+    else:
+      readCpuPressureFile(path)
+  elif defined(windows):
     if path == DefaultCpuPressureFile:
       readWindowsProcessorQueuePressure()
     else:
