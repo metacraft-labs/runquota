@@ -337,6 +337,27 @@ normal. Because of that `runquota status` reports priority as `degraded` on
 Windows with the switch on, naming the urgent-tier gap, with
 `enforcement_os: windows`.
 
+**On macOS** there are no cgroups and no CPU cap. A launcher that keeps
+`fork` and `execve` (so that preload libraries' fork handlers still run) can
+put a tree under the *background policy* (`setpriority(PRIO_DARWIN_BG)`, what
+`taskpolicy -b` does), which the scheduler honours and every process of the
+tree inherits. Nothing between the default and background can be set that way,
+and a plain `nice` did not change the CPU share of an exec'd tree in
+measurement, so macOS has two levels: a reclaimed grant's tree and a `low`
+group's tree run in the background, everything else is unchanged (`high` and
+`urgent` do not rise above `normal`). The switch is off by default:
+
+```toml
+[enforcement]
+qos = "on"
+```
+
+(`runquota config set enforcement.qos on`). `RUNQUOTA_QOS=off` turns it off for
+one user or shell and `=on` turns it on. `runquota status` reports `priority`
+as `degraded` and `reclaimed` as `enforced` with the switch on, and says what
+is missing; with it off `priority` is `admission-only` and `reclaimed` is
+`degraded` (its nice +10, which does not schedule an exec'd tree on macOS).
+
 ## `runquota jobserver`
 
 Run a command that speaks the GNU make jobserver protocol under one lease, and
