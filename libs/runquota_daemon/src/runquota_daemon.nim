@@ -12,6 +12,7 @@ import runquota_daemon/types as daemonTypes
 # every leg rather than only on the one that uses it.
 import runquota_daemon/windows_service
 import runquota_daemon/host_config
+import runquota_daemon/benchmark_policy
 import runquota_daemon/host_memory
 import runquota_daemon/reload_report
 import runquota_daemon/child_identity
@@ -119,6 +120,8 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     retentionPolicy: defaultRetentionPolicy(),
     retentionSweepIntervalMillis: defaultRetentionSweepIntervalMillis,
     retentionMaxDeferredSweeps: defaultMaxDeferredSweeps,
+    benchmarkMaxQueueWaitMillis: DefaultBenchmarkMaxQueueWaitMillis,
+    benchmarkMaxHoldMillis: DefaultBenchmarkMaxHoldMillis,
     admissionMaxWaitMillis: DefaultMaxWaitMillis,
     admissionOrder: @DefaultAdmissionOrder,
     shareBetweenUsers: sbuDrf,
@@ -213,6 +216,17 @@ proc applyPredictiveKeys(config: var DaemonConfig; host: HostConfig) =
   config.pressureHighPct = host.pressureHighPct.get(DefaultPressureHighPct)
   config.pressureLowPct = host.pressureLowPct.get(DefaultPressureLowPct)
 
+proc applyBenchmarkPolicy(config: var DaemonConfig; host: HostConfig) =
+  ## `[benchmark]` of the host file, or the built-in bounds. Used by start
+  ## and by every reload (`resolveBudget`), so an absent key returns to its
+  ## default.
+  config.benchmarkAllowedUsers = host.benchmarkAllowedUsers
+  config.benchmarkAllowedGroups = host.benchmarkAllowedGroups
+  config.benchmarkMaxQueueWaitMillis =
+    host.benchmarkMaxQueueWaitMillis.get(DefaultBenchmarkMaxQueueWaitMillis)
+  config.benchmarkMaxHoldMillis =
+    host.benchmarkMaxHoldMillis.get(DefaultBenchmarkMaxHoldMillis)
+
 proc applyHostConfig*(config: var DaemonConfig; host: HostConfig) =
   ## Overlay the host budget file (`runquota_daemon/host_config`) onto
   ## `defaultDaemonConfig`. `runquotad` applies its flags after this, which is
@@ -228,6 +242,7 @@ proc applyHostConfig*(config: var DaemonConfig; host: HostConfig) =
   config.admissionOrder = admissionOrderOf(host)
   config.shareBetweenUsers = shareBetweenUsersOf(host)
   config.applyPredictiveKeys(host)
+  config.applyBenchmarkPolicy(host)
 
 proc recomputePoolCaps*(config: var DaemonConfig) =
   ## The pool caps from the bottom up: what open sessions declared
@@ -339,6 +354,7 @@ proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
   config.admissionOrder = order
   config.shareBetweenUsers = share
   config.applyPredictiveKeys(host)
+  config.applyBenchmarkPolicy(host)
 
 proc machineCapacity*(id: string; cpuSlots: MilliCpu; memoryBytes: Bytes;
                       ioSlots: uint32; cpuShareGroup = ""): MachineCapacity =
@@ -1123,7 +1139,9 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
       daemon.sessionGroups[lease.groupKey].grantedCpuMilliMillis +=
         uint64(cpuDelta) * elapsedSince(since)
       daemon.sessionGroups[lease.groupKey].changeHeldCpu(-int64(cpuDelta))
-    if lease.purpose == leasePurposeBenchmark and daemon.activeBenchmarkCount > 0'u32:
+    if lease.purpose == leasePurposeBenchmark and
+        not lease.benchmarkGateReleased and
+        daemon.activeBenchmarkCount > 0'u32:
       dec daemon.activeBenchmarkCount
   # AMBIENT SAMPLING IS GATED ON THIS. The sampler writes no row over an
   # interval in which no lease was live, so the count has to be published
@@ -2790,6 +2808,22 @@ proc handleHello(daemon: var RunQuotaDaemon; connection: var LocalConnection;
   context.peer = peer
   true
 
+proc benchmarkPermitted(daemon: RunQuotaDaemon; sessionId: SessionId): bool =
+  ## Whether the session's peer may hold the whole host to itself
+  ## (`runquota_daemon/benchmark_policy`).
+  let ownerId =
+    when defined(posix): int64(getuid())
+    else: currentProcessOwnerId().get(-1'i64)
+  daemon.sessions[sessionId.value].peer.benchmarkAllowed(ownerId,
+    daemon.config.benchmarkAllowedUsers, daemon.config.benchmarkAllowedGroups)
+
+proc benchmarkRefusal(daemon: RunQuotaDaemon): Diagnostic =
+  diagnostic(diagDenied,
+    "this user may not take a benchmark lease on this host",
+    "a benchmark lease stops every other grant; the host file's [benchmark] " &
+    "allowed-users or allowed-groups must name the caller (the daemon's own " &
+    "user and root are always allowed); " & daemon.refusedByText())
+
 proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
                        clientCandidateId: uint64; label: string;
                        commandStatsId: string; resources: ResourceVector;
@@ -3938,10 +3972,53 @@ proc widenIntoFreeSlots(daemon: var RunQuotaDaemon; now: int64) =
     let added = daemon.leases[candidate.id].resources.cpu.value - charged
     plan.noteGranted(candidate.owner, uint64(added), 0'u64, candidate.groupKey)
 
+proc enforceBenchmarkBounds(daemon: var RunQuotaDaemon) =
+  ## A benchmark lease may stop everyone else's admission only for a bounded
+  ## time, because the daemon is host-wide and one user's benchmark (or a
+  ## crashed benchmark supervisor whose child still runs) must not halt the
+  ## host indefinitely.
+  ## * A QUEUED benchmark older than `benchmarkMaxQueueWaitMillis` is
+  ##   denied; its session is told on its next `GrantNext`, and the queue
+  ##   behind it is freed.
+  ## * A GRANTED benchmark older than `benchmarkMaxHoldMillis` stops gating:
+  ##   it keeps its resources (the daemon never kills a client's process), but
+  ##   new grants only need to fit beside it.
+  if daemon.activeBenchmarkCount == 0'u32 and
+      daemon.earliestQueuedBenchmarkId() == 0'u64:
+    return
+  let now = monoMillis()
+  var expiredQueued: seq[uint64] = @[]
+  var expiredHeld: seq[uint64] = @[]
+  for id, lease in daemon.leases.pairs:
+    if lease.purpose != leasePurposeBenchmark or lease.parentLeaseId != 0'u64:
+      continue
+    if lease.state == leaseStateQueued:
+      if now - lease.queuedAtMillis > daemon.config.benchmarkMaxQueueWaitMillis:
+        expiredQueued.add(id)
+    elif lease.state.isResourceActive and not lease.benchmarkGateReleased and
+        now - lease.grantedAtMillis > daemon.config.benchmarkMaxHoldMillis:
+      expiredHeld.add(id)
+  for id in expiredQueued:
+    let lease = daemon.leases[id]
+    daemon.pendingDenials.mgetOrPut(lease.sessionId.value, @[]).add(
+      lease.leaseDecision(leaseDecisionDenied, diagnostic(diagDenied,
+        "benchmark lease waited too long for the host to drain",
+        "a queued benchmark may stop other grants for at most " &
+        $(daemon.config.benchmarkMaxQueueWaitMillis div 1000) &
+        " s ([benchmark] max-queue-wait); " & daemon.refusedByText())))
+    daemon.removeLeaseFromTable(id)
+  for id in expiredHeld:
+    var lease = daemon.leases[id]
+    lease.benchmarkGateReleased = true
+    daemon.leases[id] = lease
+    if daemon.activeBenchmarkCount > 0'u32:
+      dec daemon.activeBenchmarkCount
+
 proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
     uint32)): seq[uint64] =
   # Before deciding what fits, stop counting what is no longer there.
   discard daemon.reapLostLeases()
+  daemon.enforceBenchmarkBounds()
   # THE ORDER IS `runquota_admission`'s: fairness between owners (unless the
   # host configured `share-between-users = none`, which drops only the
   # division by usage: group attributes still rank only their owner's
@@ -4756,6 +4833,12 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
         encodeLeaseDenied(LeaseDeniedMessage(sessionId: msg.sessionId,
           diagnostic: diagnostic(diagInvalidArgument, malformed))))
       return
+    if msg.purpose == leasePurposeBenchmark and
+        not daemon.benchmarkPermitted(msg.sessionId):
+      connection.sendResponse(rqLeaseDenied, frame.header.requestId,
+        encodeLeaseDenied(LeaseDeniedMessage(sessionId: msg.sessionId,
+          diagnostic: daemon.benchmarkRefusal())))
+      return
     var reason = ""
     # The owner of the SESSION, which is what the lease will be recorded as
     # (`createQueuedLease` copies the session's peer).
@@ -5009,6 +5092,14 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           kind: leaseDecisionDenied,
           resources: effective,
           diagnostic: diagnostic(diagInvalidArgument, malformed)))
+      elif candidate.purpose == leasePurposeBenchmark and
+          not daemon.benchmarkPermitted(msg.sessionId):
+        decisions.add(LeaseDecision(
+          clientCandidateId: candidate.clientCandidateId,
+          leaseId: leaseId(0),
+          kind: leaseDecisionDenied,
+          resources: effective,
+          diagnostic: daemon.benchmarkRefusal()))
       elif not daemon.possible(effective.rangedResources(candidate.width),
           ownerKeyOf(daemon.sessions[msg.sessionId.value].peer), reason):
         decisions.add(LeaseDecision(

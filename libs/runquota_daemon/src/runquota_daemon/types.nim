@@ -220,6 +220,14 @@ type
     socketActivation*: SocketActivation
       ## Set by `runquotad` from `takeSocketActivation` at start. See
       ## `runquota_daemon/socket_activation`.
+    benchmarkAllowedUsers*: seq[string]
+    benchmarkAllowedGroups*: seq[string]
+      ## Who may take a `purpose = benchmark` lease besides the daemon's own
+      ## user and root (host file `[benchmark]`).
+    benchmarkMaxQueueWaitMillis*: int64
+    benchmarkMaxHoldMillis*: int64
+      ## The two bounds on how long a benchmark may stop everyone else's
+      ## admission: queued (denied after) and granted (stops gating after).
     admissionMaxWaitMillis*: int64
       ## The starvation bound in force (`runquotad
       ## --admission-max-wait-millis`, else the host file's
@@ -359,6 +367,9 @@ type
       ## The session group of the session that made the request, copied at
       ## request time: a lease whose supervisor was lost outlives its session
       ## and still holds capacity on that group's behalf.
+    benchmarkGateReleased*: bool
+      ## A benchmark lease held past `benchmarkMaxHoldMillis`: it still holds
+      ## its resources but no longer gates other grants.
     queuedAtMillis*: int64
     grantedAtMillis*: int64
       ## Monotonic milliseconds (`monoMillis`) at which the request was queued

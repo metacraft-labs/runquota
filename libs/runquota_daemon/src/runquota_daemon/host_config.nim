@@ -81,6 +81,16 @@ const
     ## here because this module stays standard-library only (see above);
     ## `libs/runquota_daemon/tests/t_host_config_admission` refuses a drift.
 
+  DefaultBenchmarkMaxQueueWaitMillis* = 10'i64 * 60_000'i64
+    ## A queued benchmark gates every other lease while it waits for the
+    ## host to drain, so the wait is bounded: past this it is denied and
+    ## normal admission resumes. Host-wide daemon, many users: no benchmark
+    ## may hold the host unbounded.
+  DefaultBenchmarkMaxHoldMillis* = 60'i64 * 60_000'i64
+    ## A granted benchmark gates admission for at most this long; after it,
+    ## the lease keeps its resources (RunQuota never kills a client) but no
+    ## longer blocks other grants.
+
   ShareBetweenUsersValues* = ["drf", "none"]
     ## `[admission] share-between-users`; `runquota_admission.ShareBetweenUsers`.
 
@@ -127,6 +137,19 @@ type
     pressureLowPct*: Option[float64]
       ## `[admission] pressure-high` / `pressure-low`, percentages 0..100,
       ## low not above high once the defaults fill an absent one.
+    benchmarkAllowedUsers*: seq[string]
+      ## `[benchmark] allowed-users`: user names or decimal uids (Windows:
+      ## SID strings) that may take a `purpose = benchmark` lease besides the
+      ## daemon's own user and root.
+    benchmarkAllowedGroups*: seq[string]
+      ## `[benchmark] allowed-groups`: group names whose members (or primary
+      ## group) may take a benchmark lease.
+    benchmarkMaxQueueWaitMillis*: Option[int64]
+      ## `[benchmark] max-queue-wait`: how long a benchmark may sit queued,
+      ## gating every other lease, before it is denied.
+    benchmarkMaxHoldMillis*: Option[int64]
+      ## `[benchmark] max-hold`: how long a granted benchmark gates
+      ## admission before normal admission resumes.
     sourcePath*: string
       ## Where it was read from; empty when no file existed. Kept so a denial
       ## can say whose budget it enforced.
@@ -250,9 +273,9 @@ proc parseHostConfig*(text, path: string): HostConfig =
       if not line.endsWith("]") or line.startsWith("[["):
         fail(path, lineNo, "unsupported table header `" & line & "`")
       section = line[1 .. ^2].strip()
-      if section notin ["machine", "pools", "admission"]:
+      if section notin ["machine", "pools", "admission", "benchmark"]:
         fail(path, lineNo, "unknown table `[" & section & "]`; expected " &
-          "[machine], [pools] or [admission]")
+          "[machine], [pools], [admission] or [benchmark]")
       continue
     let eq = line.find('=')
     if eq <= 0:
@@ -341,6 +364,23 @@ proc parseHostConfig*(text, path: string): HostConfig =
         fail(path, lineNo, "unknown key `" & key & "` in [admission]; " &
           "expected order, max-wait, share-between-users, predictive, " &
           "horizon, pressure-high or pressure-low")
+    of "benchmark":
+      case key
+      of "allowed-users":
+        result.benchmarkAllowedUsers = parseStringArray(value, path, lineNo)
+      of "allowed-groups":
+        result.benchmarkAllowedGroups = parseStringArray(value, path, lineNo)
+      of "max-queue-wait", "max-hold":
+        var millis = 0'i64
+        if not parseDurationMillis(parseQuoted(value, path, lineNo), millis) or
+            millis <= 0:
+          fail(path, lineNo, key & " must be a positive duration such as " &
+            "\"10m\" or \"90s\", got " & value)
+        if key == "max-hold": result.benchmarkMaxHoldMillis = some(millis)
+        else: result.benchmarkMaxQueueWaitMillis = some(millis)
+      else:
+        fail(path, lineNo, "unknown key `" & key & "` in [benchmark]; " &
+          "expected allowed-users, allowed-groups, max-queue-wait or max-hold")
     else:
       discard
   # THE THRESHOLDS ARE JUDGED TOGETHER, after the defaults fill an absent
