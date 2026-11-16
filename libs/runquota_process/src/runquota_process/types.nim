@@ -52,6 +52,13 @@ type
     stderrLimit*: int
     createProcessGroup*: bool
     stdio*: ProcessStdio
+    niceIncrement*: int
+      ## Added to the child's nice value before it executes (POSIX), so
+      ## the whole tree it starts inherits the lower scheduling weight. 0
+      ## leaves it unchanged. A launcher sets it for a RECLAIMED grant (CPU
+      ## admitted into predicted slack), which must yield to the work it
+      ## was admitted beside. Not applied on Windows yet: a Windows
+      ## launcher does not accept reclaimed grants.
 
   LaunchResult* = object
     processId*: uint64

@@ -17,6 +17,7 @@ import runquota_daemon/reload_report
 import runquota_daemon/child_identity
 import runquota_daemon/parent_watch
 import runquota_daemon/socket_activation
+import runquota_daemon/prediction
 import runquota_admission
 import runquota_codec
 import runquota_core
@@ -58,6 +59,10 @@ const libraryName* = "runquota_daemon"
 
 proc libraryInfo*(): daemonTypes.LibraryInfo =
   daemonTypes.LibraryInfo(name: libraryName)
+
+const DefaultAdmissionHorizonMillis* = 10_000'i64
+  ## `admission.horizon`: how far ahead a reclaimed grant's CPU must be
+  ## predicted free.
 
 proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
   ## The built-in budget is proportional to the host: one core per logical
@@ -116,7 +121,13 @@ proc defaultDaemonConfig*(endpoint = defaultEndpoint()): DaemonConfig =
     retentionMaxDeferredSweeps: defaultMaxDeferredSweeps,
     admissionMaxWaitMillis: DefaultMaxWaitMillis,
     admissionOrder: @DefaultAdmissionOrder,
-    shareBetweenUsers: sbuDrf
+    shareBetweenUsers: sbuDrf,
+    predictiveAdmission: false,
+    admissionHorizonMillis: DefaultAdmissionHorizonMillis,
+    pressureHighPct: DefaultPressureHighPct,
+    pressureLowPct: DefaultPressureLowPct,
+    cpuPressureFile: DefaultCpuPressureFile,
+    hostBusyFile: ""
   )
 
 proc admissionOrderOf(host: HostConfig): seq[AdmissionKey] =
@@ -192,6 +203,16 @@ proc applyDaemonMeasurementSwitches*(config: var DaemonConfig;
     config.metricsTextfilePath = ""
   ""
 
+proc applyPredictiveKeys(config: var DaemonConfig; host: HostConfig) =
+  ## `admission.predictive`, `horizon`, `pressure-high` and `pressure-low`:
+  ## the file's value or the default, recomputed whole on every reload so
+  ## an unset key goes back to its default. No flag names them.
+  config.predictiveAdmission = host.admissionPredictive.get(false)
+  config.admissionHorizonMillis =
+    host.admissionHorizonMillis.get(DefaultAdmissionHorizonMillis)
+  config.pressureHighPct = host.pressureHighPct.get(DefaultPressureHighPct)
+  config.pressureLowPct = host.pressureLowPct.get(DefaultPressureLowPct)
+
 proc applyHostConfig*(config: var DaemonConfig; host: HostConfig) =
   ## Overlay the host budget file (`runquota_daemon/host_config`) onto
   ## `defaultDaemonConfig`. `runquotad` applies its flags after this, which is
@@ -206,6 +227,7 @@ proc applyHostConfig*(config: var DaemonConfig; host: HostConfig) =
     config.admissionMaxWaitMillis = host.admissionMaxWaitMillis.get
   config.admissionOrder = admissionOrderOf(host)
   config.shareBetweenUsers = shareBetweenUsersOf(host)
+  config.applyPredictiveKeys(host)
 
 proc recomputePoolCaps*(config: var DaemonConfig) =
   ## The pool caps from the bottom up: what open sessions declared
@@ -316,6 +338,7 @@ proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
     else: DefaultMaxWaitMillis
   config.admissionOrder = order
   config.shareBetweenUsers = share
+  config.applyPredictiveKeys(host)
 
 proc machineCapacity*(id: string; cpuSlots: MilliCpu; memoryBytes: Bytes;
                       ioSlots: uint32; cpuShareGroup = ""): MachineCapacity =
@@ -1439,16 +1462,24 @@ proc pressureAllows(daemon: var RunQuotaDaemon; resources: ResourceVector;
     true
 
 proc fitsNow(daemon: RunQuotaDaemon; resources: ResourceVector;
-             owner: string): bool =
+             owner: string; judgeCpu = true): bool =
+  ## Whether `resources` fit the ledger now, for `owner`'s pools. With
+  ## `judgeCpu = false` every dimension but CPU is judged: the question
+  ## asked for a request whose CPU is decided elsewhere (a reclaimed grant,
+  ## which is admitted against predicted CPU; a narrowing, which is what
+  ## frees CPU). Leaving CPU out matters, not only `resources.cpu = 0`: a
+  ## ledger already above its CPU budget (a reclaimed grant is charged to
+  ## it) would otherwise read as "memory, IO or a pool does not fit" when
+  ## nothing but CPU is short.
   var machine: MachineCapacity
   if not daemon.machineFor(resources.resolvedMachineId(), machine):
     return false
   let group = daemon.cpuShareGroupFor(machine)
   let usage = daemon.machineUsage.getOrDefault(machine.id, MachineUsage())
   let usedSharedCpu = daemon.cpuShareGroupUsage.getOrDefault(group.id, 0'u32)
-  if usage.cpu + resources.cpu.value > machine.cpuSlots.value:
+  if judgeCpu and usage.cpu + resources.cpu.value > machine.cpuSlots.value:
     return false
-  if usedSharedCpu + resources.cpu.value > group.cpuSlots.value:
+  if judgeCpu and usedSharedCpu + resources.cpu.value > group.cpuSlots.value:
     return false
   if usage.memory + resources.memory.value > machine.memoryBytes.value:
     return false
@@ -1567,7 +1598,8 @@ proc leaseDecision(lease: LeaseRow; kind: LeaseDecisionKind;
     leaseId: lease.id,
     kind: kind,
     resources: lease.resources,
-    diagnostic: if kind == leaseDecisionQueued: lease.queueDiagnostic else: diagnostic
+    diagnostic: if kind == leaseDecisionQueued: lease.queueDiagnostic else: diagnostic,
+    reclaimed: kind == leaseDecisionGranted and lease.reclaimed
   )
 
 proc sessionsJson(daemon: RunQuotaDaemon): string =
@@ -1820,6 +1852,29 @@ proc metricsTextfileJson(config: DaemonConfig): string =
     ",\"last_error\":" & (let e = metricsError();
       if e.len == 0: "null" else: jsonEscape(e)) & "}"
 
+proc admissionPredictionJson(daemon: RunQuotaDaemon): string =
+  ## Predictive admission and the CPU pressure gate, as in force.
+  let gate = daemon.cpuPressure
+  "{\"predictive\":" & $daemon.config.predictiveAdmission &
+    ",\"horizon_millis\":" & $daemon.config.admissionHorizonMillis &
+    ",\"pressure_high_pct\":" & $daemon.config.pressureHighPct &
+    ",\"pressure_low_pct\":" & $daemon.config.pressureLowPct &
+    ",\"host_busy_source\":" & jsonEscape(
+      if daemon.config.hostBusyFile.len > 0: daemon.config.hostBusyFile
+      else: "ambient sampler") &
+    ",\"cpu_pressure\":{\"source\":" &
+      jsonEscape(daemon.config.cpuPressureFile) &
+      ",\"read\":" & $gate.read &
+      ",\"available\":" & $gate.lastSample.available &
+      ",\"some_avg10_pct\":" & (if gate.lastSample.available:
+        $gate.lastSample.someAvg10Pct else: "null") &
+      ",\"detail\":" & jsonEscape(gate.lastSample.detail) &
+      ",\"gate_closed\":" & $gate.closed &
+      ",\"closures\":" & $gate.closures & "}" &
+    ",\"reclaimed_granted\":" & $daemon.reclaimedGranted &
+    ",\"last_reclaim_decision\":" & jsonEscape(daemon.lastReclaimDecision) &
+    "}"
+
 proc statusJson(daemon: RunQuotaDaemon): string =
   ## The `status` inspection subject: the wire status, as JSON, with the
   ## session groups and the capacity figures beside it.
@@ -1836,7 +1891,8 @@ proc statusJson(daemon: RunQuotaDaemon): string =
     ",\"session_groups\":" & daemon.sessionGroupsJson() &
     ",\"capacity\":" & capacityJson(capacitySnapshot(daemon.capacityCopy()),
       metricsTextfileJson(daemon.config)) &
-    ",\"pressure\":" & daemon.pressureJson(psAll, "") & "}"
+    ",\"pressure\":" & daemon.pressureJson(psAll, "") &
+    ",\"admission_prediction\":" & daemon.admissionPredictionJson() & "}"
 
 proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
   var ids: seq[uint64] = @[]
@@ -1878,6 +1934,9 @@ proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
         ",\"target_milli\":" & $lease.cpuTargetMilli &
         ",\"current_milli\":" & $lease.cpuCurrentMilli &
         ",\"wanted_milli\":" & $lease.growWantedMilli & "}," &
+      # Granted into predicted slack (predictive admission): its tree runs
+      # at the lower weight.
+      "\"reclaimed\":" & $lease.reclaimed & "," &
       "\"diagnostic\":{\"code\":" & jsonEscape($lease.queueDiagnostic.code) &
         ",\"message\":" & jsonEscape(lease.queueDiagnostic.message) &
         ",\"detail\":" & jsonEscape(lease.queueDiagnostic.detail) & "}" &
@@ -2810,6 +2869,7 @@ proc recordWidth(daemon: var RunQuotaDaemon; id: uint64;
     lease.cpuMinMilli = width.minMilli
     lease.cpuPreferredMilli = width.preferredMilli
     lease.resizable = width.resizable
+    lease.acceptsReclaimed = width.acceptsReclaimed
     lease.resources.cpu = milliCpu(width.preferredMilli)
   else:
     lease.cpuMinMilli = lease.resources.cpu.value
@@ -3616,6 +3676,155 @@ proc promoteQueuedSubLeases(daemon: var RunQuotaDaemon): seq[uint64] =
     daemon.grantQueuedLease(id, false)
     result.add(id)
 
+proc refreshCpuPressure(daemon: var RunQuotaDaemon; now: int64) =
+  ## Read the CPU pressure signal into the gate, at most every
+  ## `CpuPressureReadIntervalMillis`. Called only where a pass would use
+  ## it (a reclaim-eligible request that does not fit, a lease to widen),
+  ## so an ordinary pass reads nothing.
+  if daemon.cpuPressure.due(now):
+    daemon.cpuPressure.observe(readCpuPressure(daemon.config.cpuPressureFile),
+      daemon.config.pressureHighPct, daemon.config.pressureLowPct, now)
+
+proc isHostLeaseHolding(lease: LeaseRow): bool =
+  lease.parentLeaseId == 0'u64 and
+    lease.state in {leaseStateGranted, leaseStateStarting, leaseStateRunning}
+
+proc forecastOf(daemon: RunQuotaDaemon; lease: LeaseRow;
+                now: int64): LeaseForecast =
+  ## What `prediction` needs about a running host lease. Only a lease whose
+  ## width is fixed and was granted from free capacity is read from its
+  ## key's shape: a resizable lease's width moves under the shape, and a
+  ## reclaimed one is already a bet on a prediction.
+  result = LeaseForecast(chargeMilli: lease.resources.cpu.value,
+    elapsedMillis: now - lease.grantedAtMillis)
+  if lease.reclaimed or lease.resizable or lease.commandStatsId.len == 0 or
+      not daemon.sessions.hasKey(lease.sessionId.value):
+    return
+  let key = estimateTableKey(daemon.sessions[lease.sessionId.value].sessionScope(),
+    lease.commandStatsId)
+  if not daemon.cpuEstimates.hasKey(key):
+    return
+  let estimate = daemon.cpuEstimates[key]
+  if not estimate.hasShape:
+    return
+  result.shapeKnown = true
+  result.shape = estimate.shape()
+  result.expectedDurationMillis =
+    estimate.expectedDurationMillis(lease.grantCpuMilli)
+
+type
+  ReclaimView = object
+    ## One pass's view of the CPU the running leases are predicted to leave
+    ## free, built the first time a reclaim-eligible request does not fit.
+    built: bool
+    backgroundKnown: bool
+    backgroundMilli: uint64
+    machineDemand: Table[string, uint64]
+    groupDemand: Table[string, uint64]
+
+proc buildReclaimView(daemon: RunQuotaDaemon; now: int64): ReclaimView =
+  result.built = true
+  var ownNow = 0'u64
+  for lease in daemon.leases.values:
+    if not lease.isHostLeaseHolding():
+      continue
+    let forecast = daemon.forecastOf(lease, now)
+    let demand = uint64(forecast.predictedDemandMilli(
+      daemon.config.admissionHorizonMillis))
+    ownNow += uint64(forecast.predictedDemandMilli(0'i64))
+    var machine: MachineCapacity
+    if daemon.machineFor(lease.resources.resolvedMachineId(), machine):
+      result.machineDemand.mgetOrPut(machine.id, 0'u64) += demand
+      result.groupDemand.mgetOrPut(daemon.cpuShareGroupFor(machine).id,
+        0'u64) += demand
+  # BACKGROUND DEMAND, from the ambient sampler's latest reading of the
+  # host's busy CPU (in memory; the store is not read), or from the file
+  # `--host-cpu-busy-file` names. A stale, absent or unreadable reading
+  # leaves it unknown, and then nothing is reclaimed.
+  var busyPct: float64
+  var busyKnown = false
+  if daemon.config.hostBusyFile.len > 0:
+    let text =
+      try: readFile(daemon.config.hostBusyFile)
+      except IOError, OSError: ""
+    busyKnown = parseHostBusyPct(text, busyPct)
+  else:
+    var foreignPct: float64
+    var takenAt: int64
+    if latestAmbientCpu(busyPct, foreignPct, takenAt):
+      let freshFor = max(3'i64 *
+        int64(daemon.config.ambientSampleIntervalMillis), 3_000'i64)
+      busyKnown = unixMillisNow() - takenAt <= freshFor
+  if busyKnown:
+    let processors = uint64(max(1, countProcessors()))
+    let hostBusy = uint64(max(0.0, busyPct) / 100.0 *
+      float64(processors * 1000'u64))
+    let budget = uint64(daemon.config.cpuSlots.value)
+    let outside =
+      if processors * 1000'u64 > budget: processors * 1000'u64 - budget
+      else: 0'u64
+    result.backgroundKnown = true
+    result.backgroundMilli = backgroundDemandMilli(hostBusy, ownNow, outside)
+
+proc reclaimFreeMilli(daemon: RunQuotaDaemon; view: ReclaimView;
+                      resources: ResourceVector): uint64 =
+  ## The CPU predicted free for a lease on `resources`' machine: the
+  ## smaller of the machine's and its shared CPU group's.
+  var machine: MachineCapacity
+  if not daemon.machineFor(resources.resolvedMachineId(), machine):
+    return 0'u64
+  let group = daemon.cpuShareGroupFor(machine)
+  min(predictedFreeMilli(uint64(machine.cpuSlots.value),
+        view.machineDemand.getOrDefault(machine.id, 0'u64),
+        view.backgroundMilli),
+      predictedFreeMilli(uint64(group.cpuSlots.value),
+        view.groupDemand.getOrDefault(group.id, 0'u64),
+        view.backgroundMilli))
+
+proc noteReclaimed(daemon: RunQuotaDaemon; view: var ReclaimView;
+                   resources: ResourceVector; width: uint32) =
+  var machine: MachineCapacity
+  if daemon.machineFor(resources.resolvedMachineId(), machine):
+    view.machineDemand.mgetOrPut(machine.id, 0'u64) += uint64(width)
+    view.groupDemand.mgetOrPut(daemon.cpuShareGroupFor(machine).id,
+      0'u64) += uint64(width)
+
+proc reclaimWidth(daemon: var RunQuotaDaemon; view: var ReclaimView;
+                  lease: LeaseRow; now: int64): uint32 =
+  ## The width a queued host lease whose minimum does NOT fit the ledger may
+  ## be granted as a RECLAIMED grant (its minimum), or 0. Every dimension
+  ## but CPU must fit the ledger exactly as for any grant: memory, IO slots
+  ## and named pools are never admitted against a prediction.
+  if not daemon.config.predictiveAdmission or not lease.acceptsReclaimed or
+      lease.parentLeaseId != 0'u64 or lease.purpose == leasePurposeBenchmark:
+    return 0'u32
+  let minimum = lease.minimumResources()
+  if not daemon.fitsNow(minimum, ownerKeyOf(lease.peer), judgeCpu = false):
+    daemon.lastReclaimDecision = "lease " & $lease.id.value &
+      ": memory, IO slots or a pool do not fit"
+    return 0'u32
+  daemon.refreshCpuPressure(now)
+  if not daemon.cpuPressure.allowsReclaim():
+    daemon.lastReclaimDecision = "lease " & $lease.id.value &
+      (if daemon.cpuPressure.lastSample.available:
+        ": the CPU pressure gate is closed"
+       else: ": no CPU pressure reading (" &
+         daemon.cpuPressure.lastSample.detail & ")")
+    return 0'u32
+  if not view.built:
+    view = daemon.buildReclaimView(now)
+  if not view.backgroundKnown:
+    daemon.lastReclaimDecision = "lease " & $lease.id.value &
+      ": no fresh ambient reading, so background demand is unknown"
+    return 0'u32
+  let free = daemon.reclaimFreeMilli(view, minimum)
+  daemon.lastReclaimDecision = "lease " & $lease.id.value & ": minimum " &
+    $minimum.cpu.value & "m, predicted free " & $free & "m (background " &
+    $view.backgroundMilli & "m)"
+  if not fitsPredictedFree(minimum.cpu.value, free):
+    return 0'u32
+  minimum.cpu.value
+
 proc resizableHolds(lease: LeaseRow): bool =
   ## A host lease the daemon may widen or narrow now: declared resizable,
   ## and held by a supervisor that is still there to follow the target.
@@ -3636,9 +3845,7 @@ proc narrowFor(daemon: var RunQuotaDaemon; waiterId: uint64) =
   ## instead of narrowing further every time the waiter is passed over.
   let waiter = daemon.leases[waiterId]
   let minimum = waiter.minimumResources()
-  var withoutCpu = minimum
-  withoutCpu.cpu = milliCpu(0)
-  if not daemon.fitsNow(withoutCpu, ownerKeyOf(waiter.peer)):
+  if not daemon.fitsNow(minimum, ownerKeyOf(waiter.peer), judgeCpu = false):
     # Memory, IO or a pool is what it waits for: CPU would not help.
     return
   let machineId = minimum.resolvedMachineId()
@@ -3700,6 +3907,10 @@ proc widenIntoFreeSlots(daemon: var RunQuotaDaemon; now: int64) =
       growth.add(entry)
   if growth.len == 0:
     return
+  # "PRESSURE IS LOW": no lease grows while the CPU pressure gate is closed.
+  daemon.refreshCpuPressure(now)
+  if not daemon.cpuPressure.allowsWidening():
+    return
   var plan = planAdmission(growth, daemon.ownerLoads(), AdmissionPolicy(
     order: daemon.config.admissionOrder,
     shareBetweenUsers: daemon.config.shareBetweenUsers,
@@ -3758,6 +3969,10 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
   # is widened: widening only ever uses slots queued work could not.
   var headWaiter = 0'u64
   var waiting = false
+  # PREDICTIVE ADMISSION's view of the running leases, built only when a
+  # reclaim-eligible request does not fit, and rebuilt after a grant from
+  # free capacity changed what runs.
+  var reclaim: ReclaimView
   while promoted < maxDecisions and plan.next(candidate):
     var lease = daemon.leases[candidate.id]
     var pressureDiagnostic: Diagnostic
@@ -3787,6 +4002,30 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
         inc daemon.nextQueueOrder
       daemon.leases[candidate.id] = lease
       daemon.grantQueuedLease(candidate.id, false)
+      plan.noteGranted(candidate.owner, uint64(width),
+        lease.resources.memory.value, candidate.groupKey)
+      result.add(candidate.id)
+      inc promoted
+      reclaim.built = false
+    elif (let width = daemon.reclaimWidth(reclaim, lease, now);
+          width > 0'u32):
+      # ADMISSION INTO THE TAIL: the minimum does not fit the granted widths
+      # but fits the CPU the running leases' shapes predict free over the
+      # horizon. Granted at its minimum, marked reclaimed (its launcher runs
+      # the tree at the lower weight), and charged to the ledger like any
+      # grant, so nothing is granted from free capacity on top of it.
+      lease.resources.cpu = milliCpu(width)
+      lease.grantCpuMilli = width
+      lease.cpuTargetMilli = width
+      lease.cpuCurrentMilli = width
+      lease.reclaimed = true
+      if lease.resizable and width < lease.growWantedMilli:
+        lease.growOrder = daemon.nextQueueOrder
+        inc daemon.nextQueueOrder
+      daemon.leases[candidate.id] = lease
+      daemon.grantQueuedLease(candidate.id, false)
+      inc daemon.reclaimedGranted
+      daemon.noteReclaimed(reclaim, lease.resources, width)
       plan.noteGranted(candidate.owner, uint64(width),
         lease.resources.memory.value, candidate.groupKey)
       result.add(candidate.id)
@@ -4554,7 +4793,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     let granted = LeaseGrantedMessage(
       sessionId: msg.sessionId,
       leaseId: queued.id,
-      resources: grantedLease.resources
+      resources: grantedLease.resources,
+      reclaimed: grantedLease.reclaimed
     )
     connection.sendResponse(rqLeaseGranted, frame.header.requestId,
         encodeLeaseGranted(granted))

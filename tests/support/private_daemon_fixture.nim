@@ -121,13 +121,21 @@ when defined(posix):
     ## is redirected into `root`, and capture is off: these tests are about
     ## the daemon's lifetime, and the store's start-up check would only slow
     ## them down on a loaded host.
+    ##
+    ## The CPU pressure signal is read from a file in `root` that does not
+    ## exist unless a test writes it: an unreadable signal leaves widening
+    ## as it was before the pressure gate (and makes no reclaimed grant), so
+    ## a widening test does not pass or fail with the shared host's own CPU
+    ## pressure. A test about the gate writes the file (or passes its own
+    ## `--cpu-pressure-file`, which comes later and wins).
     result = @["--socket", socket,
       "--host-config", root / "host.toml",
       "--host-identity-file", root / "host-id",
       "--estimate-db", root / "est.sqlite",
       "--no-write-stats",
       "--ambient-sample-interval-millis", "0",
-      "--memory-pressure-source", "unavailable"]
+      "--memory-pressure-source", "unavailable",
+      "--cpu-pressure-file", root / "cpu-pressure"]
     for arg in extra: result.add(arg)
 
   proc launch*(root, socket: string; env: StringTableRef;

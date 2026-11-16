@@ -10,8 +10,10 @@ import runquota_stats_table/publisher
 import ./owners
 import ./cpu_shape
 import ./capacity_metrics
+import ./cpu_pressure
 
 export cpu_shape
+export cpu_pressure
 export capacity_metrics
 
 export owners
@@ -232,6 +234,26 @@ type
       ## `DefaultAdmissionOrder`. Never empty once `resolveBudget` ran.
     shareBetweenUsers*: ShareBetweenUsers
       ## The host file's `admission.share-between-users`, default `drf`.
+    predictiveAdmission*: bool
+      ## The host file's `admission.predictive`, off by default: admit a
+      ## queued request's minimum width into CPU the running leases' learned
+      ## shapes predict free (a RECLAIMED grant), for clients that accept one.
+    admissionHorizonMillis*: int64
+      ## `admission.horizon`, default 10 s: how far ahead a reclaimed
+      ## grant's CPU must be predicted free.
+    pressureHighPct*: float64
+    pressureLowPct*: float64
+      ## `admission.pressure-high` / `pressure-low` (percent of CPU *some*
+      ## pressure): the CPU pressure gate closes above the first and opens
+      ## below the second (`cpu_pressure`).
+    cpuPressureFile*: string
+      ## Where the CPU pressure signal is read (`--cpu-pressure-file`,
+      ## default `/proc/pressure/cpu`).
+    hostBusyFile*: string
+      ## `--host-cpu-busy-file`: where predictive admission reads the host's
+      ## busy CPU share (a percentage) instead of the ambient sampler's
+      ## latest reading. Empty (the default): the sampler. For tests, which
+      ## cannot control what other tenants of a shared host keep busy.
 
   SessionRow* = object
     id*: SessionId
@@ -390,6 +412,12 @@ type
       ## Monotonic milliseconds since which `resources.cpu` has been the
       ## charge; the group's CPU-time counter integrates each charge over
       ## its own interval.
+    acceptsReclaimed*: bool
+      ## The client runs a reclaimed grant at a lower weight, so admission
+      ## may grant this request into predicted slack.
+    reclaimed*: bool
+      ## Granted into predicted slack rather than free capacity. Charged to
+      ## the ledger like any grant; predicted at its charge thereafter.
 
   ConnectionContext* = object
     supervisorProcessId*: uint64
@@ -620,6 +648,13 @@ type
       ## tables are kept for every lease, so a reload that moves a name
       ## between the two scopes finds the right figure already counted.
     pressureFileCache*: PressureFileCache
+    cpuPressure*: CpuPressureGate
+      ## The CPU pressure gate (reclaimed admission and widening).
+    reclaimedGranted*: uint64
+      ## Reclaimed grants made since start.
+    lastReclaimDecision*: string
+      ## Why the last reclaim-eligible request was or was not admitted into
+      ## predicted slack, with the figures it was judged by (inspection).
     capacity*: CapacityLedger
       ## The per-host and per-session-group counters capacity tools read
       ## (`capacity_metrics`): CPU used by finished leases, grants and

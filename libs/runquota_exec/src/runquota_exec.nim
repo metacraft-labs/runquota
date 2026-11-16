@@ -8,6 +8,18 @@ export execTypes
 
 const libraryName* = "runquota_exec"
 
+const ReclaimedNiceIncrement* = 10
+  ## How much lower a RECLAIMED grant's tree runs (nice +10; a weight of
+  ## about a tenth of a nice-0 task under Linux's CFS/EEVDF weights). The
+  ## grant was admitted into CPU the daemon predicts the running leases'
+  ## tails leave free, so when a tail turns out wider than predicted the job
+  ## that was granted first must keep priority. This stands in for the
+  ## lower-weight cgroup the design names until that enforcement exists.
+
+proc reclaimedNice*(lease: RunQuotaLease): int =
+  ## The nice increment a tree launched under `lease` must run with.
+  if lease.reclaimed: ReclaimedNiceIncrement else: 0
+
 proc libraryInfo*(): execTypes.LibraryInfo =
   execTypes.LibraryInfo(name: libraryName)
 
@@ -73,6 +85,8 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
     result.state = esStarting
     lease.markStarting()
     var spec = command
+    # A reclaimed grant runs at the lower weight, whatever the caller asked.
+    spec.niceIncrement = max(spec.niceIncrement, lease.reclaimedNice())
     if exportParentLease:
       spec.env.add(lease.parentLeaseEnvEntry())
     var child = launchProcess(spec)

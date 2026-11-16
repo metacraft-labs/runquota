@@ -55,6 +55,11 @@ type
     resources*: ResourceVector
     active*: bool
     state*: LeaseClientState
+    reclaimed*: bool
+      ## The daemon granted this lease into PREDICTED slack (the running
+      ## leases' tails), not into free capacity: the launcher must run its
+      ## tree at the lower weight. Only ever true for a request that
+      ## accepted it (``acceptingReclaimed``).
     expectedUncontendedMillis*: uint64
       ## After a ``finish`` that asked for it (``askExpectedDuration``), the
       ## daemon's learned expected uncontended duration of this command at

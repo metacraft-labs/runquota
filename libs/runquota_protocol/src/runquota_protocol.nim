@@ -7,7 +7,7 @@ export protocolTypes
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 2'u16
-const RqspProtocolMinor* = 7'u16
+const RqspProtocolMinor* = 8'u16
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -83,6 +83,18 @@ const PressureMinor* = 7'u16
   ## additively: an older daemon closes the connection on a message kind it
   ## does not know and refuses an unknown presence bit, so a client sends
   ## none of them below this minor and reports no pressure there.
+const ReclaimedGrantsMinor* = 8'u16
+  ## The first daemon minor that may make RECLAIMED grants: admission of a
+  ## request's minimum width into CPU it predicts the running leases' tails
+  ## leave free. MINOR 8 ANNOUNCES IT. A client asks to be eligible with
+  ## bit 1 of the width block's flags (``WidthRange.acceptsReclaimed``),
+  ## which every daemon from ``NegotiatedWidthsMinor`` on ignores when it
+  ## does not know it, so the bit needs no minor check. The grant is marked
+  ## in an optional trailing block of ``LeaseDecisionBatch`` and an
+  ## optional trailing flags word of ``LeaseGranted``, which the daemon
+  ## writes only when a decision in them IS reclaimed -- and it reclaims
+  ## only for a request that set the bit, so an older client never meets
+  ## either.
 const MaxPressureWaitsPerReport* = 64
   ## The most waits one `PressureReport` carries. A client with more keeps
   ## the rest for its next report; the daemon refuses a longer list, so a
@@ -468,11 +480,20 @@ const WidthResizableBit = 1'u32
   ## Bit 0 of a width block's flags. The other bits are reserved: a decoder
   ## ignores them, so a later minor can add a flag an older daemon reads as
   ## absent rather than as a malformed frame.
+const WidthAcceptsReclaimedBit = 2'u32
+  ## Bit 1: ``WidthRange.acceptsReclaimed`` (``ReclaimedGrantsMinor``).
+const DecisionReclaimedBit = 1'u32
+  ## Bit 0 of a decision's flags (the trailing block of a decision batch,
+  ## and the trailing word of ``LeaseGranted``): a reclaimed grant. Other
+  ## bits are reserved and ignored by the decoder.
 
 proc writeWidthFields(w: var BinaryWriter; width: WidthRange) =
   w.writeU32(width.minMilli)
   w.writeU32(width.preferredMilli)
-  w.writeU32(if width.resizable: WidthResizableBit else: 0'u32)
+  var flags = 0'u32
+  if width.resizable: flags = flags or WidthResizableBit
+  if width.acceptsReclaimed: flags = flags or WidthAcceptsReclaimedBit
+  w.writeU32(flags)
 
 proc readWidthFields(r: var BinaryReader; width: var WidthRange): bool =
   ## Structural only. Whether the range is well formed (non-zero minimum,
@@ -484,6 +505,7 @@ proc readWidthFields(r: var BinaryReader; width: var WidthRange): bool =
   if not r.readU32(flags): return false
   width.present = true
   width.resizable = (flags and WidthResizableBit) != 0'u32
+  width.acceptsReclaimed = (flags and WidthAcceptsReclaimedBit) != 0'u32
   true
 
 proc encodeLeaseRequest*(msg: LeaseRequestMessage): string =
@@ -723,6 +745,17 @@ proc encodeLeaseDecisionBatch*(msg: LeaseDecisionBatchMessage): string =
     w.writeU32(uint32(ord(decision.kind)))
     w.writeResourceVector(decision.resources)
     w.writeDiagnostic(decision.diagnostic)
+  # THE FLAGS BLOCK, after the last decision, only when some decision is a
+  # reclaimed grant: a list cannot carry a trailing field per element, and
+  # without the block the batch is byte-identical to minor 7.
+  var anyReclaimed = false
+  for decision in msg.decisions:
+    if decision.reclaimed:
+      anyReclaimed = true
+  if anyReclaimed:
+    w.writeU32(uint32(msg.decisions.len))
+    for decision in msg.decisions:
+      w.writeU32(if decision.reclaimed: DecisionReclaimedBit else: 0'u32)
   w.data
 
 proc decodeLeaseDecisionBatch*(payload: string;
@@ -752,6 +785,16 @@ proc decodeLeaseDecisionBatch*(payload: string;
       resources: resources,
       diagnostic: diagnostic
     ))
+  if r.remaining != 0:
+    var flagsCount: uint32
+    if not r.readU32(flagsCount): return false
+    # One entry per decision or the block is malformed: which decision a
+    # flag belongs to must not be guesswork.
+    if flagsCount != count: return false
+    for i in 0 ..< decisions.len:
+      var flags: uint32
+      if not r.readU32(flags): return false
+      decisions[i].reclaimed = (flags and DecisionReclaimedBit) != 0'u32
   if r.remaining != 0: return false
   msg = LeaseDecisionBatchMessage(sessionId: sessionId(sessionRaw),
       decisions: decisions)
@@ -775,6 +818,10 @@ proc encodeLeaseGranted*(msg: LeaseGrantedMessage): string =
   w.writeU64(msg.sessionId.value)
   w.writeU64(msg.leaseId.value)
   w.writeResourceVector(msg.resources)
+  # Only for a reclaimed grant (``ReclaimedGrantsMinor``); otherwise the
+  # message is byte-identical to minor 7.
+  if msg.reclaimed:
+    w.writeU32(DecisionReclaimedBit)
   w.data
 
 proc decodeLeaseGranted*(payload: string; msg: var LeaseGrantedMessage): bool =
@@ -782,14 +829,18 @@ proc decodeLeaseGranted*(payload: string; msg: var LeaseGrantedMessage): bool =
   var sessionRaw: uint64
   var leaseRaw: uint64
   var resources: ResourceVector
+  var flags = 0'u32
   if not r.readU64(sessionRaw): return false
   if not r.readU64(leaseRaw): return false
   if not r.readResourceVector(resources): return false
+  if r.remaining != 0:
+    if not r.readU32(flags): return false
   if r.remaining != 0: return false
   msg = LeaseGrantedMessage(
     sessionId: sessionId(sessionRaw),
     leaseId: leaseId(leaseRaw),
-    resources: resources
+    resources: resources,
+    reclaimed: (flags and DecisionReclaimedBit) != 0'u32
   )
   true
 

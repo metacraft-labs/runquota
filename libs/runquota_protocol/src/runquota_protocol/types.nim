@@ -227,6 +227,11 @@ type
     minMilli*: uint32
     preferredMilli*: uint32
     resizable*: bool
+    acceptsReclaimed*: bool
+      ## The client runs a RECLAIMED grant (one admitted into CPU the
+      ## daemon predicts the running leases' tails leave free) at a lower
+      ## scheduling weight, and so may be given one. Only a launcher that
+      ## lowers the tree's weight may set it; an older daemon ignores it.
 
   LeaseRequestMessage* = object
     sessionId*: SessionId
@@ -293,6 +298,9 @@ type
     kind*: LeaseDecisionKind
     resources*: ResourceVector
     diagnostic*: Diagnostic
+    reclaimed*: bool
+      ## A grant into predicted slack: the client runs its tree at the
+      ## lower weight. Travels in the batch's optional trailing flags block.
 
   LeaseDecisionBatchMessage* = object
     sessionId*: SessionId
@@ -305,6 +313,8 @@ type
     sessionId*: SessionId
     leaseId*: LeaseId
     resources*: ResourceVector
+    reclaimed*: bool
+      ## See ``LeaseDecision.reclaimed``; an optional trailing flags word.
 
   LeaseDeniedMessage* = object
     sessionId*: SessionId

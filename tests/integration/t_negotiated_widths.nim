@@ -37,8 +37,20 @@
 ##    host ledger after the holder reports a smaller width. Mutation: charge
 ##    max(target, current) only (`resizeCharge` ignoring `subHeldCpuMilli`)
 ##    and the reported 2 frees slots the sub-lease runs on.
+## 8. "Pressure is low": while CPU pressure is above
+##    `admission.pressure-high` no lease is widened, a reading between the
+##    thresholds keeps it so, and one below `admission.pressure-low` lets
+##    the next pass widen it. Mutation: widening without consulting the
+##    pressure gate (`widenIntoFreeSlots` skipping `allowsWidening`).
 ##
 ## NO MOCKS: the built `runquotad`, a real socket, the real client library.
+## The one substitution is the CPU pressure signal: the daemon reads it from
+## a file this test writes (`--cpu-pressure-file`, in `/proc/pressure/cpu`'s
+## format), held low for every case but 8. Widening stops while the host's
+## real pressure is high, and the shared, loaded host this suite runs on is
+## neither what the other cases test nor something they could control; the
+## reader itself is tested against the kernel's file in
+## `libs/runquota_daemon/tests/t_predictive_admission_rules.nim`.
 
 when defined(posix):
   import std/[json, os, osproc, strutils, unittest]
@@ -58,10 +70,21 @@ when defined(posix):
     socket: string
     daemon: Process
 
+  proc writePressure(pct: float64) =
+    ## The CPU pressure the daemon reads, written whole and renamed into
+    ## place so it never reads half a file.
+    let path = root / "psi"
+    writeFile(path & ".tmp", "some avg10=" & formatFloat(pct, ffDecimal, 2) &
+      " avg60=0.00 avg300=0.00 total=0\n" &
+      "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+    moveFile(path & ".tmp", path)
+
   root = scratchDir("rqwidth")
   socket = root / "d.sock"
+  writePressure(0.0)
   daemon = launch(root, socket, privateEnv(socket),
-    ["--cpu-milli", $BudgetMilli, "--memory-bytes", $(64'u64 * GiB)])
+    ["--cpu-milli", $BudgetMilli, "--memory-bytes", $(64'u64 * GiB),
+     "--cpu-pressure-file", root / "psi"])
   prerequisite awaitSocket(daemon, socket),
     daemon.startupContext("the daemon did not bind " & socket)
   putEnv("RUNQUOTA_ENDPOINT_SCOPE", "private")
@@ -205,6 +228,42 @@ when defined(posix):
       let answer = lease.reportResized(milliCpu(2000))
       check answer.cpuTargetMilli == 8000'u32
       check answer.cpuChargedMilli == 8000'u32
+      lease.release()
+      neighbourSession.closeSession()
+      session.closeSession()
+
+    test "no lease is widened while CPU pressure is high":
+      var client = connectDefault()
+      defer: client.close()
+      var neighbourSession = client.registerSession("neighbour", "1")
+      var session = client.registerSession("jobserver", "1")
+      writePressure(50.0)
+      # The gate is read at most every 500 ms: let a fresh reading be due.
+      sleep(600)
+      var neighbour = neighbourSession.fixed(6000)
+      var lease = session.requestLease(ranged(2000, 8000, resizable = true))
+      neighbour.release()
+      # Free slots, nothing waiting -- and pressure above high: no widening.
+      check client.widthOf(lease)["target_milli"].getInt() == 2000
+      var answer = lease.reportResized(milliCpu(2000))
+      check answer.cpuTargetMilli == 2000'u32
+      let gate = parseJson(client.inspectionJson("status"))[
+        "admission_prediction"]["cpu_pressure"]
+      checkpoint $gate
+      check gate["gate_closed"].getBool
+      # Between the thresholds (default 5..10): still closed.
+      writePressure(7.0)
+      sleep(600)
+      discard neighbourSession.pollNextGrant()
+      check client.widthOf(lease)["target_milli"].getInt() == 2000
+      # Below low: the next pass widens it.
+      writePressure(1.0)
+      sleep(600)
+      discard neighbourSession.pollNextGrant()
+      check client.widthOf(lease)["target_milli"].getInt() == 8000
+      answer = lease.reportResized(milliCpu(2000))
+      check answer.cpuTargetMilli == 8000'u32
+      writePressure(0.0)
       lease.release()
       neighbourSession.closeSession()
       session.closeSession()

@@ -324,6 +324,9 @@ proc runRun*(args: seq[string];
         request = request.withWidthRange(
           milliCpu(uint32(options.minWidth) * 1000'u32),
           milliCpu(uint32(width) * 1000'u32))
+        # The command is launched below at the lower weight when the grant
+        # is reclaimed (`reclaimedNice`), so this launcher may receive one.
+        request = request.acceptingReclaimed()
       request.commandStatsId = statsKey
       try:
         lease = session.requestLeaseWaiting(request)
@@ -355,7 +358,8 @@ proc runRun*(args: seq[string];
           ": " & note)
   if options.verbose:
     stderr.writeLine("runquota run: lease " & $lease.id & " width " &
-      $slots & ": " & command.join(" "))
+      $slots & (if lease.reclaimed: " (reclaimed, nice +" &
+        $lease.reclaimedNice() & ")" else: "") & ": " & command.join(" "))
 
   var code = 0
   var ran = false
@@ -365,8 +369,10 @@ proc runRun*(args: seq[string];
     lease.markStarting()
     var child: LaunchedProcess
     try:
-      child = launchProcess(commandSpec(command, env = env,
-        stdio = inheritStdio, createProcessGroup = false))
+      var spec = commandSpec(command, env = env,
+        stdio = inheritStdio, createProcessGroup = false)
+      spec.niceIncrement = lease.reclaimedNice()
+      child = launchProcess(spec)
     except CatchableError as failure:
       lease.finish(outcome = launchFailed())
       lease.release()
@@ -381,9 +387,14 @@ proc runRun*(args: seq[string];
     when defined(posix):
       forwardTarget = 0
     child.close()
+    # The tree's totals and (with `profiles` on) its CPU profile, as
+    # `runquota acquire -- CMD` sends them: they are what the daemon learns
+    # a command's shape from, and predictive admission reads that shape.
     lease.finish(outcome = finishOutcome(completion),
       peakMemoryBytes = completion.peakResidentMemoryBytes,
-      processCount = completion.processCount)
+      processCount = completion.processCount,
+      totals = completion.totals,
+      cpuProfile = completion.cpuProfile)
     code = exitCodeOf(completion)
     ran = true
     lease.release()

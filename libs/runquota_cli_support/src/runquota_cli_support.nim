@@ -778,6 +778,13 @@ proc runDebugAcquire(args: seq[string]): int =
         " " & statsTableReport(table)
   if benchmark:
     request = request.benchmarkRequest()
+  elif command.len > 0:
+    # `runWithLease` runs a reclaimed grant's tree at the lower weight, so
+    # this launcher may be given one (only a daemon with predictive
+    # admission on makes them). A benchmark is never reclaimed: it wants
+    # the host to itself. A lease held without a command is not, either:
+    # nothing here would lower the weight of what its holder runs.
+    request = request.acceptingReclaimed()
   # CAUGHT HERE, WHERE THE CLIENT IS STILL IN SCOPE, which is the whole
   # reason this handler exists rather than `runThinApp`'s: by the time the
   # error reaches the dispatcher the `defer` above has closed the client and

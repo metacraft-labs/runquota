@@ -153,7 +153,7 @@ when isMainModule:
   var config = defaultDaemonConfig(defaultEndpoint())
   config.exitWithParentPid = exitWithParentPid
   config.socketActivation = socketActivation
-  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--measurement NAME=on|off[,...]] [--ambient-sample-interval-millis N] [--profile-uncontended-pct N] [--metrics-textfile PATH] [--metrics-interval-millis N] [--pressure-long-wait-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--admission-max-wait-millis N] [--log-file PATH]"
+  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--cpu-pressure-file PATH] [--host-cpu-busy-file PATH] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--measurement NAME=on|off[,...]] [--ambient-sample-interval-millis N] [--profile-uncontended-pct N] [--metrics-textfile PATH] [--metrics-interval-millis N] [--pressure-long-wait-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--admission-max-wait-millis N] [--log-file PATH]"
   var measurementSwitches: seq[string]
   var i = 0
   while i < args.len:
@@ -231,6 +231,26 @@ when isMainModule:
       if i + 1 >= args.len:
         quit 2
       config.pressureFile = args[i + 1]
+      i += 2
+    of "--cpu-pressure-file":
+      # The CPU pressure signal predictive admission and widening are
+      # corrected by: a file in `/proc/pressure/cpu`'s format (the default
+      # path). Another path is for tests, which hold the signal where they
+      # need it.
+      if i + 1 >= args.len or args[i + 1].len == 0:
+        echo "runquotad: --cpu-pressure-file needs a path\n" & usage
+        quit 2
+      config.cpuPressureFile = args[i + 1]
+      i += 2
+    of "--host-cpu-busy-file":
+      # The host's busy CPU share predictive admission takes background
+      # demand from, as a percentage in a file, instead of the ambient
+      # sampler: for tests, which cannot control what other tenants of a
+      # shared host keep busy.
+      if i + 1 >= args.len or args[i + 1].len == 0:
+        echo "runquotad: --host-cpu-busy-file needs a path\n" & usage
+        quit 2
+      config.hostBusyFile = args[i + 1]
       i += 2
     of "--memory-pressure-required":
       config.pressureRequired = true

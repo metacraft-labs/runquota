@@ -1158,6 +1158,12 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         discard close(stderrPipe[0])
       if spec.createProcessGroup and setpgid(0, 0) != 0:
         childExit(126)
+      if spec.niceIncrement > 0:
+        # Async-signal-safe in effect (two syscalls, no allocation). A nice
+        # that fails leaves the child at its inherited weight: the grant is
+        # still within what admission predicted, so failing the launch
+        # would cost the work for nothing.
+        discard posix.nice(cint(spec.niceIncrement))
       if spec.cwd.len > 0 and chdir(cstring(spec.cwd)) != 0:
         childExit(126)
       if spec.stdio == captureStdio:

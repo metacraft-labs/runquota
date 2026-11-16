@@ -81,6 +81,37 @@ share-between-users = "drf"    # or "none"; default "drf"
 empty list are refused like any other malformed line. `--admission-max-wait-millis`
 overrides `max-wait` for that launch.
 
+Four more keys turn on and tune **predictive admission**:
+
+```toml
+[admission]
+predictive    = "off"   # "on": admit into the predicted tails of running leases
+horizon       = "10s"   # how far ahead that CPU must be predicted free
+pressure-high = "10"    # CPU pressure (percent) above which it, and widening, stop
+pressure-low  = "5"     # ... and below which they resume
+```
+
+With `predictive = "on"`, a queued request whose minimum width does not fit
+the granted widths can still be granted, at its minimum, when the running
+leases' learned CPU curves say that much CPU will be free for the whole
+horizon: a test run that saturated the host for a minute and now runs on one
+core is predicted at one core, not at its grant. Such a grant is marked
+**reclaimed**. Only launchers that run a reclaimed tree at a lower
+scheduling weight ask for one (`runquota acquire -- COMMAND` and `runquota
+run`, which start it at nice +10), memory, I/O slots and pools must still fit
+exactly, and the curves exist only where the daemon captures observations
+(`--measurement capture=on`) and the launching clients record CPU profiles
+(`RUNQUOTA_MEASUREMENT=profiles=on`); without a curve a lease is predicted at
+its granted width, so admission is unchanged. Measured CPU pressure corrects
+the prediction: on Linux the *some* `avg10` of `/proc/pressure/cpu` (another
+file of that format with `--cpu-pressure-file PATH`). Above `pressure-high`
+no reclaimed grant is made and no resizable lease is widened, until it falls
+below `pressure-low`; when the signal cannot be read, nothing is reclaimed
+and widening is unaffected. `runquota status --json` reports all of it under
+`admission_prediction`, and `runquota leases --json` marks each reclaimed
+lease. The thresholds are percentages from 0 to 100, and `pressure-low` may
+not be above `pressure-high`.
+
 A `runquotad` older than this table refuses a file that has it: it does not
 start, and a reload is refused with the budget in force unchanged. Upgrade
 the daemon before adding the table.
@@ -122,6 +153,7 @@ runquota config set pools.compile 8
 runquota config set admission.order starvation,fair-share,arrival
 runquota config set admission.max-wait 90s
 runquota config set admission.share-between-users none
+runquota config set admission.predictive on
 runquota config unset pools.compile               # back to the default
 runquota config reload                            # after editing the file by hand
 runquota config path
@@ -246,6 +278,13 @@ Memory pressure:
 | `--memory-pressure-file PATH` | — | The file `deterministic-file` reads. |
 | `--memory-pressure-required` | off | Treat an unavailable reading as a refusal rather than a shrug. |
 | `--memory-pressure-heavy-bytes N` | 512 MiB | The threshold a request counts as heavy at. |
+
+CPU pressure:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--cpu-pressure-file PATH` | `/proc/pressure/cpu` | Where the CPU pressure signal that corrects predictive admission and stops widening is read (a file in the kernel's PSI format). |
+| `--host-cpu-busy-file PATH` | the ambient sampler | Read the host's busy CPU share, which predictive admission takes background demand from, as one percentage (0-100) from this file. For tests: what other tenants of a shared host keep busy is neither controllable nor repeatable. An unreadable file means no reclaimed grants. |
 
 Recording (see [the observation store](/usage_guide/observations)):
 

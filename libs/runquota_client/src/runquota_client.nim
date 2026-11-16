@@ -84,6 +84,23 @@ proc withWidthRange*(request: ResourceRequest; minimum, preferred: MilliCpu;
   result.width = WidthRange(present: true, minMilli: minimum.value,
     preferredMilli: preferred.value, resizable: resizable)
 
+proc acceptingReclaimed*(request: ResourceRequest): ResourceRequest =
+  ## Says this client may be given a RECLAIMED grant: one admitted at the
+  ## request's minimum width into CPU the daemon predicts the running
+  ## leases' tails leave free (``ReclaimedGrantsMinor``). Only a launcher
+  ## that runs such a tree at a lower scheduling weight may ask for this --
+  ## ``runquota_exec.runWithLease`` does, from ``RunQuotaLease.reclaimed``.
+  ##
+  ## The flag travels in the width block, so a request for one CPU value
+  ## gets a block with both ends equal. A daemon that predates the flag
+  ## ignores it (it ignores unknown width flags) and simply never reclaims.
+  result = request
+  if not result.width.present:
+    result.width = WidthRange(present: true,
+      minMilli: request.resources.cpu.value,
+      preferredMilli: request.resources.cpu.value)
+  result.width.acceptsReclaimed = true
+
 proc benchmarkRequest*(request: ResourceRequest): ResourceRequest =
   result = request
   result.purpose = leasePurposeBenchmark
@@ -424,7 +441,8 @@ proc requestLease*(session: var RunQuotaSession;
         id: granted.leaseId,
         resources: granted.resources,
         active: true,
-        state: leaseClientGranted
+        state: leaseClientGranted,
+        reclaimed: granted.reclaimed
       )
     of rqLeaseDenied:
       var denied: LeaseDeniedMessage
@@ -492,7 +510,8 @@ proc decodeDecisionBatch(session: var RunQuotaSession; frame: RqspFrame): seq[Of
         id: decision.leaseId,
         resources: decision.resources,
         active: active,
-        state: if decision.kind == leaseDecisionGranted: leaseClientGranted else: leaseClientQueued
+        state: if decision.kind == leaseDecisionGranted: leaseClientGranted else: leaseClientQueued,
+        reclaimed: decision.kind == leaseDecisionGranted and decision.reclaimed
       ),
       queued: decision.kind == leaseDecisionQueued,
       diagnostic: decision.diagnostic

@@ -24,6 +24,7 @@ import runquota_client
 import runquota_core
 from runquota_ipc import defaultEndpoint
 import runquota_daemon/host_config
+import runquota_daemon/cpu_pressure
 import runquota_daemon/host_memory
 import runquota_daemon/reload_report
 
@@ -124,6 +125,20 @@ proc showFile(path: string): int =
   echo "  admission.share-between-users = " & (
     if host.shareBetweenUsers.isSome: host.shareBetweenUsers.get
     else: "unset -> default drf")
+  echo "  admission.predictive = " & (
+    if host.admissionPredictive.isSome:
+      (if host.admissionPredictive.get: "on" else: "off")
+    else: "unset -> default off")
+  echo "  admission.horizon = " & (
+    if host.admissionHorizonMillis.isSome:
+      $host.admissionHorizonMillis.get & "ms"
+    else: "unset -> default 10s")
+  echo "  admission.pressure-high = " & (
+    if host.pressureHighPct.isSome: $host.pressureHighPct.get
+    else: "unset -> default " & $DefaultPressureHighPct)
+  echo "  admission.pressure-low = " & (
+    if host.pressureLowPct.isSome: $host.pressureLowPct.get
+    else: "unset -> default " & $DefaultPressureLowPct)
   0
 
 proc showDaemon(): int =

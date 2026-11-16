@@ -31,6 +31,8 @@
 
 import std/[options, os, strutils, tables]
 
+import ./cpu_pressure
+
 when defined(posix):
   import std/posix
 
@@ -38,6 +40,8 @@ when defined(posix):
 # which budget flags its auto-spawn must NOT pass (a flag overrides the file),
 # and it does not link the daemon. Applying the file to a `DaemonConfig` is
 # `resolveBudget` in `runquota_daemon` (at start and on every reload).
+# `./cpu_pressure`, imported for the threshold defaults, is standard-library
+# only as well.
 
 const
   HostConfigSchema* = "runquota.host-config.v1"
@@ -115,6 +119,14 @@ type
       ## `[admission] max-wait`; 0 turns the starvation bound off.
     shareBetweenUsers*: Option[string]
       ## `[admission] share-between-users`, one of `ShareBetweenUsersValues`.
+    admissionPredictive*: Option[bool]
+      ## `[admission] predictive`, `"on"` or `"off"`.
+    admissionHorizonMillis*: Option[int64]
+      ## `[admission] horizon`, a positive duration.
+    pressureHighPct*: Option[float64]
+    pressureLowPct*: Option[float64]
+      ## `[admission] pressure-high` / `pressure-low`, percentages 0..100,
+      ## low not above high once the defaults fill an absent one.
     sourcePath*: string
       ## Where it was read from; empty when no file existed. Kept so a denial
       ## can say whose budget it enforced.
@@ -298,11 +310,48 @@ proc parseHostConfig*(text, path: string): HostConfig =
           fail(path, lineNo, "share-between-users must be " &
             ShareBetweenUsersValues.join(" or ") & ", got " & value)
         result.shareBetweenUsers = some(share)
+      of "predictive":
+        let raw = parseQuoted(value, path, lineNo)
+        case raw
+        of "on": result.admissionPredictive = some(true)
+        of "off": result.admissionPredictive = some(false)
+        else:
+          fail(path, lineNo, "predictive must be \"on\" or \"off\", got " &
+            value)
+      of "horizon":
+        var millis = 0'i64
+        if not parseDurationMillis(parseQuoted(value, path, lineNo), millis) or
+            millis <= 0:
+          fail(path, lineNo, "horizon must be a positive duration such as " &
+            "\"10s\" or \"1500ms\", got " & value)
+        result.admissionHorizonMillis = some(millis)
+      of "pressure-high", "pressure-low":
+        let raw = parseQuoted(value, path, lineNo)
+        var pct = -1.0
+        try:
+          pct = parseFloat(raw)
+        except ValueError:
+          discard
+        if pct < 0.0 or pct > 100.0 or pct != pct:
+          fail(path, lineNo, key & " must be a percentage from 0 to 100 " &
+            "such as \"10\" or \"2.5\", got " & value)
+        if key == "pressure-high": result.pressureHighPct = some(pct)
+        else: result.pressureLowPct = some(pct)
       else:
         fail(path, lineNo, "unknown key `" & key & "` in [admission]; " &
-          "expected order, max-wait or share-between-users")
+          "expected order, max-wait, share-between-users, predictive, " &
+          "horizon, pressure-high or pressure-low")
     else:
       discard
+  # THE THRESHOLDS ARE JUDGED TOGETHER, after the defaults fill an absent
+  # one: a gate that closes above 4 and opens only below 5 would reopen at
+  # once, which is a mistake about the other key's default, not a setting.
+  let high = result.pressureHighPct.get(DefaultPressureHighPct)
+  let low = result.pressureLowPct.get(DefaultPressureLowPct)
+  if low > high:
+    fail(path, lineNo, "admission pressure-low (" & $low &
+      ") is above pressure-high (" & $high & "); the gate opens below " &
+      "pressure-low and closes above pressure-high")
 
 proc readHostConfig*(path = hostConfigPath): HostConfig =
   ## The empty config when the file does not exist.
@@ -362,13 +411,17 @@ proc isBareKey(name: string): bool =
 
 proc parseHostConfigKey*(key: string): HostConfigKey =
   ## `machine.memory_bytes`, `machine.cpu_milli`, `pools.NAME`,
-  ## `admission.order`, `admission.max-wait` or
-  ## `admission.share-between-users`.
+  ## `admission.order`, `admission.max-wait`,
+  ## `admission.share-between-users`, `admission.predictive`,
+  ## `admission.horizon`, `admission.pressure-high` or
+  ## `admission.pressure-low`.
   let dot = key.find('.')
   if dot <= 0 or dot == key.len - 1:
     raise newException(HostConfigError, "unknown key `" & key &
       "`; expected machine.memory_bytes, machine.cpu_milli, pools.NAME or " &
-      "admission.order, admission.max-wait, admission.share-between-users")
+      "admission.order, admission.max-wait, admission.share-between-users, " &
+      "admission.predictive, admission.horizon, admission.pressure-high, " &
+      "admission.pressure-low")
   result = HostConfigKey(section: key[0 ..< dot], name: key[dot + 1 .. ^1])
   case result.section
   of "machine":
@@ -382,9 +435,11 @@ proc parseHostConfigKey*(key: string): HostConfigKey =
       raise newException(HostConfigError, "pool name `" & result.name &
         "` must be letters, digits, `_` or `-`")
   of "admission":
-    if result.name notin ["order", "max-wait", "share-between-users"]:
+    if result.name notin ["order", "max-wait", "share-between-users",
+        "predictive", "horizon", "pressure-high", "pressure-low"]:
       raise newException(HostConfigError, "unknown key `" & key &
-        "`; [admission] has order, max-wait and share-between-users")
+        "`; [admission] has order, max-wait, share-between-users, " &
+        "predictive, horizon, pressure-high and pressure-low")
   else:
     raise newException(HostConfigError, "unknown table `" & result.section &
       "` in `" & key & "`; expected machine, pools or admission")
