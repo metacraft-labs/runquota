@@ -613,14 +613,27 @@ when defined(linux) or defined(macosx):
           if expected.len > 0: check expected in gap
           else: check gap == ""
       proc checkText(text: string) =
+        # Judge the measurement record's own lines, not the whole text:
+        # `status` also prints the enforcement record, whose lines carry a
+        # ` gap: ` of their own whenever a mechanism is not enforced (always
+        # so in this suite, which runs with cgroup placement off). A check
+        # over the whole text would read those as a measurement gap.
         check "measurement_os: " & os in text
-        check "measurement: write-bytes " & coverage in text
-        check "measurement: memory " & coverage in text
-        if writeGap.len > 0:
-          check "gap: " & writeGap in text
-          check "gap: " & memoryGap in text
-        else:
-          check "gap:" notin text
+        var lines: seq[string]
+        for line in text.splitLines():
+          if line.startsWith("measurement: "):
+            lines.add(line)
+        checkpoint "measurement lines: " & $lines
+        # `check`, not `require`: `require` quits the process and skips the
+        # teardown that stops this suite's private daemon.
+        check lines.len == 2
+        if lines.len != 2: return
+        for (at, quantity, expected) in [(0, "write-bytes", writeGap),
+            (1, "memory", memoryGap)]:
+          check lines[at].startsWith("measurement: " & quantity & " " &
+            coverage & " (")
+          if expected.len > 0: check " gap: " & expected in lines[at]
+          else: check "gap:" notin lines[at]
       let sizingJ = sizingJson(socket, ["sizing", "--project", "synth",
         "--cpus", "1", "--since", "7d", "--all-users", "--json"])
       check sizingJ.code == 0
