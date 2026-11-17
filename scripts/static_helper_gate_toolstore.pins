@@ -15,7 +15,7 @@
 # FRESH from that archive, so what compiles and scans is the pinned bytes and
 # not whatever a mutable prefix now holds. The values are reprobuild's own
 # (`repro_dsl_stdlib/packages/{nim,gcc,git}.nim` at reprobuild
-# 9dbf4e71); they are copied here rather than read from there because the
+# b9cf09b07, v0.2.26); they are copied here rather than read from there because the
 # point of a pin is that the gate does not ask the thing it is checking.
 #
 # Hosts with no line here have no tool-store authority, and the gate says so

@@ -4921,17 +4921,17 @@
     "runquota-package-catalog_2": {
       "flake": false,
       "locked": {
-        "lastModified": 1793850782,
-        "narHash": "sha256-+yxXIdQwoKgjMRAXNZMxWKAJVYq7ny29sL9sAwu8HPo=",
+        "lastModified": 1794796778,
+        "narHash": "sha256-pfH/6Xc8xdVYQPqUJ5QfXHa5kTD4ZjRbgFGLFE2nynI=",
         "owner": "metacraft-labs",
         "repo": "reprobuild-packages",
-        "rev": "2c58192ab2e936da98440be5986a999339108cf6",
+        "rev": "29b7bb9bac83ccb2a69e5c626df7fc900a5fbc25",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "reprobuild-packages",
-        "rev": "2c58192ab2e936da98440be5986a999339108cf6",
+        "rev": "29b7bb9bac83ccb2a69e5c626df7fc900a5fbc25",
         "type": "github"
       }
     },
