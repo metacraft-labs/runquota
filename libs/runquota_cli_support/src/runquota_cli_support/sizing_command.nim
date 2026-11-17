@@ -15,6 +15,7 @@
 import std/[json, strutils]
 
 import runquota_client
+import runquota_process/enforcement
 import runquota_protocol
 
 type
@@ -29,6 +30,8 @@ type
     allUsers*: bool
     json*: bool
     redaction*: SizingRedaction
+
+const HeaderPrefix = "{\"type\":\"header\""
 
 proc parseDuration*(text: string; millis: var uint64): bool =
   ## `30d`, `12h`, `90m`, `45s` or `1500ms`.
@@ -219,25 +222,35 @@ proc runSizingVerb*(verb: string; args: seq[string]): int =
       # NDJSON ON STDOUT, THE STATUS ON STDERR, as `stats export` does, so
       # the output pipes into a replay or `jq` unchanged.
       var status = "ok"
+      var firstPage = true
       while true:
         let page = parseJson(client.querySizing(query))
         status = page{"status"}.getStr()
         for line in page{"lines"}.getElems():
-          stdout.writeLine(line.getStr())
+          var text = line.getStr()
+          # The header is the first line of the first page; it carries the
+          # measurement record of the host that produced the export.
+          if firstPage and text.startsWith(HeaderPrefix):
+            text = withMeasurementKey(text, hostMeasurementRecord())
+          firstPage = false
+          stdout.writeLine(text)
         let next = page{"next"}
         if next.isNil or next.kind != JInt:
           break
         query.offset = uint32(next.getInt())
       stderr.writeLine("runquota observations export: " & status)
       return statusExit(status)
+    # THE MEASUREMENT RECORD is this host's, added to the
+    # daemon's answer and printed after the figures it qualifies.
+    let measurement = hostMeasurementRecord()
     let text = client.querySizing(query)
     let answer = parseJson(text)
     if options.json:
-      echo text
-    elif options.what == swSizing:
-      echo renderSizingText(answer)
+      echo withMeasurementKey(text, measurement)
     else:
-      echo renderProfileText(answer)
+      echo (if options.what == swSizing: renderSizingText(answer)
+            else: renderProfileText(answer)) & "\n" &
+        measurement.renderLines().join("\n")
     statusExit(answer{"status"}.getStr())
   except CatchableError as error:
     stderr.writeLine("runquota " & name & ": " & error.msg)

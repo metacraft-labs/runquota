@@ -330,3 +330,126 @@ proc toJson*(record: EnforcementRecord): string =
     ",\"cgroup_root\":" & jsonString(record.cgroupRoot) &
     ",\"placement_problem\":" & jsonString(record.placementProblem) &
     ",\"mechanisms\":[" & items.join(",") & "]}"
+
+# ---------------------------------------------------------------------------
+# The capability record of MEASUREMENT
+# ---------------------------------------------------------------------------
+#
+# What `sizing-data` can measure of a tree differs by operating system, and a
+# figure that is a floor must not read as a complete one. The enforcement
+# record above covers what is held below admission; this one covers what is
+# measured, and is printed by `runquota status`, `runquota profile` and
+# `runquota sizing` (text and JSON) and carried in the header of `runquota
+# observations export --format sizing`.
+#
+# IT DESCRIBES THE HOST THE QUERY RAN ON, which is the daemon's host (the
+# socket is local), computed from the OS at query time. It is NOT a property
+# of the stored rows: those are scoped per host profile (`--host-profile
+# all` can include rows another host recorded), and a row carries no
+# provenance, so the record states the capability of this host's launchers
+# only. No schema field is involved.
+
+type
+  MeasurementCoverage* = enum
+    mcFull = "full"
+      ## The figure covers the whole process tree.
+    mcPartial = "partial"
+      ## The figure is a lower bound: part of the tree is not counted.
+    mcNone = "none"
+      ## Not measured on this host.
+
+  MeasurementQuantity* = enum
+    mqWriteBytes = "write-bytes"
+      ## `executions.io_write_bytes` and the write bandwidth derived from it.
+    mqMemory = "memory"
+      ## The tree's peak and profiled memory.
+
+  MeasurementEntry* = object
+    quantity*: MeasurementQuantity
+    coverage*: MeasurementCoverage
+    how*: string
+    gap*: string
+      ## "" when full; otherwise what the figure leaves out.
+
+  MeasurementRecord* = object
+    os*: string
+    entries*: seq[MeasurementEntry]
+
+const
+  MeasurementDescribes* = "the host the daemon runs on, not the host that " &
+    "recorded stored rows"
+
+proc measurementRecordFor*(os: string): MeasurementRecord =
+  ## The record for `os` (`linux`, `macos`, `windows`); pure, so every
+  ## record can be checked on any host.
+  result.os = os
+  case os
+  of "linux":
+    result.entries = @[
+      MeasurementEntry(quantity: mqWriteBytes, coverage: mcFull,
+        how: "the whole tree: /proc/<pid>/io of the root read at its " &
+          "exit, which includes the descendants it waited for"),
+      MeasurementEntry(quantity: mqMemory, coverage: mcFull,
+        how: "the whole tree: the sum of VmRSS over its processes")]
+  of "macos":
+    result.entries = @[
+      MeasurementEntry(quantity: mqWriteBytes, coverage: mcPartial,
+        how: "the launched root process's own writes " &
+          "(proc_pid_rusage ri_diskio_byteswritten)",
+        gap: "children's writes are not counted (macOS keeps no " &
+          "reaped-children share of storage IO), so a root that only " &
+          "forks writers reads low, often 0"),
+      MeasurementEntry(quantity: mqMemory, coverage: mcPartial,
+        how: "resident size summed over the tree (pti_resident_size)",
+        gap: "pages the memory compressor holds are excluded, so a tree " &
+          "under memory pressure reads low: the figure is a floor")]
+  of "windows":
+    result.entries = @[
+      MeasurementEntry(quantity: mqWriteBytes, coverage: mcNone,
+        how: "not measured", gap: "sizing-data is inert on windows"),
+      MeasurementEntry(quantity: mqMemory, coverage: mcNone,
+        how: "not measured", gap: "sizing-data is inert on windows")]
+  else:
+    result.entries = @[
+      MeasurementEntry(quantity: mqWriteBytes, coverage: mcNone,
+        how: "not measured", gap: "no backend for " & os),
+      MeasurementEntry(quantity: mqMemory, coverage: mcNone,
+        how: "not measured", gap: "no backend for " & os)]
+
+proc hostMeasurementRecord*(): MeasurementRecord =
+  measurementRecordFor(hostOsName())
+
+proc renderLines*(record: MeasurementRecord): seq[string] =
+  ## `measurement_os:` then one `measurement:` line per quantity, for the
+  ## text of `status`, `profile` and `sizing`.
+  result.add("measurement_os: " & record.os & " (describes " &
+    MeasurementDescribes & ")")
+  for item in record.entries:
+    result.add("measurement: " & $item.quantity & " " & $item.coverage &
+      " (" & item.how & ")" &
+      (if item.gap.len > 0: " gap: " & item.gap else: ""))
+
+proc toJson*(record: MeasurementRecord): string =
+  ## `{"os", "describes", "measurements": [{"quantity", "coverage", "how",
+  ## "gap"}]}`. Every key is present on every OS ("gap" is "" when
+  ## coverage is "full") so a consumer never infers from absence.
+  var items: seq[string]
+  for item in record.entries:
+    items.add("{\"quantity\":" & jsonString($item.quantity) &
+      ",\"coverage\":" & jsonString($item.coverage) &
+      ",\"how\":" & jsonString(item.how) &
+      ",\"gap\":" & jsonString(item.gap) & "}")
+  "{\"os\":" & jsonString(record.os) &
+    ",\"describes\":" & jsonString(MeasurementDescribes) &
+    ",\"measurements\":[" & items.join(",") & "]}"
+
+proc withMeasurementKey*(objectJson: string; record: MeasurementRecord): string =
+  ## `objectJson` (a JSON object) with `"measurement": <record>` as its
+  ## first member, by text insertion so every other byte, number spelling
+  ## included, is the daemon's. Anything that is not a non-empty object is
+  ## returned unchanged.
+  if objectJson.len < 2 or objectJson[0] != '{':
+    return objectJson
+  let rest = objectJson[1 .. ^1]
+  let separator = if rest.strip().startsWith("}"): "" else: ","
+  "{\"measurement\":" & record.toJson() & separator & rest

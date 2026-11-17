@@ -586,6 +586,67 @@ when defined(linux) or defined(macosx):
             check "[redacted:project:" in
               header{"query"}{"project"}.getStr()
 
+    test "measurement capability record is visible in every output":
+      # Where a figure is a floor on this OS, the output says so.
+      # The record is the host's, computed at query time, not a row field.
+      when defined(macosx):
+        const
+          os = "macos"
+          coverage = "partial"
+          writeGap = "children's writes are not counted"
+          memoryGap = "pages the memory compressor holds are excluded"
+      else:
+        const
+          os = "linux"
+          coverage = "full"
+          writeGap = ""
+          memoryGap = ""
+      proc checkRecord(record: JsonNode) =
+        check record{"os"}.getStr() == os
+        check "daemon runs on" in record{"describes"}.getStr()
+        check record{"measurements"}.getElems().len == 2
+        for item in record{"measurements"}.getElems():
+          check item{"coverage"}.getStr() == coverage
+        check record{"measurements"}[0]{"quantity"}.getStr() == "write-bytes"
+        for (at, expected) in [(0, writeGap), (1, memoryGap)]:
+          let gap = record{"measurements"}[at]{"gap"}.getStr()
+          if expected.len > 0: check expected in gap
+          else: check gap == ""
+      proc checkText(text: string) =
+        check "measurement_os: " & os in text
+        check "measurement: write-bytes " & coverage in text
+        check "measurement: memory " & coverage in text
+        if writeGap.len > 0:
+          check "gap: " & writeGap in text
+          check "gap: " & memoryGap in text
+        else:
+          check "gap:" notin text
+      let sizingJ = sizingJson(socket, ["sizing", "--project", "synth",
+        "--cpus", "1", "--since", "7d", "--all-users", "--json"])
+      check sizingJ.code == 0
+      checkRecord(sizingJ.json{"measurement"})
+      let profileJ = sizingJson(socket, ["profile", "--project", "mix",
+        "--since", "7d", "--all-users", "--json"])
+      check profileJ.code == 0
+      checkRecord(profileJ.json{"measurement"})
+      let (_, sizingText) = cli(privateEnv(socket), ["sizing", "--project",
+        "synth", "--cpus", "1", "--since", "7d", "--all-users"])
+      checkText(sizingText)
+      let (_, profileText) = cli(privateEnv(socket), ["profile", "--project",
+        "mix", "--since", "7d", "--all-users"])
+      checkText(profileText)
+      let (statusCode, statusText) = cli(privateEnv(socket), ["status"])
+      check statusCode == 0
+      checkText(statusText)
+      let (jsonCode, statusJsonText) = cli(privateEnv(socket),
+        ["status", "--json"])
+      check jsonCode == 0
+      checkRecord(parseJson(statusJsonText){"measurement"})
+      # The export header carries it too; the replay reads past it.
+      let ndjson = exportLines(socket, ["observations", "export", "--format",
+        "sizing", "--project", "synth", "--since", "7d", "--all-users"])
+      checkRecord(parseJson(ndjson.splitLines()[0]){"measurement"})
+
     test "profile reports per project and entry point":
       let (code, answer, text) = sizingJson(socket, ["profile", "--project",
         "mix", "--since", "7d", "--all-users", "--json"])

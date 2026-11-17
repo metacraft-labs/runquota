@@ -157,19 +157,23 @@ proc printSessionGroups(statusJson: string) =
       " oldest_queued_wait_millis=" &
         $group{"oldest_queued_wait_millis"}.getBiggestInt()
 
-proc withEnforcement(daemonJson: string; record: EnforcementRecord): string =
+proc withEnforcement(daemonJson: string; record: EnforcementRecord;
+                     measurement: MeasurementRecord): string =
   ## The daemon's status object with the client's enforcement record added
-  ## as `enforcement`. A daemon answer that is not a JSON object is wrapped
-  ## rather than lost.
+  ## as `enforcement` and the measurement record as `measurement`. A daemon
+  ## answer that is not a JSON object is wrapped rather than lost.
   try:
     let parsed = parseJson(daemonJson)
     if parsed.kind == JObject:
       parsed["enforcement"] = parseJson(record.toJson())
+      parsed["measurement"] = parseJson(measurement.toJson())
       return $parsed
-    return $(%*{"daemon": parsed, "enforcement": parseJson(record.toJson())})
+    return $(%*{"daemon": parsed, "enforcement": parseJson(record.toJson()),
+      "measurement": parseJson(measurement.toJson())})
   except JsonParsingError:
     return $(%*{"daemon": daemonJson,
-      "enforcement": parseJson(record.toJson())})
+      "enforcement": parseJson(record.toJson()),
+      "measurement": parseJson(measurement.toJson())})
 
 proc printStatus(json: bool): int =
   var client = connectDefault()
@@ -189,7 +193,7 @@ proc printStatus(json: bool): int =
   if json:
     let daemonJson =
       if statusJson.len > 0: statusJson else: inspectionStatusJson(status)
-    echo withEnforcement(daemonJson, enforcement)
+    echo withEnforcement(daemonJson, enforcement, hostMeasurementRecord())
   else:
     echo "sessions: " & $status.activeSessions
     echo "leases: " & $status.activeLeases
@@ -216,6 +220,8 @@ proc printStatus(json: bool): int =
     except CatchableError:
       discard
     for line in enforcement.renderLines():
+      echo line
+    for line in hostMeasurementRecord().renderLines():
       echo line
   0
 

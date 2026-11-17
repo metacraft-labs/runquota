@@ -470,7 +470,13 @@ knows its graph, which earlier jobs each one waited for. That measurement is
 off by default. On Linux the bytes include the descendants the root
 waited for; on macOS they are the root process's own, because the kernel
 keeps no reaped-children share for storage IO, so a tree whose root only
-forks reads low there.
+forks reads low there, and memory is resident size, which leaves out
+pages the compressor holds (a floor under pressure). `runquota profile`,
+`sizing` and `status`, in text and in `--json` (a `measurement` object, with
+the same keys on every OS), and the header of the sizing export say which
+applies: a `measurement:` line per quantity with its coverage (`full`,
+`partial` or `none`) and its gap. The record describes the host the daemon
+runs on, not the host that recorded stored rows.
 
 ```sh
 runquota profile --project myproject
