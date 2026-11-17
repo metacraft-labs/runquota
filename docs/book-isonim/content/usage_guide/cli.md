@@ -467,7 +467,10 @@ A session says which project it works for and through which entry point
 tree's memory over time (so a job's peak is the sum of its processes, not
 its largest one), the bytes it read and wrote, and, for a build engine that
 knows its graph, which earlier jobs each one waited for. That measurement is
-off by default.
+off by default. On Linux the bytes include the descendants the root
+waited for; on macOS they are the root process's own, because the kernel
+keeps no reaped-children share for storage IO, so a tree whose root only
+forks reads low there.
 
 ```sh
 runquota profile --project myproject

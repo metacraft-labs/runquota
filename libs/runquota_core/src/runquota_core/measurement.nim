@@ -108,7 +108,7 @@ const
     # (Reprobuild's engine, `runquota run`, `runquota jobserver`).
     measurePressureReports: MeasurementInfo(side: measuredByClient,
       implemented: true, defaultOn: false),
-    # IMPLEMENTED (Linux), AND OFF BY DEFAULT until the overhead gate passes
+    # IMPLEMENTED (Linux, macOS), AND OFF BY DEFAULT until the overhead gate passes
     # with it on: the launcher reads its tree at the profile cadence for a
     # memory profile, reads the root's IO counters once at its exit, and
     # Reprobuild sends each action's `after` list.

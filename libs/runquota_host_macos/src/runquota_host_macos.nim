@@ -67,6 +67,8 @@ proc sampleMacosMemoryPressure*(required = false): HostMemoryPressureSample =
 proc sampleMacosProcessTreeTelemetry*(rootProcessId: uint64): HostProcessTreeTelemetrySample =
   sampleMacosProcessTreeTelemetryNative(rootProcessId)
 
+export process_telemetry.readMacosProcessDiskIo
+
 when defined(macosx):
   proc sysctlbyname(name: cstring; oldp: pointer; oldlenp: ptr csize_t;
                     newp: pointer; newlen: csize_t): cint

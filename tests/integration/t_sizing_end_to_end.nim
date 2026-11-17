@@ -20,6 +20,14 @@
 ## * Write bytes: a tree that writes and fsyncs 32 MiB on a disk-backed
 ##   directory reports at least 32 MiB written. Mutation: not reading
 ##   `/proc/<pid>/io` before the reap leaves the column NULL.
+##   On macOS the figure is `proc_pid_rusage`'s `ri_diskio_byteswritten` of
+##   the root, which has no reaped-children share: the root `exec`s the
+##   writer there, and a second case records, as a capability, that a
+##   root whose child wrote reads below 32 MiB. Mutation: not reading it
+##   leaves the column NULL.
+## * macOS memory: the libproc tree reader (`runquota_host_macos`
+##   `sampleMacosProcessTreeTelemetryNative`) sums `pti_resident_size`;
+##   taking the maximum instead fails job_peak_is_tree_sum.
 ## * `after` over the wire: a finish naming an earlier lease of its session
 ##   records that lease's execution id; one naming another session's lease
 ##   records nothing for it. Mutation: storing the lease ids verbatim.
@@ -40,7 +48,7 @@
 ## `runquotad` and `runquota`, real processes, a real SQLite store, and the
 ## reference script run by the real `node`.
 
-when defined(linux):
+when defined(linux) or defined(macosx):
   import std/[json, options, os, osproc, posix, sequtils, streams, strtabs, strutils,
     tables, times, unittest]
 
@@ -84,10 +92,30 @@ when defined(linux):
   let self = getAppFilename()
 
   proc memAvailableBytes(): int64 =
-    for line in readFile("/proc/meminfo").splitLines():
-      if line.startsWith("MemAvailable:"):
-        return parseBiggestInt(line.splitWhitespace()[1]) * 1024
-    0
+    ## What a new 4-GiB tree could take without pushing the host into
+    ## reclaim. Linux: `MemAvailable`. macOS: free + inactive + speculative
+    ## + purgeable pages from `vm_stat` (the pages the kernel hands out
+    ## without compressing or swapping anything).
+    when defined(linux):
+      for line in readFile("/proc/meminfo").splitLines():
+        if line.startsWith("MemAvailable:"):
+          return parseBiggestInt(line.splitWhitespace()[1]) * 1024
+      0
+    else:
+      let (text, code) = execCmdEx("/usr/bin/vm_stat")
+      if code != 0: return 0
+      var pageSize = 16384'i64
+      var pages = 0'i64
+      for line in text.splitLines():
+        if line.startsWith("Mach Virtual Memory Statistics"):
+          let at = line.find("page size of ")
+          if at >= 0:
+            pageSize = parseBiggestInt(line[at + 13 .. ^1].splitWhitespace()[0])
+        for name in ["Pages free:", "Pages inactive:", "Pages speculative:",
+                     "Pages purgeable:"]:
+          if line.startsWith(name):
+            pages += parseBiggestInt(line.split(':')[1].strip().strip(chars = {'.'}))
+      pages * pageSize
 
   proc startDaemon(root, socket: string; capture = true;
                    extra: openArray[string] = []): Process =
@@ -116,22 +144,27 @@ when defined(linux):
     stopOwned(daemon)
     openObservationStore(root / "observations.sqlite3")
 
-  proc statfs(path: cstring; buf: pointer): cint {.importc,
-    header: "<sys/vfs.h>".}
+  when defined(linux):
+    proc statfs(path: cstring; buf: pointer): cint {.importc,
+      header: "<sys/vfs.h>".}
 
   proc diskBackedDir(): string =
-    ## A directory on a real disk: `/proc/<pid>/io` counts bytes sent to
-    ## storage, and tmpfs sends none. The working directory (the checkout)
-    ## first, then the home cache.
+    ## A directory on a real disk: the kernel's IO counters count bytes sent
+    ## to storage, and tmpfs sends none. The working directory (the
+    ## checkout) first, then the home cache. macOS has no tmpfs on these
+    ## paths (APFS), so the first existing candidate is disk-backed.
     const tmpfsMagic = 0x01021994'u64
     for candidate in [getEnv("RUNQUOTA_TEST_DISK_DIR"), getCurrentDir(),
                       getHomeDir() / ".cache"]:
       if candidate.len == 0 or not dirExists(candidate):
         continue
-      # `struct statfs` starts with `f_type` (a long) on Linux.
-      var fs: array[128, int64]
-      if statfs(candidate.cstring, addr fs[0]) == 0 and
-          uint64(fs[0]) != tmpfsMagic:
+      when defined(linux):
+        # `struct statfs` starts with `f_type` (a long) on Linux.
+        var fs: array[128, int64]
+        if statfs(candidate.cstring, addr fs[0]) == 0 and
+            uint64(fs[0]) != tmpfsMagic:
+          return candidate
+      else:
         return candidate
     ""
 
@@ -222,9 +255,14 @@ when defined(linux):
       prerequisite awaitCapture(socket), "capture never came on"
       var env = privateEnv(socket)
       env["RUNQUOTA_MEASUREMENT"] = "sizing-data=on"
+      # Linux: the writer is a child of the root `sh`, and the kernel folds
+      # a reaped child's IO into its parent, so the root's figure includes
+      # it. macOS keeps no such share (`proc_pid_rusage` has no child IO
+      # fields), so the root must BE the writer: `exec` replaces the shell.
+      let writer = quoteShell(self) & " --write " & quoteShell(target) & " 32"
+      let script = when defined(linux): "(" & writer & ")" else: "exec " & writer
       let (code, text) = cli(env, ["acquire", "--cpu", "1000", "--mem",
-        "64MiB", "--stats-key", "io", "--", "/bin/sh", "-c",
-        "(" & quoteShell(self) & " --write " & quoteShell(target) & " 32)"])
+        "64MiB", "--stats-key", "io", "--", "/bin/sh", "-c", script])
       checkpoint text
       check code == 0
       let store = stoppedStore(daemon, root)
@@ -234,6 +272,42 @@ when defined(linux):
         echo "io write ", rows[0].ioWriteBytes, " read ", rows[0].ioReadBytes
         check rows[0].ioWriteBytes.isSome
         check rows[0].ioWriteBytes.get(0) >= 32 * MiB
+
+    when defined(macosx):
+      test "macos capability record: a reaped child's writes are not the root's":
+        # CAPABILITY RECORD (macOS): `proc_pid_rusage` reports a process's
+        # OWN storage bytes and has no reaped-children share, so a root that
+        # only forks a writer reads low. This measures that on this host and
+        # fails if it changes, so the spec's statement (Observation Store §
+        # Sizing data and replay) is re-examined when it does.
+        let dir = diskBackedDir()
+        prerequisite dir.len > 0, "no disk-backed directory to write in"
+        let target = dir / ("rqsz-io-child-" & $getCurrentProcessId())
+        defer: removeFile(target)
+        let root = scratchDir("rqszioc")
+        defer: removeDir(root)
+        let socket = root / "ep" / "d.sock"
+        let daemon = startDaemon(root, socket, extra =
+          ["--ambient-sample-interval-millis", "0"])
+        defer: stopOwned(daemon)
+        prerequisite awaitSocket(daemon, socket),
+          daemon.startupContext("the daemon did not bind " & socket)
+        prerequisite awaitCapture(socket), "capture never came on"
+        var env = privateEnv(socket)
+        env["RUNQUOTA_MEASUREMENT"] = "sizing-data=on"
+        let (code, text) = cli(env, ["acquire", "--cpu", "1000", "--mem",
+          "64MiB", "--stats-key", "iochild", "--", "/bin/sh", "-c",
+          "(" & quoteShell(self) & " --write " & quoteShell(target) & " 32)"])
+        checkpoint text
+        check code == 0
+        let store = stoppedStore(daemon, root)
+        let rows = store.readExecutions()
+        check rows.len == 1
+        if rows.len == 1:
+          echo "capability: macOS io_write_bytes of a root whose child wrote ",
+            "32 MiB: ", rows[0].ioWriteBytes
+          check rows[0].ioWriteBytes.isSome
+          check rows[0].ioWriteBytes.get(0) < 32 * MiB
 
     test "after names executions of the same run only":
       let root = scratchDir("rqszafter")

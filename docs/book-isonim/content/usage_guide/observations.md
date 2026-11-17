@@ -61,7 +61,7 @@ measurement has a name and a switch:
 | `profiles` | the launching client: a CPU profile of the child tree (Linux and macOS), see "CPU totals and profiles" below | off by default |
 | `metrics-export` | the daemon: the [capacity figures text file](/usage_guide/daemon#exporting-capacity-figures-for-prometheus) | off unless `runquotad --metrics-textfile PATH` names a file; `metrics-export=on` without one is refused |
 | `pressure-reports` | the launching client: [build-wait pressure](/usage_guide/daemon#build-wait-pressure) reports (Reprobuild, `runquota run`, `runquota jobserver`) | off by default |
-| `sizing-data` | — | registered, not implemented yet: the switch is accepted and does nothing |
+| `sizing-data` | the launching client: the tree's summed resident memory over time, the root's storage bytes at its exit, and (Reprobuild) each action's `after` list, see "Profiles and sizing" in the CLI guide (Linux and macOS) | off by default |
 
 A switch is `NAME=on|off`, comma-separated and applied left to right;
 `all=on|off` covers every name. The daemon takes it as `runquotad

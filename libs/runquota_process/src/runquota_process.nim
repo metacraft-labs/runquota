@@ -931,6 +931,24 @@ when defined(posix):
           return IoTotals(known: false)
       result.known = readSeen and writeSeen
 
+  when defined(macosx):
+    const pPid = cint(1)
+      ## `P_PID` of `idtype_t` (<sys/wait.h>).
+
+    proc readExitedRootIo(pid: int): IoTotals =
+      ## The root's `ri_diskio_bytesread` / `ri_diskio_byteswritten` from
+      ## `proc_pid_rusage`, read while it is a zombie (after it exited,
+      ## before it is reaped). THESE ARE THE ROOT'S OWN BYTES: macOS keeps no
+      ## reaped-children share for disk IO (there is `ri_child_user_time` but
+      ## no `ri_child_diskio_*`), so what a descendant wrote is NOT in the
+      ## root's figure, unlike Linux's `/proc/<pid>/io`. A tree whose root
+      ## only forks reads low (often 0). Not known when the read fails.
+      var readBytes, writtenBytes = 0'u64
+      if readMacosProcessDiskIo(uint64(pid), readBytes, writtenBytes):
+        IoTotals(known: true, readBytes: readBytes, writeBytes: writtenBytes)
+      else:
+        IoTotals(known: false)
+
   proc reapChild(child: var LaunchedProcess; status: var cint;
                  options: cint): Pid =
     ## `waitpid` that also keeps what the kernel says the reaped tree used.
@@ -943,7 +961,7 @@ when defined(posix):
     ## children at once (a build engine) cannot attribute it to one of them.
     ## What neither can see is a descendant re-parented away before it was
     ## waited for; see `runquota_core/cpu_profile`.
-    when defined(linux):
+    when defined(linux) or defined(macosx):
       # `sizing-data`: LOOK AT THE EXIT WITHOUT CONSUMING IT, read the
       # zombie's IO counters, then reap it below as always. `waitid` with
       # `WNOWAIT` leaves the child waitable, so the `wait4` that follows
@@ -1346,10 +1364,13 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     # alone.
     let profiles = measureProfiles in measurements and
       (defined(linux) or defined(macosx))
-    # SIZING DATA ON LINUX ONLY: the memory profile needs the tree reader
-    # (which macOS has too, but its leg is not done), and the IO counters
-    # are `/proc/<pid>/io`.
-    let sizingData = measureSizingData in measurements and defined(linux)
+    # SIZING DATA ON LINUX AND MACOS: the memory profile needs the tree
+    # reader (`/proc` on Linux, libproc on macOS; both sum the resident set
+    # over the tree) and the IO counters are `/proc/<pid>/io` on Linux and
+    # `proc_pid_rusage` on macOS (the root's own bytes there). Inert
+    # elsewhere.
+    let sizingData = measureSizingData in measurements and
+      (defined(linux) or defined(macosx))
 
     # Everything the child needs between fork and exec is composed here, while
     # there is still a whole process to compose it in. After the fork the child

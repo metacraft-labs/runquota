@@ -93,7 +93,7 @@ suite "measurement switch parser":
   test "the registry says which measurements exist and where they are taken":
     check measurementRegistry[measureCapture].side == measuredByDaemon
     check measurementRegistry[measureTreeSampling].side == measuredByClient
-    # Sizing data exists (Linux), is taken by the launching client, and is
+    # Sizing data exists (Linux, macOS), is taken by the launching client, and is
     # off by default: a measurement is on by default only once it has
     # passed the overhead gate.
     check measurementRegistry[measureSizingData].implemented

@@ -40,6 +40,8 @@ when defined(macosx):
       ri_system_time {.importc.}: uint64
       ri_child_user_time {.importc.}: uint64
       ri_child_system_time {.importc.}: uint64
+      ri_diskio_bytesread {.importc.}: uint64
+      ri_diskio_byteswritten {.importc.}: uint64
 
     MachTimebaseInfoData {.importc: "mach_timebase_info_data_t",
                             header: "<mach/mach_time.h>", bycopy.} = object
@@ -203,6 +205,28 @@ when defined(macosx):
     cumulativeTicks.checkedAdd(usage.ri_child_system_time)
     cumulativeMicros = absoluteTimeMicros(cumulativeTicks, timebase)
     true
+
+proc readMacosProcessDiskIo*(processId: uint64; bytesRead,
+                             bytesWritten: var uint64): bool =
+  ## `ri_diskio_bytesread` / `ri_diskio_byteswritten` of ONE process, from
+  ## `proc_pid_rusage`. Works on a zombie (an exited, not yet reaped
+  ## process), which is how the launcher reads the root's final figures
+  ## between `waitid(WNOWAIT)` and `wait4`. Measured on macOS 26: the
+  ## counters are the process's OWN bytes sent to storage; unlike
+  ## `ri_child_user_time` there is no reaped-children share, so the bytes a
+  ## reaped child wrote are NOT in its parent's figures (Linux folds them
+  ## in). False when the process cannot be read.
+  when defined(macosx):
+    if processId == 0'u64 or processId > uint64(high(DarwinPid)):
+      return false
+    var usage: RusageInfoV2
+    if procPidRusage(cint(processId), RusageFlavorV2, addr usage) != 0.cint:
+      return false
+    bytesRead = usage.ri_diskio_bytesread
+    bytesWritten = usage.ri_diskio_byteswritten
+    true
+  else:
+    false
 
 proc sampleMacosProcessTreeTelemetryNative*(
     rootProcessId: uint64): HostProcessTreeTelemetrySample =
