@@ -761,6 +761,7 @@ proc initDaemon*(config: DaemonConfig; deferCapture = false): RunQuotaDaemon =
   result = RunQuotaDaemon(
     config: effectiveConfig,
     state: dsStarting,
+    namespaces: currentNamespaces(),
     nextSessionId: 1'u64,
     nextLeaseId: 1'u64,
     nextQueueOrder: 1'u64,
@@ -1948,6 +1949,11 @@ proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
       # daemon could not read the child's start time (pid-only judgement).
       "\"child_process_id\":" & $lease.childProcessId & "," &
       "\"child_start_stamp\":" & $lease.childStartStamp & "," &
+      # TRUE WHEN THE CLIENT RUNS IN ANOTHER PID NAMESPACE (a container's
+      # client on the host daemon): `child_process_id` is then the
+      # connection's peer process, watched in the child's place, not the pid
+      # the client reported (`watchedChildProcessId`).
+      "\"foreign_pid_namespace\":" & $lease.foreignPidNamespace & "," &
       "\"parent_lease_id\":" & $lease.parentLeaseId & "," &
       # NEGOTIATED WIDTH: the range asked for, the width granted, and for a
       # resizable lease the target its jobserver follows and the width it
@@ -2837,7 +2843,8 @@ proc observeHelloPeer*(connection: LocalConnection): HelloPeer =
   ## WITHOUT the daemon-wide lock -- see ``HelloPeer``. Called once per
   ## connection, before its Hello is handled.
   let identity = connection.peerIdentity()
-  HelloPeer(identity: identity, ownerName: observePeerOwner(identity).name)
+  HelloPeer(identity: identity, ownerName: observePeerOwner(identity).name,
+            namespaces: observePeerNamespaces(identity))
 
 proc noteOwner(daemon: var RunQuotaDaemon; principal: OwnerPrincipal;
                name: Option[string]): string =
@@ -2879,7 +2886,34 @@ proc handleHello(daemon: var RunQuotaDaemon; connection: var LocalConnection;
   # rather than corrected: a client that declares somebody else's uid is
   # either broken or lying, and neither is a connection to keep serving.
   let peer = helloPeer.identity
-  if peer.kind != peerIdentityUnavailable and hello.userId != peer.userId:
+  # A CLIENT IN ANOTHER NAMESPACE SPEAKS IN ITS OWN IDS. A container's client
+  # reaches this daemon through a forwarded socket, and the uid it declares
+  # is a container uid while the peer credentials name the host uid of
+  # whatever connected (the forwarding proxy, or the container's mapped
+  # root). The comparison below would refuse every such client, so a client
+  # in another USER namespace is excused from it -- and only from it: its
+  # owner is still the peer credential, as for everybody, and the uid it
+  # declared is not even recorded, so the excuse cannot attribute anything
+  # to anybody. Its pids are not the daemon's either; see
+  # `foreignPidNamespace` and LeaseRunning.
+  #
+  # The namespaces are the KERNEL's where it can tell, never the client's
+  # word against it: a client that is itself the peer and claims namespaces
+  # the kernel says it does not have is refused here (`peer_namespaces`).
+  let claimed = parseClientNamespaces(hello.desiredCapabilities)
+    .differenceFrom(daemon.namespaces)
+  let verdict = judgeNamespaces(claimed, helloPeer.namespaces,
+    peerIsClient = peer.kind == peerIdentityProcess and
+      peer.processId == hello.processId)
+  if verdict.refusal.len > 0:
+    connection.sendError(frame.header.requestId, diagnostic(diagDenied,
+      verdict.refusal,
+      "namespace tokens describe the client; the daemon checks them " &
+        "against the peer's /proc/<pid>/status NSpid and uid_map"))
+    return false
+  let difference = verdict.difference
+  if peer.kind != peerIdentityUnavailable and not difference.user and
+      hello.userId != peer.userId:
     connection.sendError(frame.header.requestId, diagnostic(diagDenied,
       "client declared uid " & $hello.userId &
         " but its peer credentials say uid " & $peer.userId,
@@ -2928,8 +2962,13 @@ proc handleHello(daemon: var RunQuotaDaemon; connection: var LocalConnection;
   )
   connection.sendResponse(rqHelloOk, frame.header.requestId, encodeHelloOk(helloOk))
   context.supervisorProcessId = hello.processId
-  context.supervisorUserId = hello.userId
+  # The declared uid of a client excused above is its own namespace's and
+  # means nothing here: keep the peer's instead of a value the client chose.
+  context.supervisorUserId =
+    if difference.user and peer.kind != peerIdentityUnavailable: peer.userId
+    else: hello.userId
   context.peer = peer
+  context.foreignPidNamespace = difference.pid
   true
 
 proc benchmarkPermitted(daemon: RunQuotaDaemon; sessionId: SessionId): bool =
@@ -2984,6 +3023,7 @@ proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
     supervisorProcessId: session.supervisorProcessId,
     supervisorUserId: session.supervisorUserId,
     peer: session.peer,
+    foreignPidNamespace: session.foreignPidNamespace,
     childProcessId: 0'u64,
     processGroupId: 0'u64,
     cleanupRegistered: false,
@@ -3719,6 +3759,27 @@ proc ownerLoads(daemon: RunQuotaDaemon): Table[string, OwnerLoad] =
       held.cpuMilli += uint64(lease.resources.cpu.value)
       held.memoryBytes += lease.resources.memory.value
       result[owner] = held
+
+proc watchedChildProcessId(lease: LeaseRow; reported: uint64): uint64 =
+  ## The host process whose life the lost-lease reaper watches for a
+  ## lease's child.
+  ##
+  ## Normally the child the client reported. A client in ANOTHER PID
+  ## NAMESPACE (a container's client on the host daemon) reports a pid of
+  ## its own namespace, which names an unrelated host process here -- a
+  ## container's pid 40 is likely a host kernel thread that never exits, and
+  ## would pin the reservation for the daemon's lifetime. Its child is
+  ## watched through the connection's PEER instead, the process the kernel
+  ## named: for a socket an incus proxy device forwards, the container's
+  ## proxy, which lives exactly as long as the device and so as long as the
+  ## container its child cannot outlive; for a socket mounted into the
+  ## namespace, the supervising client itself, so its loss releases the
+  ## lease as one that never reported a child does. 0 (nothing to watch)
+  ## when the reported pid is 0 or the transport named no peer process.
+  if reported == 0'u64 or not lease.foreignPidNamespace:
+    return reported
+  if lease.peer.kind == peerIdentityProcess: lease.peer.processId
+  else: 0'u64
 
 proc lostChildVerdict(lease: LeaseRow): ChildVerdict =
   ## Is anything the lost lease launched still consuming its reservation?
@@ -4946,6 +5007,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       supervisorProcessId: context.supervisorProcessId,
       supervisorUserId: context.supervisorUserId,
       peer: context.peer,
+      foreignPidNamespace: context.foreignPidNamespace,
       groupKey: groupKey,
       registeredAtMillis: monoMillis(),
       project: msg.project,
@@ -5111,6 +5173,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
         supervisorProcessId: session.supervisorProcessId,
         supervisorUserId: session.supervisorUserId,
         peer: session.peer,
+        foreignPidNamespace: session.foreignPidNamespace,
         finish: cancelled(),
         finishDiagnostic: okDiagnostic(),
         queueDiagnostic: okDiagnostic(),
@@ -5362,12 +5425,12 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           diagInvalidArgument, "lease cannot become running"))
       return
     daemon.transitionLeaseState(lease, leaseStateRunning)
-    lease.childProcessId = msg.childProcessId
+    lease.childProcessId = watchedChildProcessId(lease, msg.childProcessId)
     # THE CHILD'S IDENTITY, READ NOW, while the supervisor still holds the
     # child unwaited and its pid therefore cannot have been handed on (see
     # `runquota_daemon/child_identity`). Read later, from the reaper, the
     # same pid may already belong to somebody else.
-    lease.childStartStamp = processStartStamp(msg.childProcessId)
+    lease.childStartStamp = processStartStamp(lease.childProcessId)
     lease.processGroupId = msg.processGroupId
     lease.cleanupRegistered = msg.cleanupRegistered
     daemon.leases[msg.leaseId.value] = lease

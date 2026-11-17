@@ -1,8 +1,10 @@
 import runquota_protocol/types as protocolTypes
+import runquota_protocol/client_namespaces
 import runquota_codec
 import runquota_core
 
 export protocolTypes
+export client_namespaces
 
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"

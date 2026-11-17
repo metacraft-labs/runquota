@@ -11,10 +11,12 @@ import ./owners
 import ./cpu_shape
 import ./capacity_metrics
 import ./cpu_pressure
+import ./peer_namespaces
 
 export cpu_shape
 export cpu_pressure
 export capacity_metrics
+export peer_namespaces
 
 export owners
 
@@ -274,6 +276,13 @@ type
     supervisorProcessId*: uint64
     supervisorUserId*: uint64
     peer*: PeerIdentity
+    foreignPidNamespace*: bool
+      ## The client runs in a pid namespace other than the daemon's -- a
+      ## container's client reaching the host daemon through a forwarded
+      ## socket -- by the kernel's evidence, or by the client's claim where
+      ## the kernel cannot contradict it (`peer_namespaces`). The pids it reports then name processes the daemon cannot
+      ## see, and a child it reports is watched through the connection's
+      ## peer process instead (LeaseRunning).
     groupKey*: string
       ## The key of the session group this session joined
       ## (`sessionGroupKey`). Empty for a row built without one, which
@@ -354,6 +363,13 @@ type
     supervisorProcessId*: uint64
     supervisorUserId*: uint64
     peer*: PeerIdentity
+    foreignPidNamespace*: bool
+      ## The client runs in a pid namespace other than the daemon's -- a
+      ## container's client reaching the host daemon through a forwarded
+      ## socket -- by the kernel's evidence, or by the client's claim where
+      ## the kernel cannot contradict it (`peer_namespaces`). The pids it reports then name processes the daemon cannot
+      ## see, and a child it reports is watched through the connection's
+      ## peer process instead (LeaseRunning).
     childProcessId*: uint64
     childStartStamp*: uint64
       ## The child's start stamp, read by the daemon itself when
@@ -445,6 +461,13 @@ type
     supervisorProcessId*: uint64
     supervisorUserId*: uint64
     peer*: PeerIdentity
+    foreignPidNamespace*: bool
+      ## The client runs in a pid namespace other than the daemon's -- a
+      ## container's client reaching the host daemon through a forwarded
+      ## socket -- by the kernel's evidence, or by the client's claim where
+      ## the kernel cannot contradict it (`peer_namespaces`). The pids it reports then name processes the daemon cannot
+      ## see, and a child it reports is watched through the connection's
+      ## peer process instead (LeaseRunning).
     sessionIds*: seq[SessionId]
 
   HelloPeer* = object
@@ -456,6 +479,9 @@ type
     ## the lock every lease decision waits behind.
     identity*: PeerIdentity
     ownerName*: Option[string]
+    namespaces*: PeerNamespaces
+      ## The kernel's evidence for the peer's pid and user namespaces
+      ## (`peer_namespaces`), read from procfs on the same worker.
 
   SessionPoolDeclaration* = object
     ## What one session declared (`DeclarePools`): the owner it declared as,
@@ -480,6 +506,9 @@ type
   RunQuotaDaemon* = object
     config*: DaemonConfig
     state*: DaemonState
+    namespaces*: ClientNamespaces
+      ## The daemon's own pid and user namespaces, read once at start and
+      ## compared with each client's (`runquota_protocol/client_namespaces`).
     imageDigest*: string
       ## `imageDigestOf` this daemon's own executable, taken on a thread
       ## `serve` starts before an installer can rename the file aside, and

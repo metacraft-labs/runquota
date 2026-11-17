@@ -128,6 +128,15 @@ start stamp), so a recycled pid does not keep it alive.
 lost lease that stays while nothing is running under its `child_process_id`
 is a bug.
 
+A lease whose `foreign_pid_namespace` is `true` came from a client in another
+pid namespace, such as a build in a container reaching the host daemon
+through a forwarded socket. The child pid such a client reports is its own
+namespace's and means nothing on the host, so `child_process_id` is then the
+process at the daemon's end of the connection: the forwarder for a socket an
+Incus proxy device forwards (one process per device, living as long as the
+container), or the client itself for a socket mounted into the container. A
+lost lease of that kind is released when that process exits.
+
 ## The published stats table says entries are stale
 
 ```text

@@ -198,7 +198,12 @@ has to be able to say whose rows it is about. The value is taken by the daemon
 from the connection's **peer credentials** and never from anything the client
 declares — a client-declared owner would let any participant write rows
 attributed to another user — and a Hello whose declared uid disagrees with the
-peer credentials is refused rather than corrected. It is `NULL`, not `0`, where
+peer credentials is refused rather than corrected, unless the Hello says the
+client runs in another user namespace (a container's client on the host
+daemon, whose uid is the container's own); its owner is then still the peer
+credential. The daemon checks that claim against what the kernel shows of the
+peer (`/proc/<pid>/status` `NSpid` and `/proc/<pid>/uid_map`) and refuses a
+client that is itself the peer and claims namespaces it is not in. It is `NULL`, not `0`, where
 the transport cannot report credentials: `0` is root, and a wrong owner is
 worse than an absent one.
 

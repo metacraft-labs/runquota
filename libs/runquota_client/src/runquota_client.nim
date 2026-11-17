@@ -213,7 +213,11 @@ proc connect*(endpoint: Endpoint; clientName = "runquota-nim";
     maxProtocolMajor: RqspProtocolMajor,
     processId: pid,
     userId: uid,
-    desiredCapabilities: "m1-lease"
+    # The namespaces this process runs in, so a daemon in other namespaces
+    # (this client in a container, the daemon on the host) knows that the
+    # uid and pids above are this process's own view and not the daemon's
+    # (`runquota_protocol/client_namespaces`).
+    desiredCapabilities: withNamespaceTokens("m1-lease", currentNamespaces())
   )
   let requestId = result.requestFrame(rqHello, encodeHello(hello), handshakeTimeoutMs())
   let frame = result.readResponse(requestId, handshakeTimeoutMs())
