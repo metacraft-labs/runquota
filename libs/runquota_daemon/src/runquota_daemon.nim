@@ -4664,18 +4664,58 @@ proc grantNextDecisions*(daemon: var RunQuotaDaemon;
       result.add(lease.leaseDecision(leaseDecisionGranted))
       break
 
-proc requireOwnedLease(daemon: RunQuotaDaemon; connection: var LocalConnection;
+proc registeredHere(context: ConnectionContext; sessionId: SessionId): bool =
+  ## Whether this connection registered `sessionId`, open or since closed.
+  ## Session ids are never reused, so a closed one still names this
+  ## connection's own session.
+  for id in context.sessionIds:
+    if id.value == sessionId.value:
+      return true
+  false
+
+proc connectionOwnsSession(daemon: RunQuotaDaemon; context: ConnectionContext;
+                           sessionId: SessionId): bool =
+  ## THE SESSION A FRAME NAMES MUST BE ONE THIS CONNECTION REGISTERED.
+  ## Session ids and lease ids are small sequential integers, and one
+  ## host-wide daemon holds every user's sessions, so a check against the
+  ## frame alone ("the lease belongs to the session the frame names") lets
+  ## any participant release, finish, start, poll, request in or close
+  ## another user's session by naming it (RunQuota-Observation-Store.md
+  ## §"Per-user records, host-wide capacity": a user MUST NOT perturb
+  ## another user's leases). A session of another connection is answered as
+  ## unknown, as `DeclarePools` and `RequestSubLease` already answer it.
+  daemon.sessions.hasKey(sessionId.value) and
+    context.registeredHere(sessionId)
+
+proc requireOwnedSession(daemon: RunQuotaDaemon; context: ConnectionContext;
+                         connection: var LocalConnection; requestId: uint64;
+                         sessionId: SessionId): bool =
+  if daemon.connectionOwnsSession(context, sessionId):
+    return true
+  connection.sendError(requestId, diagnostic(diagInvalidArgument,
+      "unknown session id"))
+  false
+
+proc requireOwnedLease(daemon: RunQuotaDaemon; context: ConnectionContext;
+                       connection: var LocalConnection;
                        requestId: uint64; sessionId: SessionId;
                        id: LeaseId; lease: var LeaseRow): bool =
-  if not daemon.leases.hasKey(id.value):
+  # Registered here, open or closed: `CloseSession` leaves finished leases
+  # behind, and the connection that closed the session must still be able
+  # to release them. The lease checks below hold either way.
+  if not context.registeredHere(sessionId):
+    connection.sendError(requestId, diagnostic(diagInvalidArgument,
+        "unknown session id"))
+    return false
+  # A lease of another session answers exactly as a missing one: lease ids
+  # are sequential, so a distinct message would let a connection enumerate
+  # which leases exist.
+  if not daemon.leases.hasKey(id.value) or
+      daemon.leases[id.value].sessionId.value != sessionId.value:
     connection.sendError(requestId, diagnostic(diagInvalidArgument,
         "unknown lease id"))
     return false
   lease = daemon.leases[id.value]
-  if lease.sessionId.value != sessionId.value:
-    connection.sendError(requestId, diagnostic(diagInvalidArgument,
-        "lease belongs to another session"))
-    return false
   true
 
 proc releaseLease(daemon: var RunQuotaDaemon; id: LeaseId) =
@@ -5060,9 +5100,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
           "invalid CloseSession payload"))
       return
-    if not daemon.sessions.hasKey(msg.sessionId.value):
-      connection.sendError(frame.header.requestId, diagnostic(
-          diagInvalidArgument, "unknown session id"))
+    if not daemon.requireOwnedSession(context, connection,
+        frame.header.requestId, msg.sessionId):
       return
     for lease in daemon.leases.values:
       if lease.sessionId.value == msg.sessionId.value and lease.state != leaseStateFinished:
@@ -5087,9 +5126,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
           "invalid RequestLease payload"))
       return
-    if not daemon.sessions.hasKey(msg.sessionId.value):
-      connection.sendError(frame.header.requestId, diagnostic(
-          diagInvalidArgument, "unknown session id"))
+    if not daemon.requireOwnedSession(context, connection,
+        frame.header.requestId, msg.sessionId):
       return
     let effective = daemon.effectiveResources(msg.sessionId,
         msg.commandStatsId, msg.resources, msg.estimate)
@@ -5269,7 +5307,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           diagInvalidArgument, "unknown session id"))
       return
     var lease: LeaseRow
-    if not daemon.requireOwnedLease(connection, frame.header.requestId,
+    if not daemon.requireOwnedLease(context, connection, frame.header.requestId,
         sessionRaw, leaseRaw, lease):
       return
     if not lease.resizableHolds():
@@ -5311,14 +5349,9 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
           "invalid ReleaseLease payload"))
       return
-    if not daemon.leases.hasKey(msg.leaseId.value):
-      connection.sendError(frame.header.requestId, diagnostic(
-          diagInvalidArgument, "unknown lease id"))
-      return
-    let lease = daemon.leases[msg.leaseId.value]
-    if lease.sessionId.value != msg.sessionId.value:
-      connection.sendError(frame.header.requestId, diagnostic(
-          diagInvalidArgument, "lease belongs to another session"))
+    var lease: LeaseRow
+    if not daemon.requireOwnedLease(context, connection,
+        frame.header.requestId, msg.sessionId, msg.leaseId, lease):
       return
     daemon.endLeaseSelfReport(msg.leaseId)
     daemon.releaseLease(msg.leaseId)
@@ -5342,9 +5375,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
         "max_candidates_per_batch=" & $flow.maxCandidatesPerBatch
       ))
       return
-    if not daemon.sessions.hasKey(msg.sessionId.value):
-      connection.sendError(frame.header.requestId, diagnostic(
-          diagInvalidArgument, "unknown session id"))
+    if not daemon.requireOwnedSession(context, connection,
+        frame.header.requestId, msg.sessionId):
       return
     var offeredIds: seq[uint64] = @[]
     var decisions: seq[LeaseDecision] = @[]
@@ -5410,9 +5442,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
           "invalid GrantNext payload"))
       return
-    if not daemon.sessions.hasKey(msg.sessionId.value):
-      connection.sendError(frame.header.requestId, diagnostic(
-          diagInvalidArgument, "unknown session id"))
+    if not daemon.requireOwnedSession(context, connection,
+        frame.header.requestId, msg.sessionId):
       return
     let decisions = daemon.grantNextDecisions(msg.sessionId)
     connection.sendResponse(
@@ -5428,7 +5459,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           "invalid LeaseStarting payload"))
       return
     var lease: LeaseRow
-    if not daemon.requireOwnedLease(connection, frame.header.requestId,
+    if not daemon.requireOwnedLease(context, connection, frame.header.requestId,
         msg.sessionId, msg.leaseId, lease):
       return
     if lease.state != leaseStateGranted:
@@ -5451,7 +5482,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           "invalid LeaseRunning payload"))
       return
     var lease: LeaseRow
-    if not daemon.requireOwnedLease(connection, frame.header.requestId,
+    if not daemon.requireOwnedLease(context, connection, frame.header.requestId,
         msg.sessionId, msg.leaseId, lease):
       return
     if lease.state != leaseStateGranted and lease.state != leaseStateStarting:
@@ -5500,7 +5531,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           "invalid LeaseFinished payload"))
       return
     var lease: LeaseRow
-    if not daemon.requireOwnedLease(connection, frame.header.requestId,
+    if not daemon.requireOwnedLease(context, connection, frame.header.requestId,
         msg.sessionId, msg.leaseId, lease):
       return
     if lease.state != leaseStateStarting and lease.state != leaseStateRunning:
