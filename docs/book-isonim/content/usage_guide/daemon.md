@@ -317,6 +317,15 @@ Retention — four bounds, each with the **same unusual rule**:
 > deliberate: "unbounded" and "keep none" are both things somebody wants, and
 > collapsing them onto one value would make one of them unsayable.
 
+Virtual machines (Linux; see [Virtual machines](/usage_guide/cli#runquota-vm-hold)):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--vm-link-vsock-port PORT` | none | On a host: accept links from the RunQuota daemons of registered virtual machines on this vsock port (21073 is the port a guest uses when it names none). Without it every registered VM is charged its full shape. A port that cannot be bound is reported in `runquota status --json` (`vm_link.error`); the daemon serves leases either way. |
+| `--link-host vsock[:CID]:PORT` | none | In a virtual machine: report what this daemon's leases hold to the host daemon at that vsock address (CID 2, the host, by default), each time it changes. The host is told nothing else and never holds this daemon back. |
+| `--link-sample-millis N` | `0` | With `--link-host`: also send the guest's busy CPU (from `/proc/stat`) and CPU pressure every `N` ms; the host then charges the larger of busy and granted. Off by default: no periodic measurement is on until it is shown to fit the measurement budget. |
+| `--link-name NAME` | none | A name this guest gives itself on the link, shown by the host. Informational: the host identifies the VM by its vsock CID. |
+
 An unrecognised flag is a refusal, not a warning: `unknown runquotad argument:
 <arg>`, exit **2**.
 

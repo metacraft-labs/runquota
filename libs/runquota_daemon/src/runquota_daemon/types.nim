@@ -12,8 +12,10 @@ import ./cpu_shape
 import ./capacity_metrics
 import ./cpu_pressure
 import ./peer_namespaces
+import ./vm_records
 
 export cpu_shape
+export vm_records
 export cpu_pressure
 export capacity_metrics
 export peer_namespaces
@@ -268,6 +270,22 @@ type
       ## busy CPU share (a percentage) instead of the ambient sampler's
       ## latest reading. Empty (the default): the sampler. For tests, which
       ## cannot control what other tenants of a shared host keep busy.
+    vmLinkVsockPort*: uint32
+      ## `--vm-link-vsock-port`: the vsock port on which this (host) daemon
+      ## accepts links from guest daemons of registered virtual machines.
+      ## 0, the default, accepts none: every registered VM is then charged
+      ## its full shape.
+    linkHostCid*: uint32
+    linkHostPort*: uint32
+      ## `--link-host vsock[:CID]:PORT`: this (guest) daemon links to the
+      ## host daemon at that vsock address. Port 0, the default: no link.
+    linkSampleMillis*: int
+      ## `--link-sample-millis`: also send the guest's busy CPU and CPU
+      ## pressure every N ms. 0, the default, sends only on changes of the
+      ## granted CPU, so nothing periodic runs.
+    linkName*: string
+      ## `--link-name`: a name the guest gives itself on the link, shown by
+      ## the host. Informational only.
 
   SessionRow* = object
     id*: SessionId
@@ -706,6 +724,20 @@ type
     lastReclaimDecision*: string
       ## Why the last reclaim-eligible request was or was not admitted into
       ## predicted slack, with the figures it was judged by (inspection).
+    virtualMachines*: Table[uint64, VirtualMachineRow]
+      ## Lease id to the registered VM it holds (`RegisterVirtualMachine`).
+      ## Removed with the lease, however the lease ends.
+    nextLinkId*: uint64
+    vmLinksAccepted*: uint64
+    vmLinksRefused*: uint64
+    vmReportsAccepted*: uint64
+    vmReportsRefused*: uint64
+      ## Host-link counters: links attached and refused, reports applied and
+      ## dropped (a report on a link whose VM is gone, or that did not
+      ## decode).
+    vmLinkListening*: bool
+    vmLinkError*: string
+      ## Whether the vsock listener is up, or why it could not start.
     capacity*: CapacityLedger
       ## The per-host and per-session-group counters capacity tools read
       ## (`capacity_metrics`): CPU used by finished leases, grants and

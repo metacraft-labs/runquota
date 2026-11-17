@@ -1,15 +1,17 @@
 import runquota_protocol/types as protocolTypes
 import runquota_protocol/client_namespaces
+import runquota_protocol/virtual_machines
 import runquota_codec
 import runquota_core
 
 export protocolTypes
 export client_namespaces
+export virtual_machines
 
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 2'u16
-const RqspProtocolMinor* = 10'u16
+const RqspProtocolMinor* = 11'u16
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -127,6 +129,12 @@ const UnsupportedMessageMinor* = 10'u16
   ## conform" has an answer an operator can read from `HelloOk` and the spec
   ## can name, rather than a build date. It claims no compatibility the
   ## decoder does not provide, which is what the comment above forbids.
+const VirtualMachinesMinor* = 11'u16
+  ## The first daemon minor that understands VIRTUAL MACHINES:
+  ## `RegisterVirtualMachine`, `VirtualMachineStarted`, and the host link
+  ## (`MachineLink`, `MachineReport`) a guest daemon speaks over vsock.
+  ## MINOR 11 ANNOUNCES THEM, additively: no existing message changed, and a
+  ## client sends none of them below this minor.
 const MaxPressureWaitsPerReport* = 64
   ## The most waits one `PressureReport` carries. A client with more keeps
   ## the rest for its next report; the daemon refuses a longer list, so a

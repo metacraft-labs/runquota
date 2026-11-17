@@ -4,6 +4,7 @@ import std/[options, sets, strutils, tables]
 import runquota_core
 import runquota_daemon
 import runquota_daemon/host_config
+import runquota_daemon/host_link
 import runquota_ipc
 
 proc optionalRetentionBound(text: string): Option[int64] =
@@ -153,7 +154,7 @@ when isMainModule:
   var config = defaultDaemonConfig(defaultEndpoint())
   config.exitWithParentPid = exitWithParentPid
   config.socketActivation = socketActivation
-  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--cpu-pressure-file PATH] [--host-cpu-busy-file PATH] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--measurement NAME=on|off[,...]] [--ambient-sample-interval-millis N] [--profile-uncontended-pct N] [--metrics-textfile PATH] [--metrics-interval-millis N] [--pressure-long-wait-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--admission-max-wait-millis N] [--log-file PATH]"
+  let usage = "usage: runquotad [--socket PATH] [--host-config PATH] [--cpu-milli N] [--memory-bytes N] [--io-slots N] [--machine ID=CPU_MILLI,MEMORY_BYTES[,IO_SLOTS[,CPU_SHARE_GROUP]]] [--cpu-share-group ID=CPU_MILLI] [--pool NAME=UNITS] [--memory-pressure-source host|deterministic-file|unavailable] [--memory-pressure-file PATH] [--memory-pressure-required] [--memory-pressure-heavy-bytes N] [--cpu-pressure-file PATH] [--host-cpu-busy-file PATH] [--estimate-db PATH] [--observation-db PATH] [--no-write-stats] [--measurement NAME=on|off[,...]] [--ambient-sample-interval-millis N] [--profile-uncontended-pct N] [--metrics-textfile PATH] [--metrics-interval-millis N] [--pressure-long-wait-millis N] [--host-identity-file PATH] [--retention-sweep-interval-millis N] [--retention-max-deferred-sweeps N] [--retention-max-execution-age-millis N] [--retention-max-executions N] [--retention-max-ambient-sample-age-millis N] [--retention-max-ambient-samples N] [--idle-exit-after SECONDS] [--admission-max-wait-millis N] [--vm-link-vsock-port PORT] [--link-host vsock[:CID]:PORT] [--link-sample-millis N] [--link-name NAME] [--log-file PATH]"
   var measurementSwitches: seq[string]
   var i = 0
   while i < args.len:
@@ -450,6 +451,55 @@ when isMainModule:
       # across reloads (`BudgetFlags`).
       config.budgetFlags.admissionMaxWaitMillis = some(millis)
       i += 2
+    of "--vm-link-vsock-port":
+      # HOST side of the VM link: accept guest daemons' links on this vsock
+      # port. Off (0) by default, and then every registered VM is charged
+      # its full shape.
+      if i + 1 >= args.len:
+        echo "runquotad: --vm-link-vsock-port needs a value\n" & usage
+        quit 2
+      try:
+        config.vmLinkVsockPort = uint32(parseUInt(args[i + 1]))
+      except ValueError, RangeDefect:
+        echo "runquotad: --vm-link-vsock-port needs a port number, got: " &
+          args[i + 1] & "\n" & usage
+        quit 2
+      i += 2
+    of "--link-host":
+      # GUEST side: report this daemon's grants to the host daemon's link.
+      if i + 1 >= args.len:
+        echo "runquotad: --link-host needs a value\n" & usage
+        quit 2
+      let problem = parseLinkHost(args[i + 1], config.linkHostCid,
+        config.linkHostPort)
+      if problem.len > 0:
+        echo "runquotad: " & problem & "\n" & usage
+        quit 2
+      i += 2
+    of "--link-sample-millis":
+      # Also send the guest's busy CPU and pressure every N ms. Off by
+      # default: a periodic measurement stays off until it is shown to cost
+      # less than the measurement budget.
+      if i + 1 >= args.len:
+        echo "runquotad: --link-sample-millis needs a value\n" & usage
+        quit 2
+      var millis = -1
+      try:
+        millis = parseInt(args[i + 1])
+      except ValueError:
+        millis = -1
+      if millis < 0:
+        echo "runquotad: --link-sample-millis needs a non-negative whole " &
+          "number of milliseconds, got: " & args[i + 1] & "\n" & usage
+        quit 2
+      config.linkSampleMillis = millis
+      i += 2
+    of "--link-name":
+      if i + 1 >= args.len:
+        echo "runquotad: --link-name needs a value\n" & usage
+        quit 2
+      config.linkName = args[i + 1]
+      i += 2
     of "--host-identity-file":
       # Where this machine's opaque `host_id` is kept. Overridable so a
       # test can run against a scratch identity instead of reading, or
@@ -471,7 +521,15 @@ when isMainModule:
         "  --admission-max-wait-millis N  the starvation bound: a request " &
         "queued this long is served before its user's others (default " &
         "120000; 0 turns the bound off); overrides the host file's " &
-        "admission.max-wait\n\n" &
+        "admission.max-wait\n" &
+        "  --vm-link-vsock-port PORT  accept links from the RunQuota daemons " &
+        "of registered virtual machines on this vsock port (default: none; " &
+        "an unlinked VM is charged its full shape)\n" &
+        "  --link-host vsock[:CID]:PORT  in a virtual machine: report this " &
+        "daemon's grants to the host daemon at that vsock address (CID " &
+        "default 2, the host)\n" &
+        "  --link-sample-millis N  with --link-host, also report busy CPU and " &
+        "CPU pressure every N ms (default 0: only when grants change)\n\n" &
         "environment:\n" &
         "  " & exitWithParentEnvVar & "=1  stop (as on SIGTERM) when the " &
         "process that started runquotad exits; POSIX only, ignored on Windows\n" &

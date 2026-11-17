@@ -450,6 +450,51 @@ reached or it predates pressure reports, 2 on bad arguments. See
 [the daemon](/usage_guide/daemon#build-wait-pressure) for what is reported
 and how it is clamped.
 
+## `runquota vm hold`
+
+```text
+runquota vm hold --name NAME --cpu-milli N --memory-bytes N [--machine ID]
+                 (--pid PID [--vsock-cid CID] | --started-from-stdin)
+                 [--restart-grace SECONDS -- PROBE [ARGS...]]
+```
+
+Holds a virtual machine's shape on the host daemon for as long as the VM
+runs (Linux). A VM provider runs it *before* starting the VM: it registers
+the VM (CPU = its vCPUs, memory = its RAM) in the session group
+`RUNQUOTA_SESSION` names, waits like any lease until the host grants it, and
+prints `granted <lease-id>`. The provider starts the VM and writes one line,
+`<pid> [<vsock-cid>]` -- the VM's host process and the CID its guest daemon
+will link from -- and the command prints `started`, detaches its standard
+streams, waits for that process to exit (a pidfd: nothing polls), releases
+the registration and exits 0. `--pid` gives the same on the command line for
+a VM that already runs. Exit 1 when no daemon answers or it refuses, 2 on bad
+arguments.
+
+While the VM is registered the host holds its whole memory, and counts its
+vCPUs at their full count until a RunQuota daemon in the guest links to the
+host daemon over vsock (`runquotad --link-host` in the guest,
+`--vm-link-vsock-port` on the host); then at what the guest's own leases
+hold, so host builds use the vCPUs an idle VM leaves free and the guest gets
+them back as soon as it takes a lease. Nothing is revoked: a running host
+lease keeps its grant, and the host admits less until it ends.
+`runquota status` prints a `virtual_machine` line per VM, with its charge and
+`link=linked` or `link=unlinked`; an unlinked VM carries a `capability=` gap.
+
+A VM restarted in place runs on in a new process (an Incus VM does on a
+guest reboot). With `--restart-grace SECONDS -- PROBE...`, when the watched
+process exits the command runs the provider's `PROBE` (every 500 ms, each
+run bounded to 10 s) for up to `SECONDS`: on exit 0 the probe prints
+`<pid> [<vsock-cid>]` while the VM runs, `0` while it exists but does not
+run, and nothing once it no longer exists. A new process is reported to the
+daemon, which watches it from then on, and the registration is kept; nothing
+printed, or the grace running out, releases it. A probe that fails is asked
+again within the grace.
+
+A SIGTERM or SIGINT ends the command *without* releasing: the daemon then
+keeps the reservation exactly as long as the VM process lives, because that
+process is the lease's watched child. Neither RunQuota nor this command ever
+stops the VM.
+
 ## Resource profiles and sizing
 
 These read the observation store, so they answer only on a host whose daemon

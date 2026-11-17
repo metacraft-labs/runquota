@@ -901,6 +901,91 @@ proc requestSubLeaseWaiting*(session: var RunQuotaSession; parent: LeaseId;
     session.client[].lastDiagnostic.message)
 
 # ---------------------------------------------------------------------------
+# Virtual machines (`VirtualMachinesMinor`)
+# ---------------------------------------------------------------------------
+
+proc supportsVirtualMachines*(client: RunQuotaClient): bool =
+  ## Whether the daemon understands `RegisterVirtualMachine` and the host
+  ## link.
+  client.capabilities.protocolMinor >= VirtualMachinesMinor
+
+proc registerVirtualMachineWaiting*(session: var RunQuotaSession;
+    name, label: string; resources: ResourceVector;
+    pollMillis = 50; maxPolls = 0): RunQuotaLease =
+  ## Register a VM of `resources`' shape (CPU = its vCPUs, memory = its RAM,
+  ## on `resources.machineId`) and wait until the host grants it. The lease
+  ## holds the VM's memory for as long as it lives, and its CPU charge is
+  ## the daemon's to move (full shape until the VM's guest daemon links).
+  ## Raises `RunQuotaClientError` with `lastDiagnostic` set on refusal.
+  if not session.active:
+    session.client[].lastDiagnostic = diagnostic(diagInvalidArgument,
+      "session is not active")
+    raise newException(RunQuotaClientError,
+      session.client[].lastDiagnostic.message)
+  if not session.client[].supportsVirtualMachines():
+    session.client[].lastDiagnostic = diagnostic(diagUnsupportedVersion,
+      "daemon (protocol minor " &
+      $session.client[].capabilities.protocolMinor &
+      ") predates virtual machine registration")
+    raise newException(RunQuotaClientError,
+      session.client[].lastDiagnostic.message)
+  let candidateId = session.client[].nextRequestId + 1'u64
+  let requestId = session.client[].requestFrame(rqRegisterVirtualMachine,
+    encodeRegisterVirtualMachine(RegisterVirtualMachineMessage(
+      sessionId: session.id, clientCandidateId: candidateId, name: name,
+      label: label, resources: resources)))
+  var queued = false
+  for decision in session.decodeDecisionBatch(
+      session.client[].readResponse(requestId)):
+    if decision.clientCandidateId == candidateId:
+      if not decision.lease.active:
+        session.client[].lastDiagnostic = decision.diagnostic
+        raise newException(RunQuotaClientError, decision.diagnostic.message)
+      if not decision.queued:
+        return decision.lease
+      queued = true
+  if not queued:
+    session.client[].lastDiagnostic = diagnostic(diagProtocol,
+      "daemon omitted the registration decision")
+    raise newException(RunQuotaClientError,
+      session.client[].lastDiagnostic.message)
+  var polls = 0
+  while maxPolls <= 0 or polls < maxPolls:
+    for grant in session.pollNextGrant():
+      if grant.clientCandidateId == candidateId and not grant.queued:
+        if not grant.lease.active:
+          session.client[].lastDiagnostic = grant.diagnostic
+          raise newException(RunQuotaClientError, grant.diagnostic.message)
+        return grant.lease
+    inc polls
+    sleep(pollMillis)
+  session.client[].lastDiagnostic = diagnostic(diagDenied,
+    "timed out waiting for the virtual machine's registration")
+  raise newException(RunQuotaClientError,
+    session.client[].lastDiagnostic.message)
+
+proc markVirtualMachineStarted*(lease: var RunQuotaLease; processId: uint64;
+                                linkKind = vmLinkNone; vsockCid = 0'u32) =
+  ## The registered VM runs as host process `processId`; its guest daemon
+  ## will link from `vsockCid`. Moves the lease to running, with the VM
+  ## process as the child the daemon watches.
+  let msg = VirtualMachineStartedMessage(sessionId: lease.session[].id,
+    leaseId: lease.id, processId: processId, linkKind: linkKind,
+    vsockCid: vsockCid)
+  let requestId = lease.session[].client[].requestFrame(
+    rqVirtualMachineStarted, encodeVirtualMachineStarted(msg))
+  let frame = lease.session[].client[].readResponse(requestId)
+  var ack: VirtualMachineStartedAckMessage
+  if frame.header.messageKind != rqVirtualMachineStartedAck or
+      not decodeVirtualMachineStartedAck(frame.payload, ack) or
+      ack.leaseId.value != lease.id.value:
+    lease.session[].client[].lastDiagnostic = diagnostic(diagProtocol,
+      "daemon did not acknowledge VirtualMachineStarted")
+    raise newException(RunQuotaClientError,
+      lease.session[].client[].lastDiagnostic.message)
+  lease.state = leaseClientRunning
+
+# ---------------------------------------------------------------------------
 # Domain extensions: the write path (M17)
 # ---------------------------------------------------------------------------
 

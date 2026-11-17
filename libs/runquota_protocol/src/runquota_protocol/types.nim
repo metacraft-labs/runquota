@@ -118,6 +118,26 @@ type
     rqSizingAnswer = 49
       ## Both are sent only to a daemon whose `HelloOk` reports protocol
       ## minor >= `SizingMinor`, for the reason `rqDeclarePools` gives.
+    rqRegisterVirtualMachine = 50
+      ## Register a virtual machine the caller is about to start: a lease of
+      ## the VM's whole shape (its vCPUs and RAM) on a host machine, held
+      ## for the VM's life. Answered with `rqLeaseDecisionBatch`, one
+      ## decision; a queued registration is delivered by `rqGrantNext`.
+    rqVirtualMachineStarted = 51
+      ## The registered VM is running: its host process (watched as the
+      ## lease's child) and its link address. Answered with
+      ## `rqVirtualMachineStartedAck`.
+    rqVirtualMachineStartedAck = 52
+    rqMachineLink = 53
+      ## A guest daemon attaches its host link. Sent only on a link
+      ## transport (vsock), never on the rendezvous socket; answered with
+      ## `rqMachineLinked`.
+    rqMachineLinked = 54
+    rqMachineReport = 55
+      ## ONE-WAY, on an attached link: what the guest daemon's leases hold
+      ## now, and optionally its busy CPU and pressure. The four kinds above
+      ## and this one are sent only to a daemon whose `HelloOk` reports
+      ## protocol minor >= `VirtualMachinesMinor`.
 
   MessageKind* = RqspMessageKind
 

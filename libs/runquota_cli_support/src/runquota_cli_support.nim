@@ -17,6 +17,7 @@ import runquota_cli_support/nix_hook
 import runquota_cli_support/run_command
 import runquota_cli_support/jobserver_command
 import runquota_cli_support/sizing_command
+import runquota_cli_support/vm_command
 
 proc wantsVersion*(args: openArray[string]): bool =
   args.len == 1 and args[0] in ["--version", "-V"]
@@ -50,6 +51,12 @@ proc renderUsage*(programName: string): string =
     "    a nix-daemon build hook (build-hook = <path> nix-build-hook in nix.conf):\n" &
     "    each derivation build waits for a lease in its requester's session\n" &
     "    group, as wide as the build's cores; with no daemon, builds unadmitted\n" &
+    "  " & programName & " vm hold --name NAME --cpu-milli N --memory-bytes N [--machine ID]\n" &
+    "      (--pid PID [--vsock-cid CID] | --started-from-stdin)\n" &
+    "      [--restart-grace SECONDS -- PROBE [ARGS...]]\n" &
+    "    holds a virtual machine's shape on the host daemon while the VM's\n" &
+    "    process runs: prints 'granted LEASE', reads '<pid> [<vsock-cid>]' on\n" &
+    "    stdin, prints 'started', releases when that process exits\n" &
     "  " & programName & " pressure [--group GROUP] [--json]\n" &
     "    build-wait pressure per host, session group and open session (exit 1\n" &
     "    when the daemon cannot be reached or predates it, 2 on bad arguments)\n" &
@@ -157,6 +164,26 @@ proc printSessionGroups(statusJson: string) =
       " oldest_queued_wait_millis=" &
         $group{"oldest_queued_wait_millis"}.getBiggestInt()
 
+proc printVirtualMachines(statusJson: string) =
+  ## One line per registered VM: what the host charges it and why. An
+  ## unlinked VM's line carries its capability gap.
+  let status = parseJson(statusJson)
+  let vms = status{"virtual_machines"}
+  if vms.isNil or vms.kind != JArray:
+    return
+  for vm in vms:
+    var line = "virtual_machine " & vm{"name"}.getStr() &
+      ": lease=" & $vm{"lease_id"}.getBiggestInt() &
+      " shape_cpu_milli=" & $vm{"shape_cpu_milli"}.getBiggestInt() &
+      " memory_bytes=" & $vm{"memory_bytes"}.getBiggestInt() &
+      " charged_cpu_milli=" & $vm{"charged_cpu_milli"}.getBiggestInt() &
+      " link=" & vm{"link"}.getStr() &
+      " counted_at=" & vm{"counted_at"}.getStr()
+    let capability = vm{"capability"}
+    if not capability.isNil and capability.kind == JString:
+      line.add(" capability=\"" & capability.getStr() & "\"")
+    echo line
+
 proc withEnforcement(daemonJson: string; record: EnforcementRecord;
                      measurement: MeasurementRecord): string =
   ## The daemon's status object with the client's enforcement record added
@@ -202,6 +229,11 @@ proc printStatus(json: bool): int =
     echo "total_granted: " & $status.totalGranted
     echo "total_finished: " & $status.totalFinished
     if statusJson.len > 0:
+      try:
+        printVirtualMachines(statusJson)
+      except JsonParsingError, KeyError, ValueError:
+        stderr.writeLine("runquota status: could not read the virtual " &
+          "machines: " & getCurrentExceptionMsg())
       try:
         printSessionGroups(statusJson)
       except JsonParsingError, KeyError, ValueError:
@@ -1230,6 +1262,11 @@ proc runThinApp*(programName: string): int =
         return runJobserver(args[1 .. ^1], clientFailureText, versionString())
       of "pressure":
         return runPressure(programName, args[1 .. ^1])
+      of "vm":
+        # A virtual machine's registration, held for the VM's life
+        # (`runquota_cli_support/vm_command`).
+        if args.len >= 2 and args[1] == "hold":
+          return runVmHold(args[2 .. ^1], versionString())
       of HookVerb:
         # Nix daemon builds under leases: the daemon's `build-hook`
         # (`runquota_cli_support/nix_hook`).

@@ -19,6 +19,7 @@ import runquota_daemon/child_identity
 import runquota_daemon/parent_watch
 import runquota_daemon/socket_activation
 import runquota_daemon/prediction
+import runquota_daemon/host_link
 import runquota_admission
 import runquota_codec
 import runquota_core
@@ -38,6 +39,8 @@ when defined(windows):
   # shutdown-handler triple below.
   import std/winlean
 import runquota_ipc
+when defined(linux):
+  import runquota_ipc/vsock
 import runquota_observation_store
 import runquota_persistence
 import runquota_protocol
@@ -1084,6 +1087,23 @@ proc changeHeldCpu(group: var SessionGroupRow; delta: int64) =
     group.heldCpuMilli =
       if group.heldCpuMilli >= less: group.heldCpuMilli - less else: 0'u64
 
+var vmLinkWakeFd = cint(-1)
+  ## The write end of the host link listener's wake pipe, -1 while no
+  ## listener runs. Written when a registered VM is forgotten, so its link
+  ## is closed at once rather than at the guest's next report.
+
+proc wakeVmLinkListener() =
+  when defined(posix):
+    if vmLinkWakeFd >= 0:
+      var b = 'w'
+      discard posix.write(vmLinkWakeFd, addr b, 1)
+
+proc totalGrantedCpuMilli(daemon: RunQuotaDaemon): uint32 =
+  ## What this daemon's host leases hold now, over every machine: what a
+  ## GUEST daemon reports to its host over the link.
+  for usage in daemon.machineUsage.values:
+    result += usage.cpu
+
 proc applySubLeaseUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
                         add: bool) =
   ## A sub-lease holds part of its PARENT, and nothing of the host. A parent
@@ -1187,6 +1207,9 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
   # release passes -- rather than sampled from the lease table on a
   # cadence, which would be the same walk this aggregate exists to avoid.
   setAmbientLiveLeaseCount(int(daemon.activeLeaseCount))
+  # A guest daemon's link reports every change of what its leases hold; a
+  # no-op without a link.
+  noteHostLinkGranted(daemon.totalGrantedCpuMilli())
 
 proc setLeaseCharge(daemon: var RunQuotaDaemon; id: uint64;
                     charge: uint32) =
@@ -1228,6 +1251,17 @@ proc setLeaseCharge(daemon: var RunQuotaDaemon; id: uint64;
   lease.chargeSinceMillis = monoMillis()
   lease.resources.cpu = milliCpu(charge)
   daemon.leases[id] = lease
+  noteHostLinkGranted(daemon.totalGrantedCpuMilli())
+
+proc applyVmCharge(daemon: var RunQuotaDaemon; id: uint64) =
+  ## Bring a registered VM's lease charge to what its row says now
+  ## (`vmCpuCharge`): the full shape without a link, the guest's use with
+  ## one. Through `setLeaseCharge`, the path a resizable lease's charge
+  ## takes, so the machine, its CPU share group and the session group move
+  ## together. A rise never revokes anything: it only leaves less for the
+  ## next admission decision.
+  if daemon.virtualMachines.hasKey(id) and daemon.leases.hasKey(id):
+    daemon.setLeaseCharge(id, daemon.virtualMachines[id].chargeMilli)
 
 proc resizeCharge(lease: LeaseRow): uint32 =
   ## What a resizable lease charges: the larger of the width its jobserver
@@ -1255,6 +1289,15 @@ proc removeLeaseFromTable(daemon: var RunQuotaDaemon; id: uint64) =
   if lease.state.isResourceActive:
     daemon.applyLeaseResourceUsage(lease, false)
   daemon.leases.del(id)
+  # A REGISTERED VM GOES WITH ITS LEASE, however the lease ended (released,
+  # finished, reaped after its holder was lost and the VM process exited, or
+  # its session lost before the grant). Its link, if any, is closed by the
+  # listener once woken.
+  if daemon.virtualMachines.hasKey(id):
+    let linked = daemon.virtualMachines[id].linked
+    daemon.virtualMachines.del(id)
+    if linked:
+      wakeVmLinkListener()
 
 proc milliCpuText(cpu: MilliCpu): string =
   ## CPU in the ONE spelling the product uses for it: milli-CPU with an `m`
@@ -1931,6 +1974,47 @@ proc admissionPredictionJson(daemon: RunQuotaDaemon): string =
     ",\"last_reclaim_decision\":" & jsonEscape(daemon.lastReclaimDecision) &
     "}"
 
+proc virtualMachinesJson(daemon: RunQuotaDaemon): string =
+  ## Every registered VM, with what it is charged and why
+  ## (`vm_records.virtualMachineJson`), ordered by lease id.
+  var ids: seq[uint64] = @[]
+  for id in daemon.virtualMachines.keys:
+    ids.add(id)
+  ids.sort()
+  let now = monoMillis()
+  result = "["
+  for i, id in ids:
+    if i > 0:
+      result.add(",")
+    let row = daemon.virtualMachines[id]
+    var state = "unknown"
+    var owner = "null"
+    var charged = row.chargeMilli
+    if daemon.leases.hasKey(id):
+      let lease = daemon.leases[id]
+      state = lease.state.stateName
+      if lease.peer.kind != peerIdentityUnavailable:
+        owner = $lease.peer.userId
+      if lease.state.isResourceActive:
+        charged = lease.resources.cpu.value
+    result.add(row.virtualMachineJson(now, state, owner, charged))
+  result.add("]")
+
+proc vmLinkJson(daemon: RunQuotaDaemon): string =
+  ## The host side of the link: whether this daemon accepts guest links,
+  ## and what it did with them.
+  "{\"vsock_port\":" &
+    (if daemon.config.vmLinkVsockPort == 0'u32: "null"
+     else: $daemon.config.vmLinkVsockPort) &
+    ",\"listening\":" & $daemon.vmLinkListening &
+    ",\"error\":" &
+      (if daemon.vmLinkError.len == 0: "null"
+       else: jsonEscape(daemon.vmLinkError)) &
+    ",\"links_accepted\":" & $daemon.vmLinksAccepted &
+    ",\"links_refused\":" & $daemon.vmLinksRefused &
+    ",\"reports_accepted\":" & $daemon.vmReportsAccepted &
+    ",\"reports_refused\":" & $daemon.vmReportsRefused & "}"
+
 proc statusJson(daemon: RunQuotaDaemon): string =
   ## The `status` inspection subject: the wire status, as JSON, with the
   ## session groups and the capacity figures beside it.
@@ -1952,7 +2036,12 @@ proc statusJson(daemon: RunQuotaDaemon): string =
     # `[machine] write_bytes_per_sec`: reported, never admitted against.
     ",\"write_bytes_per_sec\":" &
       (if daemon.config.writeBytesPerSec > 0: $daemon.config.writeBytesPerSec
-       else: "null") & "}"
+       else: "null") &
+    # Registered VMs and what each is charged; the link listener (host) and
+    # this daemon's own link to its host (guest).
+    ",\"virtual_machines\":" & daemon.virtualMachinesJson() &
+    ",\"vm_link\":" & daemon.vmLinkJson() &
+    ",\"host_link\":" & hostLinkJson() & "}"
 
 proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
   var ids: seq[uint64] = @[]
@@ -2002,6 +2091,11 @@ proc leasesJson(daemon: RunQuotaDaemon; onlySession = sessionId(0)): string =
       # Granted into predicted slack (predictive admission): its tree runs
       # at the lower weight.
       "\"reclaimed\":" & $lease.reclaimed & "," &
+      # The registered VM this lease holds the shape of, or null.
+      "\"virtual_machine\":" &
+        (if daemon.virtualMachines.hasKey(id):
+           jsonEscape(daemon.virtualMachines[id].name)
+         else: "null") & "," &
       "\"diagnostic\":{\"code\":" & jsonEscape($lease.queueDiagnostic.code) &
         ",\"message\":" & jsonEscape(lease.queueDiagnostic.message) &
         ",\"detail\":" & jsonEscape(lease.queueDiagnostic.detail) & "}" &
@@ -4645,6 +4739,158 @@ proc updateSessionGroup*(daemon: var RunQuotaDaemon; peer: PeerIdentity;
     sessions: uint32(max(0, group.sessions)))
   true
 
+# ---------------------------------------------------------------------------
+# Virtual machines: the host side of the link (RQSP minor 11)
+# ---------------------------------------------------------------------------
+
+proc attachVmLink*(daemon: var RunQuotaDaemon; linkId: uint64;
+                   peerCid: uint32; msg: MachineLinkMessage;
+                   leaseOut: var uint64): MachineLinkedMessage =
+  ## A guest daemon opened a link from vsock CID `peerCid`. THE CID IS THE
+  ## IDENTITY: the hypervisor assigns it and the guest cannot choose it, so
+  ## the link goes to the registration whose `VirtualMachineStarted` named
+  ## that CID, and to none otherwise. Nothing the guest sent selects the VM.
+  ## A newer link from the same CID replaces an older one.
+  leaseOut = 0'u64
+  var found = 0'u64
+  for id, row in daemon.virtualMachines.pairs:
+    if row.started and row.linkKind == vmLinkVsock and
+        row.vsockCid == peerCid and daemon.leases.hasKey(id) and
+        daemon.leases[id].state in {leaseStateRunning,
+          leaseStateSupervisorLost}:
+      found = id
+      break
+  if found == 0'u64:
+    inc daemon.vmLinksRefused
+    return MachineLinkedMessage(accepted: false, diagnostic: diagnostic(
+      diagInvalidArgument, "no virtual machine with vsock CID " & $peerCid &
+      " is registered on this host daemon",
+      "the VM counts at its full shape until it is registered and started"))
+  var row = daemon.virtualMachines[found]
+  let replacing = row.linked
+  row.linkId = linkId
+  row.linkedAtMillis = monoMillis()
+  row.lastReportAtMillis = row.linkedAtMillis
+  inc row.linksAttached
+  row.guestVersion = msg.guestVersion
+  row.guestName = msg.name
+  row.guestBudgetCpuMilli = msg.budgetCpuMilli
+  row.guestBudgetMemoryBytes = msg.budgetMemoryBytes
+  row.guestGrantedCpuMilli = msg.grantedCpuMilli
+  row.guestUsedPresent = false
+  row.guestPressurePresent = false
+  row.lastSequence = 0'u64
+  daemon.virtualMachines[found] = row
+  inc daemon.vmLinksAccepted
+  if replacing:
+    # The older link's connection is closed when the listener next checks
+    # which links still own their VM.
+    wakeVmLinkListener()
+  daemon.applyVmCharge(found)
+  discard daemon.tryPromoteQueued(
+    defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
+  leaseOut = found
+  MachineLinkedMessage(accepted: true, name: row.name,
+    diagnostic: okDiagnostic())
+
+proc applyVmReport*(daemon: var RunQuotaDaemon; linkId, leaseId: uint64;
+                    msg: MachineReportMessage): bool =
+  ## Apply a guest's report to the VM its link is attached to. False -- and
+  ## the caller closes the link -- when that VM is gone or the link has been
+  ## replaced. A report that lowers the charge runs an admission pass at
+  ## once; one that raises it never revokes a running lease, it only leaves
+  ## less for the next decision.
+  if not daemon.virtualMachines.hasKey(leaseId) or
+      daemon.virtualMachines[leaseId].linkId != linkId:
+    inc daemon.vmReportsRefused
+    return false
+  var row = daemon.virtualMachines[leaseId]
+  let before = row.chargeMilli
+  row.guestGrantedCpuMilli = msg.grantedCpuMilli
+  row.guestUsedPresent = msg.usedPresent
+  row.guestUsedCpuMilli = msg.usedCpuMilli
+  row.guestPressurePresent = msg.pressurePresent
+  row.guestCpuSomePermille = msg.cpuSomePermille
+  row.lastSequence = msg.sequence
+  row.lastReportAtMillis = monoMillis()
+  inc row.reports
+  daemon.virtualMachines[leaseId] = row
+  inc daemon.vmReportsAccepted
+  daemon.applyVmCharge(leaseId)
+  if row.chargeMilli < before:
+    discard daemon.tryPromoteQueued(
+      defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
+  true
+
+proc detachVmLink*(daemon: var RunQuotaDaemon; linkId, leaseId: uint64) =
+  ## The link ended: the VM is charged its full shape from now on.
+  if daemon.virtualMachines.hasKey(leaseId) and
+      daemon.virtualMachines[leaseId].linkId == linkId:
+    daemon.virtualMachines[leaseId].linkId = 0'u64
+    daemon.applyVmCharge(leaseId)
+
+proc vmLinkStillAttached*(daemon: RunQuotaDaemon; linkId,
+                          leaseId: uint64): bool =
+  daemon.virtualMachines.hasKey(leaseId) and
+    daemon.virtualMachines[leaseId].linkId == linkId
+
+proc startVirtualMachine*(daemon: var RunQuotaDaemon; id: uint64;
+                          processId: uint64; linkKind: VmLinkKind;
+                          vsockCid: uint32): string =
+  ## `VirtualMachineStarted` for the registration lease `id`, whose session
+  ## the caller has checked: the VM runs as host process `processId`, and
+  ## its guest daemon links from `vsockCid`. "" when accepted, else why not.
+  ##
+  ## A granted (or starting) registration becomes running with the VM
+  ## process as its watched child. A RUNNING one is a VM RESTARTED IN PLACE
+  ## -- a guest reboot gives an Incus VM a new hypervisor process -- and the
+  ## new process replaces the old as the watched child, so the reservation
+  ## the holder kept across the restart is watched on the process that now
+  ## uses it. A link from the old process is dropped (the VM is charged its
+  ## full shape until its guest daemon links again).
+  if not daemon.virtualMachines.hasKey(id) or not daemon.leases.hasKey(id):
+    return "lease " & $id & " is not a virtual machine registration"
+  var lease = daemon.leases[id]
+  let restart = lease.state == leaseStateRunning and
+    daemon.virtualMachines[id].started
+  if not restart and lease.state != leaseStateGranted and
+      lease.state != leaseStateStarting:
+    return "the virtual machine's lease is not granted"
+  if processId == 0'u64:
+    return "VirtualMachineStarted needs the VM's process id"
+  if linkKind == vmLinkVsock:
+    # 0, 1 and 2 are the hypervisor, local and host addresses, never a
+    # guest's; 0xFFFFFFFF is "any".
+    if vsockCid <= 2'u32 or vsockCid == 0xFFFF_FFFF'u32:
+      return "vsock CID " & $vsockCid & " cannot be a guest's"
+    for other in daemon.virtualMachines.values:
+      if other.leaseId != id and other.started and
+          other.linkKind == vmLinkVsock and other.vsockCid == vsockCid:
+        return "vsock CID " & $vsockCid &
+          " is already registered to another virtual machine (lease " &
+          $other.leaseId & ")"
+  if not restart:
+    daemon.transitionLeaseState(lease, leaseStateRunning)
+    lease.startedAtUnixMillis = unixMillisNow()
+  # THE VM PROCESS IS THE WATCHED CHILD: a holder that is lost leaves the
+  # reservation held exactly as long as this process lives.
+  lease.childProcessId = watchedChildProcessId(lease, processId)
+  lease.childStartStamp = processStartStamp(lease.childProcessId)
+  daemon.leases[id] = lease
+  var row = daemon.virtualMachines[id]
+  if restart:
+    inc row.restarts
+    if row.linked:
+      row.linkId = 0'u64
+      wakeVmLinkListener()
+  row.started = true
+  row.processId = processId
+  row.linkKind = linkKind
+  row.vsockCid = if linkKind == vmLinkVsock: vsockCid else: 0'u32
+  daemon.virtualMachines[id] = row
+  daemon.applyVmCharge(id)
+  ""
+
 proc grantNextDecisions*(daemon: var RunQuotaDaemon;
                          sessionId: SessionId): seq[LeaseDecision] =
   ## What a `GrantNext` from `sessionId` is answered with. Denials a reload
@@ -5700,6 +5946,96 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       inc daemon.observationExtensionRows
     else:
       inc daemon.observationExtensionRowsRefused
+  of rqRegisterVirtualMachine:
+    var msg: RegisterVirtualMachineMessage
+    if not decodeRegisterVirtualMachine(frame.payload, msg):
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "invalid RegisterVirtualMachine payload"))
+      return
+    # On the connection that registered the session, as `RequestSubLease`:
+    # the registration is recorded under that session's owner.
+    if not daemon.requireOwnedSession(context, connection,
+        frame.header.requestId, msg.sessionId):
+      return
+    let session = daemon.sessions[msg.sessionId.value]
+    let owner = ownerKeyOf(session.peer)
+    # THE WHOLE SHAPE, AS ASKED: no learned estimate raises or lowers a VM's
+    # memory, which is the RAM its provider gave it.
+    var resources = resourceVector(msg.resources.cpu, msg.resources.memory)
+    resources.machineId =
+      if msg.resources.machineId.len == 0: DefaultMachineId
+      else: msg.resources.machineId
+    var code = diagInvalidArgument
+    var refusal = virtualMachineNameProblem(msg.name)
+    if refusal.len == 0:
+      for row in daemon.virtualMachines.values:
+        if row.ownerKey == owner and row.name == msg.name:
+          refusal = "a virtual machine named '" & msg.name &
+            "' is already registered by this user (lease " & $row.leaseId &
+            ")"
+          break
+    if refusal.len == 0:
+      var reason = ""
+      if not daemon.possible(resources, owner, reason):
+        refusal = reason
+        code = diagDenied
+    var decision: LeaseDecision
+    if refusal.len > 0:
+      decision = LeaseDecision(clientCandidateId: msg.clientCandidateId,
+        leaseId: leaseId(0), kind: leaseDecisionDenied, resources: resources,
+        diagnostic: diagnostic(code, refusal,
+          if code == diagDenied: daemon.refusedByText() else: ""))
+    else:
+      let label = if msg.label.len > 0: msg.label else: "vm " & msg.name
+      let queued = daemon.createQueuedLease(msg.sessionId,
+        msg.clientCandidateId, label, "", resources, priorityNormal,
+        leasePurposeWork)
+      daemon.virtualMachines[queued.id.value] = VirtualMachineRow(
+        leaseId: queued.id.value, name: msg.name, ownerKey: owner,
+        shapeCpuMilli: resources.cpu.value,
+        memoryBytes: resources.memory.value)
+      discard daemon.tryPromoteQueued(
+        defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
+      var row = daemon.leases[queued.id.value]
+      if row.state == leaseStateGranted:
+        row.delivered = true
+        daemon.leases[queued.id.value] = row
+        decision = row.leaseDecision(leaseDecisionGranted)
+      else:
+        decision = row.leaseDecision(leaseDecisionQueued)
+    connection.sendResponse(rqLeaseDecisionBatch, frame.header.requestId,
+      encodeLeaseDecisionBatch(LeaseDecisionBatchMessage(
+        sessionId: msg.sessionId, decisions: @[decision])))
+  of rqVirtualMachineStarted:
+    var msg: VirtualMachineStartedMessage
+    if not decodeVirtualMachineStarted(frame.payload, msg):
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "invalid VirtualMachineStarted payload"))
+      return
+    var lease: LeaseRow
+    if not daemon.requireOwnedLease(context, connection,
+        frame.header.requestId, msg.sessionId, msg.leaseId, lease):
+      return
+    let problem = daemon.startVirtualMachine(msg.leaseId.value,
+      msg.processId, msg.linkKind, msg.vsockCid)
+    if problem.len > 0:
+      connection.sendError(frame.header.requestId, diagnostic(
+          diagInvalidArgument, problem))
+      return
+    connection.sendResponse(rqVirtualMachineStartedAck,
+      frame.header.requestId,
+      encodeVirtualMachineStartedAck(VirtualMachineStartedAckMessage(
+        sessionId: msg.sessionId, leaseId: msg.leaseId)))
+  of rqMachineLink, rqMachineReport:
+    # THE LINK IS NOT SPOKEN HERE. On the rendezvous socket the daemon could
+    # only identify a guest by what it says; on the link transport the
+    # hypervisor says it.
+    connection.sendError(frame.header.requestId, diagnostic(
+        diagInvalidArgument, "the host link is accepted only on the " &
+        "virtual-machine link transport (runquotad --vm-link-vsock-port)"))
+  of rqVirtualMachineStartedAck, rqMachineLinked:
+    connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+        "that message is the daemon's answer, not a request"))
   of rqStatusRequest:
     connection.sendResponse(rqStatusResponse, frame.header.requestId,
         encodeStatus(daemon.status()))
@@ -6201,6 +6537,219 @@ proc noteConnectionFailure(message: string) {.gcsafe.} =
         flushFile(stdout)
     finally:
       release(sharedDaemon.lock)
+
+# ---------------------------------------------------------------------------
+# The host link listener (Linux, vsock)
+#
+# ONE THREAD, every link on one `poll`: links are few (one per running VM),
+# each sends a handful of bytes when its guest's grants change, and a thread
+# per link would let a guest that opens connections without end cost the
+# host a thread each. Links are bounded (`MaxVmLinks`) and so is every frame
+# (`MaxLinkFrameBytes`). The daemon lock is taken per frame, never across
+# I/O; the one write (`MachineLinked`) happens after it is released.
+# ---------------------------------------------------------------------------
+
+const MaxVmLinks = 256
+
+when defined(linux):
+  type VmLinkConnection = object
+    fd: cint
+    cid: uint32
+    linkId: uint64
+    leaseId: uint64
+      ## The VM the link is attached to; 0 until `MachineLink` succeeded.
+    buffer: string
+
+  var
+    vmLinkThread: Thread[void]
+    vmLinkRunning = false
+    vmLinkListenFd = cint(-1)
+    vmLinkWakeReadFd = cint(-1)
+    vmLinkStopFlag: Atomic[bool]
+
+  proc closeVmLink(conn: var VmLinkConnection) =
+    if conn.leaseId != 0'u64:
+      acquire(sharedDaemon.lock)
+      try:
+        sharedDaemon.daemon.detachVmLink(conn.linkId, conn.leaseId)
+      finally:
+        release(sharedDaemon.lock)
+    discard posix.close(conn.fd)
+    conn.fd = -1
+
+  proc serveVmLinkFrame(conn: var VmLinkConnection; frame: RqspFrame): bool =
+    ## One frame of a link; false ends the link.
+    if conn.leaseId == 0'u64:
+      if frame.header.messageKind != rqMachineLink:
+        return false
+      var msg: MachineLinkMessage
+      var answer: MachineLinkedMessage
+      if not decodeMachineLink(frame.payload, msg):
+        answer = MachineLinkedMessage(accepted: false, diagnostic: diagnostic(
+          diagProtocol, "invalid MachineLink payload"))
+        acquire(sharedDaemon.lock)
+        inc sharedDaemon.daemon.vmLinksRefused
+        release(sharedDaemon.lock)
+      else:
+        acquire(sharedDaemon.lock)
+        try:
+          answer = sharedDaemon.daemon.attachVmLink(conn.linkId, conn.cid,
+            msg, conn.leaseId)
+        finally:
+          release(sharedDaemon.lock)
+      let reply = encodeFrame(rqMachineLinked, FrameFlagResponse,
+        frame.header.requestId, encodeMachineLinked(answer))
+      if not writeAllFd(conn.fd, reply, 1000):
+        return false
+      return answer.accepted
+    if frame.header.messageKind != rqMachineReport:
+      return false
+    var msg: MachineReportMessage
+    if not decodeMachineReport(frame.payload, msg):
+      acquire(sharedDaemon.lock)
+      inc sharedDaemon.daemon.vmReportsRefused
+      release(sharedDaemon.lock)
+      return false
+    acquire(sharedDaemon.lock)
+    try:
+      result = sharedDaemon.daemon.applyVmReport(conn.linkId, conn.leaseId, msg)
+    finally:
+      release(sharedDaemon.lock)
+
+  proc readVmLink(conn: var VmLinkConnection): bool =
+    ## Read what the link has, and serve every whole frame in it. False ends
+    ## the link: closed, malformed, oversized, or refused.
+    var chunk: array[1024, char]
+    let n = posix.read(conn.fd, addr chunk[0], chunk.len)
+    if n == 0:
+      return false
+    if n < 0:
+      let errno = osLastError().int32
+      return errno == EAGAIN or errno == EWOULDBLOCK or errno == EINTR
+    for i in 0 ..< n:
+      conn.buffer.add(chunk[i])
+    while conn.buffer.len >= int(RqspHeaderLen):
+      var header: FrameHeader
+      var kindRaw: uint16
+      var kindKnown: bool
+      if not decodeFrameHeaderRaw(conn.buffer[0 ..< int(RqspHeaderLen)],
+          header, kindRaw, kindKnown) or not kindKnown:
+        return false
+      let total = int(RqspHeaderLen) + int(header.payloadLen)
+      if total > MaxLinkFrameBytes:
+        return false
+      if conn.buffer.len < total:
+        break
+      let frame = RqspFrame(header: header,
+        payload: conn.buffer[int(RqspHeaderLen) ..< total])
+      conn.buffer = conn.buffer[total .. ^1]
+      if not conn.serveVmLinkFrame(frame):
+        return false
+    true
+
+  proc vmLinkListenerMain() {.thread.} =
+    {.cast(gcsafe).}:
+      var links: seq[VmLinkConnection] = @[]
+      while not vmLinkStopFlag.load():
+        var fds = newSeq[TPollfd](2 + links.len)
+        fds[0] = TPollfd(fd: vmLinkListenFd, events: POLLIN)
+        fds[1] = TPollfd(fd: vmLinkWakeReadFd, events: POLLIN)
+        for i, link in links:
+          fds[2 + i] = TPollfd(fd: link.fd, events: POLLIN)
+        if poll(addr fds[0], Tnfds(fds.len), -1) < 0:
+          if osLastError().int32 == EINTR: continue
+          break
+        if vmLinkStopFlag.load():
+          break
+        var keep = newSeq[bool](links.len)
+        for i in 0 ..< links.len:
+          keep[i] = true
+        if (fds[1].revents and POLLIN) != 0:
+          var drain: array[64, char]
+          while posix.read(vmLinkWakeReadFd, addr drain[0], drain.len) > 0:
+            discard
+          # A VM was forgotten or its link replaced: close the links that no
+          # longer own their VM.
+          acquire(sharedDaemon.lock)
+          try:
+            for i, link in links:
+              if link.leaseId != 0'u64 and
+                  not sharedDaemon.daemon.vmLinkStillAttached(link.linkId,
+                    link.leaseId):
+                keep[i] = false
+          finally:
+            release(sharedDaemon.lock)
+        for i in 0 ..< links.len:
+          if keep[i] and (fds[2 + i].revents and
+              (POLLIN or POLLHUP or POLLERR)) != 0:
+            keep[i] = links[i].readVmLink()
+        var remaining: seq[VmLinkConnection] = @[]
+        for i in 0 ..< links.len:
+          if keep[i]:
+            remaining.add(links[i])
+          else:
+            var gone = links[i]
+            gone.closeVmLink()
+        links = remaining
+        if (fds[0].revents and POLLIN) != 0:
+          var cid = 0'u32
+          let fd = vsockAccept(vmLinkListenFd, cid)
+          if fd >= 0:
+            if links.len >= MaxVmLinks:
+              discard posix.close(fd)
+              acquire(sharedDaemon.lock)
+              inc sharedDaemon.daemon.vmLinksRefused
+              release(sharedDaemon.lock)
+            else:
+              setNonBlocking(fd)
+              acquire(sharedDaemon.lock)
+              inc sharedDaemon.daemon.nextLinkId
+              let linkId = sharedDaemon.daemon.nextLinkId
+              release(sharedDaemon.lock)
+              links.add(VmLinkConnection(fd: fd, cid: cid, linkId: linkId))
+      for link in links.mitems:
+        link.closeVmLink()
+
+  proc startVmLinkListener(port: uint32): string =
+    ## Listen for guest links. "" on success, else why not; the daemon
+    ## serves leases either way, and every VM is then charged its shape.
+    var fds: array[2, cint]
+    if pipe(fds) != 0:
+      return "cannot create the link listener's wake pipe: " &
+        osErrorMsg(osLastError())
+    for fd in fds:
+      discard fcntl(fd, F_SETFD, FD_CLOEXEC)
+      setNonBlocking(fd)
+    try:
+      vmLinkListenFd = vsockListen(port)
+    except OSError as error:
+      discard posix.close(fds[0])
+      discard posix.close(fds[1])
+      return error.msg
+    vmLinkWakeReadFd = fds[0]
+    vmLinkWakeFd = fds[1]
+    vmLinkStopFlag.store(false)
+    createThread(vmLinkThread, vmLinkListenerMain)
+    vmLinkRunning = true
+    ""
+
+  proc stopVmLinkListener() =
+    if not vmLinkRunning:
+      return
+    vmLinkStopFlag.store(true)
+    wakeVmLinkListener()
+    joinThread(vmLinkThread)
+    vmLinkRunning = false
+    discard posix.close(vmLinkListenFd)
+    discard posix.close(vmLinkWakeReadFd)
+    discard posix.close(vmLinkWakeFd)
+    vmLinkListenFd = -1
+    vmLinkWakeReadFd = -1
+    vmLinkWakeFd = -1
+else:
+  proc startVmLinkListener(port: uint32): string =
+    "the host link needs vsock, which this platform does not have"
+  proc stopVmLinkListener() = discard
 
 proc handleSharedConnection(accepted: AcceptedConnection) {.thread, gcsafe.} =
   {.cast(gcsafe).}:
@@ -7144,6 +7693,24 @@ proc serve*(config: DaemonConfig): int =
   var threads = newSeq[Thread[void]](connectionWorkerCount())
   for i in 0 ..< threads.len:
     createThread(threads[i], connectionWorker)
+  # THE HOST LINK, both ends, once workers exist (each end takes the daemon
+  # lock). Neither can stop the daemon: a listener that cannot bind leaves
+  # every VM charged its full shape, a guest whose link fails keeps
+  # admitting against its own budget, and both are reported by `status`.
+  if config.vmLinkVsockPort > 0'u32:
+    let problem = startVmLinkListener(config.vmLinkVsockPort)
+    acquire(sharedDaemon.lock)
+    sharedDaemon.daemon.vmLinkListening = problem.len == 0
+    sharedDaemon.daemon.vmLinkError = problem
+    release(sharedDaemon.lock)
+  if config.linkHostPort > 0'u32:
+    let problem = startHostLink(config.linkHostCid, config.linkHostPort,
+      config.linkName, config.version, config.cpuSlots.value,
+      config.memoryBytes.value, config.linkSampleMillis, 0'u32)
+    if problem.len > 0:
+      acquire(sharedDaemon.lock)
+      sharedDaemon.daemon.vmLinkError = problem
+      release(sharedDaemon.lock)
   # SERVICE_RUNNING IS REPORTED HERE AND NOWHERE EARLIER. The endpoint is
   # bound, the rendezvous directory has been verified, and a worker pool
   # exists to serve what the loop below accepts -- so this is the first
@@ -7280,6 +7847,10 @@ proc serve*(config: DaemonConfig): int =
     stopConnectionQueue()
     for i in 0 ..< threads.len:
       joinThread(threads[i])
+    # Both link threads take the daemon lock, so they go before it is taken
+    # below and long before it is deinitialised.
+    stopVmLinkListener()
+    stopHostLink()
     # THE OPENER MUST HAVE FINISHED before the writer, sampler and sweeper
     # are stopped below, because it is what starts them: stopping them first
     # would let it start them again behind the shutdown. It also takes the
