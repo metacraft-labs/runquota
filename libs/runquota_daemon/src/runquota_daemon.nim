@@ -841,13 +841,47 @@ proc sendError(connection: var LocalConnection; requestId: uint64;
       requestId, payload))
 
 proc receiveFrameOrDiagnostic(connection: var LocalConnection;
-    frame: var RqspFrame): bool =
-  var frameDiagnostic = okDiagnostic()
-  if connection.receiveFrame(frame, frameDiagnostic):
-    return true
-  if frameDiagnostic.code != diagOk and frame.header.requestId != 0'u64:
-    connection.sendError(frame.header.requestId, frameDiagnostic)
-  false
+    frame: var RqspFrame; afterHello = true): bool =
+  ## The next frame of a kind this daemon knows, or false when the
+  ## connection must end.
+  ##
+  ## AFTER HELLO, A FRAME OF AN UNKNOWN KIND DOES NOT END THE CONNECTION
+  ## (RQSP minor ``UnsupportedMessageMinor``). It is read whole and the next
+  ## frame is read, so the other sessions and leases on the connection are
+  ## untouched (reprobuild-specs/RunQuota-Protocol-And-Client-Libraries.md,
+  ## "Encoding"). A request -- the request flag set and a non-zero
+  ## `request_id` -- is answered under its own id with `UnsupportedMessage`;
+  ## any other frame is skipped without a reply, since nobody waits on one.
+  ## Every earlier daemon failed to decode the header and returned false
+  ## here, which closed the connection and every session on it. Tested by
+  ## `tests/integration/t_unknown_message_kind_keeps_the_connection.nim`.
+  ##
+  ## BEFORE HELLO (``afterHello = false``) it still ends the connection,
+  ## after answering the request with `UnsupportedMessage`: a peer that has
+  ## not said Hello holds no session to protect, and must not be able to
+  ## keep the daemon reading frames it will never serve.
+  ##
+  ## What always ends the connection is a frame this daemon cannot find the
+  ## end of -- a header whose layout is invalid, or a payload longer than
+  ## the flow-control limit -- and the end of input.
+  while true:
+    var frameDiagnostic = okDiagnostic()
+    var kindKnown = false
+    var kindRaw = 0'u16
+    if not connection.receiveFrameOfAnyKind(frame, frameDiagnostic,
+        kindKnown, kindRaw):
+      if frameDiagnostic.code != diagOk and frame.header.requestId != 0'u64:
+        connection.sendError(frame.header.requestId, frameDiagnostic)
+      return false
+    if kindKnown:
+      return true
+    if (frame.header.flags and FrameFlagRequest) != 0'u16 and
+        frame.header.requestId != 0'u64:
+      connection.sendError(frame.header.requestId, diagnostic(
+        diagUnsupportedMessage, "unknown RQSP message kind",
+        "msg_type=" & $kindRaw))
+    if not afterHello:
+      return false
 
 proc ioSlots(resources: ResourceVector; cap: uint32): uint32 =
   case resources.ioClass
@@ -5759,6 +5793,10 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           json: daemon.inspectionJson(msg)))
     )
   else:
+    # A kind this daemon knows but does not accept from a client (a
+    # response kind, or a second Hello). Not `UnsupportedMessage`, which is
+    # for kinds the daemon does not know; the text differs so a log tells
+    # the two apart.
     connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
         "unsupported RQSP message"))
 
@@ -5776,7 +5814,7 @@ proc handleConnection*(daemon: var RunQuotaDaemon;
     sessionIds: @[]
   )
   var frame: RqspFrame
-  if not connection.receiveFrameOrDiagnostic(frame):
+  if not connection.receiveFrameOrDiagnostic(frame, afterHello = false):
     return
   let helloPeer = connection.observeHelloPeer()
   if not daemon.handleHello(connection, context, frame, helloPeer):
@@ -6148,15 +6186,17 @@ proc handleSharedConnection(accepted: AcceptedConnection) {.thread, gcsafe.} =
       sessionIds: @[]
     )
     var frame: RqspFrame
-    if not localConnection.receiveFrameOrDiagnostic(frame):
+    if not localConnection.receiveFrameOrDiagnostic(frame, afterHello = false):
       # THE PATH THAT RAISES NOTHING, and the one the counter was missing. A
       # peer that connects and drops before it says anything reaches exactly
       # here: `receiveFrame` reports end of input, not an error, and every
       # line from the accept to this return succeeds. It is still a
-      # connection this daemon never served.
+      # connection this daemon never served. A first frame of a kind this
+      # daemon does not know ends here too, after it was answered with
+      # `UnsupportedMessage`, so the line does not claim nothing was read.
       noteConnectionFailure(
         "runquota connection ended before Hello: " &
-        "the peer sent no readable frame")
+        "the peer sent no readable frame of a known kind")
       localConnection.close()
       return
     # OUTSIDE THE LOCK: reading the peer's token and resolving its name may

@@ -9,7 +9,7 @@ export client_namespaces
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 2'u16
-const RqspProtocolMinor* = 9'u16
+const RqspProtocolMinor* = 10'u16
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -34,9 +34,10 @@ const RqspProtocolMinor* = 9'u16
   ##
   ## MINOR 1 ANNOUNCES ONE ADDITIVE REQUEST, `DeclarePools` (2026-10-01), and
   ## that is a use of the minor a client really does act on. Nothing about an
-  ## existing message changed. But a daemon that does not know a message kind
-  ## does not answer "unsupported": it fails to decode the frame header and
-  ## closes the connection, taking every session on it along. A client that
+  ## existing message changed. But a daemon below ``UnsupportedMessageMinor``
+  ## that does not know a message kind does not answer "unsupported": it
+  ## fails to decode the frame header and closes the connection, taking every
+  ## session on it along. A client that
   ## wants to declare pools therefore reads the daemon's minor from `HelloOk`
   ## (`capabilities.protocolMinor`) first, and sends `DeclarePools` only at
   ## `PoolDeclarationsMinor` or above. The majors still decide whether two
@@ -106,6 +107,26 @@ const SizingMinor* = 9'u16
   ## bits and unknown message kinds, so a client sends none of them below
   ## this minor and the declarations and figures are dropped there, never
   ## the session or the finish.
+const UnsupportedMessageMinor* = 10'u16
+  ## The first daemon minor that ANSWERS A MESSAGE KIND IT DOES NOT KNOW
+  ## with `UnsupportedMessage` (`diagUnsupportedMessage`), correlated by the
+  ## frame's `request_id`, and keeps the connection and every session on it.
+  ## Every daemon below this minor fails to decode the frame header and
+  ## closes the connection instead -- the defect the comments on the minors
+  ## above route around (reprobuild-specs/RunQuota-Protocol-And-Client-
+  ## Libraries.md, "Encoding"). MINOR 10 ANNOUNCES THE REPAIR: no message
+  ## changed, and the only addition to the wire is the diagnostic code
+  ## `diagUnsupportedMessage` (u32 8), which only a client that sent an
+  ## unknown kind is ever sent.
+  ##
+  ## WHY A MINOR FOR SOMETHING NO CLIENT GATES ON. Every other minor here
+  ## announces a request a client acts on; this one gates nothing, and must
+  ## not -- daemons that close are deployed, so `UnsupportedMessage` is never
+  ## a way to discover a feature, and a client still sends a newer kind only
+  ## at the minor that announces it. The bump exists so that "which daemons
+  ## conform" has an answer an operator can read from `HelloOk` and the spec
+  ## can name, rather than a build date. It claims no compatibility the
+  ## decoder does not provide, which is what the comment above forbids.
 const MaxPressureWaitsPerReport* = 64
   ## The most waits one `PressureReport` carries. A client with more keeps
   ## the rest for its next report; the daemon refuses a longer list, so a
@@ -176,7 +197,17 @@ proc encodeFrame*(kind: RqspMessageKind; flags: uint16; requestId: uint64;
   w.data.add(payload)
   w.data
 
-proc decodeFrameHeader*(bytes: string; header: var FrameHeader): bool =
+proc decodeFrameHeaderRaw*(bytes: string; header: var FrameHeader;
+    kindRaw: var uint16; kindKnown: var bool): bool =
+  ## Decode a header whose layout is valid, WHATEVER ITS `msg_type`. On a
+  ## kind this build does not know it still returns true, with
+  ## ``kindKnown = false``, the wire value in ``kindRaw``, and every other
+  ## field of ``header`` filled -- ``messageKind`` excepted, which is then
+  ## meaningless. That is what lets a daemon read the frame's payload, answer
+  ## its `request_id` with `UnsupportedMessage` and keep the connection,
+  ## instead of losing the frame boundary and closing it.
+  kindKnown = false
+  kindRaw = 0'u16
   if bytes.len != int(RqspHeaderLen):
     return false
   if bytes.substr(0, RqspMagic.len - 1) != RqspMagic:
@@ -184,16 +215,15 @@ proc decodeFrameHeader*(bytes: string; header: var FrameHeader): bool =
   var r = reader(bytes.substr(RqspMagic.len))
   var version: uint16
   var headerLen: uint16
-  var kindRaw: uint16
   var flags: uint16
   var requestId: uint64
   var payloadLen: uint32
-  var kind: RqspMessageKind
+  var kind = low(RqspMessageKind)
   if not r.readU16(version): return false
   if not r.readU16(headerLen): return false
   if headerLen != RqspHeaderLen: return false
   if not r.readU16(kindRaw): return false
-  if not messageKindFromWire(kindRaw, kind): return false
+  kindKnown = messageKindFromWire(kindRaw, kind)
   if not r.readU16(flags): return false
   if not r.readU64(requestId): return false
   if not r.readU32(payloadLen): return false
@@ -205,6 +235,20 @@ proc decodeFrameHeader*(bytes: string; header: var FrameHeader): bool =
     requestId: requestId,
     payloadLen: payloadLen
   )
+  true
+
+proc decodeFrameHeader*(bytes: string; header: var FrameHeader): bool =
+  ## A header of a kind this build knows. An unknown `msg_type` is refused
+  ## here, as it always was; a reader that must survive one uses
+  ## ``decodeFrameHeaderRaw``.
+  var kindRaw: uint16
+  var kindKnown: bool
+  var decoded: FrameHeader
+  if not decodeFrameHeaderRaw(bytes, decoded, kindRaw, kindKnown):
+    return false
+  if not kindKnown:
+    return false
+  header = decoded
   true
 
 proc decodeFrame*(data: string; frame: var RqspFrame): bool =

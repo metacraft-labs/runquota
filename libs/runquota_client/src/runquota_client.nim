@@ -1382,9 +1382,13 @@ proc reloadHostConfig*(client: var RunQuotaClient): HostConfigReloadedMessage =
     try:
       client.readResponse(requestId)
     except RunQuotaClientError as err:
-      if client.lastDiagnostic.code == diagProtocol:
-        # An older daemon refuses a message kind it does not know by closing
-        # the connection or answering "unsupported RQSP message".
+      if client.lastDiagnostic.code in {diagProtocol, diagUnsupportedMessage}:
+        # An older daemon refuses a message kind it does not know: below
+        # `UnsupportedMessageMinor` by closing the connection or answering
+        # "unsupported RQSP message" (`diagProtocol`), from that minor on by
+        # answering `diagUnsupportedMessage`. Every daemon at or above that
+        # minor knows `ReloadHostConfig`, so today only the first form
+        # occurs; both are matched so the check does not depend on that.
         client.lastDiagnostic = diagnostic(diagUnsupportedVersion,
           "the running runquotad does not support ReloadHostConfig (" &
           err.msg & "); it is older than this client, so restart it to " &

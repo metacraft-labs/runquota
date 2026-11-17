@@ -2409,18 +2409,35 @@ proc readExact(connection: var LocalConnection; size: int; data: var string;
   else:
     false
 
-proc receiveFrame*(connection: var LocalConnection; frame: var RqspFrame;
-                   frameDiagnostic: var Diagnostic; timeoutMs = 0): bool =
-  ## Read one RQSP frame. ``timeoutMs > 0`` bounds each underlying read with an
-  ## absolute deadline (see ``readExactSocket``); used for the quick control
-  ## handshakes. ``timeoutMs == 0`` keeps the unbounded blocking behaviour for
+proc receiveFrameOfAnyKind*(connection: var LocalConnection;
+    frame: var RqspFrame; frameDiagnostic: var Diagnostic;
+    kindKnown: var bool; kindRaw: var uint16; timeoutMs = 0): bool =
+  ## Read one whole RQSP frame, WHATEVER ITS `msg_type`. Returns true with
+  ## ``kindKnown = false`` and the wire value in ``kindRaw`` for a kind this
+  ## build does not know: its payload has been read, so the stream is still
+  ## at a frame boundary and the caller can answer the frame's `request_id`
+  ## and go on reading (RQSP `UnsupportedMessage`). ``frame.header`` then
+  ## carries the request id, flags and payload length; its ``messageKind``
+  ## is a placeholder (``low(RqspMessageKind)``, a real kind), so a caller
+  ## MUST check ``kindKnown`` before dispatching on it.
+  ##
+  ## ``frame`` IS RESET FIRST. A header that fails to decode used to leave
+  ## the PREVIOUS frame's header in place, and the daemon answered that
+  ## failure under the previous, already answered `request_id`.
+  ##
+  ## ``timeoutMs > 0`` bounds each underlying read with an absolute deadline
+  ## (see ``readExactSocket``); used for the quick control handshakes.
+  ## ``timeoutMs == 0`` keeps the unbounded blocking behaviour for
   ## long-running reads such as the grant stream.
   frameDiagnostic = okDiagnostic()
+  frame = RqspFrame()
+  kindKnown = false
+  kindRaw = 0'u16
   var headerBytes: string
   if not connection.readExact(int(RqspHeaderLen), headerBytes, timeoutMs):
     return false
   var header: FrameHeader
-  if not decodeFrameHeader(headerBytes, header):
+  if not decodeFrameHeaderRaw(headerBytes, header, kindRaw, kindKnown):
     frameDiagnostic = diagnostic(diagProtocol, "invalid RQSP frame header")
     return false
   if header.payloadLen > DefaultMaxFrameBytes:
@@ -2435,6 +2452,26 @@ proc receiveFrame*(connection: var LocalConnection; frame: var RqspFrame;
   if not connection.readExact(int(header.payloadLen), payload, timeoutMs):
     return false
   frame = RqspFrame(header: header, payload: payload)
+  true
+
+proc receiveFrame*(connection: var LocalConnection; frame: var RqspFrame;
+                   frameDiagnostic: var Diagnostic; timeoutMs = 0): bool =
+  ## Read one RQSP frame of a kind this build knows. A frame of an unknown
+  ## kind is read whole and then refused as an invalid header, as it always
+  ## was: a CLIENT has no request of its own to answer it with. The daemon
+  ## reads through ``receiveFrameOfAnyKind`` instead.
+  var kindKnown: bool
+  var kindRaw: uint16
+  if not connection.receiveFrameOfAnyKind(frame, frameDiagnostic, kindKnown,
+      kindRaw, timeoutMs):
+    return false
+  if not kindKnown:
+    # Cleared, so no caller can read the placeholder `messageKind` of an
+    # unknown frame as a real kind.
+    frame = RqspFrame()
+    frameDiagnostic = diagnostic(diagProtocol, "invalid RQSP frame header",
+      "unknown msg_type=" & $kindRaw)
+    return false
   true
 
 proc receiveFrame*(connection: var LocalConnection; frame: var RqspFrame;

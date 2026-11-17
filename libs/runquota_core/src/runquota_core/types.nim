@@ -79,6 +79,14 @@ type
     diagProtocol
     diagInvalidArgument
     diagInternal
+    diagUnsupportedMessage
+      ## RQSP's `UnsupportedMessage`: the daemon read a whole frame whose
+      ## `msg_type` it does not know, answered that one request with this
+      ## code, and kept the connection. APPENDED, NOT INSERTED: the code
+      ## travels as its ordinal, so every earlier code keeps its number. A
+      ## peer built before it cannot decode it, and never needs to -- only a
+      ## client that sent a kind the daemon does not know is sent it, and a
+      ## client gates every newer kind on `protocolMinor`.
 
   MemoryLimitMode* = enum
     memoryLimitAdvisory

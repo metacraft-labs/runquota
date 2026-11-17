@@ -25,6 +25,32 @@ suite "RQSP protocol and codec":
     check decodeHello(frame.payload, hello)
     check hello.clientName == "test"
 
+  test "a header of an unknown kind keeps its request id and frame length":
+    # What lets the daemon answer an unknown `msg_type` with
+    # `UnsupportedMessage` and keep the connection: the raw decode still
+    # yields the request id and payload length, so the frame can be skipped
+    # and answered. `decodeFrameHeader` still refuses it, as it always did.
+    var encoded = encodeFrame(rqStatusRequest, FrameFlagRequest, 41'u64,
+      "abcd")
+    let unknownKind = uint16(ord(high(RqspMessageKind))) + 1'u16
+    encoded[8] = char(unknownKind and 0xFF'u16)
+    encoded[9] = char(unknownKind shr 8)
+    let headerBytes = encoded.substr(0, int(RqspHeaderLen) - 1)
+    var header: FrameHeader
+    var kindRaw: uint16
+    var kindKnown = true
+    check decodeFrameHeaderRaw(headerBytes, header, kindRaw, kindKnown)
+    check not kindKnown
+    check kindRaw == unknownKind
+    check header.requestId == 41'u64
+    check header.payloadLen == 4'u32
+    check not decodeFrameHeader(headerBytes, header)
+    # A known kind decodes the same through both.
+    let known = encodeFrame(rqStatusRequest, FrameFlagRequest, 42'u64, "")
+    check decodeFrameHeaderRaw(known, header, kindRaw, kindKnown)
+    check kindKnown and header.messageKind == rqStatusRequest
+    check RqspProtocolMinor >= UnsupportedMessageMinor
+
   test "binary envelope keeps metadata separate from JSON views":
     let envelope = BinaryEnvelope(
       tag: envelopeProtocolPayload,
