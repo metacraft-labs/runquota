@@ -13,6 +13,7 @@ import runquota_protocol
 import runquota_stats_table
 import runquota_cli_support/stats
 import runquota_cli_support/config
+import runquota_cli_support/nix_hook
 import runquota_cli_support/run_command
 import runquota_cli_support/jobserver_command
 import runquota_cli_support/sizing_command
@@ -45,6 +46,10 @@ proc renderUsage*(programName: string): string =
     "    change a session group's priority or prompt-cache deadline; only the\n" &
     "    group's owner may (exit 1 when the daemon refuses, 2 on bad arguments)\n" &
     configUsage.replace("  runquota ", "  " & programName & " ") &
+    "  " & programName & " nix-build-hook VERBOSITY\n" &
+    "    a nix-daemon build hook (build-hook = <path> nix-build-hook in nix.conf):\n" &
+    "    each derivation build waits for a lease in its requester's session\n" &
+    "    group, as wide as the build's cores; with no daemon, builds unadmitted\n" &
     "  " & programName & " pressure [--group GROUP] [--json]\n" &
     "    build-wait pressure per host, session group and open session (exit 1\n" &
     "    when the daemon cannot be reached or predates it, 2 on bad arguments)\n" &
@@ -1219,6 +1224,10 @@ proc runThinApp*(programName: string): int =
         return runJobserver(args[1 .. ^1], clientFailureText, versionString())
       of "pressure":
         return runPressure(programName, args[1 .. ^1])
+      of HookVerb:
+        # Nix daemon builds under leases: the daemon's `build-hook`
+        # (`runquota_cli_support/nix_hook`).
+        return runNixBuildHook(args[1 .. ^1], versionString())
       of "session":
         if args.len >= 2 and args[1] == "set":
           return runSessionSet(args[2 .. ^1])
