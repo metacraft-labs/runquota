@@ -127,16 +127,17 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@8ee1026a5d427a7aa5cf8c036fab12cb3d009503
         with:
           env-flavor: reprobuild
-          # Reprobuild v0.2.26. The engine reads the committed v3 lock on
+          # Reprobuild 33be1e9964 (agents; its catalog is the one repro.lock
+          # pins, 56ffd673). The engine reads the committed v3 lock on
           # every host and builds on Windows. Keep the bootstrap libraries at
           # that engine's own flake-lock revisions. Older engines reject the
           # committed lock ("unsupported lock schema ...v3").
           # Windows ARM64 keeps the existing emulated x64 Reprobuild tools.
           repro-from-source: true
-          repro-build-pin: b9cf09b07e2c780f314c4244e4c8df7988fc2e78
-          repro-runquota-pin: 98ea3e58df67f736a8527788d1563e31291a4881
-          repro-io-mon-pin: 30d85793e891c1a80859d52a9eb197b42d56752c
-          repro-stackable-hooks-pin: d715806424e8373708494913e59a48237978cc2a
+          repro-build-pin: 33be1e9964f3acdda5df705aefacfddd79b1574f
+          repro-runquota-pin: 6ff973131e7f715f0237cb0f08b8dd16cbeba0dc
+          repro-io-mon-pin: 735726963f48d91031463cbd9d1e9cf8f444f5ee
+          repro-stackable-hooks-pin: c34e3252d413361a0f250d8921e00c119d30e114
           gh-token: ${{ steps.ci_token.outputs.token }}
           app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
           app-private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}

@@ -10,7 +10,7 @@
     # Interface catalog consumed by the selected reprobuild SDK. Keep this
     # immutable pin independent of an older workspace catalog checkout.
     runquota-package-catalog = {
-      url = "github:metacraft-labs/reprobuild-packages/29b7bb9bac83ccb2a69e5c626df7fc900a5fbc25";
+      url = "github:metacraft-labs/reprobuild-packages/56ffd673bc0f43ab266de53fd5e2e7f656e37431";
       flake = false;
     };
 
