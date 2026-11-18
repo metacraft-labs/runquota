@@ -94,6 +94,20 @@ const
   ShareBetweenUsersValues* = ["drf", "none"]
     ## `[admission] share-between-users`; `runquota_admission.ShareBetweenUsers`.
 
+  MaxOversubscriptionPermille* = 1000'u32
+    ## The largest `admission.oversubscription` the file may set: 1.0, i.e.
+    ## grants of up to twice the CPU budget. A larger value is far more
+    ## likely a percentage written where a fraction belongs (`"10"` for
+    ## ten percent) than a target anybody means, so it is refused.
+
+  MaxReservationClassBytes = 64
+    ## The longest class name in a `[reservation.<class>]` header: the same
+    ## bound as `runquota_core.MaxClassNameBytes`, restated here because
+    ## this module imports only the standard library.
+
+  ReservationKeys* = ["cpu-milli", "memory-bytes", "lend"]
+    ## The keys of a `[reservation.<class>]` table.
+
   HostConfigTemplate* = """# RunQuota host budget. One file per host: every workspace and every user on
 # this machine shares the one runquotad that reads it.
 #
@@ -118,6 +132,16 @@ schema = "runquota.host-config.v1"
     ## the empty configuration, so seeding it changes no budget.
 
 type
+  ClassReservation* = object
+    ## `[reservation.<class>]`: the capacity a class of work holds that
+    ## other work cannot be granted. An absent key reserves nothing of that
+    ## dimension; `lend` (default true) lets the class's idle reserved CPU
+    ## go to other work until the class asks for it. Reserved memory is
+    ## never lent.
+    cpuMilli*: uint64
+    memoryBytes*: uint64
+    lend*: bool
+
   HostConfig* = object
     memoryBytes*: Option[uint64]
     cpuMilli*: Option[uint64]
@@ -176,6 +200,12 @@ type
     benchmarkMaxHoldMillis*: Option[int64]
       ## `[benchmark] max-hold`: how long a granted benchmark gates
       ## admission before normal admission resumes.
+    oversubscriptionPermille*: Option[uint32]
+      ## `[admission] oversubscription`: the CPU oversubscription target as
+      ## a fraction of the budget, kept in thousandths (`"0.1"` is 100). The
+      ## sum of CPU grants may reach the budget x (1 + target).
+    reservations*: OrderedTable[string, ClassReservation]
+      ## `[reservation.<class>]` tables, in file order.
     sourcePath*: string
       ## Where it was read from; empty when no file existed. Kept so a denial
       ## can say whose budget it enforced.
@@ -285,8 +315,68 @@ proc validateAdmissionOrder(keys: seq[string]; path: string; lineNo: int) =
       fail(path, lineNo, "admission order lists `" & key & "` twice")
     seen.add(key)
 
+proc reservationClassProblem*(name: string): string =
+  ## Why `name` cannot be a class in `[reservation.<class>]`, or "" when it
+  ## can: 1 to 64 bytes of letters, digits, `_` and `-`. The rule
+  ## `runquota_core.classNameProblem` applies to `RUNQUOTA_CLASS`, restated
+  ## (this module imports only the standard library), so every class a
+  ## client can name can be given a reservation, and the reverse.
+  if name.len == 0:
+    return "a class name is empty"
+  if name.len > MaxReservationClassBytes:
+    return "a class name is longer than " & $MaxReservationClassBytes &
+      " bytes"
+  for ch in name:
+    if ch notin {'A' .. 'Z', 'a' .. 'z', '0' .. '9', '_', '-'}:
+      return "a class name may hold only letters, digits, `_` and `-`"
+  ""
+
+proc parseOversubscriptionPermille*(raw: string; permille: var uint32): bool =
+  ## A decimal fraction from 0 to 1 with at most three decimal places
+  ## (`"0"`, `"0.1"`, `"0.125"`, `"1"`), in thousandths. Anything else --
+  ## a sign, an exponent, a percent sign, a fourth decimal -- is refused.
+  let text = raw.strip()
+  if text.len == 0:
+    return false
+  let dot = text.find('.')
+  let whole = if dot < 0: text else: text[0 ..< dot]
+  let frac = if dot < 0: "" else: text[dot + 1 .. ^1]
+  if whole.len == 0 or (dot >= 0 and frac.len == 0) or frac.len > 3:
+    return false
+  for ch in whole & frac:
+    if ch notin {'0' .. '9'}:
+      return false
+  if whole.len > 4:
+    return false
+  var value = uint32(parseInt(whole)) * 1000'u32
+  if frac.len > 0:
+    value += uint32(parseInt(frac & repeat('0', 3 - frac.len)))
+  if value > MaxOversubscriptionPermille:
+    return false
+  permille = value
+  true
+
+proc oversubscriptionText*(permille: uint32): string =
+  ## The fraction as the file spells it: `0`, `0.1`, `0.125`, `1`.
+  result = $(permille div 1000'u32)
+  var frac = $(permille mod 1000'u32)
+  if frac != "0":
+    frac = align(frac, 3, '0')
+    while frac.endsWith("0"):
+      frac.setLen(frac.len - 1)
+    result.add("." & frac)
+
+proc reservationClassOf(section: string): string =
+  ## The class a `reservation.<class>` table header names, or "" when the
+  ## header is not one.
+  if section.startsWith("reservation.") and section.len > "reservation.".len:
+    section["reservation.".len .. ^1]
+  else:
+    ""
+
 proc parseHostConfig*(text, path: string): HostConfig =
   result.pools = initOrderedTable[string, uint32]()
+  result.reservations = initOrderedTable[string, ClassReservation]()
   result.sourcePath = path
   var section = ""
   var lineNo = 0
@@ -299,10 +389,20 @@ proc parseHostConfig*(text, path: string): HostConfig =
       if not line.endsWith("]") or line.startsWith("[["):
         fail(path, lineNo, "unsupported table header `" & line & "`")
       section = line[1 .. ^2].strip()
+      let reserved = reservationClassOf(section)
+      if reserved.len > 0:
+        let problem = reservationClassProblem(reserved)
+        if problem.len > 0:
+          fail(path, lineNo, "table `[" & section & "]`: " & problem)
+        if result.reservations.hasKey(reserved):
+          fail(path, lineNo, "table `[" & section & "]` appears twice")
+        result.reservations[reserved] = ClassReservation(lend: true)
+        continue
       if section notin ["machine", "pools", "admission", "benchmark",
           "enforcement"]:
         fail(path, lineNo, "unknown table `[" & section & "]`; expected " &
-          "[machine], [pools], [admission], [benchmark] or [enforcement]")
+          "[machine], [pools], [admission], [benchmark], [enforcement] or " &
+          "[reservation.<class>]")
       continue
     let eq = line.find('=')
     if eq <= 0:
@@ -394,10 +494,18 @@ proc parseHostConfig*(text, path: string): HostConfig =
             "such as \"10\" or \"2.5\", got " & value)
         if key == "pressure-high": result.pressureHighPct = some(pct)
         else: result.pressureLowPct = some(pct)
+      of "oversubscription":
+        var permille = 0'u32
+        if not parseOversubscriptionPermille(parseQuoted(value, path, lineNo),
+            permille):
+          fail(path, lineNo, "oversubscription must be a fraction of the " &
+            "CPU budget from \"0\" to \"1\" with at most three decimals, " &
+            "such as \"0.1\" for ten percent, got " & value)
+        result.oversubscriptionPermille = some(permille)
       else:
         fail(path, lineNo, "unknown key `" & key & "` in [admission]; " &
           "expected order, max-wait, share-between-users, predictive, " &
-          "horizon, pressure-high or pressure-low")
+          "horizon, pressure-high, pressure-low or oversubscription")
     of "benchmark":
       case key
       of "allowed-users":
@@ -444,7 +552,29 @@ proc parseHostConfig*(text, path: string): HostConfig =
         fail(path, lineNo, "unknown key `" & key & "` in [enforcement]; " &
           "expected cgroups, job-priority or qos")
     else:
-      discard
+      let reserved = reservationClassOf(section)
+      if reserved.len == 0:
+        discard
+      else:
+        var entry = result.reservations[reserved]
+        case key
+        of "cpu-milli":
+          let v = parseInteger(value, path, lineNo)
+          if v > uint64(high(uint32)):
+            fail(path, lineNo, "cpu-milli out of range: " & $v)
+          entry.cpuMilli = v
+        of "memory-bytes":
+          entry.memoryBytes = parseInteger(value, path, lineNo)
+        of "lend":
+          case value
+          of "true": entry.lend = true
+          of "false": entry.lend = false
+          else:
+            fail(path, lineNo, "lend must be true or false, got " & value)
+        else:
+          fail(path, lineNo, "unknown key `" & key & "` in [" & section &
+            "]; expected " & ReservationKeys.join(", "))
+        result.reservations[reserved] = entry
   # THE THRESHOLDS ARE JUDGED TOGETHER, after the defaults fill an absent
   # one: a gate that closes above 4 and opens only below 5 would reopen at
   # once, which is a mistake about the other key's default, not a setting.
@@ -542,7 +672,9 @@ proc humanBytes*(value: uint64): string =
 
 type
   HostConfigKey* = object
-    section*: string ## `machine`, `pools` or `admission`
+    section*: string
+      ## `machine`, `pools`, `admission`, `enforcement` or
+      ## `reservation.<class>`
     name*: string
 
 proc isBareKey(name: string): bool =
@@ -558,14 +690,34 @@ proc parseHostConfigKey*(key: string): HostConfigKey =
   ## `admission.order`, `admission.max-wait`,
   ## `admission.share-between-users`, `admission.predictive`,
   ## `admission.horizon`, `admission.pressure-high` or
-  ## `admission.pressure-low`.
+  ## `admission.pressure-low`, `admission.oversubscription`, or
+  ## `reservation.<class>.cpu-milli` / `memory-bytes` / `lend`.
+  if key.startsWith("reservation."):
+    # `reservation.<class>.<key>`: the table is `[reservation.<class>]`.
+    let last = key.rfind('.')
+    let section = key[0 ..< max(0, last)]
+    let class = reservationClassOf(section)
+    if last <= 0 or class.len == 0 or last == key.len - 1:
+      raise newException(HostConfigError, "unknown key `" & key &
+        "`; a reservation is set as reservation.CLASS.cpu-milli, " &
+        "reservation.CLASS.memory-bytes or reservation.CLASS.lend")
+    let problem = reservationClassProblem(class)
+    if problem.len > 0:
+      raise newException(HostConfigError, "`" & key & "`: " & problem)
+    result = HostConfigKey(section: section, name: key[last + 1 .. ^1])
+    if result.name notin ReservationKeys:
+      raise newException(HostConfigError, "unknown key `" & key &
+        "`; [" & section & "] has " & ReservationKeys.join(", "))
+    return
   let dot = key.find('.')
   if dot <= 0 or dot == key.len - 1:
     raise newException(HostConfigError, "unknown key `" & key &
       "`; expected machine.memory_bytes, machine.cpu_milli, pools.NAME or " &
       "admission.order, admission.max-wait, admission.share-between-users, " &
       "admission.predictive, admission.horizon, admission.pressure-high, " &
-      "admission.pressure-low, enforcement.cgroups, enforcement.job-priority, " &
+      "admission.pressure-low, admission.oversubscription, " &
+      "reservation.CLASS.cpu-milli, reservation.CLASS.memory-bytes, " &
+      "reservation.CLASS.lend, enforcement.cgroups, enforcement.job-priority, " &
       "enforcement.qos")
   result = HostConfigKey(section: key[0 ..< dot], name: key[dot + 1 .. ^1])
   case result.section
@@ -581,17 +733,20 @@ proc parseHostConfigKey*(key: string): HostConfigKey =
         "` must be letters, digits, `_` or `-`")
   of "admission":
     if result.name notin ["order", "max-wait", "share-between-users",
-        "predictive", "horizon", "pressure-high", "pressure-low"]:
+        "predictive", "horizon", "pressure-high", "pressure-low",
+        "oversubscription"]:
       raise newException(HostConfigError, "unknown key `" & key &
         "`; [admission] has order, max-wait, share-between-users, " &
-        "predictive, horizon, pressure-high and pressure-low")
+        "predictive, horizon, pressure-high, pressure-low and " &
+        "oversubscription")
   of "enforcement":
     if result.name notin ["cgroups", "job-priority", "qos"]:
       raise newException(HostConfigError, "unknown key `" & key &
         "`; [enforcement] has cgroups, job-priority and qos")
   else:
     raise newException(HostConfigError, "unknown table `" & result.section &
-      "` in `" & key & "`; expected machine, pools, admission or enforcement")
+      "` in `" & key & "`; expected machine, pools, admission, enforcement or " &
+      "reservation.CLASS")
 
 proc `$`*(key: HostConfigKey): string = key.section & "." & key.name
 
@@ -603,8 +758,9 @@ proc parseHostConfigValue*(key: HostConfigKey; raw: string): uint64 =
   let text = raw.strip().replace("_", "")
   var digits = text
   var multiplier = 1'u64
-  if key.section == "machine" and
-      key.name in ["memory_bytes", "write_bytes_per_sec"]:
+  if (key.section == "machine" and
+      key.name in ["memory_bytes", "write_bytes_per_sec"]) or
+      (key.section.startsWith("reservation.") and key.name == "memory-bytes"):
     let lower = text.toLowerAscii()
     for (suffix, factor) in [("gib", 1024'u64 * 1024'u64 * 1024'u64),
                              ("mib", 1024'u64 * 1024'u64),
@@ -648,7 +804,8 @@ proc shapeOf(rawLine: string): LineShape =
 
 proc renderEntry(key: HostConfigKey; value: uint64): string =
   result = key.name & " = " & $value
-  if key.section == "machine" and key.name == "memory_bytes":
+  if (key.section == "machine" and key.name == "memory_bytes") or
+      (key.section.startsWith("reservation.") and key.name == "memory-bytes"):
     let human = humanBytes(value)
     if not human.endsWith("bytes"):
       result.add("   # " & human)
@@ -685,6 +842,13 @@ proc renderAdmissionEntry(key: HostConfigKey; raw: string): string =
 
 proc hostConfigEntry*(key: HostConfigKey; raw: string): string =
   ## The `key = value` line `runquota config set KEY VALUE` writes.
+  if key.section.startsWith("reservation.") and key.name == "lend":
+    # A TOML boolean, bare: `lend = true`.
+    let text = raw.strip()
+    if text notin ["true", "false"]:
+      raise newException(HostConfigError, "`" & $key &
+        "` takes true or false, got `" & raw & "`")
+    return key.name & " = " & text
   if key.section in ["admission", "enforcement"]:
     # `[enforcement] cgroups` is a quoted `on` / `off`, like
     # `[admission] predictive`.

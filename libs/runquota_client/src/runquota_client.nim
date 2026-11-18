@@ -257,6 +257,10 @@ const
   SessionCacheTtlEnvVar* = "RUNQUOTA_SESSION_CACHE_TTL"
     ## Seconds until the group's provider prompt cache expires: the group's
     ## cache deadline (now + TTL) if this session creates it.
+  ClassEnvVar* = "RUNQUOTA_CLASS"
+    ## The class of the session's group (`ci`, a VM pool's class): the
+    ## class the group joins if this session creates it. A class may hold a
+    ## reservation in the host file. Unset or empty: no class.
 
 proc supportsNegotiatedWidths*(client: RunQuotaClient): bool =
   ## Whether the daemon understands CPU ranges on host leases and the resize
@@ -304,6 +308,11 @@ proc supportsSessionGroups*(client: RunQuotaClient): bool =
   ## `UpdateSessionGroup`.
   client.capabilities.protocolMinor >= SessionGroupsMinor
 
+proc supportsClasses*(client: RunQuotaClient): bool =
+  ## Whether the daemon understands classes (`ClassesMinor`): the class
+  ## block of `RegisterSession`. An older daemon would refuse it.
+  client.capabilities.protocolMinor >= ClassesMinor
+
 proc sessionGroupFromEnvironment*(): SessionGroupDeclaration =
   ## The group the launcher exported, read from `RUNQUOTA_SESSION`,
   ## `RUNQUOTA_SESSION_PRIORITY` and `RUNQUOTA_SESSION_CACHE_TTL`.
@@ -316,6 +325,9 @@ proc sessionGroupFromEnvironment*(): SessionGroupDeclaration =
   ## `registerSession` refuses it.
   result.priority = sessionPriorityNormal
   result.name = getEnv(SessionGroupEnvVar)
+  # THE CLASS IS READ WITH OR WITHOUT A GROUP: a session that names a class
+  # and no group joins its owner's group named after the class.
+  result.className = getEnv(ClassEnvVar).strip()
   if result.name.len == 0:
     return
   var priority: SessionPriority
@@ -351,10 +363,24 @@ proc registerSession*(client: var RunQuotaClient; name, version: string;
       client.lastDiagnostic = diagnostic(diagInvalidArgument,
         "invalid session group " & SessionGroupEnvVar & ": " & problem)
       raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  if group.className.len > 0:
+    # A CLASS THAT CANNOT BE ONE IS REFUSED, like a group name: it decides
+    # which reservation the session's work is admitted under, so a typo
+    # would silently put a CI job outside its reservation.
+    let problem = classNameProblem(group.className)
+    if problem.len > 0:
+      client.lastDiagnostic = diagnostic(diagInvalidArgument,
+        "invalid class " & ClassEnvVar & ": " & problem)
+      raise newException(RunQuotaClientError, client.lastDiagnostic.message)
   var msg = RegisterSessionMessage(name: name, version: version,
       metadata: metadataNone())
   if client.supportsSessionGroups():
     msg.group = group
+    # A DAEMON THAT PREDATES CLASSES IS SENT NONE (it would refuse the
+    # block); the session is then served outside every reservation, as
+    # that daemon serves every session.
+    if not client.supportsClasses():
+      msg.group.className = ""
   # THE SIZING DECLARATIONS: the caller's, else the launcher's variables.
   # Not a measurement (one pair of strings per session) and so not behind
   # `sizing-data`; sent only to a daemon that reads them.
@@ -376,9 +402,13 @@ proc registerSession*(client: var RunQuotaClient; name, version: string;
   # asking: the name it declared (or `interactive`), and the priority it
   # would start the group with. `groupPriorityInForce` asks for the real one.
   let groupName =
-    if group.name.len > 0: group.name else: InteractiveSessionGroup
+    if group.name.len > 0: group.name
+    elif msg.group.className.len > 0: msg.group.className
+    else: InteractiveSessionGroup
   let declared =
-    if group.name.len == 0: sessionPriorityHigh
+    if group.name.len == 0 and msg.group.className.len > 0:
+      sessionPriorityNormal
+    elif group.name.len == 0: sessionPriorityHigh
     elif group.priorityPresent: group.priority
     else: sessionPriorityNormal
   RunQuotaSession(client: addr client, id: registered.sessionId, active: true,

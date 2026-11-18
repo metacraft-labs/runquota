@@ -13,6 +13,7 @@ import ./capacity_metrics
 import ./cpu_pressure
 import ./peer_namespaces
 import ./vm_records
+import ./host_config
 
 export cpu_shape
 export vm_records
@@ -250,6 +251,13 @@ type
       ## `[machine] write_bytes_per_sec` of the host file, 0 when it sets
       ## none. Reported (`status`, `profile`, `sizing`), never admitted
       ## against.
+    oversubscriptionPermille*: uint32
+      ## `admission.oversubscription` in thousandths: CPU grants may reach
+      ## each machine's and CPU share group's budget x (1 + this / 1000).
+      ## Memory is never oversubscribed. 0 by default.
+    reservations*: OrderedTable[string, ClassReservation]
+      ## `[reservation.<class>]` of the host file, recomputed on every
+      ## reload. They govern the `local` machine's budget.
     predictiveAdmission*: bool
       ## The host file's `admission.predictive`, off by default: admit a
       ## queued request's minimum width into CPU the running leases' learned
@@ -336,6 +344,10 @@ type
     priority*: SessionPriority
     cacheDeadlinePresent*: bool
     cacheDeadlineUnixMillis*: uint64
+    className*: string
+      ## The class the group belongs to (`RUNQUOTA_CLASS`), set by the
+      ## session that created the group and never changed afterwards; empty
+      ## for none. A class may hold a reservation in the host file.
     sessions*: int
       ## Open sessions that name the group.
     busySince*: uint64
@@ -409,6 +421,10 @@ type
       ## The session group of the session that made the request, copied at
       ## request time: a lease whose supervisor was lost outlives its session
       ## and still holds capacity on that group's behalf.
+    className*: string
+      ## The class of that group, copied at request time for the same
+      ## reason: what the lease holds is counted against this class until
+      ## it is released, whatever happens to the group.
     benchmarkGateReleased*: bool
       ## A benchmark lease held past `benchmarkMaxHoldMillis`: it still holds
       ## its resources but no longer gates other grants.
@@ -514,6 +530,18 @@ type
     cpu*: uint32
     memory*: uint64
     ioSlots*: uint32
+
+  ClassFigures* = object
+    ## One class's queue time and reported pressure. Inspection output: the
+    ## daemon decides nothing from it.
+    grants*: uint64
+    waitTotalMillis*: uint64
+    waitMaxMillis*: uint64
+      ## The class's host leases granted, and how long they had been queued
+      ## (total and longest), measured by the daemon.
+    pressure*: PressureFigures
+      ## Build-wait pressure its sessions reported, including the
+      ## `class-queue` waits a pool reports for its jobs.
 
   PressureFileCache* = object
     path*: string
@@ -708,6 +736,21 @@ type
     activeBenchmarkCount*: uint32
     machineUsage*: Table[string, MachineUsage]
     cpuShareGroupUsage*: Table[string, uint32]
+    classUsage*: Table[string, MachineUsage]
+      ## What each class's granted host leases on the `local` machine charge
+      ## now (CPU charge, memory), kept by the same paths as `machineUsage`.
+      ## The reservations are judged against it.
+    classesWaiting*: HashSet[string]
+      ## Classes with a queued host lease, as of the current admission
+      ## pass: a lending class's idle reservation is held for it only while
+      ## it waits.
+    classFigures*: Table[string, ClassFigures]
+      ## Per class: the daemon's own queue-time counters of its leases and
+      ## the build-wait pressure its sessions reported (class-queue waits
+      ## among them). Bounded by `MaxTrackedClasses`.
+    classesUntracked*: uint64
+      ## Times a class's figures were not kept because `MaxTrackedClasses`
+      ## classes the host file does not name were kept already.
     namedPoolUsage*: Table[string, uint32]
       ## Units held per pool name, over every owner: what a HOST-WIDE pool
       ## (`namedPoolCaps`) is measured against.

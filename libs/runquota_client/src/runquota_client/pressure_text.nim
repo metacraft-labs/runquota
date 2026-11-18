@@ -68,6 +68,19 @@ proc renderPressureText*(answer: string): string =
       lines.add(scopeLines("session " & $session{"session_id"}.getBiggestInt &
         " " & session{"name"}.getStr & " (group " & session{"group"}.getStr &
         ")", session))
+  if root.hasKey("classes"):
+    for class in root["classes"]:
+      let leaseWaits = class{"lease_waits"}
+      var title = "class " & class{"name"}.getStr
+      if not class{"configured"}.getBool:
+        title.add(" (no reservation)")
+      lines.add(scopeLines(title, class))
+      if not leaseWaits.isNil:
+        lines.add("  leases granted: " & $leaseWaits{"grants"}.getBiggestInt &
+          ", queued " & fixed(float64(
+            leaseWaits{"wait_total_millis"}.getBiggestInt) / 1000.0, 1) &
+          " s in all, longest " & fixed(float64(
+            leaseWaits{"wait_max_millis"}.getBiggestInt) / 1000.0, 1) & " s")
   if root{"reports_refused"}.getBiggestInt > 0:
     lines.add("reports refused: " & $root{"reports_refused"}.getBiggestInt)
   lines.join("\n")

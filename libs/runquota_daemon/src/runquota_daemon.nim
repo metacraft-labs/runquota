@@ -314,6 +314,47 @@ proc poolCapSource*(config: DaemonConfig; name: string; owner = ""): string =
       config.declaredPools[owner].hasKey(name): "declared"
   else: ""
 
+proc reservationProblem*(reservations: OrderedTable[string, ClassReservation];
+                         cpuSlots: MilliCpu; memoryBytes: Bytes): string =
+  ## Why the reservations cannot be put in force under this budget, or "".
+  ## A reservation is capacity the class is promised, so the reservations
+  ## together must fit the budget itself: the oversubscription target does
+  ## not count, and no memory is ever oversubscribed.
+  var cpu = 0'u64
+  var memory = 0'u64
+  var parts: seq[string] = @[]
+  for name, reservation in reservations.pairs:
+    # SATURATING: the file's figures are any non-negative 64-bit integers,
+    # and a sum that wrapped would let reservations far above the budget
+    # look as if they fit.
+    cpu =
+      if reservation.cpuMilli > high(uint64) - cpu: high(uint64)
+      else: cpu + reservation.cpuMilli
+    memory =
+      if reservation.memoryBytes > high(uint64) - memory: high(uint64)
+      else: memory + reservation.memoryBytes
+    parts.add(name & " " & $reservation.cpuMilli & "m CPU, " &
+      humanBytes(reservation.memoryBytes))
+  if cpu > uint64(cpuSlots.value):
+    return "the class reservations hold " & $cpu & "m CPU in all (" &
+      parts.join("; ") & "), above the CPU budget of " &
+      $cpuSlots.value & "m; reserved CPU must be real capacity, so the " &
+      "reservations together must fit the budget (the oversubscription " &
+      "target does not count)"
+  if memory > memoryBytes.value:
+    return "the class reservations hold " & humanBytes(memory) &
+      " of memory in all (" & parts.join("; ") &
+      "), above the memory budget of " & humanBytes(memoryBytes.value) &
+      "; memory is never oversubscribed"
+  ""
+
+proc applyClassKeys(config: var DaemonConfig; host: HostConfig) =
+  ## `admission.oversubscription` and the `[reservation.<class>]` tables:
+  ## the file's or none, recomputed whole on every reload, so a table the
+  ## file dropped is no reservation any more. No flag names them.
+  config.oversubscriptionPermille = host.oversubscriptionPermille.get(0'u32)
+  config.reservations = host.reservations
+
 proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
   ## The budget from the bottom up: the built-in defaults, then `host`, then
   ## the flags in `config.budgetFlags`. Used at start and by every reload, so
@@ -347,6 +388,17 @@ proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
     if flags.cpuSlots.isSome: flags.cpuSlots.get
     elif host.cpuMilli.isSome: milliCpu(host.cpuMilli.get)
     else: config.builtinCpuSlots
+  # RESERVATIONS MUST FIT THE BUDGET IN FORCE, judged against the budget
+  # this resolution arrives at (a flag may pin it below the file's). A file
+  # whose reservations do not fit is refused like a file that does not
+  # parse: the daemon does not start, and a reload changes nothing (its
+  # caller resolves into a copy, so a raise here leaves the daemon's
+  # configuration as it was).
+  let reservationRefusal = reservationProblem(host.reservations,
+    config.cpuSlots, config.memoryBytes)
+  if reservationRefusal.len > 0:
+    raise newException(HostConfigError, host.sourcePath & ": " &
+      reservationRefusal)
   config.hostFilePools = initTable[string, uint32]()
   for name, units in host.pools:
     config.hostFilePools[name] = units
@@ -361,6 +413,7 @@ proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
   config.shareBetweenUsers = share
   config.applyPredictiveKeys(host)
   config.applyBenchmarkPolicy(host)
+  config.applyClassKeys(host)
 
 proc machineCapacity*(id: string; cpuSlots: MilliCpu; memoryBytes: Bytes;
                       ioSlots: uint32; cpuShareGroup = ""): MachineCapacity =
@@ -969,6 +1022,13 @@ proc groupFor(daemon: RunQuotaDaemon; key: string): SessionGroupRow =
   SessionGroupRow(key: key, name: InteractiveSessionGroup,
     priority: sessionPriorityHigh)
 
+proc sessionClass(daemon: RunQuotaDaemon; id: SessionId): string =
+  ## The class of the session's group, which its leases are admitted under.
+  if daemon.sessions.hasKey(id.value):
+    daemon.groupFor(daemon.sessions[id.value].groupKey).className
+  else:
+    ""
+
 proc liveLeaseFigures(daemon: RunQuotaDaemon; now: int64): seq[LeaseFigure] =
   ## What the capacity figures need of every host lease that is queued or
   ## holds capacity. Sub-leases are left out: they hold part of their
@@ -1019,9 +1079,14 @@ proc joinSessionGroup(daemon: var RunQuotaDaemon; peer: PeerIdentity;
   ## joining an existing group leaves the attributes alone, because the
   ## launcher may have changed them since the environment it inherited was
   ## written (see `SessionGroupDeclaration`).
+  # A SESSION THAT NAMES A CLASS AND NO GROUP joins its owner's group named
+  # after the class: the user's `interactive` group is shared by every
+  # terminal of that user, so putting one CI job's class on it would put
+  # them all in the class.
   let name =
-    if declaration.name.len == 0: InteractiveSessionGroup
-    else: declaration.name
+    if declaration.name.len > 0: declaration.name
+    elif declaration.className.len > 0: declaration.className
+    else: InteractiveSessionGroup
   result = sessionGroupKey(peer, name)
   daemon.noteCapacityActivity(result)
   if daemon.sessionGroups.hasKey(result):
@@ -1044,6 +1109,10 @@ proc joinSessionGroup(daemon: var RunQuotaDaemon; peer: PeerIdentity;
     if declaration.cacheDeadlinePresent:
       group.cacheDeadlinePresent = true
       group.cacheDeadlineUnixMillis = declaration.cacheDeadlineUnixMillis
+  # THE CLASS, LIKE THE ATTRIBUTES, IS THE CREATING SESSION'S. A session
+  # that joins an existing group neither sets nor changes it: a group is one
+  # body of work, and its leases cannot be in two classes.
+  group.className = declaration.className
   daemon.sessionGroups[result] = group
 
 proc leaveSessionGroup(daemon: var RunQuotaDaemon; key: string) =
@@ -1157,6 +1226,12 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
       let key = ownerPoolKey(owner, demand.name)
       daemon.ownerPoolUsage[key] =
         daemon.ownerPoolUsage.getOrDefault(key, 0'u32) + demand.units
+    if lease.className.len > 0 and machine.id == DefaultMachineId:
+      var held = daemon.classUsage.getOrDefault(lease.className,
+        MachineUsage())
+      held.cpu += cpuDelta
+      held.memory += memDelta
+      daemon.classUsage[lease.className] = held
     inc daemon.activeLeaseCount
     if lease.purpose == leasePurposeBenchmark:
       inc daemon.activeBenchmarkCount
@@ -1185,6 +1260,16 @@ proc applyLeaseResourceUsage(daemon: var RunQuotaDaemon; lease: LeaseRow;
         # Dropped at zero, so the table holds one key per pool an owner is
         # USING, not one per pool any owner ever used.
         daemon.ownerPoolUsage.del(key)
+    if lease.className.len > 0 and machine.id == DefaultMachineId and
+        daemon.classUsage.hasKey(lease.className):
+      var held = daemon.classUsage[lease.className]
+      held.cpu = (if held.cpu >= cpuDelta: held.cpu - cpuDelta else: 0'u32)
+      held.memory =
+        if held.memory >= memDelta: held.memory - memDelta else: 0'u64
+      if held.cpu == 0'u32 and held.memory == 0'u64:
+        daemon.classUsage.del(lease.className)
+      else:
+        daemon.classUsage[lease.className] = held
     if daemon.activeLeaseCount > 0'u32:
       dec daemon.activeLeaseCount
     # The group was working until now: its idle time starts here.
@@ -1240,6 +1325,16 @@ proc setLeaseCharge(daemon: var RunQuotaDaemon; id: uint64;
     daemon.cpuShareGroupUsage[groupId] =
       if shared >= less: shared - less else: 0'u32
   daemon.machineUsage[machine.id] = usage
+  if lease.className.len > 0 and machine.id == DefaultMachineId:
+    # The class's charge moves with the lease's: a widened lease holds more
+    # of its class, a linked VM whose guest got busy too.
+    var held = daemon.classUsage.getOrDefault(lease.className, MachineUsage())
+    if charge > old:
+      held.cpu += charge - old
+    else:
+      held.cpu = (if held.cpu >= old - charge: held.cpu - (old - charge)
+                  else: 0'u32)
+    daemon.classUsage[lease.className] = held
   let since =
     if lease.chargeSinceMillis != 0'i64: lease.chargeSinceMillis
     else: lease.grantedAtMillis
@@ -1312,8 +1407,84 @@ proc countText(count: uint32; noun: string): string =
   ## or as milli-CPU to anybody who did not write the line.
   $count & " " & noun & (if count == 1'u32: "" else: "s")
 
+const MaxTrackedClasses = 64
+  ## The most classes the daemon keeps figures for that the host file does
+  ## not name. A class is a client-chosen word, so its figures must be
+  ## bounded; a configured class (one with a reservation) is always kept.
+
+proc oversubscribed(daemon: RunQuotaDaemon; slots: uint32): uint32 =
+  ## A CPU budget with the oversubscription target applied: what the CPU
+  ## grants on it may sum to. Memory budgets are never scaled.
+  let scaled = uint64(slots) *
+    uint64(1000'u32 + daemon.config.oversubscriptionPermille) div 1000'u64
+  uint32(min(scaled, uint64(high(uint32))))
+
+proc reserves(daemon: RunQuotaDaemon; className: string): bool =
+  ## Whether `className` holds a reservation of any CPU or memory.
+  className.len > 0 and daemon.config.reservations.hasKey(className) and
+    (daemon.config.reservations[className].cpuMilli > 0'u64 or
+     daemon.config.reservations[className].memoryBytes > 0'u64)
+
+proc protectedFrom(daemon: RunQuotaDaemon; className: string;
+                   cpu, memory: var uint64) =
+  ## What the OTHER classes' reservations keep from a request of
+  ## `className` (empty: work outside every class) on the `local` machine,
+  ## beyond what those classes already hold.
+  ##
+  ## * MEMORY IS NEVER LENT: a class's reserved memory it does not hold is
+  ##   kept from every other request, whether or not the class is waiting.
+  ## * CPU: a class that does not lend (`lend = false`) keeps its unused
+  ##   reserved CPU always; a class that lends keeps it only while it has a
+  ##   request waiting (`classesWaiting`). Otherwise the idle reservation is
+  ##   lent, and the CPU comes back as the borrowers' leases finish: while
+  ##   the class waits, every CPU freed up to its reservation stays free for
+  ##   it. Nothing is revoked.
+  cpu = 0'u64
+  memory = 0'u64
+  for name, reservation in daemon.config.reservations.pairs:
+    if name == className:
+      continue
+    let held = daemon.classUsage.getOrDefault(name, MachineUsage())
+    if reservation.memoryBytes > held.memory:
+      memory += reservation.memoryBytes - held.memory
+    if reservation.cpuMilli > uint64(held.cpu) and
+        (not reservation.lend or name in daemon.classesWaiting):
+      cpu += reservation.cpuMilli - uint64(held.cpu)
+
+proc reservedElsewhere(daemon: RunQuotaDaemon; className: string;
+                       cpuNeverLent, memory: var uint64) =
+  ## What the other classes' reservations keep from `className` for good:
+  ## all their reserved memory, and the reserved CPU of those that do not
+  ## lend. A request larger than the budget less this can never be granted.
+  cpuNeverLent = 0'u64
+  memory = 0'u64
+  for name, reservation in daemon.config.reservations.pairs:
+    if name == className:
+      continue
+    memory += reservation.memoryBytes
+    if not reservation.lend:
+      cpuNeverLent += reservation.cpuMilli
+
+proc withinReservation(daemon: RunQuotaDaemon; className: string;
+                       minimum: ResourceVector): bool =
+  ## Whether a request of `className` at `minimum` fits what its class has
+  ## left of its own reservation, in each dimension the class reserves.
+  ## Such a request is served by the reserved pass, ahead of the order.
+  if not daemon.reserves(className) or
+      minimum.resolvedMachineId() != DefaultMachineId:
+    return false
+  let reservation = daemon.config.reservations[className]
+  let held = daemon.classUsage.getOrDefault(className, MachineUsage())
+  if reservation.cpuMilli > 0'u64 and
+      uint64(held.cpu) + uint64(minimum.cpu.value) > reservation.cpuMilli:
+    return false
+  if reservation.memoryBytes > 0'u64 and
+      held.memory + minimum.memory.value > reservation.memoryBytes:
+    return false
+  true
+
 proc possible(daemon: RunQuotaDaemon; resources: ResourceVector;
-    owner: string; reason: var string): bool =
+    owner: string; reason: var string; className = ""): bool =
   ## Can this request EVER fit the budget in force -- as opposed to fitting
   ## right now, which is `fitsNow` and a queue rather than a refusal.
   ##
@@ -1363,6 +1534,34 @@ proc possible(daemon: RunQuotaDaemon; resources: ResourceVector;
         " (requested " & humanBytes(resources.memory.value) & ", budget " &
         humanBytes(machine.memoryBytes.value) & ")"
     return false
+  if machine.id == DefaultMachineId and daemon.config.reservations.len > 0:
+    # OTHER CLASSES' RESERVATIONS that this request can never use: their
+    # memory (never lent) and the CPU of those that do not lend. Waiting
+    # could not end, so it is a refusal, naming both figures and the share
+    # reserved for others.
+    var cpuNeverLent, reservedMemory: uint64
+    daemon.reservedElsewhere(className, cpuNeverLent, reservedMemory)
+    let cpuRoom = uint64(daemon.oversubscribed(machine.cpuSlots.value))
+    if cpuNeverLent > 0'u64 and
+        uint64(resources.cpu.value) + cpuNeverLent > cpuRoom:
+      reason = "lease request exceeds what other classes' reservations " &
+        "leave of the machine CPU budget: " & machine.id & " (requested " &
+        milliCpuText(resources.cpu) & ", budget " &
+        milliCpuText(milliCpu(uint32(cpuRoom))) & " of which " &
+        $cpuNeverLent & "m is reserved for other classes and not lent" &
+        (if className.len > 0: "; class " & className else: "; no class") &
+        ")"
+      return false
+    if reservedMemory > 0'u64 and
+        resources.memory.value + reservedMemory > machine.memoryBytes.value:
+      reason = "lease request exceeds what other classes' reservations " &
+        "leave of the machine memory budget: " & machine.id &
+        " (requested " & humanBytes(resources.memory.value) & ", budget " &
+        humanBytes(machine.memoryBytes.value) & " of which " &
+        humanBytes(reservedMemory) & " is reserved for other classes" &
+        (if className.len > 0: "; class " & className else: "; no class") &
+        ")"
+      return false
   if resources.ioSlots(machine.ioSlots) > machine.ioSlots:
     # REACHED ONLY BY A MACHINE WITH NO IO BUDGET AT ALL: `ioSlots` maps an
     # exclusive request to the cap ITSELF and a heavy one to a single slot,
@@ -1561,7 +1760,7 @@ proc pressureAllows(daemon: var RunQuotaDaemon; resources: ResourceVector;
     true
 
 proc fitsNow(daemon: RunQuotaDaemon; resources: ResourceVector;
-             owner: string; judgeCpu = true): bool =
+             owner: string; judgeCpu = true; className = ""): bool =
   ## Whether `resources` fit the ledger now, for `owner`'s pools. With
   ## `judgeCpu = false` every dimension but CPU is judged: the question
   ## asked for a request whose CPU is decided elsewhere (a reclaimed grant,
@@ -1576,11 +1775,19 @@ proc fitsNow(daemon: RunQuotaDaemon; resources: ResourceVector;
   let group = daemon.cpuShareGroupFor(machine)
   let usage = daemon.machineUsage.getOrDefault(machine.id, MachineUsage())
   let usedSharedCpu = daemon.cpuShareGroupUsage.getOrDefault(group.id, 0'u32)
-  if judgeCpu and usage.cpu + resources.cpu.value > machine.cpuSlots.value:
+  # THE CPU BUDGETS WITH THE OVERSUBSCRIPTION TARGET, AND WHAT OTHER
+  # CLASSES' RESERVATIONS KEEP (`protectedFrom`), on the local machine.
+  var protectedCpu, protectedMemory: uint64
+  if machine.id == DefaultMachineId:
+    daemon.protectedFrom(className, protectedCpu, protectedMemory)
+  if judgeCpu and uint64(usage.cpu) + uint64(resources.cpu.value) +
+      protectedCpu > uint64(daemon.oversubscribed(machine.cpuSlots.value)):
     return false
-  if judgeCpu and usedSharedCpu + resources.cpu.value > group.cpuSlots.value:
+  if judgeCpu and uint64(usedSharedCpu) + uint64(resources.cpu.value) +
+      protectedCpu > uint64(daemon.oversubscribed(group.cpuSlots.value)):
     return false
-  if usage.memory + resources.memory.value > machine.memoryBytes.value:
+  if usage.memory + resources.memory.value + protectedMemory >
+      machine.memoryBytes.value:
     return false
   if usage.ioSlots + resources.ioSlots(machine.ioSlots) > machine.ioSlots:
     return false
@@ -1591,7 +1798,8 @@ proc fitsNow(daemon: RunQuotaDaemon; resources: ResourceVector;
       return false
   true
 
-proc freeCpuFor(daemon: RunQuotaDaemon; resources: ResourceVector): uint32 =
+proc freeCpuFor(daemon: RunQuotaDaemon; resources: ResourceVector;
+                className = ""): uint32 =
   ## The CPU a lease on `resources`' machine could still be granted now: the
   ## smaller of what the machine's and its shared CPU group's budgets have
   ## left. Saturating, so a ledger that is over its budget (a reload shrank
@@ -1602,13 +1810,17 @@ proc freeCpuFor(daemon: RunQuotaDaemon; resources: ResourceVector): uint32 =
   let group = daemon.cpuShareGroupFor(machine)
   let usage = daemon.machineUsage.getOrDefault(machine.id, MachineUsage())
   let usedShared = daemon.cpuShareGroupUsage.getOrDefault(group.id, 0'u32)
+  var protectedCpu, protectedMemory: uint64
+  if machine.id == DefaultMachineId:
+    daemon.protectedFrom(className, protectedCpu, protectedMemory)
+  let machineCap = uint64(daemon.oversubscribed(machine.cpuSlots.value))
+  let groupCap = uint64(daemon.oversubscribed(group.cpuSlots.value))
+  let machineUsed = uint64(usage.cpu) + protectedCpu
+  let groupUsed = uint64(usedShared) + protectedCpu
   let machineFree =
-    if machine.cpuSlots.value > usage.cpu: machine.cpuSlots.value - usage.cpu
-    else: 0'u32
-  let groupFree =
-    if group.cpuSlots.value > usedShared: group.cpuSlots.value - usedShared
-    else: 0'u32
-  min(machineFree, groupFree)
+    if machineCap > machineUsed: machineCap - machineUsed else: 0'u64
+  let groupFree = if groupCap > groupUsed: groupCap - groupUsed else: 0'u64
+  uint32(min(machineFree, groupFree))
 
 const SlotMilli = 1000'u32
   ## Widths above a range's minimum move in whole slots: a jobserver serves
@@ -1760,6 +1972,9 @@ proc sessionGroupsJson(daemon: RunQuotaDaemon): string =
       "\"owner_uid\":" &
         (if group.ownerKnown: $group.ownerUid else: "null") & "," &
       "\"priority\":" & jsonEscape(sessionPriorityName(group.priority)) & "," &
+      "\"class\":" &
+        (if group.className.len > 0: jsonEscape(group.className)
+         else: "null") & "," &
       "\"cache_deadline_unix_millis\":" &
         (if group.cacheDeadlinePresent: $group.cacheDeadlineUnixMillis
          else: "null") & "," &
@@ -1819,6 +2034,26 @@ proc metricsError(): string =
   finally:
     release(metricsErrorLock)
 
+proc classFiguresFor(daemon: var RunQuotaDaemon;
+                     className: string): ptr ClassFigures =
+  ## The figures kept for `className`, created on first use; nil for no
+  ## class, or for a class the host file does not name once
+  ## `MaxTrackedClasses` such classes are kept (a client-chosen word must
+  ## not grow the daemon without bound).
+  if className.len == 0:
+    return nil
+  if not daemon.classFigures.hasKey(className):
+    if not daemon.config.reservations.hasKey(className):
+      var unconfigured = 0
+      for name in daemon.classFigures.keys:
+        if not daemon.config.reservations.hasKey(name):
+          inc unconfigured
+      if unconfigured >= MaxTrackedClasses:
+        inc daemon.classesUntracked
+        return nil
+    daemon.classFigures[className] = ClassFigures()
+  addr daemon.classFigures[className]
+
 proc applyPressureReport(daemon: var RunQuotaDaemon;
                          msg: PressureReportMessage) =
   ## Fold one report, from a connection that owns its session, into the
@@ -1836,13 +2071,25 @@ proc applyPressureReport(daemon: var RunQuotaDaemon;
       session.pressure.wallMicros), msg.queueOnly)
   session.pressure.noteReport(sample, now)
   daemon.capacity.notePressureReport(session.groupKey, sample, now)
+  # AND THE CLASS'S, when the session's group has one: what a class's
+  # sessions report -- a pool's `class-queue` waits for its jobs among it --
+  # is published per class beside the per-group figures.
+  let groupKey = session.groupKey
+  let registeredAt = session.registeredAtMillis
+  let classFigures =
+    daemon.classFiguresFor(daemon.groupFor(groupKey).className)
+  if not classFigures.isNil:
+    classFigures.pressure.noteReport(sample, now)
   for wait in msg.waits:
     let kind = PressureWaitKindIndex(ord(wait.kind))
-    let length = clampWaitMillis(wait.lengthMillis,
-      now - session.registeredAtMillis)
-    session.pressure.noteWait(kind, length, daemon.config.pressureLongWaitMillis)
-    daemon.capacity.notePressureWait(session.groupKey, kind, length,
+    let length = clampWaitMillis(wait.lengthMillis, now - registeredAt)
+    daemon.sessions[msg.sessionId.value].pressure.noteWait(kind, length,
       daemon.config.pressureLongWaitMillis)
+    daemon.capacity.notePressureWait(groupKey, kind, length,
+      daemon.config.pressureLongWaitMillis)
+    if not classFigures.isNil:
+      classFigures.pressure.noteWait(kind, length,
+        daemon.config.pressureLongWaitMillis)
 
 proc expectedUncontendedMillis(daemon: RunQuotaDaemon; lease: LeaseRow): uint64 =
   ## The learned expected uncontended duration of `lease`'s command at its
@@ -1863,8 +2110,16 @@ proc capacityCopy(daemon: RunQuotaDaemon): CapacityCopy =
   ## must not change daemon-owned memory, and does the rest after releasing
   ## the lock.
   let now = monoMillis()
-  daemon.capacity.copyFor(daemon.liveLeaseFigures(now),
+  result = daemon.capacity.copyFor(daemon.liveLeaseFigures(now),
     uint64(daemon.config.cpuSlots.value), now)
+  var names: seq[string] = @[]
+  for name in daemon.config.reservations.keys: names.add(name)
+  for name in daemon.classFigures.keys:
+    if name notin names: names.add(name)
+  names.sort()
+  for name in names:
+    result.classes.add((name: name, pressure:
+      daemon.classFigures.getOrDefault(name, ClassFigures()).pressure))
 
 proc capacitySnapshot(copy: CapacityCopy): CapacitySnapshot =
   ## The capacity figures, with the ambient sampler's latest reading (taken
@@ -1936,9 +2191,26 @@ proc pressureJson(daemon: RunQuotaDaemon; scope: PressureScope;
         pressureFiguresJson(session.pressure, now) & "}")
     result.add("]")
   if scope in {psAll, psClass}:
-    # Admission classes do not exist yet; their queue time is published
-    # here once they do.
-    result.add(",\"classes\":[]")
+    # PER CLASS, beside the groups: the pressure the class's sessions
+    # reported (a pool's `class-queue` waits for its jobs among it), and
+    # the class's lease queue time as the daemon measured it. Every class
+    # the host file reserves for is listed, reported or not.
+    result.add(",\"classes\":[")
+    var names: seq[string] = @[]
+    for name in daemon.config.reservations.keys: names.add(name)
+    for name in daemon.classFigures.keys:
+      if name notin names: names.add(name)
+    names.sort()
+    for i, name in names:
+      let figures = daemon.classFigures.getOrDefault(name, ClassFigures())
+      if i > 0: result.add(",")
+      result.add("{\"name\":" & jsonEscape(name) &
+        ",\"configured\":" & $daemon.config.reservations.hasKey(name) &
+        ",\"lease_waits\":{\"grants\":" & $figures.grants &
+          ",\"wait_total_millis\":" & $figures.waitTotalMillis &
+          ",\"wait_max_millis\":" & $figures.waitMaxMillis & "}," &
+        pressureFiguresJson(figures.pressure, now) & "}")
+    result.add("]")
   result.add("}")
 
 proc metricsTextfileJson(config: DaemonConfig): string =
@@ -2015,6 +2287,84 @@ proc vmLinkJson(daemon: RunQuotaDaemon): string =
     ",\"reports_accepted\":" & $daemon.vmReportsAccepted &
     ",\"reports_refused\":" & $daemon.vmReportsRefused & "}"
 
+proc classNames(daemon: RunQuotaDaemon): seq[string] =
+  ## Every class the daemon can say something about: configured, holding
+  ## capacity, waiting, or with figures. Sorted.
+  var names = initHashSet[string]()
+  for name in daemon.config.reservations.keys: names.incl(name)
+  for name in daemon.classUsage.keys: names.incl(name)
+  for name in daemon.classFigures.keys: names.incl(name)
+  for lease in daemon.leases.values:
+    if lease.className.len > 0 and lease.parentLeaseId == 0'u64 and
+        (lease.state == leaseStateQueued or lease.state.isResourceActive):
+      names.incl(lease.className)
+  for name in names: result.add(name)
+  result.sort()
+
+proc classesJson(daemon: RunQuotaDaemon): string =
+  ## Per class, for `runquota status --json`: its reservation, what its
+  ## leases hold on the local machine and how much of that is BORROWED
+  ## (above the reservation), what is PROTECTED for it now (kept from other
+  ## work: its idle reserved memory always, its idle reserved CPU when it
+  ## does not lend or has a request waiting), its queue, and its queue time
+  ## as the daemon measured it. Inspection output only.
+  let now = monoMillis()
+  result = "["
+  var first = true
+  for name in daemon.classNames():
+    let configured = daemon.config.reservations.hasKey(name)
+    let reservation =
+      if configured: daemon.config.reservations[name]
+      else: ClassReservation(lend: true)
+    let held = daemon.classUsage.getOrDefault(name, MachineUsage())
+    var queued = 0
+    var oldest = 0'i64
+    for lease in daemon.leases.values:
+      if lease.className == name and lease.parentLeaseId == 0'u64 and
+          lease.state == leaseStateQueued:
+        inc queued
+        oldest = max(oldest, now - lease.queuedAtMillis)
+    let idleCpu =
+      if reservation.cpuMilli > uint64(held.cpu):
+        reservation.cpuMilli - uint64(held.cpu)
+      else: 0'u64
+    let protectedCpu =
+      if not reservation.lend or name in daemon.classesWaiting: idleCpu
+      else: 0'u64
+    let figures = daemon.classFigures.getOrDefault(name, ClassFigures())
+    if not first: result.add(",")
+    first = false
+    result.add("{\"name\":" & jsonEscape(name) &
+      ",\"configured\":" & $configured &
+      ",\"reservation\":{\"cpu_milli\":" & $reservation.cpuMilli &
+        ",\"memory_bytes\":" & $reservation.memoryBytes &
+        ",\"lend\":" & $reservation.lend & "}" &
+      ",\"held_cpu_milli\":" & $held.cpu &
+      ",\"held_memory_bytes\":" & $held.memory &
+      ",\"borrowed_cpu_milli\":" &
+        $(uint64(held.cpu) - min(uint64(held.cpu), reservation.cpuMilli)) &
+      ",\"borrowed_memory_bytes\":" &
+        $(held.memory - min(held.memory, reservation.memoryBytes)) &
+      ",\"protected_cpu_milli\":" & $protectedCpu &
+      ",\"protected_memory_bytes\":" &
+        $(reservation.memoryBytes - min(reservation.memoryBytes,
+          held.memory)) &
+      ",\"queued_leases\":" & $queued &
+      ",\"oldest_queued_wait_millis\":" & $max(0'i64, oldest) &
+      ",\"grants_total\":" & $figures.grants &
+      ",\"wait_total_millis\":" & $figures.waitTotalMillis &
+      ",\"wait_max_millis\":" & $figures.waitMaxMillis & "}")
+  result.add("]")
+
+proc admissionClassesJson(daemon: RunQuotaDaemon): string =
+  ## The class keys in force, for `status` and `topology`.
+  "\"admission_oversubscription\":" &
+    jsonEscape(oversubscriptionText(daemon.config.oversubscriptionPermille)) &
+    ",\"cpu_grant_limit_milli\":" &
+      $daemon.oversubscribed(daemon.config.cpuSlots.value) &
+    ",\"classes_untracked\":" & $daemon.classesUntracked &
+    ",\"classes\":" & daemon.classesJson()
+
 proc statusJson(daemon: RunQuotaDaemon): string =
   ## The `status` inspection subject: the wire status, as JSON, with the
   ## session groups and the capacity figures beside it.
@@ -2028,6 +2378,7 @@ proc statusJson(daemon: RunQuotaDaemon): string =
     ",\"admission_order\":[" & order.join(",") & "]" &
     ",\"admission_share_between_users\":" &
       jsonEscape($daemon.config.shareBetweenUsers) &
+    "," & daemon.admissionClassesJson() &
     ",\"session_groups\":" & daemon.sessionGroupsJson() &
     ",\"capacity\":" & capacityJson(capacitySnapshot(daemon.capacityCopy()),
       metricsTextfileJson(daemon.config)) &
@@ -2183,6 +2534,17 @@ proc topologyJson(daemon: RunQuotaDaemon): string =
       result.add(",\"owner\":" &
         (if pool.owner == "?": "null" else: jsonEscape(pool.owner)))
     result.add("}")
+  # THE CLASS KEYS IN FORCE, beside the budget they divide.
+  result.add("],\"admission_oversubscription\":" &
+    jsonEscape(oversubscriptionText(daemon.config.oversubscriptionPermille)) &
+    ",\"reservations\":[")
+  var firstReservation = true
+  for name, reservation in daemon.config.reservations.pairs:
+    if not firstReservation: result.add(",")
+    firstReservation = false
+    result.add("{\"class\":" & jsonEscape(name) & ",\"cpu_milli\":" &
+      $reservation.cpuMilli & ",\"memory_bytes\":" &
+      $reservation.memoryBytes & ",\"lend\":" & $reservation.lend & "}")
   result.add("],\"host_config\":{" &
     "\"path\":" & jsonEscape(daemon.config.hostConfigPath) & "," &
     "\"source\":" & jsonEscape(daemon.config.hostConfigSource) & "," &
@@ -3163,6 +3525,7 @@ proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
     pressureEvents: 0'u32,
     queueDiagnostic: okDiagnostic(),
     groupKey: session.groupKey,
+    className: daemon.groupFor(session.groupKey).className,
     queuedAtMillis: monoMillis(),
     requestedAtUnixMillis: unixMillisNow()
   )
@@ -3850,6 +4213,13 @@ proc grantQueuedLease(daemon: var RunQuotaDaemon; id: uint64; delivered: bool) =
   if lease.parentLeaseId == 0'u64:
     daemon.capacity.noteGrant(lease.groupKey,
       elapsedSince(lease.queuedAtMillis), monoMillis())
+    # THE CLASS'S OWN QUEUE TIME, as the daemon measured it.
+    let figures = daemon.classFiguresFor(lease.className)
+    if not figures.isNil:
+      let waited = elapsedSince(lease.queuedAtMillis)
+      inc figures.grants
+      figures.waitTotalMillis += waited
+      figures.waitMaxMillis = max(figures.waitMaxMillis, waited)
   if lease.parentLeaseId == 0'u64 and lease.groupKey.len > 0 and
       daemon.sessionGroups.hasKey(lease.groupKey):
     let waited = elapsedSince(lease.queuedAtMillis)
@@ -4160,19 +4530,24 @@ proc buildReclaimView(daemon: RunQuotaDaemon; now: int64): ReclaimView =
     result.backgroundMilli = backgroundDemandMilli(hostBusy, ownNow, outside)
 
 proc reclaimFreeMilli(daemon: RunQuotaDaemon; view: ReclaimView;
-                      resources: ResourceVector): uint64 =
+                      resources: ResourceVector; className = ""): uint64 =
   ## The CPU predicted free for a lease on `resources`' machine: the
   ## smaller of the machine's and its shared CPU group's.
   var machine: MachineCapacity
   if not daemon.machineFor(resources.resolvedMachineId(), machine):
     return 0'u64
   let group = daemon.cpuShareGroupFor(machine)
-  min(predictedFreeMilli(uint64(machine.cpuSlots.value),
+  let free = min(predictedFreeMilli(uint64(machine.cpuSlots.value),
         view.machineDemand.getOrDefault(machine.id, 0'u64),
         view.backgroundMilli),
       predictedFreeMilli(uint64(group.cpuSlots.value),
         view.groupDemand.getOrDefault(group.id, 0'u64),
         view.backgroundMilli))
+  # A prediction never reaches another class's protected reservation.
+  var protectedCpu, protectedMemory: uint64
+  if machine.id == DefaultMachineId:
+    daemon.protectedFrom(className, protectedCpu, protectedMemory)
+  if free > protectedCpu: free - protectedCpu else: 0'u64
 
 proc noteReclaimed(daemon: RunQuotaDaemon; view: var ReclaimView;
                    resources: ResourceVector; width: uint32) =
@@ -4192,7 +4567,8 @@ proc reclaimWidth(daemon: var RunQuotaDaemon; view: var ReclaimView;
       lease.parentLeaseId != 0'u64 or lease.purpose == leasePurposeBenchmark:
     return 0'u32
   let minimum = lease.minimumResources()
-  if not daemon.fitsNow(minimum, ownerKeyOf(lease.peer), judgeCpu = false):
+  if not daemon.fitsNow(minimum, ownerKeyOf(lease.peer), judgeCpu = false,
+      className = lease.className):
     daemon.lastReclaimDecision = "lease " & $lease.id.value &
       ": memory, IO slots or a pool do not fit"
     return 0'u32
@@ -4210,7 +4586,7 @@ proc reclaimWidth(daemon: var RunQuotaDaemon; view: var ReclaimView;
     daemon.lastReclaimDecision = "lease " & $lease.id.value &
       ": no fresh ambient reading, so background demand is unknown"
     return 0'u32
-  let free = daemon.reclaimFreeMilli(view, minimum)
+  let free = daemon.reclaimFreeMilli(view, minimum, lease.className)
   daemon.lastReclaimDecision = "lease " & $lease.id.value & ": minimum " &
     $minimum.cpu.value & "m, predicted free " & $free & "m (background " &
     $view.backgroundMilli & "m)"
@@ -4238,11 +4614,12 @@ proc narrowFor(daemon: var RunQuotaDaemon; waiterId: uint64) =
   ## instead of narrowing further every time the waiter is passed over.
   let waiter = daemon.leases[waiterId]
   let minimum = waiter.minimumResources()
-  if not daemon.fitsNow(minimum, ownerKeyOf(waiter.peer), judgeCpu = false):
+  if not daemon.fitsNow(minimum, ownerKeyOf(waiter.peer), judgeCpu = false,
+      className = waiter.className):
     # Memory, IO or a pool is what it waits for: CPU would not help.
     return
   let machineId = minimum.resolvedMachineId()
-  let free = daemon.freeCpuFor(minimum)
+  let free = daemon.freeCpuFor(minimum, waiter.className)
   if minimum.cpu.value <= free:
     return
   var deficit = minimum.cpu.value - free
@@ -4314,7 +4691,7 @@ proc widenIntoFreeSlots(daemon: var RunQuotaDaemon; now: int64) =
   while plan.next(candidate):
     var lease = daemon.leases[candidate.id]
     let charged = lease.resources.cpu.value
-    let free = daemon.freeCpuFor(lease.resources)
+    let free = daemon.freeCpuFor(lease.resources, lease.className)
     # The new target may reach the current charge plus whole free slots;
     # up to the charge it costs nothing (a narrowing not yet completed).
     let whole = free - free mod SlotMilli
@@ -4386,25 +4763,110 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
   # starvation bound -- then nothing behind it is granted in this pass, so
   # the capacity that frees up is kept for it. Nothing already granted is
   # ever revoked.
+  #
+  # CLASS RESERVATIONS COME FIRST. Before the order runs, every queued
+  # request of a class that holds a reservation and that fits what its
+  # class has left of that reservation is tried (the RESERVED PASS), in the
+  # same order among those requests. The reservation is the class's own: a
+  # starved request of other work, a higher-priority group or another
+  # owner's smaller share do not stand between the class and it, so the
+  # class gets its reserved capacity in the first pass in which it is free.
+  # What it asks beyond its reservation it borrows in the ordinary pass,
+  # like any work, from capacity no other class's reservation protects
+  # (`protectedFrom`).
   result = daemon.promoteQueuedSubLeases()
   let now = monoMillis()
   var pending: seq[PendingRequest] = @[]
+  var reservedPending: seq[PendingRequest] = @[]
+  daemon.classesWaiting.clear()
   for lease in daemon.leases.values:
     if lease.state == leaseStateQueued and lease.parentLeaseId == 0'u64:
-      pending.add(daemon.pendingRequest(lease, now))
-  var plan = planAdmission(pending, daemon.ownerLoads(), AdmissionPolicy(
+      let request = daemon.pendingRequest(lease, now)
+      pending.add(request)
+      if lease.className.len > 0:
+        daemon.classesWaiting.incl(lease.className)
+        if daemon.reserves(lease.className):
+          reservedPending.add(request)
+  let policy = AdmissionPolicy(
     order: daemon.config.admissionOrder,
     shareBetweenUsers: daemon.config.shareBetweenUsers,
     maxWaitMillis: daemon.config.admissionMaxWaitMillis,
     capacityCpuMilli: uint64(daemon.config.cpuSlots.value),
-    capacityMemoryBytes: daemon.config.memoryBytes.value))
+    capacityMemoryBytes: daemon.config.memoryBytes.value)
   var promoted = 0'u32
   var candidate: PendingRequest
   # THE FIRST REQUEST IN ADMISSION ORDER THAT WAITS FOR CAPACITY, if any. It
   # is what narrowing serves, and while it (or any request) waits, nothing
-  # is widened: widening only ever uses slots queued work could not.
+  # is widened: widening only ever uses slots queued work could not. A
+  # reserved request that waits goes before every other.
   var headWaiter = 0'u64
   var waiting = false
+  var grantedInPass = initHashSet[uint64]()
+
+  proc grantFromFree(daemon: var RunQuotaDaemon; id: uint64;
+                     minimum: ResourceVector): uint32 =
+    ## Grant a queued host lease whose minimum fits: THE WIDEST VALUE IN
+    ## THE RANGE THAT IS FREE, at least the minimum. A request with one CPU
+    ## value has both ends equal to it, and is granted exactly that.
+    var lease = daemon.leases[id]
+    let width = rangedWidth(minimum.cpu.value,
+      max(lease.cpuPreferredMilli, minimum.cpu.value),
+      daemon.freeCpuFor(minimum, lease.className))
+    lease.resources.cpu = milliCpu(width)
+    lease.grantCpuMilli = width
+    lease.cpuTargetMilli = width
+    lease.cpuCurrentMilli = width
+    if lease.resizable and width < lease.growWantedMilli:
+      lease.growOrder = daemon.nextQueueOrder
+      inc daemon.nextQueueOrder
+    daemon.leases[id] = lease
+    daemon.grantQueuedLease(id, false)
+    width
+
+  # THE RESERVED PASS.
+  if reservedPending.len > 0:
+    var reservedPlan = planAdmission(reservedPending, daemon.ownerLoads(),
+      policy)
+    while promoted < maxDecisions and reservedPlan.next(candidate):
+      let lease = daemon.leases[candidate.id]
+      var pressureDiagnostic: Diagnostic
+      if not daemon.benchmarkGateAllows(lease) or
+          not daemon.pressureAllows(lease.resources, pressureDiagnostic):
+        continue
+      let minimum = lease.minimumResources()
+      if not daemon.withinReservation(lease.className, minimum):
+        # Beyond what the class has left of its reservation: it borrows,
+        # and borrowing is the ordinary pass's.
+        continue
+      if daemon.fitsNow(minimum, ownerKeyOf(lease.peer),
+          className = lease.className):
+        let width = daemon.grantFromFree(candidate.id, minimum)
+        reservedPlan.noteGranted(candidate.owner, uint64(width),
+          lease.resources.memory.value, candidate.groupKey)
+        result.add(candidate.id)
+        grantedInPass.incl(candidate.id)
+        inc promoted
+      else:
+        # Its reservation is lent and not back yet: the CPU comes back as
+        # the borrowers' leases finish, and is held for it meanwhile.
+        waiting = true
+        if headWaiter == 0'u64:
+          headWaiter = candidate.id
+    if grantedInPass.len > 0:
+      # A class whose every waiter was served no longer has its idle
+      # reservation held for it.
+      daemon.classesWaiting.clear()
+      for request in pending:
+        if request.id notin grantedInPass:
+          let className = daemon.leases[request.id].className
+          if className.len > 0:
+            daemon.classesWaiting.incl(className)
+
+  var ordinary: seq[PendingRequest] = @[]
+  for request in pending:
+    if request.id notin grantedInPass:
+      ordinary.add(request)
+  var plan = planAdmission(ordinary, daemon.ownerLoads(), policy)
   # PREDICTIVE ADMISSION's view of the running leases, built only when a
   # reclaim-eligible request does not fit, and rebuilt after a grant from
   # free capacity changed what runs.
@@ -4422,22 +4884,9 @@ proc tryPromoteQueued(daemon: var RunQuotaDaemon; maxDecisions: uint32 = high(
       # on a condition no grant can change.
       continue
     let minimum = lease.minimumResources()
-    if daemon.fitsNow(minimum, ownerKeyOf(lease.peer)):
-      # THE GRANT IS THE WIDEST VALUE IN THE RANGE THAT IS FREE, at least the
-      # minimum (which fits). A request with one CPU value has both ends
-      # equal to it, and is granted exactly that.
-      let width = rangedWidth(minimum.cpu.value,
-        max(lease.cpuPreferredMilli, minimum.cpu.value),
-        daemon.freeCpuFor(minimum))
-      lease.resources.cpu = milliCpu(width)
-      lease.grantCpuMilli = width
-      lease.cpuTargetMilli = width
-      lease.cpuCurrentMilli = width
-      if lease.resizable and width < lease.growWantedMilli:
-        lease.growOrder = daemon.nextQueueOrder
-        inc daemon.nextQueueOrder
-      daemon.leases[candidate.id] = lease
-      daemon.grantQueuedLease(candidate.id, false)
+    if daemon.fitsNow(minimum, ownerKeyOf(lease.peer),
+        className = lease.className):
+      let width = daemon.grantFromFree(candidate.id, minimum)
       plan.noteGranted(candidate.owner, uint64(width),
         lease.resources.memory.value, candidate.groupKey)
       result.add(candidate.id)
@@ -4503,13 +4952,13 @@ proc rebudgetQueuedLeases(daemon: var RunQuotaDaemon;
     if lease.state == leaseStateQueued and lease.parentLeaseId == 0'u64:
       var reason = ""
       if not daemon.possible(lease.minimumResources(),
-          ownerKeyOf(lease.peer), reason):
+          ownerKeyOf(lease.peer), reason, lease.className):
         doomed.add(id)
   for id in doomed:
     let lease = daemon.leases[id]
     var reason = ""
     discard daemon.possible(lease.minimumResources(), ownerKeyOf(lease.peer),
-      reason)
+      reason, lease.className)
     # THE CAUSE AND THE DAEMON, both: they answer different questions --
     # WHY NOW (the budget changed under a lease that was already waiting)
     # and WHO (which daemon holds that budget) -- so the identity is
@@ -4642,6 +5091,13 @@ proc reloadHostConfig*(daemon: var RunQuotaDaemon; owner = ""):
         next.cpuShareGroups.hasKey(group):
       next.cpuShareGroups[group] = cpuShareGroup(group, next.cpuSlots)
   next.hostConfigSource = host.sourcePath
+  # The reservations govern the `local` machine, whose figures a pinned
+  # topology may set apart from the file's.
+  let reservationRefusal = reservationProblem(next.reservations,
+    next.cpuSlots, next.memoryBytes)
+  if reservationRefusal.len > 0:
+    raise newException(HostConfigError, host.sourcePath & ": " &
+      reservationRefusal)
   daemon.config = next
   inc daemon.hostConfigReloads
 
@@ -5393,7 +5849,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     # The owner of the SESSION, which is what the lease will be recorded as
     # (`createQueuedLease` copies the session's peer).
     if not daemon.possible(effective.rangedResources(msg.width),
-        ownerKeyOf(daemon.sessions[msg.sessionId.value].peer), reason):
+        ownerKeyOf(daemon.sessions[msg.sessionId.value].peer), reason,
+        daemon.sessionClass(msg.sessionId)):
       let denied = LeaseDeniedMessage(
         sessionId: msg.sessionId,
         diagnostic: diagnostic(diagDenied, reason, daemon.refusedByText())
@@ -5647,7 +6104,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           resources: effective,
           diagnostic: daemon.benchmarkRefusal()))
       elif not daemon.possible(effective.rangedResources(candidate.width),
-          ownerKeyOf(daemon.sessions[msg.sessionId.value].peer), reason):
+          ownerKeyOf(daemon.sessions[msg.sessionId.value].peer), reason,
+          daemon.sessionClass(msg.sessionId)):
         decisions.add(LeaseDecision(
           clientCandidateId: candidate.clientCandidateId,
           leaseId: leaseId(0),
@@ -5976,7 +6434,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           break
     if refusal.len == 0:
       var reason = ""
-      if not daemon.possible(resources, owner, reason):
+      if not daemon.possible(resources, owner, reason,
+          daemon.sessionClass(msg.sessionId)):
         refusal = reason
         code = diagDenied
     var decision: LeaseDecision

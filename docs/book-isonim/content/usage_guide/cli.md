@@ -47,6 +47,7 @@ The `stats` verbs have a page of their own:
 | `runquota observations --json` | The recording subsystem: whether capture is on, which store is open, and every counter about what has been accepted, refused, queued or dropped. |
 | `runquota explain SESSION_ID` | The leases belonging to one session. |
 | `runquota pressure [--group G] [--json]` | [Build-wait pressure](#build-wait-pressure) per host, session group and open session. |
+| `runquota pressure report [--class CLASS]` | A pool's reporting session: reads `class-queue <started-unix-millis> <length-millis>` lines on stdin and reports each as a wait of the class's queue (see [Build-wait pressure](#build-wait-pressure)). |
 | `runquota profile [--project P] [--json]` | [Resource profiles](#resource-profiles-and-sizing) per project, entry point and host profile. |
 | `runquota sizing --project P --cpus N[,N...] [--json]` | How much memory N dedicated CPUs need for a project: its recorded runs [replayed](#resource-profiles-and-sizing) at N CPUs. |
 | `runquota daemon status` | Same as `status`. |
@@ -449,6 +450,16 @@ up half of it. It exits 0 when the daemon answered, 1 when no daemon could be
 reached or it predates pressure reports, 2 on bad arguments. See
 [the daemon](/usage_guide/daemon#build-wait-pressure) for what is reported
 and how it is clamped.
+
+It also prints each **class**: the pressure its sessions reported and its
+lease queue time as the daemon measured it. A pool that runs jobs in a
+class (a CI runner pool, a VM pool) reports how long each job waited for a
+slot through `runquota pressure report --class CLASS`, which it starts once
+and keeps: it prints `ready <session>`, then reads one line per finished
+wait, `class-queue <started-unix-millis> <length-millis>`, and answers
+`reported <length>`, `skipped` (under a second) or `refused` (a line it
+cannot read). The daemon trusts no wait longer than the reporting session
+has existed, which is why it is one long-lived session and not one per job.
 
 ## `runquota vm hold`
 

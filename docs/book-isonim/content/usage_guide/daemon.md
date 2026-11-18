@@ -116,6 +116,44 @@ A `runquotad` older than this table refuses a file that has it: it does not
 start, and a reload is refused with the budget in force unchanged. Upgrade
 the daemon before adding the table.
 
+**Classes, reservations and the oversubscription target.** A launcher
+puts its sessions in a *class* by exporting `RUNQUOTA_CLASS` (for example
+`ci`), and the host file can reserve capacity for a class and let CPU
+grants overlap the budget:
+
+```toml
+[admission]
+oversubscription = "0.1"     # CPU grants may sum to the budget x 1.1; default "0"
+
+[reservation.ci]
+cpu-milli    = 8000          # reserved CPU; absent: none
+memory-bytes = 34359738368   # reserved memory; absent: none
+lend         = true          # idle reserved CPU may be lent (default true)
+```
+
+Work outside a class is never granted a class's reserved memory, and
+reserved memory is never lent. A class's idle reserved CPU is lent to other
+work when `lend = true`; as soon as the class asks, its idle reservation is
+held for it, and every CPU a finishing lease frees, up to the reservation,
+goes to the class first. Running leases are never revoked. Each admission
+pass serves the requests that fit their class's reservation before the
+admission order runs, so a class gets its reserved capacity whatever else is
+queued; beyond its reservation a class borrows like any other work, only
+from capacity no other class's reservation protects. Lent CPU comes back
+only as the borrowers' leases finish, so a class that must have its cores
+the moment it asks should set `lend = false`. The admission order's
+starvation bound still holds for other work, over the capacity the
+reservations leave it. A class is not a permission: any process that
+reaches the daemon may export any class and be admitted under its
+reservation, so a reservation protects a class's capacity from work that
+does not name it, not from a user who does. The reservations
+together must fit the budget itself (the target does not make room for
+them): a file that breaks this does not start the daemon, and a reload of
+it is refused. `oversubscription` is a fraction from `"0"` to `"1"`; memory
+is never oversubscribed. `runquota status` shows each class's reservation,
+what it holds and borrows, and what is held for it; `runquota pressure`
+shows each class's queue time (see [Build-wait pressure](#build-wait-pressure)).
+
 The reader accepts exactly this shape: a `schema` string, positive integers in
 `[machine]` and `[pools]`, `_` between digits, the `[admission]` keys above
 (plain double-quoted strings without escapes, and `order` as a one-line
@@ -154,6 +192,10 @@ runquota config set admission.order starvation,fair-share,arrival
 runquota config set admission.max-wait 90s
 runquota config set admission.share-between-users none
 runquota config set admission.predictive on
+runquota config set admission.oversubscription 0.1
+runquota config set reservation.ci.cpu-milli 8000
+runquota config set reservation.ci.memory-bytes 32GiB
+runquota config set reservation.ci.lend false
 runquota config unset pools.compile               # back to the default
 runquota config reload                            # after editing the file by hand
 runquota config path

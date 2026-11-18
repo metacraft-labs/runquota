@@ -122,7 +122,10 @@ suite "the [admission] table":
         ("[admission]\nshare-between-users = \"fair\"\n",
           "share-between-users must be drf or none"),
         ("[admission]\nshare-between-users = drf\n", "double-quoted"),
-        ("[admission]\noversubscription = 0\n", "unknown key `oversubscription`"),
+        # `oversubscription` is a key (a quoted fraction) since classes
+        # and the oversubscription target were added.
+        ("[admission]\noversubscription = 0\n", "double-quoted"),
+        ("[admission]\noversubmission = \"0\"\n", "unknown key `oversubmission`"),
         ("[admissions]\n", "unknown table")]:
       let message = refusal(text)
       check needle in message

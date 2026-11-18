@@ -43,6 +43,27 @@ proc parseSessionPriority*(text: string; priority: var SessionPriority): bool =
       return true
   false
 
+const MaxClassNameBytes* = 64
+  ## The longest class name (`RUNQUOTA_CLASS`).
+
+proc classNameProblem*(name: string): string =
+  ## Why `name` cannot be a class name, or "" when it can: 1 to
+  ## `MaxClassNameBytes` bytes of ASCII letters, digits, `_` and `-`. A class
+  ## is named by a launcher and by the host file's `[reservation.<class>]`
+  ## table header, so the rule is the bare-key rule of that file: every class
+  ## a client can name can be given a reservation. (The host file's reader,
+  ## `runquota_daemon/host_config`, states the same rule for itself, since
+  ## it imports only the standard library.)
+  if name.len == 0:
+    return "a class name must not be empty"
+  if name.len > MaxClassNameBytes:
+    return "a class name is at most " & $MaxClassNameBytes & " bytes, got " &
+      $name.len
+  for ch in name:
+    if ch notin {'A' .. 'Z', 'a' .. 'z', '0' .. '9', '_', '-'}:
+      return "a class name may hold only ASCII letters, digits, `_` and `-`"
+  ""
+
 proc sessionGroupNameProblem*(name: string): string =
   ## Why `name` cannot be a session group name, or "" when it can. Empty is
   ## not a name (it means "no group" on the wire); control bytes would make

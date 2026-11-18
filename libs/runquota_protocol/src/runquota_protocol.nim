@@ -11,7 +11,7 @@ export virtual_machines
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 2'u16
-const RqspProtocolMinor* = 11'u16
+const RqspProtocolMinor* = 12'u16
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -135,6 +135,15 @@ const VirtualMachinesMinor* = 11'u16
   ## (`MachineLink`, `MachineReport`) a guest daemon speaks over vsock.
   ## MINOR 11 ANNOUNCES THEM, additively: no existing message changed, and a
   ## client sends none of them below this minor.
+const ClassesMinor* = 12'u16
+  ## The first daemon minor that understands CLASSES: the trailing class
+  ## block of `RegisterSession` (the session group's class, from
+  ## `RUNQUOTA_CLASS`), class reservations and the oversubscription target
+  ## in admission, and per-class figures in `QueryPressure`. MINOR 12
+  ## ANNOUNCES THEM, additively: an older daemon refuses trailing bytes, so
+  ## a client sends the class block only at this minor or above, and below
+  ## it the session is served without a class -- outside every reservation,
+  ## as that daemon serves every session.
 const MaxPressureWaitsPerReport* = 64
   ## The most waits one `PressureReport` carries. A client with more keeps
   ## the rest for its next report; the daemon refuses a longer list, so a
@@ -403,7 +412,13 @@ proc encodeRegisterSession*(msg: RegisterSessionMessage): string =
   # empty name. Only a minor-9 daemon is ever sent the sizing block (the
   # client checks), and it reads an empty group name followed by more bytes
   # as "no group".
-  let sizing = msg.project.len > 0 or msg.entryPoint.len > 0
+  # THE CLASS BLOCK FOLLOWS THE SIZING BLOCK, so a registration that names a
+  # class writes both earlier blocks, empty where they say nothing (an empty
+  # group name, an empty project and entry point). Only a minor-12 daemon is
+  # ever sent it (the client checks), and it reads those empty blocks
+  # followed by a class as "no group, nothing declared, this class".
+  let classed = msg.group.className.len > 0
+  let sizing = msg.project.len > 0 or msg.entryPoint.len > 0 or classed
   if msg.group.name.len > 0 or sizing:
     w.writeString(msg.group.name)
     w.writeBool(msg.group.priorityPresent)
@@ -413,6 +428,8 @@ proc encodeRegisterSession*(msg: RegisterSessionMessage): string =
   if sizing:
     w.writeString(msg.project)
     w.writeString(msg.entryPoint)
+  if classed:
+    w.writeString(msg.group.className)
   w.data
 
 proc decodeRegisterSession*(payload: string;
@@ -427,6 +444,7 @@ proc decodeRegisterSession*(payload: string;
   var group = SessionGroupDeclaration(priority: sessionPriorityNormal)
   var project = ""
   var entryPoint = ""
+  var className = ""
   if r.remaining != 0:
     if not r.readString(group.name): return false
     if not r.readBool(group.priorityPresent): return false
@@ -439,9 +457,15 @@ proc decodeRegisterSession*(payload: string;
       if project.len > MaxSizingDeclarationBytes or
           entryPoint.len > MaxSizingDeclarationBytes:
         return false
-      # A sizing block that declares nothing is not something the encoder
-      # writes.
-      if project.len == 0 and entryPoint.len == 0: return false
+      if r.remaining != 0:
+        if not r.readString(className): return false
+        # An empty class is not something the encoder writes, and a name
+        # outside the class-name rule (`classNameProblem`) is refused: the
+        # client library refuses to send one.
+        if classNameProblem(className).len > 0: return false
+      # A sizing block that declares nothing, with no class after it, is
+      # not something the encoder writes.
+      elif project.len == 0 and entryPoint.len == 0: return false
     elif group.name.len == 0:
       # A group block that names no group and carries no sizing block after
       # it is not something the encoder writes, so it is a malformed frame
@@ -449,6 +473,7 @@ proc decodeRegisterSession*(payload: string;
       return false
     if group.name.len == 0:
       group = SessionGroupDeclaration(priority: sessionPriorityNormal)
+    group.className = className
   if r.remaining != 0: return false
   msg = RegisterSessionMessage(name: name, version: version, metadata: metadata,
     group: group, project: project, entryPoint: entryPoint)

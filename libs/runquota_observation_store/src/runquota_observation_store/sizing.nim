@@ -411,6 +411,9 @@ proc profileAnswerJson*(runs: seq[SizingRun]; status: SizingAnswerStatus;
     executions: int
     excluded: int
     peak, duration, cpu, width, write: seq[int64]
+    runWrites: OrderedTable[string, int64]
+      ## Per run, the bytes its complete executions that measured IO wrote
+      ## in all: what one run of the project writes, for sizing a disk.
   var groups = initOrderedTable[string, Group]()
   for run in runs:
     for e in run.executions:
@@ -436,6 +439,10 @@ proc profileAnswerJson*(runs: seq[SizingRun]; status: SizingAnswerStatus;
         g.width.add(e.cpuGrantedMilli.get)
       if e.ioWriteBytes.isSome and e.durationMillis > 0:
         g.write.add((e.ioWriteBytes.get * 1000) div e.durationMillis)
+      if e.ioWriteBytes.isSome:
+        let runKey = run.hostId & "\0" & run.runId
+        g.runWrites[runKey] = g.runWrites.getOrDefault(runKey, 0'i64) +
+          max(0'i64, e.ioWriteBytes.get)
       groups[key] = g
   var keys = toSeq(groups.keys)
   keys.sort()
@@ -463,7 +470,9 @@ proc profileAnswerJson*(runs: seq[SizingRun]; status: SizingAnswerStatus;
       ",\"duration_millis\":" & figureJson(g.duration, q) &
       ",\"mean_cpu_milli\":" & figureJson(g.cpu, q) &
       ",\"granted_width_milli\":" & figureJson(g.width, q) &
-      ",\"write_bytes_per_sec\":" & figureJson(g.write, q) & "}")
+      ",\"write_bytes_per_sec\":" & figureJson(g.write, q) &
+      ",\"run_write_bytes\":" & figureJson(toSeq(g.runWrites.values), q) &
+      "}")
   result.add("]}")
 
 # ---------------------------------------------------------------------------

@@ -127,6 +127,9 @@ type
     pressure*: PressureFigures
 
   CapacitySnapshot* = object
+    classes*: seq[tuple[name: string, pressure: PressureFigures]]
+      ## Per class, the pressure its sessions reported (`class-queue`
+      ## waits among it), for the `runquota_class_*` series.
     cpuBudgetMilli*: uint64
     hostCounters*: CapacityCounters
     hostLive*: LiveFigures
@@ -141,6 +144,7 @@ type
     ## What a snapshot is computed from, copied out of the daemon under its
     ## lock so that everything else -- filtering, parsing keys, sorting,
     ## rendering -- happens after the lock is released.
+    classes*: seq[tuple[name: string, pressure: PressureFigures]]
     host*: CapacityCounters
     hostPressure*: PressureFigures
     groups*: seq[tuple[key: string, group: GroupCapacity]]
@@ -324,6 +328,7 @@ proc snapshot*(copy: CapacityCopy): CapacitySnapshot =
   result.hostLive = live.host
   result.hostPressure = copy.hostPressure
   result.nowMillis = copy.nowMillis
+  result.classes = copy.classes
   var seen = initHashSet[string]()
   for (key, entry) in copy.groups:
     seen.incl(key)
@@ -472,6 +477,16 @@ proc expositionText*(snap: CapacitySnapshot): string =
   result.expositionFamilies("runquota_host", [("", snap.hostPressure)],
     snap.nowMillis)
   result.expositionFamilies("runquota_group", pressureGroups, snap.nowMillis)
+  # Per class: every class with figures, reported or not, so a reserved
+  # class's queue time is a series from the start.
+  var pressureClasses: seq[tuple[labels: string, figures: PressureFigures]]
+  for entry in snap.classes:
+    let (label, hex) = validUtf8Label(entry.name)
+    var labels = "class=\"" & escapeLabelValue(label) & "\""
+    if hex.len > 0:
+      labels.add(",class_hex=\"" & hex & "\"")
+    pressureClasses.add((labels, entry.pressure))
+  result.expositionFamilies("runquota_class", pressureClasses, snap.nowMillis)
   if snap.groups.len == 0:
     return
   # One family at a time: the format wants every sample of a family

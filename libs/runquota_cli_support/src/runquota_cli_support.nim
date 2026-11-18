@@ -58,8 +58,12 @@ proc renderUsage*(programName: string): string =
     "    process runs: prints 'granted LEASE', reads '<pid> [<vsock-cid>]' on\n" &
     "    stdin, prints 'started', releases when that process exits\n" &
     "  " & programName & " pressure [--group GROUP] [--json]\n" &
-    "    build-wait pressure per host, session group and open session (exit 1\n" &
-    "    when the daemon cannot be reached or predates it, 2 on bad arguments)\n" &
+    "    build-wait pressure per host, session group, open session and class\n" &
+    "    (exit 1 when the daemon cannot be reached or predates it, 2 on bad\n" &
+    "    arguments)\n" &
+    "  " & programName & " pressure report [--class CLASS]\n" &
+    "    a pool's reporting session: reads 'class-queue <started-unix-millis>\n" &
+    "    <length-millis>' lines and reports each as a wait of CLASS's queue\n" &
     "  " & programName & " profile [--project P] [--entry-point E] [--quantile Q] [--since 30d] [--host-profile current|all] [--all-users] [--json]\n" &
     "    per project, entry point and host profile: peak memory per job, CPU,\n" &
     "    duration, width and write rate from the observation store\n" &
@@ -129,6 +133,36 @@ proc printSessionGroups(statusJson: string) =
   if parsed.hasKey("admission_share_between_users"):
     echo "admission_share_between_users: " &
       parsed{"admission_share_between_users"}.getStr()
+  if parsed.hasKey("admission_oversubscription"):
+    echo "admission_oversubscription: " &
+      parsed{"admission_oversubscription"}.getStr() &
+      " (CPU grants up to " &
+      $parsed{"cpu_grant_limit_milli"}.getBiggestInt() & "m)"
+  let classes = parsed{"classes"}
+  if not classes.isNil and classes.kind == JArray:
+    for class in classes:
+      let reservation = class{"reservation"}
+      echo "class: " & class{"name"}.getStr() &
+        " reserved_cpu_milli=" & $reservation{"cpu_milli"}.getBiggestInt() &
+        " reserved_memory_bytes=" &
+          $reservation{"memory_bytes"}.getBiggestInt() &
+        " lend=" & $reservation{"lend"}.getBool() &
+        " held_cpu_milli=" & $class{"held_cpu_milli"}.getBiggestInt() &
+        " held_memory_bytes=" & $class{"held_memory_bytes"}.getBiggestInt() &
+        " borrowed_cpu_milli=" &
+          $class{"borrowed_cpu_milli"}.getBiggestInt() &
+        " borrowed_memory_bytes=" &
+          $class{"borrowed_memory_bytes"}.getBiggestInt() &
+        " protected_cpu_milli=" &
+          $class{"protected_cpu_milli"}.getBiggestInt() &
+        " protected_memory_bytes=" &
+          $class{"protected_memory_bytes"}.getBiggestInt() &
+        " queued=" & $class{"queued_leases"}.getBiggestInt() &
+        " oldest_queued_wait_millis=" &
+          $class{"oldest_queued_wait_millis"}.getBiggestInt() &
+        " grants=" & $class{"grants_total"}.getBiggestInt() &
+        " wait_total_millis=" & $class{"wait_total_millis"}.getBiggestInt() &
+        " wait_max_millis=" & $class{"wait_max_millis"}.getBiggestInt()
   for group in parsed["session_groups"]:
     if group.isNil or group.kind != JObject:
       continue
@@ -145,9 +179,12 @@ proc printSessionGroups(statusJson: string) =
         format(fromUnix(deadlineNode.getBiggestInt() div 1000).utc,
           "yyyy-MM-dd'T'HH:mm:ss'Z'")
       else: "none"
+    let classNode = group{"class"}
     echo "session_group: " & group{"name"}.getStr() &
       " owner_uid=" & owner &
       " priority=" & group{"priority"}.getStr() &
+      (if not classNode.isNil and classNode.kind == JString:
+         " class=" & classNode.getStr() else: "") &
       " cache_deadline=" & deadline &
       " sessions=" & $group{"sessions"}.getBiggestInt() &
       " queued=" & $group{"queued_leases"}.getBiggestInt() &
@@ -747,9 +784,112 @@ proc clientFailureText(message: string; last: Diagnostic): string =
   else:
     message
 
+const ClassQueueMinWaitMillis = 1000'u64
+  ## The shortest wait a pool reports, as for every reported wait.
+
+proc runPressureReport(args: seq[string]): int =
+  ## `runquota pressure report [--class CLASS]`: a POOL's reporting session.
+  ##
+  ## A pool that runs jobs in a class (a CI runner pool, a VM pool) reports
+  ## how long each job waited for a slot as a `class-queue` wait. It starts
+  ## this once and keeps it for its life: the session joins the group
+  ## `RUNQUOTA_SESSION` names (else the group named after the class) in
+  ## CLASS (`--class`, else `RUNQUOTA_CLASS`), prints `ready <session>`,
+  ## and then reads one line per finished wait on stdin:
+  ##
+  ##     class-queue <started-unix-millis> <length-millis>
+  ##
+  ## answering each with `reported <length-millis>`, `skipped <reason>` (a
+  ## wait under a second, which no client reports) or `refused <reason>` (a
+  ## line it cannot read; the session stays open). End of input closes the
+  ## session and exits 0.
+  ##
+  ## WHY A LONG-LIVED SESSION, not one per wait: the daemon trusts no
+  ## client-sent duration beyond the reporting session's age, so a session
+  ## opened when the job got its slot could report a wait of about a second
+  ## and no more. A pool's session is as old as the pool.
+  var className = getEnv(ClassEnvVar).strip()
+  var i = 0
+  while i < args.len:
+    case args[i]
+    of "--class":
+      if i + 1 >= args.len:
+        stderr.writeLine("runquota pressure report: --class needs a class")
+        return 2
+      className = args[i + 1]
+      i += 2
+    else:
+      stderr.writeLine("runquota pressure report: unrecognised argument '" &
+        args[i] & "'")
+      return 2
+  if className.len == 0:
+    stderr.writeLine("runquota pressure report: name the class the waits " &
+      "are counted in (--class, or " & ClassEnvVar & ")")
+    return 2
+  let problem = classNameProblem(className)
+  if problem.len > 0:
+    stderr.writeLine("runquota pressure report: " & problem)
+    return 2
+  var client: RunQuotaClient
+  try:
+    client = connectDefault()
+  except CatchableError as error:
+    stderr.writeLine("runquota pressure report: " & error.msg)
+    return 1
+  defer: client.close()
+  if not client.supportsClasses():
+    stderr.writeLine("runquota pressure report: the daemon (" &
+      client.daemonVersion & ", protocol minor " &
+      $client.capabilities.protocolMinor & ") predates classes (needs " &
+      $ClassesMinor & ")")
+    return 1
+  var group = sessionGroupFromEnvironment()
+  group.className = className
+  var session: RunQuotaSession
+  try:
+    session = client.registerSession("runquota-pressure-report", "0", group)
+  except CatchableError as error:
+    stderr.writeLine("runquota pressure report: " & error.msg)
+    return 1
+  echo "ready " & $session.id.value
+  flushFile(stdout)
+  var line = ""
+  while stdin.readLine(line):
+    let fields = line.strip().splitWhitespace()
+    var startedAt, length: uint64
+    var readable = fields.len == 3 and fields[0] == "class-queue"
+    if readable:
+      try:
+        startedAt = parseBiggestUInt(fields[1])
+        length = parseBiggestUInt(fields[2])
+      except ValueError:
+        readable = false
+    if not readable:
+      echo "refused expected `class-queue <started-unix-millis> " &
+        "<length-millis>`, got `" & line.strip() & "`"
+    elif length < ClassQueueMinWaitMillis:
+      echo "skipped a wait under 1 s is not reported"
+    else:
+      # Only the wait: a pool is not an invocation with commands of its own,
+      # so it covers no wall time and claims no held-up share.
+      discard session.reportPressure(PressureReportMessage(
+        sessionId: session.id, queueOnly: true,
+        waits: @[PressureWait(startedAtUnixMillis: startedAt,
+          lengthMillis: length, kind: pwkClassQueue)]))
+      echo "reported " & $length
+    flushFile(stdout)
+  try:
+    session.closeSession()
+  except CatchableError:
+    discard
+  0
+
 proc runPressure(programName: string; args: seq[string]): int =
   ## `runquota pressure [--group G] [--json]`: the daemon's `QueryPressure`
-  ## answer, as text or as the JSON it sent.
+  ## answer, as text or as the JSON it sent. `runquota pressure report` is
+  ## a pool's reporting session (`runPressureReport`).
+  if args.len >= 1 and args[0] == "report":
+    return runPressureReport(args[1 .. ^1])
   var json = false
   var group = ""
   var i = 0

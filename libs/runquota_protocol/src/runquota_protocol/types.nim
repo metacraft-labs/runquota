@@ -197,6 +197,12 @@ type
     cacheDeadlineUnixMillis*: uint64
       ## Absolute UTC time, milliseconds since the Unix epoch, at which the
       ## group's provider prompt cache expires if it keeps waiting.
+    className*: string
+      ## The group's class (`RUNQUOTA_CLASS`), or empty for none. Like the
+      ## attributes, it is applied only by the session that creates the
+      ## group. A session that names a class and no group joins its owner's
+      ## group named after the class. Travels in its own trailing block of
+      ## `RegisterSession`, only to a daemon at `ClassesMinor` or above.
 
   RegisterSessionMessage* = object
     name*: string
