@@ -25,7 +25,11 @@
 ## 4. The finish answers the expected uncontended duration when asked, and
 ##    reads it BEFORE folding the finish in: the first finish of a key
 ##    learns 0, the second the first run's 1000 ms. Mutation: fold before
-##    reading, and the first finish learns its own duration.
+##    reading, and the first finish learns its own duration. A sampler that
+##    took no reading in a run's judged window is refused as a precondition
+##    (the host's load), not failed as a learned 0. A first lease granted
+##    before the store is installed is covered by
+##    `libs/runquota_daemon/tests/t_lease_live_before_capture_is_sampled`.
 ## 5. The text file carries the pressure series and still passes
 ##    `promtool check metrics`; `status --json` carries `pressure`; and
 ##    `runquota pressure --group` filters to one group.
@@ -274,6 +278,21 @@ when defined(linux) or defined(macosx):
         lease.markRunning(childProcessId = uint64(getCurrentProcessId()))
         # Ambient samples must cover the run for the daemon to judge it.
         sleep(1300)
+        # A sampler starved through the whole judged window (the run's last
+        # 1000 ms) leaves the run unjudged. That is the host's load, not a
+        # regression, so it is refused as a named precondition rather than
+        # failed as a learned 0. One read, not a poll: waiting here would
+        # move the finish, and its window, past the reading.
+        let windowStart = (getTime() - initDuration(milliseconds = 1000))
+          .toUnixFloat * 1000.0
+        let (statusCode, statusText) =
+          cli(privateEnv(socket), ["status", "--json"])
+        prerequisite statusCode == 0, "runquota status failed: " & statusText
+        let readAt = parseJson(statusText)["capacity"]["host"][
+          "ambient_reading_unix_millis"]
+        prerequisite readAt.kind == JInt and
+          float64(readAt.getBiggestInt) > windowStart,
+          "the ambient sampler took no reading in the run's judged window"
         lease.finish(outcome = succeeded(), totals = FinishTotals(known: true,
           cpuUserMicros: 1000, durationMillis: 1000),
           askExpectedDuration = true)

@@ -1182,9 +1182,11 @@ proc startAmbientSampler*(path, hostId: string;
     samplerLastSampledAt = 0
     latestReadingAt = 0
     # A sampler starts with NOTHING LIVE, and therefore writing nothing.
-    # The lease authority publishes the count as leases come and go; there
-    # can be no live lease before the daemon that grants them is serving,
-    # so starting from zero cannot lose one.
+    # The lease authority publishes the count as leases come and go. The
+    # daemon serves leases while the store opens, so leases CAN be live
+    # before this runs; the lease authority republishes its count when it
+    # takes the store over (`installCapture` in `runquota_daemon`), and
+    # every grant after this point publishes it too.
     samplerLiveLeases = 0
     samplerLeaseCovered = false
     samplerStop = false

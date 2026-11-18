@@ -798,6 +798,15 @@ proc installCapture*(daemon: var RunQuotaDaemon; setup: sink CaptureSetup) =
   # owners seen by THIS daemon; see `docs/database.md`, "When the endpoint
   # appears".
   daemon.owners.seed(setup.users)
+  # THE SAMPLER STARTED FROM ZERO LIVE LEASES (`startAmbientSampler`), but
+  # `serve` grants leases while the store opens, so leases may already be
+  # live. Republish the count here, under the same lock as every grant and
+  # release, or a lease granted before the hand-over is never covered: no
+  # ambient sample over its run, its finish unjudged, and its key learns no
+  # uncontended duration (reprobuild-pm issue
+  # 2026-11-16-runquota-expected-uncontended-duration-is-never-learned-on-a-loaded-host;
+  # `t_lease_live_before_capture_is_sampled`).
+  setAmbientLiveLeaseCount(int(daemon.activeLeaseCount))
 
 proc initDaemon*(config: DaemonConfig; deferCapture = false): RunQuotaDaemon =
   ## ``deferCapture`` leaves the observation store UNOPENED (``ssVerifying``,
