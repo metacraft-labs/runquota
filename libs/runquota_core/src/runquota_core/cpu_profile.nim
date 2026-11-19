@@ -279,8 +279,8 @@ type
 
   IoTotals* = object
     ## Bytes the tree caused to be read from and written to storage
-    ## (Linux ``/proc/<pid>/io`` ``read_bytes`` / ``write_bytes`` of the
-    ## root, which include its waited-for descendants; macOS
+    ## (Linux ``ru_inblock`` / ``ru_oublock`` of the ``wait4`` that reaped
+    ## the root, times 512, which include its waited-for descendants; macOS
     ## ``ri_diskio_bytesread`` / ``ri_diskio_byteswritten`` of the root,
     ## which do NOT include its reaped descendants).
     known*: bool

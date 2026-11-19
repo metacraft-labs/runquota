@@ -387,8 +387,9 @@ proc measurementRecordFor*(os: string): MeasurementRecord =
   of "linux":
     result.entries = @[
       MeasurementEntry(quantity: mqWriteBytes, coverage: mcFull,
-        how: "the whole tree: /proc/<pid>/io of the root read at its " &
-          "exit, which includes the descendants it waited for"),
+        how: "the whole tree: wait4 ru_oublock of the root at its " &
+          "exit, in 512-byte units, which includes the descendants it " &
+          "waited for"),
       MeasurementEntry(quantity: mqMemory, coverage: mcFull,
         how: "the whole tree: the sum of VmRSS over its processes")]
   of "macos":

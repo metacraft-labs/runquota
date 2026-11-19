@@ -18,8 +18,12 @@
 ##   available, runs one 4-GiB tree at a time, and every holder exits by
 ##   itself after four seconds, so nothing outlives a failed assertion.
 ## * Write bytes: a tree that writes and fsyncs 32 MiB on a disk-backed
-##   directory reports at least 32 MiB written. Mutation: not reading
-##   `/proc/<pid>/io` before the reap leaves the column NULL.
+##   directory reports at least 32 MiB written. On Linux the figure is the
+##   reaping `wait4`'s `ru_oublock` times 512 (the root and the children it
+##   waited for). Mutation: not taking it leaves the column NULL; so does
+##   reading the exited root's `/proc/<pid>/io` instead for an unprivileged
+##   launcher on Linux 6.18, which refuses that read
+##   (`libs/runquota_process/tests/t_exit_io_totals.nim` pins this one).
 ##   On macOS the figure is `proc_pid_rusage`'s `ri_diskio_byteswritten` of
 ##   the root, which has no reaped-children share: the root `exec`s the
 ##   writer there, and a second case records, as a capability, that a

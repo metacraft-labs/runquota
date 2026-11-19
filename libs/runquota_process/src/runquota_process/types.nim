@@ -176,10 +176,11 @@ type
       ## and macOS),
       ## sent with the finish for sizing replay. Absent otherwise.
     io*: IoTotals
-      ## Storage read and write bytes, read from the root after it exited
-      ## and before it was reaped (`sizing-data`): `/proc/<pid>/io` on Linux
-      ## (the root and the descendants it waited for), `proc_pid_rusage` on
-      ## macOS (the root's own bytes only). Not known otherwise.
+      ## Storage read and write bytes, measured at the root's exit
+      ## (`sizing-data`): on Linux the `ru_inblock` / `ru_oublock` of the
+      ## `wait4` that reaped it, times 512 (the root and the descendants it
+      ## waited for); on macOS `proc_pid_rusage` of the exited, not yet
+      ## reaped root (the root's own bytes only). Not known otherwise.
 
   LaunchedProcess* = object
     pid*: int

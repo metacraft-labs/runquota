@@ -898,38 +898,37 @@ when defined(posix):
       uint64(max(0'i64, int64(value.tv_usec)))
 
   when defined(linux):
-    const pPid = cint(1)
-      ## `P_PID` of `idtype_t` (<sys/wait.h>); std/posix does not define it
-      ## for Linux.
-
-    proc readExitedRootIo(pid: int): IoTotals =
-      ## The root's `/proc/<pid>/io`, read while it is a zombie: after it
-      ## has exited and before it is reaped, so `read_bytes` / `write_bytes`
-      ## are final and include every descendant it waited for (the kernel
-      ## folds a reaped child's IO accounting into its parent's, as it does
-      ## its CPU time). Not known when the file cannot be read or parsed.
-      var text = ""
-      try:
-        text = readFile("/proc/" & $pid & "/io")
-      except CatchableError:
+    proc ioTotalsFromRusage(usage: Rusage): IoTotals =
+      ## The tree's storage bytes from the `wait4` that reaped its root:
+      ## `ru_inblock` / `ru_oublock`, which Linux counts in 512-byte units
+      ## from the same task IO accounting that feeds `read_bytes` /
+      ## `write_bytes` of `/proc/<pid>/io`, for the root and every
+      ## descendant it waited for (getrusage(2); the kernel folds a reaped
+      ## child's IO into its parent's, as it does its CPU time).
+      ##
+      ## WHY NOT `/proc/<pid>/io` OF THE EXITED ROOT, which is what this
+      ## read until 2026-11-19: once a task has exited, Linux shows its
+      ## `/proc/<pid>` files as owned by root, and `io` is mode 0400. The
+      ## open fails with EACCES for a launcher that is not root, even though
+      ## it is the task's parent and has the same uid (measured on Linux
+      ## 6.18; CAP_DAC_READ_SEARCH reads it, CAP_SYS_PTRACE does not). So an
+      ## unprivileged launcher measured nothing. `wait4` has no such check:
+      ## the parent is entitled to its child's usage.
+      ##
+      ## Each task's count is truncated to whole 512-byte units, so the
+      ## figure can read below the byte count by less than 512 bytes per
+      ## process and thread of the tree.
+      ##
+      ## Not known where the kernel does not account task IO
+      ## (`CONFIG_TASK_IO_ACCOUNTING` off): both fields are then always 0,
+      ## and a zero nobody measured must not be stored as a measurement.
+      ## `/proc/self/io` is the file that option provides. Without procfs
+      ## mounted nothing is reported either, although `wait4` measured.
+      if not fileExists("/proc/self/io"):
         return IoTotals(known: false)
-      var readSeen, writeSeen = false
-      for line in text.splitLines():
-        let colon = line.find(':')
-        if colon <= 0:
-          continue
-        let name = line[0 ..< colon]
-        let value = line[colon + 1 .. ^1].strip()
-        try:
-          if name == "read_bytes":
-            result.readBytes = parseBiggestUInt(value).uint64
-            readSeen = true
-          elif name == "write_bytes":
-            result.writeBytes = parseBiggestUInt(value).uint64
-            writeSeen = true
-        except ValueError:
-          return IoTotals(known: false)
-      result.known = readSeen and writeSeen
+      IoTotals(known: true,
+        readBytes: uint64(max(0'i64, int64(usage.ru_inblock))) * 512'u64,
+        writeBytes: uint64(max(0'i64, int64(usage.ru_oublock))) * 512'u64)
 
   when defined(macosx):
     const pPid = cint(1)
@@ -941,7 +940,7 @@ when defined(posix):
       ## before it is reaped). THESE ARE THE ROOT'S OWN BYTES: macOS keeps no
       ## reaped-children share for disk IO (there is `ri_child_user_time` but
       ## no `ri_child_diskio_*`), so what a descendant wrote is NOT in the
-      ## root's figure, unlike Linux's `/proc/<pid>/io`. A tree whose root
+      ## root's figure, unlike Linux's `wait4` block counts. A tree whose root
       ## only forks reads low (often 0). Not known when the read fails.
       var readBytes, writtenBytes = 0'u64
       if readMacosProcessDiskIo(uint64(pid), readBytes, writtenBytes):
@@ -961,9 +960,10 @@ when defined(posix):
     ## children at once (a build engine) cannot attribute it to one of them.
     ## What neither can see is a descendant re-parented away before it was
     ## waited for; see `runquota_core/cpu_profile`.
-    when defined(linux) or defined(macosx):
+    when defined(macosx):
       # `sizing-data`: LOOK AT THE EXIT WITHOUT CONSUMING IT, read the
-      # zombie's IO counters, then reap it below as always. `waitid` with
+      # zombie's IO counters, then reap it below as always (Linux takes
+      # the counters from the `wait4` below instead). `waitid` with
       # `WNOWAIT` leaves the child waitable, so the `wait4` that follows
       # returns at once with the same status and the rusage. A `waitid` that
       # fails, or reports no exit yet under `WNOHANG`, changes nothing:
@@ -992,6 +992,10 @@ when defined(posix):
         when defined(macosx): maxRss else: maxRss * 1024'u64
       child.rusageMajorFaults = uint64(max(0'i64, int64(usage.ru_majflt)))
       child.reapMonoMillis = getMonoTime().ticks div 1_000_000
+      when defined(linux):
+        # `sizing-data`: the tree's storage bytes are in the same rusage.
+        if child.sizingData and not child.ioTotals.known:
+          child.ioTotals = ioTotalsFromRusage(usage)
 
   proc buildCompletion(child: LaunchedProcess; status: cint; elapsedMillis: uint64;
                        stdoutText, stderrText: string; stdoutBytes, stderrBytes: uint64;
@@ -1366,8 +1370,9 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       (defined(linux) or defined(macosx))
     # SIZING DATA ON LINUX AND MACOS: the memory profile needs the tree
     # reader (`/proc` on Linux, libproc on macOS; both sum the resident set
-    # over the tree) and the IO counters are `/proc/<pid>/io` on Linux and
-    # `proc_pid_rusage` on macOS (the root's own bytes there). Inert
+    # over the tree) and the IO counters are the reaping `wait4`'s block
+    # counts on Linux and `proc_pid_rusage` on macOS (the root's own bytes
+    # there). Inert
     # elsewhere.
     let sizingData = measureSizingData in measurements and
       (defined(linux) or defined(macosx))
