@@ -108,15 +108,45 @@ when defined(windows):
       sleep(100)
       waited += 100
 
+  proc stop*(daemon: var Daemon)
+
+  proc launchOwned*(daemon: var Daemon; args: openArray[string];
+                    what = "the daemon") =
+    ## Starts `runquotad` for a `daemon` whose root, pipe and env are set,
+    ## and waits until it serves. Every helper that starts and waits for a
+    ## daemon should go through here. The daemon is not owned by any `defer`
+    ## of the caller until the helper returns, so anything that leaves this
+    ## proc early once it is running -- the readiness wait, the CLI binary
+    ## refused by `daemon_binary` part-way through a session, or a Defect --
+    ## stops it (and removes `root`) here while the exception propagates.
+    ## Without this, leftover `runquotad.exe` processes accumulated on a
+    ## Windows host (reprobuild-pm
+    ## `issues/2026-11-16-daemon-binary-staleness-guard-quits-after-a-caller-already-spawned-a-daemon.md`).
+    ##
+    ## A `finally` guarded by a flag rather than `except CatchableError`, so
+    ## the cleanup also runs for a Defect, which unittest reports and then
+    ## carries on past.
+    var launched = false
+    try:
+      daemon.process = startProcess(daemonPath(), env = daemon.env,
+        args = args, options = {poStdErrToStdOut})
+      prerequisite awaitDaemon(daemon),
+        what & " did not serve " & daemon.pipe
+      launched = true
+    finally:
+      if not launched:
+        # No process to stop if the spawn itself raised; the scratch
+        # directory is removed either way.
+        if daemon.process == nil:
+          daemon.stopped = true
+        stop(daemon)
+
   proc startDaemon*(prefix: string; cpuMilli: int): Daemon =
     result.root = scratchDir(prefix)
     result.pipe = uniquePipe()
     result.env = hostEnv(result.pipe)
-    result.process = startProcess(daemonPath(), env = result.env,
-      args = daemonArgs(result.root, result.pipe, ["--cpu-milli", $cpuMilli]),
-      options = {poStdErrToStdOut})
-    prerequisite awaitDaemon(result),
-      "the daemon did not serve " & result.pipe
+    launchOwned(result,
+      daemonArgs(result.root, result.pipe, ["--cpu-milli", $cpuMilli]))
 
   proc stop*(daemon: var Daemon) =
     ## Ends a daemon THIS test started. Never raises: it runs from `defer`.

@@ -54,7 +54,6 @@ when defined(windows):
   import runquota_core
   import runquota_protocol
   import runquota_daemon/capacity_metrics
-  import daemon_binary
   import windows_daemon_fixture
 
   # -------------------------------------------------------------------
@@ -68,11 +67,7 @@ when defined(windows):
     result.root = scratchDir(prefix)
     result.pipe = uniquePipe()
     result.env = hostEnv(result.pipe)
-    result.process = startProcess(daemonPath(), env = result.env,
-      args = daemonArgs(result.root, result.pipe, extra),
-      options = {poStdErrToStdOut})
-    prerequisite awaitDaemon(result),
-      "the daemon did not serve " & result.pipe
+    launchOwned(result, daemonArgs(result.root, result.pipe, extra))
 
   proc useDaemon(daemon: Daemon) =
     ## Point THIS process's in-process client at the daemon's pipe. The CLI

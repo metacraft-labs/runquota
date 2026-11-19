@@ -77,11 +77,7 @@ when defined(windows):
     result.root = scratchDir(prefix)
     result.pipe = uniquePipe()
     result.env = hostEnv(result.pipe)
-    result.process = startProcess(daemonPath(), env = result.env,
-      args = daemonArgs(result.root, result.pipe, extra),
-      options = {poStdErrToStdOut})
-    prerequisite awaitDaemon(result),
-      "the daemon did not serve " & result.pipe
+    launchOwned(result, daemonArgs(result.root, result.pipe, extra))
 
   proc useDaemon(daemon: Daemon) =
     ## Point THIS process's in-process client at the daemon's pipe. The CLI

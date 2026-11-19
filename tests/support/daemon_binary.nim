@@ -27,8 +27,26 @@
 ## the safe direction. A checkout that stamps sources newer than a valid
 ## binary reports stale and costs a rebuild; nothing reports fresh when it
 ## is not, which is the only direction that can produce a wrong green.
+##
+## WHY RAISE AND NOT QUIT. A refusal used to `quit(1)`, and `quit` does not
+## unwind: no `finally`, no `defer` runs. A test that had already started a
+## `runquotad` and was then refused the CLI exited with the daemon still
+## running, reparented and holding its endpoint; leftover `runquotad.exe`
+## processes accumulated on a Windows host that way (reprobuild-pm
+## `issues/2026-11-16-daemon-binary-staleness-guard-quits-after-a-caller-already-spawned-a-daemon.md`,
+## the same shape as the `unittest.require` hazard `unwinding_require`
+## answers). A refusal now raises `AppBinaryUnusable`, a `CatchableError`:
+## every enclosing `finally` stops what the test started, and unittest's
+## per-test handler reports the test failed with the message, so nothing is
+## lost in reporting. And `daemonPath()` checks the CLI as well, so the usual
+## order -- daemon first, CLI later -- is refused before a daemon exists.
+## `tests/unit/t_stale_binary_refusal_unwinds.nim` holds both properties.
 
 import std/[os, strutils, times]
+
+type
+  AppBinaryUnusable* = object of CatchableError
+    ## An app under `build/bin` is missing or older than its sources.
 
 proc newestSourceTime(dir: string): (Time, string) =
   ## Newest modification time under `dir`, with the file that carries it.
@@ -44,7 +62,8 @@ proc newestSourceTime(dir: string): (Time, string) =
 
 proc checkedBinary(name: string): string =
   ## `build/bin/<name>`, checked to be at least as new as every source it
-  ## is built from. Quits with an actionable message otherwise.
+  ## is built from. Raises `AppBinaryUnusable` with an actionable message
+  ## otherwise -- never `quit`, which would skip the caller's cleanup.
   # `addFileExt`, not `name & ExeExt`: Nim's `ExeExt` has no dot ("exe" on
   # Windows, "" elsewhere), and `nim c --out:build/bin/runquotad` writes
   # `runquotad.exe` on Windows. Without the extension this looked for a file
@@ -53,12 +72,12 @@ proc checkedBinary(name: string): string =
   result = getCurrentDir() / "build" / "bin" / addFileExt(name, ExeExt)
 
   if not fileExists(result):
-    quit(name & " is not built.\n" &
+    raise newException(AppBinaryUnusable, name & " is not built.\n" &
       "  expected: " & result & "\n" &
       "  build it: scripts/run_tests.sh (builds the apps first), or\n" &
       "            scripts/build_apps.sh\n" &
       "This file is an INPUT to the integration tests, not an output of " &
-      "compiling them.", 1)
+      "compiling them.")
 
   let binaryTime = getLastModificationTime(result)
   var stalest = fromUnix(0)
@@ -70,15 +89,22 @@ proc checkedBinary(name: string): string =
       culprit = path
 
   if culprit.len > 0:
-    quit(name & " is STALE -- it predates the sources it is built from, " &
+    raise newException(AppBinaryUnusable, name & " is STALE -- it predates the sources it is built from, " &
       "so this test would exercise an old binary and report a result that " &
       "belongs to the build rather than to the code.\n" &
       "  binary: " & result & " (" & $binaryTime.utc & ")\n" &
       "  newer source: " & culprit & " (" & $stalest.utc & ")\n" &
       "  rebuild: scripts/run_tests.sh, or scripts/build_apps.sh\n" &
       "An `nim c -r` of a test file recompiles the test and the client " &
-      "library but NOT the apps.", 1)
-
-proc daemonPath*(): string = checkedBinary("runquotad")
+      "library but NOT the apps.")
 
 proc cliPath*(): string = checkedBinary("runquota")
+
+proc daemonPath*(): string =
+  ## The daemon, refused unless the CLI is usable too: a test that starts a
+  ## daemon and only later resolves the CLI to talk to it must be refused
+  ## BEFORE the daemon exists. (`scripts/build_apps.sh` builds both.) A
+  ## refusal after it exists -- sources touched mid-session -- still raises,
+  ## so the caller's `finally` stops it.
+  discard cliPath()
+  checkedBinary("runquotad")

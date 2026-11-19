@@ -33,12 +33,11 @@
 ## native PDH reader is exercised by `t_cpu_pressure_windows`.
 
 when defined(windows):
-  import std/[json, os, osproc, strutils, unittest]
+  import std/[json, os, strutils, unittest]
 
   import runquota_client
   import runquota_core
   import runquota_ipc
-  import daemon_binary
   import windows_daemon_fixture
 
   const
@@ -67,10 +66,7 @@ when defined(windows):
     let args = daemonArgs(result.daemon.root, result.daemon.pipe,
       ["--cpu-milli", $BudgetMilli, "--memory-bytes", $(64'u64 * GiB),
        "--cpu-pressure-file", result.root / "psi"])
-    result.daemon.process = startProcess(daemonPath(),
-      env = result.daemon.env, args = args, options = {poStdErrToStdOut})
-    prerequisite awaitDaemon(result.daemon),
-      "the private daemon did not serve " & result.daemon.pipe
+    launchOwned(result.daemon, args, "the private daemon")
 
   proc fixed(session: var RunQuotaSession; cpuMilli: uint32): RunQuotaLease =
     session.requestLease(resourceRequest("fixed", milliCpu(cpuMilli),

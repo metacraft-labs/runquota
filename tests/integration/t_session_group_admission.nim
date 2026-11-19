@@ -1124,10 +1124,7 @@ when defined(windows):
     let args = daemonArgs(result.daemon.root, result.daemon.pipe,
       @["--cpu-milli", $(slots * SlotMilli),
         "--memory-bytes", $(4096'u64 * MiB)] & @extra)
-    result.daemon.process = startProcess(daemonPath(), env = result.daemon.env,
-      args = args, options = {poStdErrToStdOut})
-    prerequisite awaitDaemon(result.daemon),
-      "the private daemon did not serve " & result.daemon.pipe
+    launchOwned(result.daemon, args, "the private daemon")
     # The in-process clients read `RUNQUOTA_SESSION` and its attributes from
     # THIS process's environment at `registerSession`; clear it so a declared
     # group is the only group, and each case sets its own.
