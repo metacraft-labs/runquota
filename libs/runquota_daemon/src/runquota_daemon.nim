@@ -3069,10 +3069,9 @@ proc sizingAnswer(daemon: var RunQuotaDaemon; context: ConnectionContext;
   let hostWrite =
     if daemon.config.writeBytesPerSec > 0: some(daemon.config.writeBytesPerSec)
     else: none(int64)
-  # A query sees what has been recorded: drain the writer first, as `stats`
-  # does, and the ambient samples the baseline is read from.
-  flushObservationWriter()
-  flushAmbientSamples()
+  # A query sees what has been recorded. The writer and the ambient samples
+  # the baseline is read from were drained BEFORE this request took the
+  # daemon-wide lock (`drainBeforeAnswering`), not here.
   let capture = daemon.observationCaptureEnabled()
   # BOUNDED WORK ON THE REQUEST PATH: the read keeps at most
   # `MaxSizingRuns` runs and `MaxSizingExecutions` executions (the newest),
@@ -3176,10 +3175,11 @@ proc statsAnswer(daemon: var RunQuotaDaemon; context: ConnectionContext;
     else:
       none(string)
   # A query must see what the daemon has already recorded. The observation
-  # queue is drained in the background, so without this a `repro stats`
+  # queue is drained in the background, so without a drain a `repro stats`
   # immediately after a build would report the build's own executions as
   # missing -- indistinguishable, to the caller, from never having run.
-  flushObservationWriter()
+  # That drain happened BEFORE this request took the daemon-wide lock
+  # (`drainBeforeAnswering`); it must not happen here.
 
   result = StatsResponseMessage(
     subject: request.subject,
@@ -6635,6 +6635,52 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
         "unsupported RQSP message"))
 
+proc drainBeforeAnswering(frame: RqspFrame) =
+  ## THE READ PATH'S DRAIN, TAKEN BEFORE THE DAEMON-WIDE LOCK AND NEVER
+  ## UNDER IT.
+  ##
+  ## A `stats` or sizing query must see what the daemon has already
+  ## recorded, so the observation writer (and, for sizing, the ambient
+  ## sampler) is drained first. That drain writes to SQLite and so waits for
+  ## whoever holds the store's write lock -- above all the retention
+  ## sweeper's delete, which can hold it for the length of a pass, and up to
+  ## the 5-second busy timeout per queued batch. `flushObservationWriter`'s
+  ## contract admits that wait only for "a reader who is already waiting for
+  ## an answer".
+  ##
+  ## WHAT WAS WRONG. `statsAnswer` and `sizingAnswer` drained inside
+  ## `handleRequest`, which the connection worker runs under
+  ## `sharedDaemon.lock`. The reader's wait on the prune was therefore EVERY
+  ## client's wait: no lease was granted, released or recorded until the
+  ## pass committed -- the outcome the sweeper's own thread and store handle
+  ## exist to prevent, reached indirectly. §"Retention" of
+  ## RunQuota-Observation-Store.md: a prune MUST NOT hold the write path,
+  ## directly or through a request handler.
+  ##
+  ## WHY HERE IS ENOUGH. Every row this connection's own earlier requests
+  ## queued was queued before this frame was read, so a drain at this point
+  ## still makes the answer include them. Rows another connection queues
+  ## after this drain may be missing from the answer; the old in-lock drain
+  ## would have included those queued before this request took the lock.
+  ## Nothing orders another connection's rows against this query, so no
+  ## caller can have relied on that.
+  ##
+  ## A frame of either kind is drained for before it is decoded, so a
+  ## malformed or refused query also pays for a drain. That cost falls on
+  ## its sender alone, and it is counted in `synchronous_drains`.
+  ##
+  ## Both drains are safe on any thread without the daemon lock: the writer
+  ## and the sampler guard their own queues, and the aggregate publisher
+  ## already calls `flushObservationWriter` from its own thread, unlocked.
+  case frame.header.messageKind
+  of rqStatsQuery:
+    flushObservationWriter()
+  of rqQuerySizing:
+    flushObservationWriter()
+    flushAmbientSamples()
+  else:
+    discard
+
 proc handleConnection*(daemon: var RunQuotaDaemon;
     connection: var LocalConnection) =
   var context = ConnectionContext(
@@ -6656,6 +6702,7 @@ proc handleConnection*(daemon: var RunQuotaDaemon;
     return
   try:
     while connection.receiveFrameOrDiagnostic(frame):
+      drainBeforeAnswering(frame)
       daemon.handleRequest(connection, context, frame)
   finally:
     daemon.cleanupConnection(context)
@@ -7269,6 +7316,9 @@ proc handleSharedConnection(accepted: AcceptedConnection) {.thread, gcsafe.} =
       return
     try:
       while localConnection.receiveFrameOrDiagnostic(frame):
+        # OUTSIDE THE LOCK: a query's drain may wait on a retention pass,
+        # and nothing else on the host may wait behind that.
+        drainBeforeAnswering(frame)
         acquire(sharedDaemon.lock)
         try:
           sharedDaemon.daemon.handleRequest(localConnection, context, frame)

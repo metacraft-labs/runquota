@@ -241,6 +241,77 @@ proc seedStore(path, hostId: string; executions: int; firstStartedAt: int64;
   sql.add("commit;\n")
   doAssert store.runStatement(sql), store.lastError
 
+when defined(windows):
+  import std/winlean
+  const
+    LockfileFailImmediately = 0x00000001'i32
+    LockfileExclusiveLock = 0x00000002'i32
+  proc shmLockFileEx(file: Handle; flags, reserved, lengthLow, lengthHigh: int32;
+                     overlapped: ptr OVERLAPPED): WINBOOL
+    {.stdcall, dynlib: "kernel32.dll", importc: "LockFileEx".}
+  proc shmUnlockFileEx(file: Handle; reserved, lengthLow, lengthHigh: int32;
+                       overlapped: ptr OVERLAPPED): WINBOOL
+    {.stdcall, dynlib: "kernel32.dll", importc: "UnlockFileEx".}
+else:
+  import std/posix
+
+const walWriteLockByte = 120
+  ## The WAL-index byte SQLite holds exclusively for the whole of a write
+  ## transaction; see `t_observation_store_retention_crash.nim`, whose
+  ## `writeLocked` this mirrors.
+
+proc writeLocked(path: string): bool =
+  ## Whether somebody holds a write transaction on ``path`` right now, read
+  ## in process from the WAL index's write-lock byte. The sweeper's pass
+  ## COUNTS in a read transaction before it deletes, and only the delete
+  ## holds the write lock, so "a pass is in flight" is not the same as "a
+  ## drain landing now must wait"; this is.
+  let shm = path & "-shm"
+  when defined(windows):
+    let file = createFileW(newWideCString(shm),
+      GENERIC_READ or GENERIC_WRITE,
+      FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+      nil, OPEN_EXISTING, 0, 0)
+    if file == INVALID_HANDLE_VALUE:
+      return false
+    defer: discard closeHandle(file)
+    var at: OVERLAPPED
+    at.offset = int32(walWriteLockByte)
+    if shmLockFileEx(file, LockfileFailImmediately or LockfileExclusiveLock,
+        0, 1, 0, addr at) == 0:
+      return true
+    discard shmUnlockFileEx(file, 0, 1, 0, addr at)
+    false
+  else:
+    let fd = posix.open(shm.cstring, O_RDWR)
+    if fd < 0:
+      return false
+    defer: discard posix.close(fd)
+    var lock: Tflock
+    lock.l_type = cshort(F_WRLCK)
+    lock.l_whence = cshort(SEEK_SET)
+    lock.l_start = Off(walWriteLockByte)
+    lock.l_len = Off(1)
+    fcntl(fd, F_GETLK, addr lock) == 0 and lock.l_type != cshort(F_UNLCK)
+
+var
+  statsIssuedAtMillis = 0'i64
+  statsAnsweredAtMillis = 0'i64
+  statsError = ""
+
+proc askStatsOnItsOwnClient() {.thread.} =
+  ## Client A's `stats` question, on a thread and a connection of its own so
+  ## the test's main thread can act as client B while A waits. The globals
+  ## are read only after `joinThread`, which orders them.
+  {.cast(gcsafe).}:
+    try:
+      var client = connectDefault()
+      discard client.queryStats(statsSubjectExecutions)
+      statsAnsweredAtMillis = unixMillisNow()
+      client.close()
+    except CatchableError as error:
+      statsError = error.msg
+
 suite "observation_retention_scheduled":
 
   # -------------------------------------------------------------------------
@@ -498,6 +569,176 @@ suite "observation_retention_scheduled":
     check kept.len <= 101
     check not kept[^1].executionId.startsWith("seed-")
     check after.orphanReport().orphans == 0
+
+  # -------------------------------------------------------------------------
+  # A QUERY THAT WAITS ON THE PRUNE WAITS ALONE
+  # -------------------------------------------------------------------------
+
+  test "a stats query waiting on a prune does not hold up another client's lease":
+    ## REGRESSION TEST FOR reprobuild-pm
+    ## `issues/2026-11-18-runquota-stats-query-mid-prune-holds-the-daemon-lock.md`.
+    ##
+    ## THE PROPERTY. §"Retention" says a prune MUST NOT hold the write path,
+    ## and the arm above shows the sweeper itself does not. This arm closes
+    ## the INDIRECT route: a `stats` (or sizing) query drains the
+    ## observation writer before it answers, and a drain that lands in a
+    ## pass waits for the pass to commit. When that drain ran inside the
+    ## connection worker's `acquire(sharedDaemon.lock)`, its wait on the
+    ## prune became every other client's wait: no lease was granted,
+    ## released or recorded until the pass ended. The drain now runs before
+    ## the lock is taken, so the reader that asked is the only party waiting.
+    ##
+    ## HOW THE ORDER IS PINNED, WITH NO SLEEP. Client A records one execution
+    ## inside the pass (its row cannot commit until the pass does), then asks
+    ## `stats` on its own thread. Client B waits until the daemon's
+    ## `synchronous_drains` counter moves -- A's drain has STARTED -- and only
+    ## then asks for a lease. With the drain under the daemon-wide lock, the
+    ## counter read itself stalls behind A and the lease is answered after
+    ## A's `stats` reply and after the pass; with the drain outside it, the
+    ## lease is answered while A is still waiting.
+    ##
+    ## NOT VACUOUS, AND SAID SO BY ASSERTIONS: A's row is queued while the
+    ## delete is observed holding the write lock, the daemon's committed-row
+    ## count has NOT moved when B's lease is answered (so A's drain is still
+    ## waiting), and it HAS moved by the end (so A's rows were written). The drain finishes when the DELETE commits, not when the pass
+    ## does (the pass goes on to ambient samples and counts), so the pass's
+    ## finish instant is not what A is compared against.
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
+    let root = scratchRoot("statslk")
+    defer: removeScratchRoot(root)
+    var endpointPolicy: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    let socketPath = rendezvousDir(root, endpointPolicy) / "d.sock"
+    let state = hostStateDir(root)
+    let identityFile = state / "host-id"
+    let dbPath = state / "observations.sqlite3"
+    let hostId = mintIdentity(identityFile)
+    seedStore(dbPath, hostId, seededExecutions, unixMillisNow() - 400_000)
+    check executionCount(dbPath) == seededExecutions
+
+    putEnv("RUNQUOTA_SOCKET", socketPath)
+    var daemon = startDaemon(socketPath,
+      ["--host-identity-file", identityFile,
+       "--retention-max-executions", "100",
+       "--retention-max-execution-age-millis", "-1",
+       "--retention-sweep-interval-millis", "1000"])
+    var sawPassInFlight = false
+    var statsThread: Thread[void]
+    var statsStarted = false
+    var drainSeenAt = 0'i64
+    var leaseAnsweredAt = 0'i64
+    var writtenBeforeA = -1
+    var writtenWhenLeaseAnswered = -1
+    var writtenAfter = -1
+    var passStartedAt = 0'i64
+    var passFinishedAt = 0'i64
+    try:
+      var clientA = connectDefault()
+      var clientB = connectDefault()
+      # FIRST THE PASS: the daemon writes at start-up too, and a write lock
+      # seen then is not the prune's.
+      var passBegan = false
+      for _ in 0 ..< 4_000:
+        let snapshot = clientB.retention()
+        if snapshot["sweeps_started"].getInt() >= 1:
+          passBegan = snapshot["sweeps_finished"].getInt() == 0
+          break
+        sleep(5)
+      check passBegan
+      # THEN A WRITE LOCK DURING THE PASS -- in practice its delete, the
+      # longest writer by far; the check after A's execution re-asserts it. Polled in process, with
+      # no request to the daemon, so the poll cannot itself be what is slow.
+      for _ in 0 ..< 400_000:
+        if writeLocked(dbPath):
+          sawPassInFlight = true
+          break
+        sleep(0)
+      check sawPassInFlight
+
+      let before = clientB.observations()
+      let drainsBefore = before["aggregate_publication"][
+        "synchronous_drains"].getInt()
+      # ROWS COMMITTED SO FAR (the JSON names `observationsWritten` "queued").
+      writtenBeforeA = before["queued"].getInt()
+      # A ROW THAT CANNOT COMMIT UNTIL THE PASS DOES. No stats key, so the
+      # aggregate publisher has nothing to drain for and the counter below
+      # moves only for A's query.
+      clientA.completeOneExecution("stats-during-prune")
+      clientA.close()
+      # STILL INSIDE THE DELETE when A's row is queued; otherwise the drain
+      # below has nothing to wait for and the arm would assert nothing.
+      check writeLocked(dbPath)
+
+      statsIssuedAtMillis = unixMillisNow()
+      createThread(statsThread, askStatsOnItsOwnClient)
+      statsStarted = true
+
+      var drains = drainsBefore
+      for _ in 0 ..< 4_000:
+        drains = clientB.observations()["aggregate_publication"][
+          "synchronous_drains"].getInt()
+        if drains > drainsBefore: break
+        sleep(1)
+      drainSeenAt = unixMillisNow()
+      check drains > drainsBefore
+
+      var session = clientB.registerSession("m15r-beside-stats", "0.2.0")
+      var lease = session.requestLease(resourceRequest(
+        "beside-stats", milliCpu(1000),
+        bytes(256'u64 * 1024'u64 * 1024'u64)))
+      leaseAnsweredAt = unixMillisNow()
+      # THE DISCRIMINATOR, READ FROM THE DAEMON AND NOT FROM A CLOCK. A's
+      # rows are queued behind the prune's delete, so while they are still
+      # uncommitted A's drain has not returned. With the drain under the
+      # daemon-wide lock this read is answered only after A's `stats`, by
+      # which time A's rows are committed; with it outside, B is answered
+      # while they are still waiting.
+      writtenWhenLeaseAnswered = clientB.observations()["queued"].getInt()
+      check lease.active
+      lease.release()
+      session.closeSession()
+
+      joinThread(statsThread)
+      statsStarted = false
+
+      var settled: JsonNode = nil
+      for _ in 0 ..< 1_200:
+        settled = clientB.retention()
+        if settled["sweeps_finished"].getInt() >= 1: break
+        sleep(50)
+      check settled["sweeps_finished"].getInt() >= 1
+      passStartedAt = settled["last_pass_started_at_unix_millis"].getBiggestInt()
+      passFinishedAt =
+        settled["last_pass_finished_at_unix_millis"].getBiggestInt()
+      writtenAfter = clientB.observations()["queued"].getInt()
+      clientB.close()
+    finally:
+      if statsStarted:
+        joinThread(statsThread)
+      daemon.stop()
+
+    echo "  prune window: " & $(passFinishedAt - passStartedAt) &
+      " ms; stats issued at " & $(statsIssuedAtMillis - passStartedAt) &
+      " ms, its drain seen at " & $(drainSeenAt - passStartedAt) &
+      " ms, B's lease answered at " & $(leaseAnsweredAt - passStartedAt) &
+      " ms, stats answered at " & $(statsAnsweredAtMillis - passStartedAt) &
+      " ms"
+
+    check statsError.len == 0
+    check passStartedAt > 0
+    check passStartedAt <= statsIssuedAtMillis
+    # THE PROPERTY: B was served while the prune's delete still held the
+    # store, and before A -- whose drain was waiting on that delete -- was
+    # answered. With the drain under the daemon-wide lock, B is answered
+    # only after A, once the delete has committed, and both checks fail.
+    check writtenBeforeA >= 0
+    check writtenWhenLeaseAnswered == writtenBeforeA
+    check leaseAnsweredAt <= passFinishedAt
+    check leaseAnsweredAt <= statsAnsweredAtMillis
+    # NOT VACUOUS: A's rows were committed in the end, and nothing dropped.
+    check writtenAfter > writtenBeforeA
+    check passFinishedAt - passStartedAt >= 300
 
   # -------------------------------------------------------------------------
   # REFUSAL: the operator turned retention off

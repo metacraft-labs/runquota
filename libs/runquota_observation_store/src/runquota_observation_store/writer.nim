@@ -145,7 +145,7 @@ var
 # THE ENQUEUES ARE NOT THE DOOR THAT LEAVES OPEN, and it is worth being
 # exact about which is: ``openObservationRun`` and its siblings all return
 # early on ``observationCaptureEnabled``. What is NOT gated is the READ
-# side. ``statsAnswer`` calls ``flushObservationWriter`` unconditionally so
+# side. A ``stats`` query calls ``flushObservationWriter`` unconditionally so
 # that a query sees what the daemon has recorded, and the status JSON reads
 # ``observationWriterFlushes``, ``observationsWritten``,
 # ``observationsDropped`` and ``observationWriteFailures`` unconditionally.
@@ -441,7 +441,7 @@ proc flushObservationWriter*() =
   ## WHAT THAT COST. ``publishDirtyAggregates`` flushes and then computes an
   ## aggregate, so it computed one over a row that had not committed -- and
   ## the wrong figure was PERMANENT, not late: the key was consumed by the
-  ## drain that published it and nothing re-dirties it. ``statsAnswer`` has
+  ## drain that published it and nothing re-dirties it. A ``stats`` query has
   ## the same exposure on the read path, where a client would be told its
   ## own execution never happened.
   ##
@@ -473,6 +473,14 @@ proc flushObservationWriter*() =
   ## the wait is still finite, because ``writerQueued`` is read ONCE and rows
   ## queued after that reading are none of this call's business, and every
   ## caller on this path is a reader who is already waiting for an answer.
+  ##
+  ## THAT LAST CLAUSE HOLDS ONLY IF THE CALLER HOLDS NOTHING ELSE. The wait
+  ## includes waiting for a retention pass's delete to commit, so a caller
+  ## that flushed while holding ``runquotad``'s daemon-wide request lock
+  ## made every other client wait on the prune as well -- which is what the
+  ## ``stats`` and sizing handlers did until 2026-11-18. The daemon now
+  ## drains for them before the lock is taken (``drainBeforeAnswering``).
+  ## NEVER CALL THIS UNDER A LOCK SOMEBODY ELSE IS WAITING FOR.
   var running = false
   var target = 0'i64
   var epoch = 0'i64

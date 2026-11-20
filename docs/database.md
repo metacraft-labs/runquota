@@ -862,7 +862,14 @@ aggregate on the completion path, which flushed the writer synchronously, so
 a lease that finished mid-prune waited for the prune. Publication is now
 deferred to a background thread, and the only threads that can wait on a
 pass are that one, the writer's own drain thread, and a client that has asked
-a `stats` question and is waiting for the answer anyway. The idle preference
+a `stats` or sizing question and is waiting for the answer anyway. **That
+client waits alone**: its drain runs on its connection worker *before* the
+request takes the daemon-wide lock, so other clients' leases are granted,
+released and recorded while it waits. Until 2026-11-18 the drain ran inside
+the locked request handler, which turned one reader's wait on a prune into a
+stall of the whole lease authority; `t_observation_retention_scheduled` now pins that a
+second client's lease is answered while a `stats` drain is still waiting on a
+real pass's delete. The idle preference
 is what keeps the overlap rare, and the busy timeout is what keeps it from
 becoming a dropped observation.
 
