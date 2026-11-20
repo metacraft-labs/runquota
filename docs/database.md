@@ -69,7 +69,9 @@ latency, and a build that sends its rows at the end — which is when a build
 system knows its output sizes — showed it only as the next request on that
 connection waiting behind the backlog. A declaration must precede any row
 and reads the registry authoritatively, so that read now furnishes the
-answer for every row that follows it; a row naming an extension this daemon
+answer for every row that follows it (it runs on the declaring connection's
+worker before the request takes the daemon-wide lock, and what it learned is
+merged into the daemon's memory under the lock, the higher version winning); a row naming an extension this daemon
 has not seen declared still falls through to the database and is still
 refused. `extension_registry_reads` in the `observations` inspection
 subject counts the reads that reach the database, which is what makes "one
@@ -869,7 +871,18 @@ released and recorded while it waits. Until 2026-11-18 the drain ran inside
 the locked request handler, which turned one reader's wait on a prune into a
 stall of the whole lease authority; `t_observation_retention_scheduled` now pins that a
 second client's lease is answered while a `stats` drain is still waiting on a
-real pass's delete. The idle preference
+real pass's delete. A client declaring
+an extension that needs its table created or migrated also waits on a pass,
+and **no lease waits with it**: the declaration's `begin immediate` script runs
+on its connection worker *before* the request takes the daemon-wide lock. The
+declarations themselves are serialized by a lock of their own, so other
+clients' declarations (even read-only ones) can queue behind it; under the
+daemon-wide lock the handler only publishes the outcome and what the
+declaration learned about the registry. Until 2026-11-19 it ran inside the locked handler, so one first
+declaration during a pass stalled every lease grant, release and record on the
+host; `tests/integration/t_extension_declaration_beside_a_prune.nim` pins that a
+second client's lease is answered while such a declaration is still waiting on
+a real pass's delete. The idle preference
 is what keeps the overlap rare, and the busy timeout is what keeps it from
 becoming a dropped observation.
 

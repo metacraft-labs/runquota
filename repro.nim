@@ -261,6 +261,7 @@ package runquota:
     const measurementTests = [
       "t_e2e_runquota_client_exit_releases_lease",
       "t_observation_retention_scheduled",
+      "t_extension_declaration_beside_a_prune",
       "t_observation_store_retention_crash",
       "t_ambient_sample_atomicity",
       "t_ambient_writer_contention",

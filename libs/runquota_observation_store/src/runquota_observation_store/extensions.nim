@@ -333,6 +333,21 @@ proc rememberExtension*(store: ObservationStore;
   ## already in hand.
   store.knownExtensions[row.extensionId] = row
 
+proc declarationHandle*(store: ObservationStore): ObservationStore =
+  ## A second handle on the same store file, for running a declaration on a
+  ## thread that does not own ``store``.
+  ##
+  ## SOUND BECAUSE THE STORE IS PATH-ADDRESSED: every statement opens the
+  ## file by ``path`` (the observation writer and the retention sweeper
+  ## rely on the same fact), so a handle is its path, its verdict and what
+  ## it has learned. The copy starts with an empty ``knownExtensions`` and a
+  ## zero ``registryReads``; the owner of ``store`` folds back whatever it
+  ## needs from it.
+  if store.isNil:
+    return nil
+  ObservationStore(path: store.path, status: store.status,
+    report: store.report, schemaVersion: store.schemaVersion)
+
 proc knownExtensionRegistryEntry*(store: ObservationStore;
     extensionId: string): Option[ExtensionRegistryRow] =
   ## The registry entry for one extension, answered FROM MEMORY when this

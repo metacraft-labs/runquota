@@ -503,6 +503,41 @@ type
       ## see, and a child it reports is watched through the connection's
       ## peer process instead (LeaseRunning).
     sessionIds*: seq[SessionId]
+    preparedDeclaration*: PreparedDeclaration
+      ## The store half of the `DeclareExtension` frame being handled, done
+      ## on this connection's worker BEFORE the request took the daemon-wide
+      ## lock. Set and consumed by the same frame; empty between frames.
+
+  PreparedDeclaration* = object
+    ## What a `DeclareExtension`'s store work produced when it ran OUTSIDE
+    ## the daemon-wide lock (`prepareDeclaration` in runquota_daemon.nim).
+    ##
+    ## A declaration that creates or migrates a table runs a
+    ## `begin immediate` script, which waits on SQLite's busy timeout for a
+    ## retention pass's delete, and RunQuota-Observation-Store.md
+    ## §"Retention" forbids anything that can wait on a pass from running
+    ## under the daemon-wide lock. So the script runs first, on the
+    ## connection's worker, and the locked handler only publishes what it
+    ## did.
+    present*: bool
+    requestId*: uint64
+      ## The frame this was prepared for; any other frame ignores it.
+    outcome*: ExtensionOutcome
+    registryReads*: int64
+      ## Registry reads the preparation made, added to the daemon's store
+      ## counter so `extension_registry_reads` still counts every one.
+    learned*: seq[ExtensionRegistryRow]
+      ## Every registry entry the preparation read or wrote. The locked
+      ## handler merges them into the daemon's `knownExtensions`, keeping
+      ## the higher version, so the declaration's authoritative read still
+      ## furnishes the row path as it did when it ran under the lock.
+    lastError*: string
+    status*: StoreStatus
+    report*: string
+      ## The preparation's handle after its write. A write that failed
+      ## without being a rejection degrades a store; the daemon's own store
+      ## is degraded the same way under the lock, as it was when the write
+      ## ran there.
 
   HelloPeer* = object
     ## What the daemon learned about a connection's peer BEFORE taking the

@@ -4010,9 +4010,79 @@ proc captureObservation(daemon: var RunQuotaDaemon; lease: LeaseRow;
       else: none(int64)
   ))
 
+proc ownsSession(context: ConnectionContext; sessionId: uint64): bool =
+  for id in context.sessionIds:
+    if id.value == sessionId:
+      return true
+  false
+
+proc toDeclaration(msg: DeclareExtensionMessage): ExtensionDeclaration =
+  ExtensionDeclaration(
+    extensionId: msg.extensionId,
+    owner: msg.owner,
+    schemaVersion: int64(msg.schemaVersion),
+    migrations: msg.migrations)
+
+var declarationLock: Lock
+  ## Serializes the store half of every `DeclareExtension`, which runs
+  ## OUTSIDE the daemon-wide lock (`prepareDeclaration`). The daemon-wide
+  ## lock used to serialize declarations as a side effect. Without this,
+  ## two first declarations of one id race to create its table; the loser's
+  ## "table already exists" is not a rejection, so it would DEGRADE the
+  ## store and turn capture off for the whole host. Only declarers ever
+  ## wait on it -- including a read-only one queued behind a create that is
+  ## waiting on a pass -- and nothing holding it takes the daemon-wide lock.
+initLock(declarationLock)
+
+proc prepareDeclaration(store: ObservationStore; captureOn: bool;
+                        context: ConnectionContext;
+                        frame: RqspFrame): PreparedDeclaration =
+  ## THE STORE HALF OF A `DeclareExtension`, RUN BEFORE THE DAEMON-WIDE LOCK
+  ## AND NEVER UNDER IT.
+  ##
+  ## WHAT WAS WRONG. `declareClientExtension` called the store's
+  ## `declareExtension` from `handleRequest`, which the connection worker
+  ## runs under `sharedDaemon.lock`. Its create and migrate branches run a
+  ## `begin immediate` script, and `begin immediate` waits on SQLite's busy
+  ## timeout for whoever holds the write lock -- a retention pass's delete
+  ## holds it for the length of the delete. One client's first declaration
+  ## during a pass therefore stopped every lease grant, release and record
+  ## on the host. RunQuota-Observation-Store.md §"Retention": nothing that
+  ## can wait on a pass may run under the daemon-wide lock.
+  ##
+  ## ``store`` is a `declarationHandle` of the daemon's store, taken under
+  ## the lock by the caller with ``captureOn``; nothing here touches daemon
+  ## state. The same checks the locked handler makes come first, so a
+  ## declaration that would be refused there writes nothing here.
+  ## ``context`` belongs to this connection's worker, which is this thread.
+  ## An empty result means "nothing prepared": the locked handler then
+  ## answers exactly as before (a refusal, or no capture).
+  if frame.header.messageKind != rqDeclareExtension or not captureOn or
+      store.isNil:
+    return
+  var msg: DeclareExtensionMessage
+  if not decodeDeclareExtension(frame.payload, msg):
+    return
+  if not context.ownsSession(msg.sessionId.value):
+    return
+  acquire(declarationLock)
+  try:
+    result.outcome = store.declareExtension(msg.toDeclaration())
+  finally:
+    release(declarationLock)
+  result.present = true
+  result.requestId = frame.header.requestId
+  result.registryReads = store.registryReads
+  for row in store.knownExtensions.values:
+    result.learned.add(row)
+  result.lastError = store.lastError
+  result.status = store.status
+  result.report = store.report
+
 proc declareClientExtension(daemon: var RunQuotaDaemon;
                             context: ConnectionContext;
-                            msg: DeclareExtensionMessage):
+                            msg: DeclareExtensionMessage;
+                            prepared: PreparedDeclaration):
     ExtensionDeclaredMessage =
   ## Register a client's extension (M17), answering with the store's own
   ## outcome.
@@ -4027,22 +4097,50 @@ proc declareClientExtension(daemon: var RunQuotaDaemon;
   ## THE SESSION MUST BE ONE THIS CONNECTION REGISTERED, exactly as for an
   ## observation. A declaration creates a table in a host-wide store; a
   ## connection naming a session it never opened has no business doing so.
+  ##
+  ## THE WRITE HAPPENED BEFORE THIS RAN. ``prepared`` is the store half,
+  ## done by `prepareDeclaration` on the connection's worker before the
+  ## request took the daemon-wide lock; what is left here is publishing it.
+  ## Both connection paths prepare every `DeclareExtension` frame, and the
+  ## preparation skips one only when capture was off, the payload did not
+  ## decode or the session was not this connection's. All three are
+  ## refused above or before this is called, except capture coming on
+  ## between the preparation and the lock: that declaration is answered
+  ## `unavailable`, as it would have been a moment earlier, because
+  ## declaring here would put the write back under the lock.
   if not daemon.observationCaptureEnabled:
     return ExtensionDeclaredMessage(accepted: false, outcome: $eoUnavailable)
-  var ownsSession = false
-  for id in context.sessionIds:
-    if id.value == msg.sessionId.value:
-      ownsSession = true
-      break
-  if not ownsSession:
+  if not context.ownsSession(msg.sessionId.value):
     return ExtensionDeclaredMessage(accepted: false,
       outcome: "unknown-session")
-  let declaration = ExtensionDeclaration(
-    extensionId: msg.extensionId,
-    owner: msg.owner,
-    schemaVersion: int64(msg.schemaVersion),
-    migrations: msg.migrations)
-  let outcome = daemon.observationStore.declareExtension(declaration)
+  var outcome: ExtensionOutcome
+  if prepared.present:
+    let store = daemon.observationStore
+    outcome = prepared.outcome
+    store.registryReads += prepared.registryReads
+    if prepared.lastError.len > 0:
+      store.lastError = prepared.lastError
+    if prepared.status != ssOpen and store.status == ssOpen:
+      store.status = prepared.status
+      store.report = prepared.report
+    # WHAT THE PREPARATION LEARNED IS WHAT THE ROW PATH ANSWERS FROM. Its
+    # registry read (or its own write) is the authoritative one, exactly as
+    # when it ran here, so every entry it holds is merged -- for EVERY
+    # outcome, not only a create or a migrate: an up-to-date declaration
+    # after a restart is what fills this map for the rows that follow.
+    #
+    # THE HIGHER VERSION WINS, because publication order is not preparation
+    # order: two declarations are serialized by `declarationLock`, but they
+    # may reach this lock in either order. A version only moves forward and
+    # an owner never changes (`declareExtension`), so the higher entry is
+    # the later fact.
+    for row in prepared.learned:
+      if not store.knownExtensions.hasKey(row.extensionId) or
+          store.knownExtensions[row.extensionId].schemaVersion <
+            row.schemaVersion:
+        store.rememberExtension(row)
+  else:
+    outcome = eoUnavailable
   ExtensionDeclaredMessage(
     accepted: outcome in {eoCreated, eoUpToDate, eoMigrated, eoAcceptedOlder},
     outcome: $outcome)
@@ -6389,6 +6487,10 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     # it happens once per client, and its answer decides whether any row
     # may be sent at all. A client told nothing would write rows into a
     # table that was refused and never find out.
+    var prepared = context.preparedDeclaration
+    context.preparedDeclaration = PreparedDeclaration()
+    if prepared.requestId != frame.header.requestId:
+      prepared = PreparedDeclaration()
     var msg: DeclareExtensionMessage
     if not decodeDeclareExtension(frame.payload, msg):
       connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
@@ -6397,7 +6499,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     connection.sendResponse(
       rqExtensionDeclared,
       frame.header.requestId,
-      encodeExtensionDeclared(daemon.declareClientExtension(context, msg))
+      encodeExtensionDeclared(
+        daemon.declareClientExtension(context, msg, prepared))
     )
   of rqExtensionRow:
     # ONE-WAY, for the reasons ``rqLeaseObservation`` is: §"Write Path"
@@ -6703,6 +6806,10 @@ proc handleConnection*(daemon: var RunQuotaDaemon;
   try:
     while connection.receiveFrameOrDiagnostic(frame):
       drainBeforeAnswering(frame)
+      if frame.header.messageKind == rqDeclareExtension:
+        context.preparedDeclaration = prepareDeclaration(
+          daemon.observationStore.declarationHandle(),
+          daemon.observationCaptureEnabled, context, frame)
       daemon.handleRequest(connection, context, frame)
   finally:
     daemon.cleanupConnection(context)
@@ -7319,6 +7426,21 @@ proc handleSharedConnection(accepted: AcceptedConnection) {.thread, gcsafe.} =
         # OUTSIDE THE LOCK: a query's drain may wait on a retention pass,
         # and nothing else on the host may wait behind that.
         drainBeforeAnswering(frame)
+        if frame.header.messageKind == rqDeclareExtension:
+          # OUTSIDE THE LOCK: a declaration that creates or migrates a table
+          # may wait on a retention pass, and nothing else on the host may
+          # wait behind that. Only the snapshot of the store is taken under
+          # the lock.
+          var handle: ObservationStore = nil
+          var captureOn = false
+          acquire(sharedDaemon.lock)
+          try:
+            handle = sharedDaemon.daemon.observationStore.declarationHandle()
+            captureOn = sharedDaemon.daemon.observationCaptureEnabled
+          finally:
+            release(sharedDaemon.lock)
+          context.preparedDeclaration = prepareDeclaration(handle, captureOn,
+            context, frame)
         acquire(sharedDaemon.lock)
         try:
           sharedDaemon.daemon.handleRequest(localConnection, context, frame)

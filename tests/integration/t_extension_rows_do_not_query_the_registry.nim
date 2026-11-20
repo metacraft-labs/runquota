@@ -344,3 +344,63 @@ suite "extension_rows_do_not_query_the_registry":
     finally:
       daemon.stop()
       delEnv("RUNQUOTA_SOCKET")
+
+  test "after a restart an up-to-date declaration still furnishes the rows":
+    let privateOwner = bindPrivateBrokerOwnerToCaller()
+    defer: restorePrivateBrokerOwner(privateOwner)
+    # CLAUSE 5. The declaration's read runs on the connection's worker,
+    # outside the daemon-wide lock, against a handle of its own (reprobuild-pm
+    # `issues/2026-11-18-runquota-declare-extension-writes-the-store-under-the-daemon-lock.md`).
+    # What it learned must still reach the daemon's memory for EVERY outcome.
+    # A daemon restarted over an existing store answers the declaration
+    # `up-to-date` without writing anything; if only a create or migrate
+    # handed its entry over, the first row after the restart would read the
+    # registry again, under the daemon-wide lock, and a migration published
+    # out of order could leave the memory on an older version for good.
+    let root = scratchRoot("again")
+    defer: removeScratchRoot(root)
+    var endpointPolicy3: PrivateBrokerCallerPolicyBinding
+    defer: restorePrivateBrokerPolicy(endpointPolicy3)
+    let socketPath = rendezvousDir(root, endpointPolicy3) / "d.sock"
+    let state = hostStateDir(root)
+    let dbPath = state / "observations.sqlite3"
+    require fileExists(daemonPath())
+
+    putEnv("RUNQUOTA_SOCKET", socketPath)
+    var first = startDaemon(socketPath, state)
+    try:
+      var client = connectDefault()
+      var session = client.registerSession("regreads-first", "0.1.0")
+      check session.declareExtension(ProbeExtension, "regreads-test", 1,
+        [probeDdl]) == ""
+      session.closeSession()
+      client.close()
+    finally:
+      first.stop()
+
+    var daemon = startDaemon(socketPath, state)
+    try:
+      var client = connectDefault()
+      var session = client.registerSession("regreads-again", "0.1.0")
+      let beforeDeclare = rowCounters(client)
+      # UP TO DATE: the store already carries version 1.
+      check session.declareExtension(ProbeExtension, "regreads-test", 1,
+        [probeDdl]) == ""
+      let afterDeclare = rowCounters(client)
+      check afterDeclare.registryReads == beforeDeclare.registryReads + 1
+
+      let leaseId = completeOneExecution(session)
+      let before = rowCounters(client)
+      session.recordExtensionRow(leaseId, ProbeExtension, 1,
+        ["probe_label"], [wireText("after-restart")])
+      let after = rowCounters(client)
+      check after.accepted - before.accepted == 1
+      check after.refused == before.refused
+      check after.registryReads == before.registryReads
+      check waitForProbeRows(dbPath, 1) >= 1
+
+      session.closeSession()
+      client.close()
+    finally:
+      daemon.stop()
+      delEnv("RUNQUOTA_SOCKET")
