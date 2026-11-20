@@ -1,0 +1,40 @@
+# Written by the runquotad Nix module (services.runquotad.hostConfig).
+# Change it there: `runquota config set` refuses a file linked into the store.
+schema = "runquota.host-config.v1"
+
+[machine]
+memory_bytes = 103079215104
+cpu_milli = 16000
+write_bytes_per_sec = 524288000
+
+[pools]
+compile = 8
+fetch = 2
+
+[admission]
+order = ["starvation", "fair-share", "arrival"]
+max-wait = "90s"
+share-between-users = "none"
+predictive = "on"
+horizon = "10s"
+pressure-high = "12.5"
+pressure-low = "4"
+oversubscription = "0.125"
+
+[benchmark]
+allowed-users = ["alice", "1001"]
+allowed-groups = ["bench"]
+max-queue-wait = "5m"
+max-hold = "30m"
+
+[enforcement]
+cgroups = "on"
+job-priority = "off"
+qos = "on"
+
+[reservation.ci]
+cpu-milli = 8000
+memory-bytes = 34359738368
+lend = false
+
+[reservation.interactive]

@@ -104,6 +104,16 @@ in
         Activation asks the running daemon to reload it
         (`runquota config reload`) rather than restarting it.
 
+        Every table of the file has options here: `memoryBytes`, `cpuMilli`,
+        `writeBytesPerSec` and `pools`, then `admission`, `benchmark`,
+        `enforcement` and `reservations.<class>`. With `hostConfig` set the
+        file is a store link that `runquota config set` refuses to edit, so
+        these options are the only way to set a key. A value the daemon's
+        reader would refuse fails the evaluation instead, except a
+        reservation judged against a budget this configuration does not
+        declare (the built-in default, or a budget flag in `extraArgs`):
+        the daemon refuses that file at reload.
+
         `null` (the default) writes no file and leaves `/etc/runquota` for
         `runquota config set` to write into, as root.
       '';
@@ -111,6 +121,20 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # What the daemon's reader would refuse across keys, refused here.
+    assertions = lib.optionals (cfg.hostConfig != null) (
+      map (problem: {
+        assertion = false;
+        message = "services.runquotad.${problem}";
+      }) (
+        hostConfigLib.problems {
+          budgetFromFlags = lib.any (
+            arg: lib.any (flag: arg == flag || lib.hasPrefix "${flag}=" arg) hostConfigLib.budgetFlags
+          ) cfg.extraArgs;
+        } cfg.hostConfig
+      )
+    );
+
     # THE PROVISIONING. It runs at activation, before any `runquotad` has
     # started, so the directory's owner and mode are the ones written down
     # in `nix/host-state.nix` rather than the ones whichever process

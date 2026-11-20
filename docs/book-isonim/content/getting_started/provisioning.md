@@ -177,8 +177,23 @@ services.runquotad.hostConfig = {
   memoryBytes = 103079215104;   # 96 GiB
   cpuMilli = 16000;
   pools = { compile = 8; };
+  admission = { maxWait = "90s"; oversubscription = "0.1"; };
+  reservations.ci = { cpuMilli = 8000; lend = false; };
 };
 ```
+
+Every table of the host file has options: `memoryBytes`, `cpuMilli`,
+`writeBytesPerSec` and `pools`; `admission` (`order`, `maxWait`,
+`shareBetweenUsers`, `predictive`, `horizon`, `pressureHigh`, `pressureLow`,
+`oversubscription`); `benchmark` (`allowedUsers`, `allowedGroups`,
+`maxQueueWait`, `maxHold`); `enforcement` (`cgroups`, `jobPriority`, `qos`);
+and `reservations.<class>` (`cpuMilli`, `memoryBytes`, `lend`). The names are
+the file's keys in camelCase, and the on/off keys are booleans. A value the
+daemon would refuse fails the evaluation. One case is left to the daemon:
+reservations that do not fit a budget the configuration does not declare (the
+built-in default, or a `--cpu-milli`, `--memory-bytes` or `--machine` flag in
+`extraArgs`). The daemon refuses that file when it reloads, and keeps the
+budget it had. A pool name holds only letters, digits, `_` and `-`.
 
 It is rendered to `/etc/runquota/runquotad.toml` as a link into the store, and
 a change is applied by **reloading** the daemon (`ExecReload` runs `runquota

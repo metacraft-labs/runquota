@@ -121,6 +121,8 @@ in
           memoryBytes = 103079215104; # 96 GiB
           cpuMilli = 16000;
           pools = { compile = 8; fetch = 2; };
+          admission.maxWait = "90s";
+          reservations.ci = { cpuMilli = 8000; lend = false; };
         }
       '';
       description = ''
@@ -132,6 +134,16 @@ in
         (`runquota config reload`), not by restarting it, so switching
         configurations does not drop every build session on the host.
 
+        Every table of the file has options here: `memoryBytes`, `cpuMilli`,
+        `writeBytesPerSec` and `pools`, then `admission`, `benchmark`,
+        `enforcement` and `reservations.<class>`. With `hostConfig` set the
+        file is a store link that `runquota config set` refuses to edit, so
+        these options are the only way to set a key. A value the daemon's
+        reader would refuse fails the evaluation instead, except a
+        reservation judged against a budget this configuration does not
+        declare (the built-in default, or a budget flag in `extraArgs`):
+        the daemon refuses that file at reload.
+
         `null` (the default) writes no file and leaves the directory for
         `runquota config set` to write into, as root.
       '';
@@ -139,12 +151,28 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = cfg.idleExitAfter == null || cfg.socketActivation;
-        message = "services.runquotad.idleExitAfter requires services.runquotad.socketActivation: a daemon that exits when idle must have a socket unit to start it again.";
-      }
-    ];
+    assertions =
+      [
+        {
+          assertion = cfg.idleExitAfter == null || cfg.socketActivation;
+          message = "services.runquotad.idleExitAfter requires services.runquotad.socketActivation: a daemon that exits when idle must have a socket unit to start it again.";
+        }
+      ]
+      # What the daemon's reader would refuse across keys, refused here.
+      ++ lib.optionals (cfg.hostConfig != null) (
+        map
+          (problem: {
+            assertion = false;
+            message = "services.runquotad.${problem}";
+          })
+          (
+            hostConfigLib.problems {
+              budgetFromFlags = lib.any (
+                arg: lib.any (flag: arg == flag || lib.hasPrefix "${flag}=" arg) hostConfigLib.budgetFlags
+              ) cfg.extraArgs;
+            } cfg.hostConfig
+          )
+      );
 
     users.users.${cfg.user} = lib.mkIf (cfg.user == hostState.user) {
       isSystemUser = true;

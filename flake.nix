@@ -126,10 +126,43 @@
                 };
                 system.stateVersion = "24.05";
                 services.runquotad.enable = true;
+                # Every key the daemon's reader accepts.
+                services.runquotad.hostConfig = import ./nix/tests/host-config-full.nix;
+              }
+            ];
+          };
+          # A host budget the daemon's reader would refuse: the classes
+          # reserve more CPU than the declared budget.
+          nixosOverReservedEval = inputs.nixos-modules.inputs.nixpkgs.lib.nixosSystem {
+            modules = [
+              self.nixosModules.runquotad
+              {
+                nixpkgs.hostPlatform = "x86_64-linux";
+                boot.loader.grub.devices = [ "/dev/sda" ];
+                fileSystems."/" = {
+                  device = "/dev/sda1";
+                  fsType = "ext4";
+                };
+                system.stateVersion = "24.05";
+                services.runquotad.enable = true;
                 services.runquotad.hostConfig = {
-                  memoryBytes = 103079215104;
-                  cpuMilli = 16000;
-                  pools.compile = 8;
+                  cpuMilli = 4000;
+                  reservations.ci.cpuMilli = 6000;
+                };
+              }
+            ];
+          };
+          darwinOverReservedEval = nix-darwin.lib.darwinSystem {
+            modules = [
+              self.darwinModules.runquotad
+              {
+                nixpkgs.hostPlatform = "aarch64-darwin";
+                system.stateVersion = 5;
+                system.primaryUser = hostState.user;
+                services.runquotad.enable = true;
+                services.runquotad.hostConfig = {
+                  cpuMilli = 4000;
+                  reservations.ci.cpuMilli = 6000;
                 };
               }
             ];
@@ -382,6 +415,35 @@
                   # daemon's strict reader must accept.
                   nixosHostConfig = nixosEval.config.environment.etc."runquota/runquotad.toml".text;
                   darwinHostConfig = darwinEval.config.environment.etc."runquota/runquotad.toml".text;
+                  # The file a configuration that sets EVERY key must render
+                  # to, which `t_host_config_nix_module_covers_reader` holds
+                  # to the daemon's reader.
+                  hostConfigFull = builtins.readFile ./nix/tests/host-config-full.toml;
+                  # The option types' refusals and the cross-key problems,
+                  # judged in `nix/tests/render-host-config.nix`.
+                  hostConfigUnexpected = builtins.toJSON (
+                    (import ./nix/tests/render-host-config.nix { inherit (pkgs) lib; }).unexpected
+                  );
+                  hostConfigFailures = builtins.toJSON (
+                    map (assertion: assertion.message) (
+                      builtins.filter
+                        (
+                          assertion:
+                          !assertion.assertion && pkgs.lib.hasPrefix "services.runquotad.hostConfig" assertion.message
+                        )
+                        (nixosEval.config.assertions ++ darwinEval.config.assertions)
+                    )
+                  );
+                  nixosOverReservedFailures = builtins.toJSON (
+                    map (assertion: assertion.message) (
+                      builtins.filter (assertion: !assertion.assertion) nixosOverReservedEval.config.assertions
+                    )
+                  );
+                  darwinOverReservedFailures = builtins.toJSON (
+                    map (assertion: assertion.message) (
+                      builtins.filter (assertion: !assertion.assertion) darwinOverReservedEval.config.assertions
+                    )
+                  );
                   nixosReload = builtins.unsafeDiscardStringContext nixosEval.config.systemd.services.runquotad.serviceConfig.ExecReload;
                   # `ExecStart` is dropped deliberately: it carries the
                   # x86_64-linux package's store path, and keeping it here
@@ -450,10 +512,27 @@
                   grep -Fx 'memory_bytes = 103079215104' nixos-host-config
                   grep -Fx 'cpu_milli = 16000' nixos-host-config
                   grep -Fx 'compile = 8' nixos-host-config
+                  # Every table and key, byte for byte: the NixOS evaluation
+                  # sets them all (`nix/tests/host-config-full.nix`).
+                  printf '%s' "$hostConfigFull" > host-config-full
+                  diff -u host-config-full nixos-host-config
+                  test "$hostConfigUnexpected" = '[]'
+                  test "$hostConfigFailures" = '[]'
+                  # A budget the daemon's reader would refuse does not
+                  # evaluate, under either module.
+                  printf '%s' "$nixosOverReservedFailures" | grep -F 'services.runquotad.hostConfig.reservations: the classes reserve 6000 milli-CPUs'
+                  printf '%s' "$darwinOverReservedFailures" | grep -F 'services.runquotad.hostConfig.reservations: the classes reserve 6000 milli-CPUs'
                   grep -F 'd /etc/runquota 0755 root root -' nixos-tmpfiles
                   printf '%s' "$nixosReload" | grep -F 'runquota config reload'
                   printf '%s' "$darwinHostConfig" > darwin-host-config
                   grep -Fx 'memory_bytes = 25769803776' darwin-host-config
+                  # The nix-darwin evaluation sets one key. A table it does
+                  # not use is not written: a daemon older than the table
+                  # would refuse the file.
+                  if grep -E '^\[(admission|benchmark|enforcement|reservation\.)' darwin-host-config; then
+                    echo "an unused table was rendered" >&2
+                    exit 1
+                  fi
                   grep -F '/etc/runquota' darwin-activation
 
                   printf '%s' "$nixosService" > nixos-service

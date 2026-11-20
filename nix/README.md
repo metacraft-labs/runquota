@@ -46,6 +46,17 @@ their modes and the group. Run it with:
 nix build .#checks.<system>.module-eval
 ```
 
+The same check holds `nix/host-config.nix`, the host budget file both modules
+render from `services.runquotad.hostConfig`, to the daemon's reader. The NixOS
+evaluation sets every key the reader accepts (`nix/tests/host-config-full.nix`)
+and its rendering must equal `nix/tests/host-config-full.toml`, which
+`libs/runquota_daemon/tests/t_host_config_nix_module_covers_reader.nim` parses
+with the reader. A key added to the reader therefore fails that test until the
+module has an option for it. `nix/tests/render-host-config.nix` checks the
+rendering and the refusals with nixpkgs' `lib` alone;
+`scripts/check_nix_host_config.sh` runs it, and `just lint` runs that, so the
+Nix half is held on every change without building the flake's check.
+
 `nix-darwin` is not a direct input of this flake; the check reaches it through
 `inputs.nixos-modules.inputs.nix-darwin`, and a full `darwinSystem` evaluation
 succeeds through that path. Neither module has been *activated* on a real host
