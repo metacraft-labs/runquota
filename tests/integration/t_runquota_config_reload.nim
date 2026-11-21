@@ -59,11 +59,22 @@ proc startDaemon(socketPath, hostConfig, stateDir: string;
     args.add(arg)
   let process = startProcess(daemonPath(), args = args,
     options = {poStdErrToStdOut})
-  for _ in 0 ..< 400:
-    if endpointIsBound(socketPath): break
-    sleep(25)
-  doAssert endpointIsBound(socketPath), "runquotad did not bind " & socketPath
-  discard readRequiredStartupLines(process, 3, "t_runquota_config_reload")
+  # Not yet owned by any `defer` of the caller: a failed startup stops the
+  # daemon here, a Defect from `doAssert` included (reprobuild-pm
+  # `issues/2026-11-20-posix-daemon-fixtures-leak-a-running-daemon-when-the-bind-wait-times-out.md`).
+  var started = false
+  try:
+    for _ in 0 ..< 400:
+      if endpointIsBound(socketPath): break
+      sleep(25)
+    doAssert endpointIsBound(socketPath), "runquotad did not bind " & socketPath
+    discard readRequiredStartupLines(process, 3, "t_runquota_config_reload")
+    started = true
+  finally:
+    if not started:
+      process.kill()
+      discard process.waitForExit(5000)
+      process.close()
   DaemonHandle(process: process)
 
 proc stop(handle: var DaemonHandle) =

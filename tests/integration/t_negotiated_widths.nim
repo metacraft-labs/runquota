@@ -82,11 +82,10 @@ when defined(posix):
   root = scratchDir("rqwidth")
   socket = root / "d.sock"
   writePressure(0.0)
-  daemon = launch(root, socket, privateEnv(socket),
-    ["--cpu-milli", $BudgetMilli, "--memory-bytes", $(64'u64 * GiB),
-     "--cpu-pressure-file", root / "psi"])
-  prerequisite awaitSocket(daemon, socket),
-    daemon.startupContext("the daemon did not bind " & socket)
+  daemon = launchOwned(root, socket, privateEnv(socket),
+    daemonArgs(root, socket,
+      ["--cpu-milli", $BudgetMilli, "--memory-bytes", $(64'u64 * GiB),
+       "--cpu-pressure-file", root / "psi"]))
   putEnv("RUNQUOTA_ENDPOINT_SCOPE", "private")
   putEnv("RUNQUOTA_SOCKET", socket)
   delEnv("RUNQUOTA_SESSION")

@@ -221,10 +221,10 @@ when defined(macosx):
   let baseNice = int(getpriority(PRIO_PROCESS, 0))
     ## What every child inherits from this test: the nice the tiers add to.
   echo "host load at start: " & loadNow() & "; " & $cpuCount & " logical CPUs"
-  let daemon = launch(scratch, socket, privateEnv(socket),
-    ["--cpu-milli", $(cpuCount * 4 * 1000), "--memory-bytes",
-     $(16'u64 shl 30)])
-  prerequisite(daemon.awaitSocket(socket), "runquotad did not start")
+  let daemon = launchOwned(scratch, socket, privateEnv(socket),
+    daemonArgs(scratch, socket, ["--cpu-milli", $(cpuCount * 4 * 1000),
+      "--memory-bytes", $(16'u64 shl 30)]),
+    what = "runquotad")
 
   suite "priority enforcement below admission (macOS)":
     test "an over-spawning low-priority tool yields to a normal-priority build":

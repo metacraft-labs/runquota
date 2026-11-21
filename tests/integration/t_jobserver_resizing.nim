@@ -60,11 +60,9 @@ when defined(posix):
     for key in ["RUNQUOTA_PARENT_LEASE", "RUNQUOTA_JOBSERVER_FIFO",
         "MAKEFLAGS", "MFLAGS", "CARGO_MAKEFLAGS", "RUNQUOTA_SESSION"]:
       result.env.del(key)
-    result.process = launch(result.root, result.socket, result.env,
-      ["--cpu-milli", $cpuMilli, "--memory-bytes", $(64'u64 * GiB)])
-    prerequisite awaitSocket(result.process, result.socket),
-      result.process.startupContext("the daemon did not bind " &
-        result.socket)
+    result.process = launchOwned(result.root, result.socket, result.env,
+      daemonArgs(result.root, result.socket,
+        ["--cpu-milli", $cpuMilli, "--memory-bytes", $(64'u64 * GiB)]))
     # The in-process client (the neighbour and the waiter) reaches the same
     # daemon.
     putEnv("RUNQUOTA_ENDPOINT_SCOPE", "private")

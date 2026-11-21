@@ -47,10 +47,9 @@ when defined(posix):
 
   root = scratchDir("rqown")
   socket = root / "d.sock"
-  daemon = launch(root, socket, privateEnv(socket),
-    ["--cpu-milli", "4000", "--memory-bytes", $(16'u64 * GiB)])
-  prerequisite awaitSocket(daemon, socket),
-    daemon.startupContext("the daemon did not bind " & socket)
+  daemon = launchOwned(root, socket, privateEnv(socket),
+    daemonArgs(root, socket,
+      ["--cpu-milli", "4000", "--memory-bytes", $(16'u64 * GiB)]))
   putEnv("RUNQUOTA_ENDPOINT_SCOPE", "private")
   putEnv("RUNQUOTA_SOCKET", socket)
   delEnv("RUNQUOTA_SESSION")

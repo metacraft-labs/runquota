@@ -67,9 +67,8 @@ when defined(posix):
   root = scratchDir("rqrun")
   socket = root / "d.sock"
   baseEnv = privateEnv(socket)
-  daemon = launch(root, socket, baseEnv, ["--cpu-milli", $BudgetMilli])
-  prerequisite awaitSocket(daemon, socket),
-    daemon.startupContext("the daemon did not bind " & socket)
+  daemon = launchOwned(root, socket, baseEnv,
+    daemonArgs(root, socket, ["--cpu-milli", $BudgetMilli]))
 
   suite "runquota run":
     # -----------------------------------------------------------------

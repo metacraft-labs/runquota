@@ -1,7 +1,8 @@
 ## A REAL `runquotad` ON A PRIVATE SCRATCH ENDPOINT, for the tests of the
 ## shared per-user daemon (reprobuild-pm `spec/RunQuota-Host-Configuration.md`,
 ## "The shared per-user daemon (POSIX)"): `t_idle_exit`, `t_lifetime_lock` and
-## `t_socket_activation`.
+## `t_socket_activation`, and by the other POSIX integration tests that need a
+## private daemon of their own.
 ##
 ## ISOLATION IS THE FIRST RULE HERE. These tests run on hosts shared with
 ## other sessions of the same uid, so nothing in this file computes or touches
@@ -10,7 +11,9 @@
 ## scratch directory, `RUNQUOTA_ENDPOINT_SCOPE=private`, and an environment
 ## from which every variable that could redirect it has been removed. Every
 ## process this file starts is one the caller owns and stops; nothing here
-## signals a process it did not start.
+## signals a process it did not start. A helper that starts a daemon and
+## waits for it owns it until it returns (`launchOwned`), so a failure inside
+## the helper stops the daemon too.
 ##
 ## THE LOCK PROBE IS WRITTEN OUT HERE, NOT IMPORTED. The lifetime lock is the
 ## thing under test, so the test's observation of it must not go through the
@@ -140,6 +143,12 @@ when defined(posix):
 
   proc launch*(root, socket: string; env: StringTableRef;
                extra: openArray[string] = []): Process =
+    ## Starts `runquotad` and returns at once; the CALLER owns the process
+    ## from here. A caller must register its stop (`defer: stopOwned(...)` or
+    ## a `finally`) BEFORE any wait or check that can raise, or a daemon that
+    ## has not bound yet outlives the failure. A helper that starts a daemon
+    ## and waits for it before handing it back cannot do that -- its caller's
+    ## `defer` does not exist yet -- and must use `launchOwned` instead.
     startProcess(daemonPath(), env = env, args = daemonArgs(root, socket, extra),
       options = {poStdErrToStdOut})
 
@@ -195,3 +204,47 @@ when defined(posix):
     let code = daemon.peekExitCode()
     what & " (daemon exit " & $code & "): " &
       (if code >= 0: daemon.output.strip() else: "still running")
+
+  proc launchOwned*(root, socket: string; env: StringTableRef;
+                    args: openArray[string]; launcher: openArray[string] = [];
+                    what = "the daemon"; budgetMillis = 30_000): Process =
+    ## Starts `runquotad` with `args` (the full argument list, normally from
+    ## `daemonArgs`) and waits until it has bound `socket`. `launcher`, when
+    ## given, is a command the daemon is started under (`unshare ...`): the
+    ## daemon's path and `args` are appended to it.
+    ##
+    ## THE HELPER OWNS THE DAEMON UNTIL IT RETURNS. No `defer` of the caller
+    ## can stop a daemon before the helper has handed it back, so anything
+    ## that leaves this proc early once the process exists -- the bind wait
+    ## running out on a loaded host while the daemon is still starting, a
+    ## binary refused by `daemon_binary`, or a Defect -- stops it here and
+    ## removes `root` while the exception propagates. Before this, the
+    ## per-suite POSIX helpers raised from the wait and left the daemon
+    ## running with its scratch root in place (reprobuild-pm
+    ## `issues/2026-11-20-posix-daemon-fixtures-leak-a-running-daemon-when-the-bind-wait-times-out.md`);
+    ## `windows_daemon_fixture.launchOwned` is the Windows counterpart.
+    ##
+    ## A `finally` guarded by a flag rather than `except CatchableError`, so
+    ## the cleanup also runs for a Defect, which unittest reports and then
+    ## carries on past.
+    var bound = false
+    try:
+      let daemon = daemonPath()
+      result =
+        if launcher.len == 0:
+          startProcess(daemon, env = env, args = args,
+            options = {poStdErrToStdOut})
+        else:
+          startProcess(launcher[0], env = env,
+            args = launcher[1 .. ^1] & @[daemon] & @args,
+            options = {poStdErrToStdOut})
+      prerequisite awaitSocket(result, socket, budgetMillis),
+        result.startupContext(what & " did not bind " & socket)
+      bound = true
+    finally:
+      if not bound:
+        # No process to stop when resolving the binary or the spawn itself
+        # raised; the scratch root is removed either way.
+        if result != nil: stopOwned(result)
+        try: removeDir(root)
+        except CatchableError: discard

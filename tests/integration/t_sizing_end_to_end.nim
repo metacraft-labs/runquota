@@ -490,21 +490,38 @@ when defined(linux) or defined(macosx):
   suite "sizing replay through the daemon":
     let root = scratchDir("rqszreplay")
     let socket = root / "ep" / "d.sock"
-    var daemon = startDaemon(root, socket, extra =
-      ["--ambient-sample-interval-millis", "0"])
-    prerequisite awaitSocket(daemon, socket),
-      daemon.startupContext("the daemon did not bind " & socket)
-    prerequisite awaitCapture(socket), "capture never came on"
-    let store = stoppedStore(daemon, root)
-    let identity = store.identityOf()
-    prerequisite identity.hostId.len > 0, "the daemon recorded no host profile"
-    let base = (getTime().toUnix - 2 * 86_400) * 1000
-    store.writeSynthetic(identity, base)
-    daemon = startDaemon(root, socket, extra =
-      ["--ambient-sample-interval-millis", "0"])
-    prerequisite awaitSocket(daemon, socket),
-      daemon.startupContext("the daemon did not restart on " & socket)
-    prerequisite awaitCapture(socket), "capture never came on again"
+    var daemon: Process
+    # The suite's setup owns the daemon until it is ready: this is not a
+    # test body, so no `defer` of a test stops it, and the `stopOwned` at
+    # the end of the suite is never reached when a prerequisite below
+    # raises (reprobuild-pm
+    # `issues/2026-11-20-posix-daemon-fixtures-leak-a-running-daemon-when-the-bind-wait-times-out.md`).
+    var ready = false
+    try:
+      daemon = startDaemon(root, socket, extra =
+        ["--ambient-sample-interval-millis", "0"])
+      prerequisite awaitSocket(daemon, socket),
+        daemon.startupContext("the daemon did not bind " & socket)
+      prerequisite awaitCapture(socket), "capture never came on"
+      let first = daemon
+      daemon = nil  # `stoppedStore` stops it; it is not stopped twice
+      let store = stoppedStore(first, root)
+      let identity = store.identityOf()
+      prerequisite identity.hostId.len > 0,
+        "the daemon recorded no host profile"
+      let base = (getTime().toUnix - 2 * 86_400) * 1000
+      store.writeSynthetic(identity, base)
+      daemon = startDaemon(root, socket, extra =
+        ["--ambient-sample-interval-millis", "0"])
+      prerequisite awaitSocket(daemon, socket),
+        daemon.startupContext("the daemon did not restart on " & socket)
+      prerequisite awaitCapture(socket), "capture never came on again"
+      ready = true
+    finally:
+      if not ready:
+        if daemon != nil: stopOwned(daemon)
+        try: removeDir(root)
+        except CatchableError: discard
 
     test "quantile_and_baseline_reported":
       let (code, answer, text) = sizingJson(socket, ["sizing", "--project",

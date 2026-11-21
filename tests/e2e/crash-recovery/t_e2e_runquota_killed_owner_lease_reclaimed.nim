@@ -187,11 +187,22 @@ proc startPrivateDaemon(fixturePolicy: var PrivateBrokerCallerPolicyBinding; tag
   log.note("daemon: " & daemonPath() & " " & args.join(" "))
   result.process = startProcess(daemonPath(), args = args,
     options = {poStdErrToStdOut})
-  for _ in 0 ..< 400:
-    if endpointIsBound(result.socketPath): break
-    sleep(25)
-  doAssert endpointIsBound(result.socketPath),
-    "private runquotad did not bind " & result.socketPath
+  # Not yet owned by any `defer` of the caller: a failed startup stops the
+  # daemon here, a Defect from `doAssert` included (reprobuild-pm
+  # `issues/2026-11-20-posix-daemon-fixtures-leak-a-running-daemon-when-the-bind-wait-times-out.md`).
+  var started = false
+  try:
+    for _ in 0 ..< 400:
+      if endpointIsBound(result.socketPath): break
+      sleep(25)
+    doAssert endpointIsBound(result.socketPath),
+      "private runquotad did not bind " & result.socketPath
+    started = true
+  finally:
+    if not started:
+      result.process.kill()
+      discard result.process.waitForExit(5000)
+      result.process.close()
 
 proc stop(daemon: var PrivateDaemon; log: CaseLog) =
   if daemon.process.running:

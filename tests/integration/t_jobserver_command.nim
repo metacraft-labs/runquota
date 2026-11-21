@@ -112,11 +112,8 @@ when defined(posix):
     for key in ["RUNQUOTA_PARENT_LEASE", "RUNQUOTA_JOBSERVER_FIFO",
         "MAKEFLAGS", "MFLAGS", "CARGO_MAKEFLAGS"]:
       result.env.del(key)
-    result.process = launch(result.root, result.socket, result.env,
-      ["--cpu-milli", $cpuMilli])
-    prerequisite awaitSocket(result.process, result.socket),
-      result.process.startupContext("the daemon did not bind " &
-        result.socket)
+    result.process = launchOwned(result.root, result.socket, result.env,
+      daemonArgs(result.root, result.socket, ["--cpu-milli", $cpuMilli]))
 
   proc stop(daemon: var Daemon) =
     if not daemon.stopped:

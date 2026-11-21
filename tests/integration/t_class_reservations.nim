@@ -89,12 +89,10 @@ when defined(posix):
     for key in GroupEnvKeys:
       if result.env.hasKey(key): result.env.del(key)
     writeFile(result.root / "host.toml", Head & hostFile)
-    result.daemon = startProcess(daemonPath(), env = result.env,
-      args = daemonArgs(result.root, result.socket,
+    result.daemon = launchOwned(result.root, result.socket, result.env,
+      daemonArgs(result.root, result.socket,
         @["--cpu-milli", $(cpuSlots * Slot), "--memory-bytes", $memory]),
-      options = {poStdErrToStdOut})
-    prerequisite awaitSocket(result.daemon, result.socket),
-      startupContext(result.daemon, "the private daemon did not bind")
+      what = "the private daemon")
     result.saveAndSet("RUNQUOTA_ENDPOINT_SCOPE", "private")
     result.saveAndSet("RUNQUOTA_SOCKET", result.socket)
     for key in GroupEnvKeys:

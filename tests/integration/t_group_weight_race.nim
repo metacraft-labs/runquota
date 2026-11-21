@@ -79,9 +79,10 @@ when defined(linux):
   var daemonStarted = false
 
   if testRoot.len > 0:
-    daemon = launch(scratch, socket, privateEnv(socket),
-      ["--cpu-milli", "8000", "--memory-bytes", $(16'u64 shl 30)])
-    prerequisite(daemon.awaitSocket(socket), "runquotad did not start")
+    daemon = launchOwned(scratch, socket, privateEnv(socket),
+      daemonArgs(scratch, socket,
+        ["--cpu-milli", "8000", "--memory-bytes", $(16'u64 shl 30)]),
+      what = "runquotad")
     daemonStarted = true
     putEnv("RUNQUOTA_ENDPOINT_SCOPE", "private")
     putEnv("RUNQUOTA_SOCKET", socket)

@@ -34,10 +34,9 @@ when defined(posix):
   writeFile(root / "host.toml",
     "schema = \"runquota.host-config.v1\"\n[benchmark]\n" &
     "max-queue-wait = \"2s\"\nmax-hold = \"2s\"\n")
-  var daemon = launch(root, socket, privateEnv(socket),
-    ["--cpu-milli", "4000", "--memory-bytes", $(16'u64 * GiB)])
-  prerequisite awaitSocket(daemon, socket),
-    daemon.startupContext("the daemon did not bind " & socket)
+  var daemon = launchOwned(root, socket, privateEnv(socket),
+    daemonArgs(root, socket,
+      ["--cpu-milli", "4000", "--memory-bytes", $(16'u64 * GiB)]))
   putEnv("RUNQUOTA_ENDPOINT_SCOPE", "private")
   putEnv("RUNQUOTA_SOCKET", socket)
   delEnv("RUNQUOTA_SESSION")

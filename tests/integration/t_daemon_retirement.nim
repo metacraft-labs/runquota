@@ -82,11 +82,22 @@ proc startDaemon(socketPath, stateDir: string): Process =
             "--memory-bytes", $(8'u64 * 1024'u64 * MiB),
             "--memory-pressure-source", "unavailable"],
     options = {poStdErrToStdOut})
-  for _ in 0 ..< 400:
-    if endpointIsBound(socketPath): break
-    sleep(25)
-  doAssert endpointIsBound(socketPath), "runquotad did not bind " & socketPath
-  discard readRequiredStartupLines(result, 3, "t_daemon_retirement")
+  # Not yet owned by any `defer` of the caller: a failed startup stops the
+  # daemon here, a Defect from `doAssert` included (reprobuild-pm
+  # `issues/2026-11-20-posix-daemon-fixtures-leak-a-running-daemon-when-the-bind-wait-times-out.md`).
+  var started = false
+  try:
+    for _ in 0 ..< 400:
+      if endpointIsBound(socketPath): break
+      sleep(25)
+    doAssert endpointIsBound(socketPath), "runquotad did not bind " & socketPath
+    discard readRequiredStartupLines(result, 3, "t_daemon_retirement")
+    started = true
+  finally:
+    if not started:
+      result.kill()
+      discard result.waitForExit(5000)
+      result.close()
 
 proc reap(daemon: var Process): int =
   ## The daemon's exit status, waiting at most `ExitBudgetMillis`; -1 when it

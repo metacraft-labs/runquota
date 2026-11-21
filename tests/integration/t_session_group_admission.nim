@@ -249,15 +249,8 @@ when defined(posix):
     var args = daemonArgs(result.root, result.socket,
       @["--cpu-milli", $(slots * SlotMilli),
         "--memory-bytes", $(4096'u64 * MiB)] & @extra)
-    if launcher.len == 0:
-      result.daemon = startProcess(daemonPath(), env = result.env, args = args,
-        options = {poStdErrToStdOut})
-    else:
-      result.daemon = startProcess(launcher[0], env = result.env,
-        args = launcher[1 .. ^1] & @[daemonPath()] & args,
-        options = {poStdErrToStdOut})
-    prerequisite awaitSocket(result.daemon, result.socket),
-      startupContext(result.daemon, "the private daemon did not bind")
+    result.daemon = launchOwned(result.root, result.socket, result.env, args,
+      launcher, what = "the private daemon")
     # The in-process clients read their endpoint from the environment, as
     # every RunQuota client does.
     result.saveAndSet("RUNQUOTA_ENDPOINT_SCOPE", "private")
