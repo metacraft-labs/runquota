@@ -439,6 +439,11 @@ proc declareExtension*(store: ObservationStore;
       # the store recorded, because they are refusals of different things:
       # one says the client's table is not joinable to the spine, the other
       # says its DDL did not run.
+      # A busy timeout is not a verdict on the declaration: the write lock
+      # was held (typically by a retention delete) for longer than the
+      # store waits. Answered `unavailable`, which the client already reads
+      # as "not now", and the store stays writable.
+      if isContention(store.lastError): return eoUnavailable
       return if extensionShapeConstraint in store.lastError: eoRefusedShape
              else: eoRefusedMigrationFailed
     store.rememberExtension(ExtensionRegistryRow(
@@ -486,6 +491,7 @@ proc declareExtension*(store: ObservationStore;
   sql.add(extensionShapeGate(tableName))
   sql.add("commit;\n")
   if not store.runStatement(sql):
+    if isContention(store.lastError): return eoUnavailable
     return if extensionShapeConstraint in store.lastError: eoRefusedShape
            else: eoRefusedMigrationFailed
   var migrated = registered

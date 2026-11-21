@@ -302,6 +302,7 @@ suite "extension_declaration_beside_a_prune":
     var declarerStarted = false
     var sawDeleteHoldingTheStore = false
     var lockedWhenADeclared = false
+    var lockedWhenBAnswered = false
     var answeredBeforeB = true
     var leaseActive = false
     var leaseAnsweredAt = 0'i64
@@ -346,6 +347,16 @@ suite "extension_declaration_beside_a_prune":
         "beside-declaration", milliCpu(1000),
         bytes(256'u64 * 1024'u64 * 1024'u64)))
       leaseAnsweredAt = unixMillisNow()
+      # SAMPLED AT BOTH ENDS. The write-lock byte is read once before A's
+      # frame is sent (above) and once here, right after B is answered. The
+      # discriminator below only means something if the delete held the
+      # store across the whole interval between the two, and a single
+      # early sample cannot say so: a delete that committed in between
+      # would make A answer quickly and read as a product regression. The
+      # delete is one transaction, so locked at both ends is locked
+      # throughout; if the second sample is clear, the arm reports that
+      # the prune ended first instead of blaming the daemon.
+      lockedWhenBAnswered = writeLocked(dbPath)
       # THE DISCRIMINATOR. With the declaration's write under the
       # daemon-wide lock, B's two requests are answered only after A's.
       answeredBeforeB = declarationAnswered.load()
@@ -379,6 +390,10 @@ suite "extension_declaration_beside_a_prune":
 
     check declarationError.len == 0
     check leaseActive
+    # PRECONDITION OF THE DISCRIMINATOR, NOT A PROPERTY OF THE DAEMON: the
+    # prune was still deleting when B was answered. When this fails the
+    # arm measured nothing; the checks below are not evidence either way.
+    check lockedWhenBAnswered
     # THE PROPERTY: B was served while A's declaration was still waiting on
     # the delete.
     check not answeredBeforeB

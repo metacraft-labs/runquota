@@ -409,6 +409,17 @@ proc isRejection(error: string): bool =
   let lowered = error.toLowerAscii
   "constraint" in lowered or "datatype mismatch" in lowered
 
+proc isContention*(error: string): bool =
+  ## SQLite gave up waiting for another writer (``SQLITE_BUSY``, "database
+  ## is locked", after the 5 s busy timeout) or hit a table lock. The store
+  ## is healthy; somebody else -- above all a retention delete -- held the
+  ## write lock for longer than the caller could wait. That is a transient
+  ## condition of THIS statement, not a verdict on the file: the caller
+  ## gets ``false`` and ``lastError`` and may retry, and capture stays on
+  ## for everyone else (OS-4 degrades a store that cannot be written, not
+  ## one that was busy).
+  "is locked" in error.toLowerAscii
+
 proc execute(store: ObservationStore; sql: string): bool =
   ## Runs ``sql`` when capture is enabled. Never raises. A store that has
   ## stopped accepting writes degrades to no capture so the next caller
@@ -418,7 +429,8 @@ proc execute(store: ObservationStore; sql: string): bool =
   let outcome = runSqlite(store.path, sql)
   if not outcome.ok:
     store.lastError = outcome.error.strip()
-    if not isRejection(store.lastError):
+    if not isRejection(store.lastError) and
+        not isContention(store.lastError):
       store.degrade(ssUnwritable,
         "runquota observation store " & store.path & ": write failed (" &
           store.lastError & "); capture disabled")
