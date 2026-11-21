@@ -54,6 +54,7 @@ else:
 
   import daemon_binary
   import private_daemon_fixture
+  import host_true_command
 
   const BudgetMilli = 2000
 
@@ -197,8 +198,9 @@ else:
         # A request for the whole budget is admitted only once the lost lease
         # is released. Watched by its foreign pid (pid 2: the host's kthreadd)
         # it never would be, and this would wait out its bound.
+        # `true` as this host has it: there is no `/bin/true` on NixOS.
         let wide = startProcess(cliPath(), env = env, args = ["run",
-          "--verbose", "--width", "2", "--", "/bin/true"],
+          "--verbose", "--width", "2", "--", trueCommand()],
           options = {poStdErrToStdOut})
         defer: wide.close()
         # On POSIX `waitForExit` kills a process still running at the end of

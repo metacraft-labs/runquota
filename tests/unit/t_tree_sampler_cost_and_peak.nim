@@ -26,15 +26,20 @@
 ## file. NO MOCKS: real processes, the real `/proc`.
 
 when defined(linux):
-  import std/[os, strutils, unittest]
+  import std/[monotimes, os, strutils, times, unittest]
 
   import runquota_core
   import runquota_process
+
+  import host_true_command
 
   const
     measurementVariable = "RUNQUOTA_MEASUREMENT"
     holdMiB = 48
     holders = 4
+    treeSampleIntervalSeconds = 0.1
+      ## `runquota_process`'s `treeSampleIntervalSeconds`, which it does not
+      ## export; the header above states the same interval.
 
   if paramCount() >= 3 and paramStr(1) == "--hold":
     # Allocate and TOUCH every page, so the resident set really is that
@@ -97,8 +102,26 @@ when defined(linux):
 
     test "a command shorter than one interval is not walked at all":
       withMeasurement("tree-sampling=on,profiles=on") do ():
-        let child = pollTightly(@["/bin/true"])
-        check child.treeWalks == 0'u32
+        # `true` as this host has it: there is no `/bin/true` on NixOS.
+        let command = trueCommand()
+        let started = getMonoTime()
+        let child = pollTightly(@[command])
+        let elapsedSeconds = (getMonoTime() - started).inNanoseconds.float / 1e9
+        # THE COMMAND RAN. A launch whose exec failed is just as short and
+        # is not walked either, so without these two the case would pass
+        # having measured no command at all (exit 127).
+        check child.completion.exited
+        check child.completion.exitCode == 0
+        # NOT WALKED BEFORE AN INTERVAL HAS PASSED. `true` usually exits well
+        # inside one 0.1 s interval, and then this is "no walk at all". On a
+        # loaded host it can take longer -- 1 walk and 3 walks were seen at
+        # load 20-30 on nixos-ci-bare-002 -- and then one walk per interval
+        # that has passed is the specified behaviour, not a defect. The bound
+        # is the elapsed time this test measured, which covers the child's
+        # whole life, so a sampler that walked at launch or at every 1 ms
+        # poll still fails it.
+        checkpoint "walks: " & $child.treeWalks & " in " & $elapsedSeconds & " s"
+        check child.treeWalks.float <= elapsedSeconds / treeSampleIntervalSeconds
         # Its peak then comes from the totals, which the daemon takes.
         check child.completion.totals.known
         check child.completion.totals.maxRssBytes > 0'u64

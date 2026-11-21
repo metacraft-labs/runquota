@@ -116,6 +116,11 @@ package runquota:
       "ps"
       "find"
       "nix"
+      # The do-nothing command several tests launch or lease, found on the
+      # action's PATH by ``tests/support/host_true_command.nim``. NixOS has
+      # no ``/bin/true`` to fall back on, so it must be declared, not merely
+      # share a directory with ``sleep``.
+      "true"
 
     # ``git``, which the static-helper gate's tool-store authority
     # (``scripts/static_helper_gate_toolstore.sh``, the arm ``just test`` runs
@@ -328,7 +333,8 @@ package runquota:
       appendRegisteredActionToolIdentityRefs(executed.id,
         ["timeout", "sleep", "nim", backendCompiler, "sqlite3", "sh", "bash", "git", "mkdir"])
       when not defined(windows):
-        appendRegisteredActionToolIdentityRefs(executed.id, ["dirname", "uname", "ps", "find", "nix"])
+        appendRegisteredActionToolIdentityRefs(executed.id,
+          ["dirname", "uname", "ps", "find", "nix", "true"])
       when not defined(windows):
         if name == "t_shared_endpoint_second_uid":
           appendRegisteredActionToolIdentityRefs(executed.id, ["chmod", "cp", "mv", "rm", "printf"])

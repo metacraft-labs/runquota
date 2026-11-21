@@ -6,12 +6,7 @@ import runquota_protocol
 from runquota_ipc import endpointDirectoryPermissions
 import daemon_binary
 import scratch_root
-
-proc truePath(): string =
-  for path in ["/usr/bin/true", "/bin/true"]:
-    if fileExists(path):
-      return path
-  "true"
+import host_true_command
 
 proc waitForDaemon(socketPath: string) =
   putEnv("RUNQUOTA_SOCKET", socketPath)
@@ -100,7 +95,7 @@ suite "e2e_runquota_concurrent_short_lived_clients":
             "--cpu", "1000",
             "--mem", "1048576",
             "--label", "short-lived-" & $i,
-            "--", truePath()
+            "--", trueCommand()
           ],
           options = {poStdErrToStdOut}
         ))
