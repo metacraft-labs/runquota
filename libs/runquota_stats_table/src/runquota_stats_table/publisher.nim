@@ -79,6 +79,14 @@ type
     ## The daemon's handle on the segment it publishes into.
     available*: bool
     path*: string
+    failure*: string
+      ## Why ``available`` is false: the step that failed, the file and the
+      ## system's error text, on one line. Empty while publishing, and empty
+      ## for the refusals that have no errno behind them (no path, a bad slot
+      ## count). ``statsPublisherReport`` carries it to the listening line,
+      ## so a table that could not be created names the file and the errno
+      ## where an operator already reads. POSIX only: the Windows arm does
+      ## not fill it in yet, and reports the bare "not publishing".
     size*: int
     slotCount*: int
     publishCount*: uint64
@@ -125,6 +133,56 @@ proc statsSegmentSize*(slotCount: int): int =
     ((raw + ps - 1) div ps) * ps
   else:
     raw
+
+when statsPublisherSupported and not defined(windows):
+  proc failureText(step, file: string; code: cint): string =
+    ## One line, always: it is appended to the listening line, which readers
+    ## consume by count.
+    step & " " & file & ": " & $strerror(code) & " (errno " & $code & ")"
+
+  proc allocateBacking(fd: cint; size: int): cint =
+    ## Make the file system COMMIT every block of the table before any of it
+    ## is mapped. Returns 0, or the errno that refused the allocation.
+    ##
+    ## ``ftruncate`` alone only moves the end of file: the file is sparse,
+    ## and a block is allocated when its page is first written. Through a
+    ## mapping that write is a page fault, and a fault the file system cannot
+    ## back -- it is full, or the user is over quota -- has no errno to
+    ## return. The kernel delivers SIGBUS instead, and the daemon died on its
+    ## first store into the header, before its listening line, with an empty
+    ## log (reprobuild-pm
+    ## ``issues/2026-11-19-per-user-runquotad-dies-with-sigbus-and-an-empty-log-when-its-endpoint-filesystem-is-over-quota.md``).
+    ## A table sized once and never grown needs the check exactly once, here.
+    ##
+    ## WHAT THIS DOES NOT COVER. On a file system that writes a new block for
+    ## every overwrite (btrfs, ZFS, a snapshotted or compressed file), an
+    ## allocated block is not a promise about the next write to it, and a
+    ## later store can still fault when the file system fills. Nothing done
+    ## at creation can close that. It holds on tmpfs, where the endpoint
+    ## directory normally lives, and on file systems that overwrite in place.
+    ##
+    ## Linux asks with ``posix_fallocate``. Where the file system does not
+    ## support it (``EOPNOTSUPP``, or ``EINVAL`` from some), and on macOS,
+    ## which has no ``posix_fallocate``, every block is written with zeros,
+    ## which fails with the same errno a full file system gives any write.
+    when defined(linux):
+      while true:
+        let code = posix_fallocate(fd, Off(0), Off(size))
+        if code == 0: return 0
+        if code == EINTR: continue
+        if code != EOPNOTSUPP and code != EINVAL: return code
+        break
+    var zeros: array[4096, byte]
+    var done = 0
+    while done < size:
+      let want = min(zeros.len, size - done)
+      let wrote = pwrite(fd, addr zeros[0], want, Off(done))
+      if wrote < 0:
+        if errno == EINTR: continue
+        return errno
+      if wrote == 0: return ENOSPC
+      done += wrote
+    0
 
 proc createStatsPublisher*(path: string; slotCount = DefaultStatsSlotCount;
                            mode = 0o640): StatsPublisher =
@@ -251,17 +309,28 @@ proc createStatsPublisher*(path: string; slotCount = DefaultStatsSlotCount;
     let tmp = path & ".tmp." & $getpid() & "." & $uniq
     discard unlink(tmp.cstring)
     let tfd = open(tmp.cstring, O_RDWR or O_CREAT or O_EXCL, Mode(mode))
-    if tfd < 0: return
+    if tfd < 0:
+      result.failure = failureText("cannot create", tmp, errno); return
+    template giveUp(step: string; code: cint) =
+      # `code` is read before `close` and `unlink` can overwrite `errno`.
+      let reason = failureText(step, tmp, code)
+      discard close(tfd); discard unlink(tmp.cstring)
+      result.failure = reason
+      return
     # `open` honours the umask, and a table the group cannot read is a table
     # every user but one falls back from -- silently, and looking exactly
     # like a cold cache. Set the mode explicitly.
     if chmod(tmp.cstring, Mode(mode)) != 0:
-      discard close(tfd); discard unlink(tmp.cstring); return
+      giveUp("cannot set the mode of", errno)
     if ftruncate(tfd, Off(size)) != 0:
-      discard close(tfd); discard unlink(tmp.cstring); return
+      giveUp("cannot size", errno)
+    # BEFORE THE MAPPING, never after: see `allocateBacking`.
+    let allocated = allocateBacking(tfd, size)
+    if allocated != 0:
+      giveUp("cannot allocate " & $size & " bytes for", allocated)
     let p = mmap(nil, size, PROT_READ or PROT_WRITE, MAP_SHARED, tfd, 0)
     if p == MAP_FAILED:
-      discard close(tfd); discard unlink(tmp.cstring); return
+      giveUp("cannot map", errno)
     let base = cast[ShmBase](p)
     storeU32Relaxed(base, StatsOffFlags, 0)
     storeU64Relaxed(base, StatsOffSlotCount, uint64(slotCount))
@@ -280,13 +349,26 @@ proc createStatsPublisher*(path: string; slotCount = DefaultStatsSlotCount;
     discard close(tfd)
     try:
       moveFile(tmp, path)
-    except OSError:
-      discard unlink(tmp.cstring); return
+    except OSError as error:
+      discard unlink(tmp.cstring)
+      result.failure = "cannot rename " & tmp & " to " & path & ": " & error.msg
+      return
+    # FROM HERE THE TABLE IS DISCOVERABLE, and its anchor names this live
+    # process. A failure below must take the file away again: left in place
+    # it would read as a table with a publisher, which nobody will ever
+    # write.
     let fd = open(path.cstring, O_RDWR)
-    if fd < 0: return
+    if fd < 0:
+      let reason = failureText("cannot reopen", path, errno)
+      discard unlink(path.cstring)
+      result.failure = reason
+      return
     let mapped = mmap(nil, size, PROT_READ or PROT_WRITE, MAP_SHARED, fd, 0)
     if mapped == MAP_FAILED:
-      discard close(fd); return
+      let reason = failureText("cannot map", path, errno)
+      discard close(fd); discard unlink(path.cstring)
+      result.failure = reason
+      return
     result.base = cast[ShmBase](mapped)
     result.fd = fd
     result.size = size
@@ -429,6 +511,12 @@ proc residentKeys*(publisher: StatsPublisher): seq[string] =
 
 proc statsPublisherReport*(publisher: StatsPublisher): string =
   if not publisher.available:
+    # ONE LINE, whatever the failure says: this is appended to the listening
+    # line, which readers consume by count.
+    if publisher.failure.len > 0:
+      return "published stats table: not publishing (" &
+        publisher.failure.multiReplace(("\n", " "), ("\r", " ")) &
+        "; socket remains authoritative)"
     return "published stats table: not publishing (socket remains authoritative)"
   "published stats table: " & publisher.path & " slots=" &
     $publisher.slotCount & " resident=" & $publisher.residentKeys().len &

@@ -147,3 +147,24 @@ The daemon exited and deliberately left the file behind — a table whose
 publisher has gone is stale, not invalid. Start the daemon again. Nothing
 depends on the table being present: it is
 [a cache and never a second source of truth](/getting_started/concepts#published-aggregate-table).
+
+## The daemon says it is not publishing the stats table
+
+```text
+runquotad listening /tmp/rq/u/runquotad.sock; published stats table: not publishing (cannot allocate 69632 bytes for /tmp/rq/u/stats-table.tmp.4711.123456: No space left on device (errno 28); socket remains authoritative)
+```
+
+The table is a file beside the socket, and the daemon could not create it.
+The text in parentheses names the step, the file and the system's error. `No
+space left on device` and `Disk quota exceeded` mean the file system that
+holds the endpoint directory is full, or the daemon's user is over quota on
+it; a `/tmp` with per-user quotas is the usual place to meet the second.
+
+A daemon whose log file is on that same file system cannot write this line
+to it either, and the log is empty: run `df` and `quota` on the endpoint
+directory when a daemon is serving with an empty log.
+
+The daemon serves leases all the same, and clients ask over the socket for
+the estimates they would have read from the table. To get the table back,
+free room on that file system, or move the endpoint to one that has it, and
+start the daemon again.
