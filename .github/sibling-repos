@@ -15,7 +15,7 @@
 # reproducible. The
 # catalog is also locked by the flake input used by the owning Nix shell.
 # Keep this non-Nix CI pin aligned with that source constructor.
-reprobuild-packages=56ffd673bc0f43ab266de53fd5e2e7f656e37431
+reprobuild-packages=92100803eb827ff21d0cc48b7474fb0a65057cbd
 
 # RunQuota's published stats table requires this source-library interface.
 # Explicitly override the carried workspace pin until it includes the interface.
