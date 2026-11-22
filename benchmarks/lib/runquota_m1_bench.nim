@@ -476,17 +476,17 @@ proc waitForSocket(path: string; timeoutMs: int): bool =
 # ---------------------------------------------------------------------------
 
 type
-  Config = object
+  Config* = object
     mode: string
-    daemonBin: string
+    daemonBin*: string
     reproBin: string
     subjectName: string
     subjectDir: string
     subjectArgs: seq[string]
     invocations: int
     subjectTimeoutMs: int
-    cpuMilli: int
-    memoryBytes: uint64
+    cpuMilli*: int
+    memoryBytes*: uint64
     pools: seq[string]
     daemonArgs: seq[string]
     dumpEvents: string
@@ -618,15 +618,18 @@ type
     process: Process
     path: string
 
-type Study = object
-  cfg: Config
+type Study* = object
+  cfg*: Config
   cal: Calibration
-  root: string
+  root*: string
   daemonSocket: string
   tapSocket: string
-  daemon: Process
+  daemon*: Process
   daemonLog: string
   drainCtx: ptr DrainCtx
+  drainer: ref Thread[ptr DrainCtx]
+    ## Joined by `stopDaemon` once the daemon has exited, before the handle
+    ## whose output stream it reads is closed.
   tap: ptr TapState
   daemonPid: int
   results: seq[InvocationResult]
@@ -654,49 +657,118 @@ proc drainThread(ctx: ptr DrainCtx) {.thread.} =
 proc daemonAlive(s: var Study): bool =
   s.daemon != nil and s.daemon.running
 
-proc startDaemon(s: var Study) =
+const DaemonReadyMillis* = 15_000
+  ## How long `startDaemon` waits for its daemon to answer a handshake.
+
+proc stopDaemon*(s: var Study) =
+  ## Ends the daemon this study started, if any: SIGTERM, then SIGKILL if it
+  ## has not exited within 5 s, and reaps it; then joins the drain thread
+  ## (which ends at the daemon's end of output) and closes the handle.
+  ## Idempotent, and raises nothing, so it is safe in a `finally` or `defer`
+  ## that must not mask the exception being propagated. A daemon
+  ## that survives SIGKILL keeps its handle and thread: closing the stream
+  ## under a thread still reading it, or joining one that never ends, would
+  ## be worse than the leak.
+  try:
+    if s.daemon != nil:
+      if s.daemon.running:
+        s.daemon.terminate()
+        discard s.daemon.waitForExit(5000)
+      if s.daemon.running:
+        s.daemon.kill()
+        discard s.daemon.waitForExit(5000)
+      if s.daemon.running:
+        return
+    if s.drainer != nil:
+      joinThread(s.drainer[])
+      s.drainer = nil
+    # THE DRAIN CONTEXT IS NOT FREED, as it never was. It holds a reference
+    # to the `Process`, and the drain thread took the process's output
+    # stream by reference: freeing the context drops the last reference
+    # from this thread, and ORC then destroys the stream while unregistering
+    # it from the joined thread's cycle roots, which crashes (SIGSEGV in
+    # `orc.unregisterCycle`, measured with this proc's first version).
+    # Leaking one small allocation per daemon is cheaper than changing how
+    # the drain thread reads the stream.
+    s.drainCtx = nil
+    if s.daemon != nil:
+      s.daemon.close()
+      s.daemon = nil
+  except CatchableError:
+    discard
+
+proc startDaemon*(s: var Study; readyBudgetMillis = DaemonReadyMillis) =
+  ## Starts the study's `runquotad` below `s.root` and returns once it
+  ## answers a handshake, waiting at most `readyBudgetMillis` (a parameter so
+  ## a test can drive the real daemon past its deadline).
+  ##
+  ## THE HELPER OWNS THE DAEMON UNTIL IT RETURNS. `s.daemon` is set before
+  ## the wait, but a caller that has not yet entered the scope that stops it
+  ## would still lose it, so every exit by an exception once the process
+  ## exists -- the wait running out while it is still starting, or a Defect
+  ## -- stops it here, joins the drain thread, and removes the daemon and
+  ## state directories and the log this proc created, leaving `s.daemon`
+  ## nil (reprobuild-pm
+  ## `issues/2026-11-21-runquota-benchmark-harnesses-leak-a-running-daemon-when-start-up-fails.md`;
+  ## the rule is `spec/Benchmark-Designs/Shared-Benchmark-Design-Guidelines.md`,
+  ## "Processes A Harness Starts"). `s.root` is the caller's. A `finally`
+  ## guarded by a flag rather than `except CatchableError`, so a Defect is
+  ## covered too.
   let daemonDir = s.root / "daemon"
-  prepareDir(daemonDir)
   let stateDir = s.root / "state"
-  prepareDir(stateDir)
-  s.daemonSocket = daemonDir / "runquotad.sock"
-  if not fileExists(s.cfg.daemonBin):
-    raise newException(OSError, "missing daemon binary: " & s.cfg.daemonBin)
-  var daemonArgs = @[
-    "--socket", s.daemonSocket,
-    "--host-identity-file", stateDir / "host-id",
-    "--cpu-milli", $s.cfg.cpuMilli,
-    "--memory-bytes", $s.cfg.memoryBytes
-  ]
-  for pool in s.cfg.pools:
-    daemonArgs.add("--pool")
-    daemonArgs.add(pool)
-  # EXTRA DAEMON FLAGS, so the SAME harness can run with and without
-  # capture. Capture is off by default (it costs more than the measurement
-  # budget allows): `--daemon-arg=--measurement --daemon-arg=capture=on`
-  # turns it on. `--daemon-arg=--no-write-stats` turns off the observation store,
-  # its writer thread, the ambient sampler and the self-report intake -- the
-  # exact one-flag control `runquota_m13_bench` established -- and running the
-  # identical build against both daemons is what turns "completion reporting
-  # dominates" into a statement about WHICH PART of completion reporting.
-  for extra in s.cfg.daemonArgs:
-    daemonArgs.add(extra)
-  s.daemon = startProcess(s.cfg.daemonBin, args = daemonArgs,
-    options = {poStdErrToStdOut})
-  s.daemonPid = s.daemon.processID
-  s.daemonLog = s.root / "runquotad.log"
-  s.drainCtx = cast[ptr DrainCtx](allocShared0(sizeof(DrainCtx)))
-  s.drainCtx.running.store(true)
-  s.drainCtx.process = s.daemon
-  s.drainCtx.path = s.daemonLog
-  var drainHandle = new(Thread[ptr DrainCtx])
-  createThread(drainHandle[], drainThread, s.drainCtx)
-  if not waitForSocket(s.daemonSocket, 15000):
-    var tail = ""
-    if fileExists(s.daemonLog):
-      tail = readFile(s.daemonLog)
-    raise newException(OSError, "runquotad did not become reachable at " &
-      s.daemonSocket & "\n--- daemon log ---\n" & tail)
+  var handedBack = false
+  try:
+    prepareDir(daemonDir)
+    prepareDir(stateDir)
+    s.daemonSocket = daemonDir / "runquotad.sock"
+    if not fileExists(s.cfg.daemonBin):
+      raise newException(OSError, "missing daemon binary: " & s.cfg.daemonBin)
+    var daemonArgs = @[
+      "--socket", s.daemonSocket,
+      "--host-identity-file", stateDir / "host-id",
+      "--cpu-milli", $s.cfg.cpuMilli,
+      "--memory-bytes", $s.cfg.memoryBytes
+    ]
+    for pool in s.cfg.pools:
+      daemonArgs.add("--pool")
+      daemonArgs.add(pool)
+    # EXTRA DAEMON FLAGS, so the SAME harness can run with and without
+    # capture. Capture is off by default (it costs more than the measurement
+    # budget allows): `--daemon-arg=--measurement --daemon-arg=capture=on`
+    # turns it on. `--daemon-arg=--no-write-stats` turns off the observation
+    # store, its writer thread, the ambient sampler and the self-report intake
+    # -- the exact one-flag control `runquota_m13_bench` established -- and
+    # running the identical build against both daemons is what turns
+    # "completion reporting dominates" into a statement about WHICH PART of
+    # completion reporting.
+    for extra in s.cfg.daemonArgs:
+      daemonArgs.add(extra)
+    s.daemon = startProcess(s.cfg.daemonBin, args = daemonArgs,
+      options = {poStdErrToStdOut})
+    s.daemonPid = s.daemon.processID
+    s.daemonLog = s.root / "runquotad.log"
+    s.drainCtx = cast[ptr DrainCtx](allocShared0(sizeof(DrainCtx)))
+    s.drainCtx.running.store(true)
+    s.drainCtx.process = s.daemon
+    s.drainCtx.path = s.daemonLog
+    s.drainer = new(Thread[ptr DrainCtx])
+    createThread(s.drainer[], drainThread, s.drainCtx)
+    if not waitForSocket(s.daemonSocket, readyBudgetMillis):
+      var tail = ""
+      if fileExists(s.daemonLog):
+        tail = readFile(s.daemonLog)
+      raise newException(OSError, "runquotad did not become reachable at " &
+        s.daemonSocket & "\n--- daemon log ---\n" & tail)
+    handedBack = true
+  finally:
+    if not handedBack:
+      stopDaemon(s)
+      for dir in [daemonDir, stateDir]:
+        try: removeDir(dir)
+        except CatchableError: discard
+      if s.daemonLog.len > 0:
+        try: removeFile(s.daemonLog)
+        except CatchableError: discard
 
 proc startTap(s: var Study) =
   let tapDir = s.root / "tap"
@@ -849,6 +921,18 @@ proc runStudy(cfg: Config) =
 
   s.root = getTempDir() / ("rq-m1-" & $getCurrentProcessId())
   prepareDir(s.root)
+  # EVERY EXIT STOPS THE DAEMON, not only the one that reaches the report:
+  # the study's `finally` below stops the load probe and the tap and used to
+  # leave a daemon running whenever an invocation or the report raised
+  # (reprobuild-pm
+  # `issues/2026-11-21-runquota-benchmark-harnesses-leak-a-running-daemon-when-start-up-fails.md`).
+  # A `defer`, so it still runs after the report, where it ran before.
+  defer:
+    stopDaemon(s)
+    try:
+      if dirExists(s.root): removeDir(s.root)
+    except CatchableError:
+      discard
   let loadAvgBefore = loadAverage()
 
   var loadState = cast[ptr LoadProbeState](allocShared0(sizeof(LoadProbeState)))
@@ -1074,12 +1158,6 @@ proc runStudy(cfg: Config) =
   else:
     echo b.data
 
-  if s.daemon != nil:
-    if s.daemon.running: s.daemon.terminate()
-    discard s.daemon.waitForExit(5000)
-    s.daemon.close()
-  if dirExists(s.root): removeDir(s.root)
-
 # --- tap overhead control -------------------------------------------------
 
 proc runTapOverhead(cfg: Config) =
@@ -1151,11 +1229,11 @@ proc runTapOverhead(cfg: Config) =
       if p.kind == rqRequestLease:
         tapMeasured.add(float(p.tEndNs - p.tStartNs) / 1000.0)
   finally:
-    if s.daemon != nil:
-      if s.daemon.running: s.daemon.terminate()
-      discard s.daemon.waitForExit(5000)
-      s.daemon.close()
-    if dirExists(s.root): removeDir(s.root)
+    stopDaemon(s)
+    try:
+      if dirExists(s.root): removeDir(s.root)
+    except CatchableError:
+      discard
 
   var b = JsonBuf()
   b.data.add("{")
@@ -1268,11 +1346,11 @@ proc runClientCost(cfg: Config) =
     session.closeSession()
     client.close()
   finally:
-    if s.daemon != nil:
-      if s.daemon.running: s.daemon.terminate()
-      discard s.daemon.waitForExit(5000)
-      s.daemon.close()
-    if dirExists(s.root): removeDir(s.root)
+    stopDaemon(s)
+    try:
+      if dirExists(s.root): removeDir(s.root)
+    except CatchableError:
+      discard
 
   var b = JsonBuf()
   b.data.add("{")
@@ -1316,4 +1394,5 @@ proc main() =
     stderr.writeLine("unknown --mode=" & cfg.mode)
     quit 2
 
-main()
+when isMainModule:
+  main()

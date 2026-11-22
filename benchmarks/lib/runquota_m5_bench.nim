@@ -1,4 +1,4 @@
-import std/[algorithm, math, os, osproc, strutils, times]
+import std/[algorithm, math, monotimes, os, osproc, strutils, times]
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
@@ -121,10 +121,14 @@ proc daemonPath(): string =
   # `addFileExt`: the build writes `runquotad.exe` on Windows.
   repoRoot() / "build" / "bin" / addFileExt("runquotad", ExeExt)
 
-proc waitForDaemon(socketPath: string) =
+const DaemonReadyMillis* = 5_000
+  ## How long `startDaemon` waits for its daemon to accept a client.
+
+proc waitForDaemon(socketPath: string; budgetMillis: int) =
   putEnv("RUNQUOTA_SOCKET", socketPath)
-  var lastError = ""
-  for _ in 0 ..< 100:
+  var lastError = "no attempt within the budget"
+  let deadline = getMonoTime() + initDuration(milliseconds = budgetMillis)
+  while getMonoTime() < deadline:
     try:
       var client = connectDefault()
       client.close()
@@ -134,28 +138,58 @@ proc waitForDaemon(socketPath: string) =
       sleep(50)
   raise newException(OSError, "runquotad did not become ready: " & lastError)
 
-proc startDaemon(socketPath: string): Process =
+proc stopDaemon*(daemon: var Process) =
+  ## Ends a daemon this benchmark started: SIGTERM, then SIGKILL if it has
+  ## not exited within 3 s, and reaps and closes it. Raises nothing, so it
+  ## is safe in a `finally` that must not mask the exception propagating.
+  try:
+    if daemon.running:
+      daemon.terminate()
+      discard daemon.waitForExit(3000)
+    if daemon.running:
+      daemon.kill()
+      discard daemon.waitForExit(3000)
+    daemon.close()
+  except CatchableError:
+    discard
+
+proc startDaemon*(socketPath: string;
+                  readyBudgetMillis = DaemonReadyMillis): Process =
+  ## Starts `runquotad` on `socketPath` and returns it once a client can
+  ## connect, waiting at most `readyBudgetMillis` (a parameter so a test can
+  ## drive the real daemon past its deadline).
+  ##
+  ## THE HELPER OWNS THE DAEMON UNTIL IT RETURNS. The caller receives the
+  ## `Process` only from the return value, so a daemon this proc has started
+  ## and then leaves by an exception -- the wait running out while it is
+  ## still starting, or a Defect -- is stopped here. Before this, the wait
+  ## raised with the daemon still running and nobody holding it (reprobuild-pm
+  ## `issues/2026-11-21-runquota-benchmark-harnesses-leak-a-running-daemon-when-start-up-fails.md`;
+  ## the rule is `spec/Benchmark-Designs/Shared-Benchmark-Design-Guidelines.md`,
+  ## "Processes A Harness Starts"). The socket directory is the caller's, so
+  ## the caller removes it. A `finally` guarded by a flag rather than
+  ## `except CatchableError`, so a Defect is covered too.
   if not fileExists(daemonPath()):
     raise newException(OSError, "missing " & daemonPath() & "; run just build first")
-  result = startProcess(
-    daemonPath(),
-    args = [
-      "--socket", socketPath,
-      # The host state beside the benchmark's socket, never the machine's:
-      # a benchmark daemon must not write rows into the host-wide store.
-      "--host-identity-file", socketPath.parentDir / "host-id",
-      "--cpu-milli", "8000",
-      "--memory-bytes", $((8'u64 * 1024'u64 * 1024'u64 * 1024'u64))
-    ],
-    options = {poStdErrToStdOut}
-  )
-  waitForDaemon(socketPath)
-
-proc stopDaemon(daemon: var Process) =
-  if daemon.running:
-    daemon.terminate()
-    discard daemon.waitForExit(3000)
-  daemon.close()
+  var handedBack = false
+  try:
+    result = startProcess(
+      daemonPath(),
+      args = [
+        "--socket", socketPath,
+        # The host state beside the benchmark's socket, never the machine's:
+        # a benchmark daemon must not write rows into the host-wide store.
+        "--host-identity-file", socketPath.parentDir / "host-id",
+        "--cpu-milli", "8000",
+        "--memory-bytes", $((8'u64 * 1024'u64 * 1024'u64 * 1024'u64))
+      ],
+      options = {poStdErrToStdOut}
+    )
+    waitForDaemon(socketPath, readyBudgetMillis)
+    handedBack = true
+  finally:
+    if not handedBack and result != nil:
+      stopDaemon(result)
 
 proc req(label: string): ResourceRequest =
   resourceRequest(label, milliCpu(100), bytes(1024 * 1024))
@@ -224,13 +258,17 @@ proc runProcessSuite(quick: bool): seq[BenchMetric] =
   if dirExists(socketDir):
     removeScratchRoot(socketDir)
   createDir(socketDir)
-  let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
-  defer: restorePrivateBrokerPolicy(endpointPolicy)
-  # Use the declared fixture policy for this endpoint. Private broker cases
-  # bind its independently inspected GID before this mode and all participants.
-  setFilePermissions(socketDir, endpointDirectoryPermissions())
-  var daemon = startDaemon(socketPath)
+  # The try opens as soon as the scratch directory exists, so a failure in
+  # the endpoint set-up or in `startDaemon` still removes it; `startDaemon`
+  # stops its own daemon when it raises, so there is none to stop then.
+  var daemon: Process = nil
   try:
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    # Use the declared fixture policy for this endpoint. Private broker cases
+    # bind its independently inspected GID before this mode and all participants.
+    setFilePermissions(socketDir, endpointDirectoryPermissions())
+    daemon = startDaemon(socketPath)
     result.addBackend("process-execution")
 
     let rawNull = measureLatencies(count, proc () =
@@ -369,7 +407,8 @@ proc runProcessSuite(quick: bool): seq[BenchMetric] =
     session.closeSession()
     client.close()
   finally:
-    stopDaemon(daemon)
+    if daemon != nil:
+      stopDaemon(daemon)
     if dirExists(socketDir):
       removeScratchRoot(socketDir)
 
@@ -381,13 +420,17 @@ proc runIpcSuite(quick: bool): seq[BenchMetric] =
   if dirExists(socketDir):
     removeScratchRoot(socketDir)
   createDir(socketDir)
-  let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
-  defer: restorePrivateBrokerPolicy(endpointPolicy)
-  # Use the declared fixture policy for this endpoint. Private broker cases
-  # bind its independently inspected GID before this mode and all participants.
-  setFilePermissions(socketDir, endpointDirectoryPermissions())
-  var daemon = startDaemon(socketPath)
+  # The try opens as soon as the scratch directory exists, so a failure in
+  # the endpoint set-up or in `startDaemon` still removes it; `startDaemon`
+  # stops its own daemon when it raises, so there is none to stop then.
+  var daemon: Process = nil
   try:
+    let endpointPolicy = bindPrivateBrokerPolicyToCaller(privateEndpointGroup(socketDir))
+    defer: restorePrivateBrokerPolicy(endpointPolicy)
+    # Use the declared fixture policy for this endpoint. Private broker cases
+    # bind its independently inspected GID before this mode and all participants.
+    setFilePermissions(socketDir, endpointDirectoryPermissions())
+    daemon = startDaemon(socketPath)
     result.addBackend("ipc-latency")
 
     let handshake = measureLatencies(count, proc () =
@@ -464,7 +507,8 @@ proc runIpcSuite(quick: bool): seq[BenchMetric] =
     session.closeSession()
     client.close()
   finally:
-    stopDaemon(daemon)
+    if daemon != nil:
+      stopDaemon(daemon)
     if dirExists(socketDir):
       removeScratchRoot(socketDir)
 
@@ -485,4 +529,5 @@ proc main() =
       runProcessSuite(quick)
   emitJson(metrics)
 
-main()
+when isMainModule:
+  main()

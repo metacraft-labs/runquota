@@ -241,7 +241,7 @@ proc syntheticCase(cfg: GateConfig; scratch: string): GateCase =
 # ---------------------------------------------------------------------------
 
 type
-  PrivateDaemon = object
+  PrivateDaemon* = object
     pid: Pid
     socket: string
     log: string
@@ -276,53 +276,11 @@ proc inspectObservations(socket: string): JsonNode =
   defer: client.close()
   parseJson(client.inspectionJson("observations"))
 
-proc startDaemon(cfg: GateConfig; root: string; arm: Arm;
-                 switches: string): PrivateDaemon =
-  let dir = root / $arm
-  createDir(dir)
-  # The daemon refuses an endpoint directory anyone else could enter.
-  setFilePermissions(dir, {fpUserRead, fpUserWrite, fpUserExec})
-  result.socket = dir / "rq.sock"
-  result.log = dir / "runquotad.log"
-  if result.socket.len > 100:
-    raise newException(ValueError, "socket path too long for a Unix " &
-      "socket (" & $result.socket.len & " bytes): " & result.socket &
-      "; set TMPDIR to a shorter directory")
-  var args = @[cfg.daemonBin,
-    "--socket", result.socket,
-    "--host-config", dir / "host.toml",
-    "--host-identity-file", dir / "host-id",
-    "--observation-db", dir / "observations.sqlite3",
-    "--estimate-db", dir / "estimates.sqlite3",
-    "--cpu-milli", $cfg.cpuMilli,
-    "--memory-bytes", $cfg.memoryBytes,
-    "--measurement", switches]
-  # `metrics-export` writes a file only where one is named, and refuses an
-  # `=on` that names none; the arm that takes it writes into its own
-  # directory, at the daemon's default cadence.
-  var parsed: MeasurementSet
-  if applyMeasurementSwitches(switches, parsed) == "" and
-      measureMetricsExport in parsed:
-    args.add(["--metrics-textfile", dir / "runquota.prom"])
-  result.pid = spawnChild(args, daemonEnv(), dir, result.log)
-  let deadline = getMonoTime() + initDuration(seconds = 60)
-  var lastError = ""
-  while getMonoTime() < deadline:
-    var status: cint
-    if waitpid(result.pid, status, WNOHANG) == result.pid:
-      raise newException(OSError, "runquotad (" & $arm & ") exited during " &
-        "start-up; log " & result.log & ":\n" & readFile(result.log))
-    try:
-      discard inspectObservations(result.socket)
-      return
-    except CatchableError as err:
-      lastError = err.msg
-      sleep(50)
-  raise newException(OSError, "runquotad (" & $arm & ") did not answer at " &
-    result.socket & " within 60 s: " & lastError)
-
-proc stopDaemon(daemon: PrivateDaemon) =
-  ## Ends a daemon THIS GATE started, by its pid, politely.
+proc stopDaemon*(daemon: PrivateDaemon) =
+  ## Ends a daemon THIS GATE started, by its pid: SIGTERM, then SIGKILL if it
+  ## has not exited within 20 s, and reaps it. A pid of 0 (never started, or
+  ## already reaped) is nothing to stop. Raises nothing, so it is safe in a
+  ## `finally` that must not mask the exception being propagated.
   if daemon.pid <= 0:
     return
   discard kill(daemon.pid, SIGTERM)
@@ -334,6 +292,89 @@ proc stopDaemon(daemon: PrivateDaemon) =
     sleep(50)
   discard kill(daemon.pid, SIGKILL)
   discard waitpid(daemon.pid, status, 0)
+
+const DaemonReadyMillis* = 60_000
+  ## How long `startDaemon` waits for a daemon to answer by default.
+
+proc startDaemon*(cfg: GateConfig; root: string; arm: Arm; switches: string;
+                  readyBudgetMillis = DaemonReadyMillis): PrivateDaemon =
+  ## Starts the arm's private `runquotad` in `root / $arm` and returns it
+  ## once it answers an observation inspection, waiting at most
+  ## `readyBudgetMillis` (a parameter so a test can drive the real daemon
+  ## past its deadline).
+  ##
+  ## THE HELPER OWNS THE DAEMON UNTIL IT RETURNS. The caller receives the
+  ## pid only from the return value, so a daemon this proc has spawned and
+  ## then leaves by an exception -- the wait running out while it is still
+  ## starting, a refused inspection, or a Defect -- is stopped here, and the
+  ## arm directory, which this proc created and only the daemon has used, is
+  ## removed. Before this, the wait raised with the daemon still running and
+  ## nobody holding its pid (reprobuild-pm
+  ## `issues/2026-11-21-runquota-benchmark-harnesses-leak-a-running-daemon-when-start-up-fails.md`;
+  ## the rule is `spec/Benchmark-Designs/Shared-Benchmark-Design-Guidelines.md`,
+  ## "Processes A Harness Starts"). A `finally` guarded by a flag rather than
+  ## `except CatchableError`, so a Defect is covered too, and nothing in the
+  ## cleanup raises over the exception being propagated.
+  let dir = root / $arm
+  let createdDir = not dirExists(dir)
+  var handedBack = false
+  try:
+    createDir(dir)
+    # The daemon refuses an endpoint directory anyone else could enter.
+    setFilePermissions(dir, {fpUserRead, fpUserWrite, fpUserExec})
+    result.socket = dir / "rq.sock"
+    result.log = dir / "runquotad.log"
+    if result.socket.len > 100:
+      raise newException(ValueError, "socket path too long for a Unix " &
+        "socket (" & $result.socket.len & " bytes): " & result.socket &
+        "; set TMPDIR to a shorter directory")
+    var args = @[cfg.daemonBin,
+      "--socket", result.socket,
+      "--host-config", dir / "host.toml",
+      "--host-identity-file", dir / "host-id",
+      "--observation-db", dir / "observations.sqlite3",
+      "--estimate-db", dir / "estimates.sqlite3",
+      "--cpu-milli", $cfg.cpuMilli,
+      "--memory-bytes", $cfg.memoryBytes,
+      "--measurement", switches]
+    # `metrics-export` writes a file only where one is named, and refuses an
+    # `=on` that names none; the arm that takes it writes into its own
+    # directory, at the daemon's default cadence.
+    var parsed: MeasurementSet
+    if applyMeasurementSwitches(switches, parsed) == "" and
+        measureMetricsExport in parsed:
+      args.add(["--metrics-textfile", dir / "runquota.prom"])
+    result.pid = spawnChild(args, daemonEnv(), dir, result.log)
+    let deadline = getMonoTime() +
+      initDuration(milliseconds = readyBudgetMillis)
+    var lastError = ""
+    while getMonoTime() < deadline:
+      var status: cint
+      if waitpid(result.pid, status, WNOHANG) == result.pid:
+        # Reaped here: the pid is no longer this daemon's, and the cleanup
+        # below must not signal whatever process reuses it.
+        result.pid = 0
+        raise newException(OSError, "runquotad (" & $arm & ") exited " &
+          "during start-up; log " & result.log & ":\n" & readFile(result.log))
+      try:
+        discard inspectObservations(result.socket)
+        handedBack = true
+        return
+      except CatchableError as err:
+        lastError = err.msg
+        sleep(50)
+    raise newException(OSError, "runquotad (" & $arm & ") did not answer at " &
+      result.socket & " within " & $readyBudgetMillis & " ms: " & lastError)
+  finally:
+    if not handedBack:
+      stopDaemon(result)
+      # Reaped now. Should the compiler have built `result` in the caller's
+      # own location (a return-value optimisation), the caller must not find
+      # this pid there and signal whatever process reuses it.
+      result.pid = 0
+      if createdDir:
+        try: removeDir(dir)
+        except CatchableError: discard
 
 proc verifyDaemonMeasurements(daemon: PrivateDaemon; arm: Arm;
                               wanted: MeasurementSet): JsonNode =
@@ -465,6 +506,20 @@ proc reprobuildCase(cfg: GateConfig; scratch: string): GateCase =
       "measurement switches. Rebuild it with RUNQUOTA_SRC pointing at this " &
       "checkout")
   var daemons: array[Arm, PrivateDaemon]
+  # THE CASE OWNS ITS DAEMONS UNTIL IT RETURNS. `main` stops a case only
+  # once `makeCase` has handed it back, so a failure after the first arm's
+  # daemon is up -- the second arm's start-up, a refused measurement check, a
+  # fixture copy -- stops every daemon already started before it propagates
+  # (reprobuild-pm
+  # `issues/2026-11-21-runquota-benchmark-harnesses-leak-a-running-daemon-when-start-up-fails.md`).
+  # An arm that never started holds pid 0, which `stopDaemon` skips.
+  # A `defer` (a `finally` over the rest of the proc), so a Defect is
+  # covered too.
+  var handedBack = false
+  defer:
+    if not handedBack:
+      for arm in Arm:
+        stopDaemon(daemons[arm])
   var reported = newJObject()
   var switches: array[Arm, string]
   var projects: array[Arm, string]
@@ -521,6 +576,7 @@ proc reprobuildCase(cfg: GateConfig; scratch: string): GateCase =
     "memory_bytes": $cfg.memoryBytes,
     "daemon_reported_measurements": reported,
   }
+  handedBack = true
 
 # ---------------------------------------------------------------------------
 # run-64: the same 64 actions, each through `runquota run`
@@ -657,13 +713,28 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
   var cgroupRoots: array[Arm, string] = ["off", "off"]
   var probe = newJNull()
   let gateRoot = if cfg.switch == "cgroups": gateCgroupRoot() else: ""
+  var daemons: array[Arm, PrivateDaemon]
+  # THE CASE OWNS WHAT IT SET UP UNTIL IT RETURNS: the daemons of the arms
+  # already started, and the gate's cgroup root, which the migration probe
+  # populates. `main` calls `stop` only on a case `makeCase` handed back, so
+  # a failure on the way -- the probe, the second arm's start-up, a work
+  # directory -- undoes both here before it propagates (reprobuild-pm
+  # `issues/2026-11-21-runquota-benchmark-harnesses-leak-a-running-daemon-when-start-up-fails.md`).
+  # A `defer` (a `finally` over the rest of the proc), so a Defect is
+  # covered too; the cleanup raises nothing over the propagating exception.
+  var handedBack = false
+  defer:
+    if not handedBack:
+      for arm in Arm:
+        stopDaemon(daemons[arm])
+      try: removeGateCgroups(gateRoot)
+      except CatchableError: discard
   if cfg.switch == "cgroups":
     if gateRoot.len == 0:
       raise newException(CaseUnavailable, "--switch=cgroups needs a " &
         "delegated cgroup v2 subtree for this user, and there is none")
     cgroupRoots[armOn] = gateRoot
     probe = migrationProbe(gateRoot)
-  var daemons: array[Arm, PrivateDaemon]
   var switches: array[Arm, string]
   var dirs: array[Arm, string]
   for arm in Arm:
@@ -712,6 +783,7 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
     "cgroup_root": {"off": cgroupRoots[armOff], "on": cgroupRoots[armOn]},
     "migration_probe": probe,
   }
+  handedBack = true
 
 # ---------------------------------------------------------------------------
 # The loop

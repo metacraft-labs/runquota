@@ -55,7 +55,7 @@
 ## because a `runs` row is per session and per-execution cost is what the
 ## gate asks for.
 
-import std/[algorithm, math, os, osproc, strutils, times]
+import std/[algorithm, math, monotimes, os, osproc, strutils, times]
 
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
@@ -154,10 +154,14 @@ proc prepareStateDir(path: string) =
   setFilePermissions(path, {fpUserRead, fpUserWrite, fpUserExec,
     fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
 
-proc waitForDaemon(socketPath: string) =
+const DaemonReadyMillis* = 5_000
+  ## How long `startArmDaemon` waits for its daemon to accept a client.
+
+proc waitForDaemon(socketPath: string; budgetMillis: int) =
   putEnv("RUNQUOTA_SOCKET", socketPath)
-  var lastError = ""
-  for _ in 0 ..< 200:
+  var lastError = "no attempt within the budget"
+  let deadline = getMonoTime() + initDuration(milliseconds = budgetMillis)
+  while getMonoTime() < deadline:
     try:
       var probe = connectDefault()
       probe.close()
@@ -167,8 +171,36 @@ proc waitForDaemon(socketPath: string) =
       sleep(25)
   raise newException(OSError, "runquotad did not become ready: " & lastError)
 
-proc startArmDaemon(socketPath, identityFile: string;
-                    captureOn: bool): Process =
+proc stopDaemon*(daemon: var Process) =
+  ## Ends a daemon this benchmark started: SIGTERM, then SIGKILL if it has
+  ## not exited within 5 s, and reaps and closes it. Raises nothing, so it
+  ## is safe in a `finally` that must not mask the exception propagating.
+  try:
+    if daemon.running:
+      daemon.terminate()
+      discard daemon.waitForExit(5000)
+    if daemon.running:
+      daemon.kill()
+      discard daemon.waitForExit(5000)
+    daemon.close()
+  except CatchableError:
+    discard
+
+proc startArmDaemon*(socketPath, identityFile: string; captureOn: bool;
+                     readyBudgetMillis = DaemonReadyMillis): Process =
+  ## Starts one arm's `runquotad` and returns it once a client can connect,
+  ## waiting at most `readyBudgetMillis` (a parameter so a test can drive the
+  ## real daemon past its deadline).
+  ##
+  ## THE HELPER OWNS THE DAEMON UNTIL IT RETURNS: a daemon this proc has
+  ## started and then leaves by an exception -- the wait running out while
+  ## it is still starting, or a Defect -- is stopped here, because the caller
+  ## has not received the `Process` yet (reprobuild-pm
+  ## `issues/2026-11-21-runquota-benchmark-harnesses-leak-a-running-daemon-when-start-up-fails.md`;
+  ## the rule is `spec/Benchmark-Designs/Shared-Benchmark-Design-Guidelines.md`,
+  ## "Processes A Harness Starts"). The socket and state directories are the
+  ## caller's. A `finally` guarded by a flag rather than `except
+  ## CatchableError`, so a Defect is covered too.
   if not fileExists(daemonPath()):
     raise newException(OSError,
       "missing " & daemonPath() & "; run `just build` first")
@@ -185,18 +217,15 @@ proc startArmDaemon(socketPath, identityFile: string;
     args.add(["--measurement", "capture=on"])
   else:
     args.add("--no-write-stats")
-  result = startProcess(daemonPath(), args = args,
-    options = {poStdErrToStdOut})
-  waitForDaemon(socketPath)
-
-proc stopDaemon(daemon: var Process) =
-  if daemon.running:
-    daemon.terminate()
-    discard daemon.waitForExit(5000)
-  if daemon.running:
-    daemon.kill()
-    discard daemon.waitForExit(5000)
-  daemon.close()
+  var handedBack = false
+  try:
+    result = startProcess(daemonPath(), args = args,
+      options = {poStdErrToStdOut})
+    waitForDaemon(socketPath, readyBudgetMillis)
+    handedBack = true
+  finally:
+    if not handedBack and result != nil:
+      stopDaemon(result)
 
 proc timeOneExecution(session: var RunQuotaSession; label: string;
                       statsKey: string): float =
@@ -229,17 +258,15 @@ proc runOverheadSuite(quick: bool): seq[BenchMetric] =
   let controlSocketDir = root / "off"
   let captureState = root / "on-state"
   let controlState = root / "off-state"
-  prepareDir(root)
-  setFilePermissions(root, {fpUserRead, fpUserWrite, fpUserExec})
-  prepareDir(captureSocketDir)
-  prepareDir(controlSocketDir)
-  prepareStateDir(captureState)
-  prepareStateDir(controlState)
   let captureSocket = captureSocketDir / "d.sock"
   let controlSocket = controlSocketDir / "d.sock"
+  prepareDir(root)
 
-  var captureDaemon = startArmDaemon(captureSocket,
-    captureState / "host-id", captureOn = true)
+  # The try opens as soon as `root` exists, so a failure in the rest of the
+  # set-up -- the arm directories, either daemon's start-up -- still stops the
+  # daemon already started and removes `root`. `startArmDaemon` stops its own
+  # daemon when it raises, so a nil handle below means there is none.
+  var captureDaemon: Process = nil
   var controlDaemon: Process = nil
   var keyedCapture: seq[float] = @[]
   var keyedControl: seq[float] = @[]
@@ -249,6 +276,13 @@ proc runOverheadSuite(quick: bool): seq[BenchMetric] =
   var keylessPaired: seq[float] = @[]
   var storeRows = 0
   try:
+    setFilePermissions(root, {fpUserRead, fpUserWrite, fpUserExec})
+    prepareDir(captureSocketDir)
+    prepareDir(controlSocketDir)
+    prepareStateDir(captureState)
+    prepareStateDir(controlState)
+    captureDaemon = startArmDaemon(captureSocket,
+      captureState / "host-id", captureOn = true)
     controlDaemon = startArmDaemon(controlSocket,
       controlState / "host-id", captureOn = false)
 
@@ -328,7 +362,8 @@ proc runOverheadSuite(quick: bool): seq[BenchMetric] =
       raise newException(ValueError,
         "the control arm wrote a store; it is not a control")
   finally:
-    stopDaemon(captureDaemon)
+    if captureDaemon != nil:
+      stopDaemon(captureDaemon)
     if controlDaemon != nil:
       stopDaemon(controlDaemon)
     if dirExists(root):
@@ -403,4 +438,5 @@ proc main() =
       raise newException(ValueError, "unknown argument: " & arg)
   emitJson(runOverheadSuite(quick))
 
-main()
+when isMainModule:
+  main()
