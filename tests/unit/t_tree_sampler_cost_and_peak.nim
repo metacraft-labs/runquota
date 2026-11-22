@@ -6,12 +6,24 @@
 ## 1. A WALK ONLY WHEN A SAMPLE IS DUE. However often the caller polls, the
 ##    launcher reads its tree at most once per `tree-sampling` interval
 ##    (0.1 s), never at the first poll after the fork, and with only
-##    `profiles` on, once per profile interval (1 s). With both on, one walk
-##    serves both: no more walks than tree sampling alone. Counted with
-##    `LaunchedProcess.treeWalks`, so the rule is asserted on the work done
-##    and not on a stopwatch. Falsifying mutation: walk the tree at every
-##    poll regardless of the cadence; the 1 ms poll loop below then makes
-##    hundreds of walks and every bound fails.
+##    `profiles` on, once per profile interval (1 s). With both on, a walk
+##    due for both is one walk, and the profile adds a walk of its own only
+##    when its interval ends between two tree samples: at most one per
+##    profile interval. Counted with `LaunchedProcess.treeWalks`, so the
+##    rule is asserted on the work done.
+##
+##    THE BOUND IS THE RUN'S MEASURED LENGTH, NOT ITS NOMINAL ONE. Each case
+##    times its own run, launch to completion, and allows one walk per
+##    interval that has passed. A run longer than its nominal `sleep` is
+##    walked more often, and that is the specified cadence, not a defect:
+##    a fixed bound of 14 walks for `sleep 1` failed with 15, 16 and 24
+##    walks on loaded hosts (load 24-25 on nixos-ci-bare-002), where the run
+##    took up to 2.3 s. To recreate those conditions on demand, run the test
+##    binary under a CPU quota:
+##    `systemd-run --user --scope -p CPUQuota=2% -- ./t_tree_sampler_cost_and_peak`.
+##    Falsifying mutation: walk the tree at every poll regardless of the
+##    cadence; the 1 ms poll loop below then makes hundreds of walks in a
+##    run of a second or two, and every bound fails.
 ## 2. THE SAMPLED PEAK IS THE TREE'S. Four processes each holding 48 MiB at
 ##    once are sampled as one tree, so the completion's peak exceeds what
 ##    the totals alone report -- `ru_maxrss`, the largest SINGLE process --
@@ -26,7 +38,7 @@
 ## file. NO MOCKS: real processes, the real `/proc`.
 
 when defined(linux):
-  import std/[monotimes, os, strutils, times, unittest]
+  import std/[math, monotimes, os, strutils, times, unittest]
 
   import runquota_core
   import runquota_process
@@ -40,6 +52,13 @@ when defined(linux):
     treeSampleIntervalSeconds = 0.1
       ## `runquota_process`'s `treeSampleIntervalSeconds`, which it does not
       ## export; the header above states the same interval.
+    profileIntervalSeconds = BaseCpuProfileIntervalMillis.float / 1000.0
+      ## The profile's first interval. It doubles only once a profile holds
+      ## `MaxCpuProfileSamples` samples, far beyond these few seconds.
+    launcherClockSeconds = 0.001
+      ## The profile's due test reads a monotonic clock truncated to whole
+      ## milliseconds at the launch and at each poll, so a profile walk can
+      ## come up to 1 ms before a full interval has really passed.
 
   if paramCount() >= 3 and paramStr(1) == "--hold":
     # Allocate and TOUCH every page, so the resident set really is that
@@ -74,30 +93,65 @@ when defined(linux):
     while not result.pollCompletion():
       sleep(1)
 
+  proc pollTightlyTimed(argv: seq[string];
+                        elapsedSeconds: var float): LaunchedProcess =
+    ## `pollTightly`, timed from before the launch to the completion. Every
+    ## walk falls inside that span, so it bounds the walks the cadence
+    ## allows however long the host made the run.
+    let started = getMonoTime()
+    result = pollTightly(argv)
+    elapsedSeconds = (getMonoTime() - started).inNanoseconds.float / 1e9
+
+  proc treeWalksAllowed(elapsedSeconds: float): float =
+    ## One tree walk per tree interval that has passed: each comes at least
+    ## one interval after the launch or the previous one.
+    elapsedSeconds / treeSampleIntervalSeconds
+
+  proc profileWalksAllowed(elapsedSeconds: float): float =
+    ## One profile walk per profile interval that has passed, on the
+    ## launch-relative grid (`CpuProfileSampler.nextDueMillis`).
+    floor((elapsedSeconds + launcherClockSeconds) / profileIntervalSeconds)
+
   suite "tree sampler cost":
     test "tree sampling walks the tree only when a sample is due":
       withMeasurement("tree-sampling=on,profiles=off") do ():
-        let child = pollTightly(@["/bin/sh", "-c", "sleep 1"])
-        checkpoint "walks: " & $child.treeWalks
-        # One walk per 0.1 s of a ~1 s run, none at launch: about 10. The
-        # bound leaves room for a slow exit, not for a walk per poll.
+        var elapsedSeconds = 0.0
+        let child = pollTightlyTimed(@["/bin/sh", "-c", "sleep 1"],
+                                     elapsedSeconds)
+        checkpoint "walks: " & $child.treeWalks & " in " & $elapsedSeconds & " s"
+        check child.completion.exited
+        check child.completion.exitCode == 0
+        # One walk per 0.1 s of a run of at least 1 s, none at launch: about
+        # 10 on an idle host, more when the host stretches the run.
         check child.treeWalks >= 5'u32
-        check child.treeWalks <= 14'u32
+        check child.treeWalks.float <= treeWalksAllowed(elapsedSeconds)
         check child.completion.peakResidentMemoryBytes > 0'u64
 
     test "profiles alone walk once per profile interval":
       withMeasurement("tree-sampling=off,profiles=on") do ():
-        let child = pollTightly(@["/bin/sh", "-c", "sleep 2.2"])
-        checkpoint "walks: " & $child.treeWalks
+        var elapsedSeconds = 0.0
+        let child = pollTightlyTimed(@["/bin/sh", "-c", "sleep 2.2"],
+                                     elapsedSeconds)
+        checkpoint "walks: " & $child.treeWalks & " in " & $elapsedSeconds & " s"
+        check child.completion.exited
+        check child.completion.exitCode == 0
+        # Due at 1 s and 2 s of a 2.2 s run: 2 walks on an idle host.
         check child.treeWalks >= 1'u32
-        check child.treeWalks <= 3'u32
+        check child.treeWalks.float <= profileWalksAllowed(elapsedSeconds)
         check child.completion.cpuProfile.present
 
     test "both on share one walk":
       withMeasurement("tree-sampling=on,profiles=on") do ():
-        let child = pollTightly(@["/bin/sh", "-c", "sleep 1"])
-        checkpoint "walks: " & $child.treeWalks
-        check child.treeWalks <= 14'u32
+        var elapsedSeconds = 0.0
+        let child = pollTightlyTimed(@["/bin/sh", "-c", "sleep 1"],
+                                     elapsedSeconds)
+        checkpoint "walks: " & $child.treeWalks & " in " & $elapsedSeconds & " s"
+        check child.completion.exited
+        check child.completion.exitCode == 0
+        # The tree's walks, plus at most one of the profile's own per profile
+        # interval: about 11 on an idle host.
+        check child.treeWalks.float <= treeWalksAllowed(elapsedSeconds) +
+          profileWalksAllowed(elapsedSeconds)
         check child.completion.cpuProfile.present
 
     test "a command shorter than one interval is not walked at all":
@@ -121,7 +175,10 @@ when defined(linux):
         # whole life, so a sampler that walked at launch or at every 1 ms
         # poll still fails it.
         checkpoint "walks: " & $child.treeWalks & " in " & $elapsedSeconds & " s"
-        check child.treeWalks.float <= elapsedSeconds / treeSampleIntervalSeconds
+        # Profiles are on too, so a run stretched past a profile interval
+        # may also take the profile's walk.
+        check child.treeWalks.float <= treeWalksAllowed(elapsedSeconds) +
+          profileWalksAllowed(elapsedSeconds)
         # Its peak then comes from the totals, which the daemon takes.
         check child.completion.totals.known
         check child.completion.totals.maxRssBytes > 0'u64
