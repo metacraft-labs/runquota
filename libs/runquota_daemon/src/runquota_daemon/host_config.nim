@@ -217,6 +217,23 @@ proc fail(path: string; lineNo: int; msg: string) {.noreturn.} =
     path & ":" & $lineNo & ": " & msg & " (runquota host configuration; see " &
     "reprobuild-specs/RunQuota-Host-Configuration.md)")
 
+proc isBareKey(name: string): bool =
+  ## A bare TOML key: letters, digits, `_` and `-`
+  ## (https://toml.io/en/v1.0.0#keys). It is the only key form the file's
+  ## subset has. A pool name outside it (`a.b`, `host/linker`) would need a
+  ## quoted or dotted key, which the subset does not model, so the reader and
+  ## `runquota config set` both refuse it, and such a pool is sized only by a
+  ## `--pool` flag or by its declared capacity (*Limitation* under *Pools a
+  ## build declares* in RunQuota-Host-Configuration.md).
+  if name.len == 0:
+    return false
+  for ch in name:
+    if ch notin {'A' .. 'Z', 'a' .. 'z', '0' .. '9', '_', '-'}:
+      return false
+  true
+
+const PoolNameRule = "must be letters, digits, `_` or `-`"
+
 proc stripComment(line: string): string =
   ## A `#` outside a double-quoted string starts a comment.
   var inString = false
@@ -441,6 +458,10 @@ proc parseHostConfig*(text, path: string): HostConfig =
         fail(path, lineNo, "unknown key `" & key & "` in [machine]; " &
           "expected memory_bytes, cpu_milli or write_bytes_per_sec")
     of "pools":
+      # Checked before the value: the key is what the subset cannot hold,
+      # and a hand edit must not size a pool `runquota config set` refuses.
+      if not key.isBareKey:
+        fail(path, lineNo, "pool name `" & key & "` " & PoolNameRule)
       let v = parseInteger(value, path, lineNo)
       # A zero cap admits nothing: `possible` refuses every lease in a pool
       # whose cap is 0.
@@ -677,14 +698,6 @@ type
       ## `reservation.<class>`
     name*: string
 
-proc isBareKey(name: string): bool =
-  if name.len == 0:
-    return false
-  for ch in name:
-    if ch notin {'A' .. 'Z', 'a' .. 'z', '0' .. '9', '_', '-'}:
-      return false
-  true
-
 proc parseHostConfigKey*(key: string): HostConfigKey =
   ## `machine.memory_bytes`, `machine.cpu_milli`, `pools.NAME`,
   ## `admission.order`, `admission.max-wait`,
@@ -726,11 +739,10 @@ proc parseHostConfigKey*(key: string): HostConfigKey =
       raise newException(HostConfigError, "unknown key `" & key &
         "`; [machine] has memory_bytes, cpu_milli and write_bytes_per_sec")
   of "pools":
-    # A pool name is a bare TOML key. Anything else would need quoting, and
-    # the reader does not model quoted keys.
+    # A pool name is a bare TOML key; the reader applies the same rule.
     if not result.name.isBareKey:
       raise newException(HostConfigError, "pool name `" & result.name &
-        "` must be letters, digits, `_` or `-`")
+        "` " & PoolNameRule)
   of "admission":
     if result.name notin ["order", "max-wait", "share-between-users",
         "predictive", "horizon", "pressure-high", "pressure-low",

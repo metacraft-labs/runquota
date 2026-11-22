@@ -90,6 +90,26 @@ suite "host config":
     check refusal("[pools]\ncompile = [1, 2]\n").contains("integer")
     check refusal("[pools]\ncompile = 0\n").contains("positive")
 
+  test "a [pools] key outside the bare-key rule is refused, as config set refuses it":
+    # RunQuota-Host-Configuration.md, *Pools a build declares*, *Limitation*:
+    # the file's keys are bare TOML keys (`A-Z a-z 0-9 _ -`), so a pool whose
+    # name has a `.` or `/` cannot be sized in the file. The reader used to
+    # take whatever preceded the `=` as the pool name, so a hand edit sized
+    # pools that `runquota config set` refuses to write.
+    for key in ["a.b", "my pool", "host/linker", "nim_pty.pty-serial",
+        "\"compile\"", "'compile'", "pöol"]:
+      let msg = refusal("[pools]\n" & key & " = 3\n")
+      checkpoint key & " -> " & msg
+      check msg.contains("host.toml:2:")
+      check msg.contains("letters, digits, `_` or `-`")
+      expect HostConfigError:
+        discard parseHostConfigKey("pools." & key)
+    # The rule is the same one on both sides: what the reader accepts, the
+    # CLI accepts, and the edge characters of the rule are inside it.
+    let host = parseHostConfig("[pools]\nA-z_09 = 3\n", "host.toml")
+    check host.pools["A-z_09"] == 3'u32
+    check parseHostConfigKey("pools.A-z_09").name == "A-z_09"
+
   test "a missing file is the empty configuration, and is not created":
     let dir = getTempDir() / "runquota-t-host-config-missing"
     removeDir(dir)
