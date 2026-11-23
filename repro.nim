@@ -250,14 +250,23 @@ package runquota:
     # execution edge because integration tests start real daemons and clients.
     const backendCompiler = (when defined(macosx): "clang" else: "gcc")
     const exeSuffix = (when defined(windows): ".exe" else: "")
+    #
+    # Discovery walks THIS project's tree (`projectRootPath`), never the
+    # working directory: a consumer such as CodeTracer evaluates this recipe as
+    # a cross-repo producer from its own root, where `libs/` holds its own
+    # vendored libraries. Walking that found two `tests/test_readme_examples.nim`
+    # (nim-faststreams' and nim-serialization's) and every CodeTracer build
+    # stopped the provider with "Duplicate test binary name". The paths stay
+    # relative to this project, as the actions expect.
     var testSources: seq[string] = @[]
     var libraryPaths: seq[string] = @[]
-    for kind, path in walkDir("libs"):
-      if kind == pcDir and dirExists(path / "src"):
-        libraryPaths.add(path / "src")
+    for kind, path in walkDir(projectRootPath / "libs", relative = true):
+      if kind == pcDir and dirExists(projectRootPath / "libs" / path / "src"):
+        libraryPaths.add("libs" / path / "src")
     libraryPaths.sort()
     for root in ["tests", "libs"]:
-      for source in walkDirRec(root):
+      for found in walkDirRec(projectRootPath / root, relative = true):
+        let source = root / found
         let normalized = source.replace('\\', '/')
         if normalized.endsWith(".nim") and normalized.extractFilename.startsWith("t") and
             (root == "tests" or "/tests/t" in normalized):
