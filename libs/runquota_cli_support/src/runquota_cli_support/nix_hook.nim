@@ -133,9 +133,21 @@
 ##   input, output and error before it does anything else.
 ## * No file is written, and no path is created; the only files read are
 ##   `/proc` entries and the derivation (a regular file, bounded).
+##
+## PLATFORMS. The hook and its holder are POSIX code (process groups, `poll`
+## on pipes, the privilege drop), and the requester lookup is Linux only
+## (`sock_diag` and `/proc`). Elsewhere on POSIX the lookup reports the
+## requester unknown. Where there is no POSIX -- Windows, which has no
+## `nix-daemon` build hook -- only the portable parts are compiled (the wire
+## format, the settings, the derivation and `/proc/locks` parsers, the
+## session and credential checks), and the verb refuses, naming the
+## platform, with a non-zero exit (`runNixBuildHook`).
 
-import std/[json, monotimes, os, osproc, posix, streams, strtabs,
-  strutils, tables, times, uri]
+import std/[json, monotimes, os, osproc, streams, strtabs, strutils, tables,
+  times, uri]
+
+when defined(posix):
+  import std/posix
 
 import runquota_client
 import runquota_core
@@ -443,26 +455,27 @@ proc outputLockPaths*(drvPath: string; outputs: openArray[DrvOutput];
     else:
       result.add(realStorePath(drvPath, store) & "." & output.name & ".lock")
 
-proc readRegularFile*(path: string; limit: int): string =
-  ## A regular file of at most `limit` bytes. Anything else (a FIFO that
-  ## would block, a device, a larger file) raises `IOError`.
-  let fd = posix.open(path.cstring, O_RDONLY or O_CLOEXEC or O_NONBLOCK)
-  if fd < 0:
-    raise newException(IOError, "cannot open " & path & ": " &
-      osErrorMsg(osLastError()))
-  defer: discard posix.close(fd)
-  var info: Stat
-  if fstat(fd, info) != 0 or not S_ISREG(info.st_mode):
-    raise newException(IOError, path & " is not a regular file")
-  if info.st_size > Off(limit):
-    raise newException(IOError, path & " is larger than " & $limit & " bytes")
-  result = newString(int(info.st_size))
-  var got = 0
-  while got < result.len:
-    let n = posix.read(fd, addr result[got], result.len - got)
-    if n <= 0: break
-    got += n
-  result.setLen(got)
+when defined(posix):
+  proc readRegularFile*(path: string; limit: int): string =
+    ## A regular file of at most `limit` bytes. Anything else (a FIFO that
+    ## would block, a device, a larger file) raises `IOError`.
+    let fd = posix.open(path.cstring, O_RDONLY or O_CLOEXEC or O_NONBLOCK)
+    if fd < 0:
+      raise newException(IOError, "cannot open " & path & ": " &
+        osErrorMsg(osLastError()))
+    defer: discard posix.close(fd)
+    var info: Stat
+    if fstat(fd, info) != 0 or not S_ISREG(info.st_mode):
+      raise newException(IOError, path & " is not a regular file")
+    if info.st_size > Off(limit):
+      raise newException(IOError, path & " is larger than " & $limit & " bytes")
+    result = newString(int(info.st_size))
+    var got = 0
+    while got < result.len:
+      let n = posix.read(fd, addr result[got], result.len - got)
+      if n <= 0: break
+      got += n
+    result.setLen(got)
 
 # ---------------------------------------------------------------------------
 # /proc/locks
@@ -493,39 +506,40 @@ proc parseProcLocks*(text: string): seq[ProcLock] =
     except ValueError:
       discard
 
-proc deviceMajor(dev: Dev): uint64 =
-  ## glibc's `major()` for a 64-bit `dev_t`.
-  let d = uint64(dev)
-  ((d shr 32) and 0xfffff000'u64) or ((d shr 8) and 0x00000fff'u64)
+when defined(posix):
+  proc deviceMajor(dev: Dev): uint64 =
+    ## glibc's `major()` for a 64-bit `dev_t`.
+    let d = uint64(dev)
+    ((d shr 32) and 0xfffff000'u64) or ((d shr 8) and 0x00000fff'u64)
 
-proc deviceMinor(dev: Dev): uint64 =
-  let d = uint64(dev)
-  ((d shr 12) and 0xffffff00'u64) or (d and 0x000000ff'u64)
+  proc deviceMinor(dev: Dev): uint64 =
+    let d = uint64(dev)
+    ((d shr 12) and 0xffffff00'u64) or (d and 0x000000ff'u64)
 
-proc lockHeldBy*(locks: openArray[ProcLock]; path: string; pid: int): bool =
-  ## Whether `pid` holds a lock on the file now at `path`.
-  var info: Stat
-  if stat(path.cstring, info) != 0:
-    return false
-  let major = deviceMajor(info.st_dev)
-  let minor = deviceMinor(info.st_dev)
-  for lock in locks:
-    if lock.pid == pid and lock.inode == uint64(info.st_ino) and
-        lock.major == major and lock.minor == minor:
-      return true
-  false
+  proc lockHeldBy*(locks: openArray[ProcLock]; path: string; pid: int): bool =
+    ## Whether `pid` holds a lock on the file now at `path`.
+    var info: Stat
+    if stat(path.cstring, info) != 0:
+      return false
+    let major = deviceMajor(info.st_dev)
+    let minor = deviceMinor(info.st_dev)
+    for lock in locks:
+      if lock.pid == pid and lock.inode == uint64(info.st_ino) and
+          lock.major == major and lock.minor == minor:
+        return true
+    false
 
-proc anyLockHeldBy*(paths: openArray[string]; pid: int): bool =
-  var text = ""
-  try:
-    text = readFile("/proc/locks")
-  except IOError:
-    return false
-  let locks = parseProcLocks(text)
-  for path in paths:
-    if locks.lockHeldBy(path, pid):
-      return true
-  false
+  proc anyLockHeldBy*(paths: openArray[string]; pid: int): bool =
+    var text = ""
+    try:
+      text = readFile("/proc/locks")
+    except IOError:
+      return false
+    let locks = parseProcLocks(text)
+    for path in paths:
+      if locks.lockHeldBy(path, pid):
+        return true
+    false
 
 # ---------------------------------------------------------------------------
 # The requester
@@ -871,16 +885,17 @@ type
     setUid*: proc (uid: int): cint     ## setuid(2): real, effective, saved
     status*: proc (): string           ## /proc/self/status
 
-proc setgroupsCall(size: csize_t; list: ptr Gid): cint {.
-  importc: "setgroups", header: "<grp.h>".}
+when defined(posix):
+  proc setgroupsCall(size: csize_t; list: ptr Gid): cint {.
+    importc: "setgroups", header: "<grp.h>".}
 
-proc systemCredentialOps*(): CredentialOps =
-  CredentialOps(
-    euid: proc (): int = int(geteuid()),
-    clearGroups: proc (): cint = setgroupsCall(0, nil),
-    setGid: proc (gid: int): cint = setgid(Gid(gid)),
-    setUid: proc (uid: int): cint = setuid(Uid(uid)),
-    status: proc (): string = readFile("/proc/self/status"))
+  proc systemCredentialOps*(): CredentialOps =
+    CredentialOps(
+      euid: proc (): int = int(geteuid()),
+      clearGroups: proc (): cint = setgroupsCall(0, nil),
+      setGid: proc (gid: int): cint = setgid(Gid(gid)),
+      setUid: proc (uid: int): cint = setuid(Uid(uid)),
+      status: proc (): string = readFile("/proc/self/status"))
 
 proc credentialProblem*(status: string; uid, gid: int): string =
   ## What in `/proc/self/status` shows a drop to `uid`/`gid` incomplete, or
@@ -980,176 +995,160 @@ proc parseHoldArgs*(args: openArray[string]; options: var HoldOptions): bool =
     return false
   options.cpuMilli > 0
 
-proc emit(line: string): bool =
-  ## One line to the hook; false once the hook is gone.
-  try:
-    stdout.write(line & "\n")
-    stdout.flushFile()
-    true
-  except IOError:
-    false
+when defined(posix):
+  proc emit(line: string): bool =
+    ## One line to the hook; false once the hook is gone.
+    try:
+      stdout.write(line & "\n")
+      stdout.flushFile()
+      true
+    except IOError:
+      false
 
-proc closeInheritedFds() =
-  ## Closes every descriptor past standard input, output and error. The
-  ## hook inherits the worker's descriptors (the builder-output pipe on 4
-  ## and 5 among them) and its other holders' pipes; none of them is this
-  ## holder's to keep, and a holder that runs as a user must not carry root's.
-  var fds: seq[cint] = @[]
-  try:
-    for _, path in walkDir("/proc/self/fd"):
+  proc closeInheritedFds() =
+    ## Closes every descriptor past standard input, output and error. The
+    ## hook inherits the worker's descriptors (the builder-output pipe on 4
+    ## and 5 among them) and its other holders' pipes; none of them is this
+    ## holder's to keep, and a holder that runs as a user must not carry root's.
+    var fds: seq[cint] = @[]
+    try:
+      for _, path in walkDir("/proc/self/fd"):
+        try:
+          let fd = parseInt(extractFilename(path))
+          if fd > 2: fds.add(cint(fd))
+        except ValueError:
+          discard
+    except OSError:
+      discard
+    for fd in fds:
+      discard posix.close(fd)   # the listing's own fd is already closed: EBADF
+
+  when defined(linux):
+    proc prctlCall(option: cint; arg2: culong): cint {.
+      varargs, importc: "prctl", header: "<sys/prctl.h>".}
+
+    const
+      PrSetPdeathsig = cint(1)
+      PrSetNoNewPrivs = cint(38)
+
+  proc tieToHook(tied: bool; hook: Pid) =
+    ## While its grant is unclaimed a holder dies with the hook that started
+    ## it, so no queued request outlives the hook (`PR_SET_PDEATHSIG`,
+    ## https://man7.org/linux/man-pages/man2/prctl.2.html; set after the
+    ## privilege drop, which clears it). Once claimed it must outlive the hook,
+    ## which the worker kills as soon as its build operation is over.
+    when defined(linux):
+      discard prctlCall(PrSetPdeathsig,
+        culong(if tied: SIGKILL else: cint(0)))
+      if tied and getppid() != hook:
+        quit(0)
+
+  proc waitForLine(timeoutMillis: int; line: var string): int =
+    ## One line on standard input: 1 read, 0 timeout, -1 end of input.
+    var fds = [TPollfd(fd: 0, events: POLLIN)]
+    let ready = poll(addr fds[0], Tnfds(1), cint(timeoutMillis))
+    if ready == 0: return 0
+    if ready < 0: return -1
+    try:
+      if stdin.readLine(line): return 1
+    except IOError:
+      discard
+    -1
+
+  proc runHolder*(args: seq[string]; clientVersion: string): int =
+    ## `runquota nix-build-hook --hold ...`: one lease for one derivation
+    ## build. Speaks to the hook in lines on standard input and output:
+    ## it writes `granted <milli>`, `unavailable <why>` or `refused <why>`;
+    ## the hook writes `claim <worker pid> <lock path>...` (tab separated),
+    ## which the holder confirms with `claimed`.
+    closeInheritedFds()
+    var options: HoldOptions
+    if not parseHoldArgs(args, options):
+      discard emit("refused bad holder arguments")
+      return 2
+    let hook = getppid()
+    try:
+      discard dropPrivilegesWith(systemCredentialOps(), options.uid,
+        options.gid)
+    except CatchableError as failure:
+      discard emit("refused cannot act as the requester: " & failure.msg)
+      return 1
+    when defined(linux):
+      # Nothing this process could exec may gain privileges again.
+      discard prctlCall(PrSetNoNewPrivs, culong(1), culong(0), culong(0),
+        culong(0))
+    # Out of the hook's process group: the worker kills that group when its
+    # build operation ends, and a claimed holder still has to give its lease
+    # back after that.
+    discard setsid()
+    tieToHook(true, hook)
+    var client: RunQuotaClient
+    try:
+      client = connectDefault()
+    except CatchableError as failure:
+      discard emit("unavailable no RunQuota daemon reached (" &
+        failure.msg.replace('\n', ' ') & ")")
+      return 0
+    defer: client.close()
+    var session: RunQuotaSession
+    var lease: RunQuotaLease
+    try:
+      session = client.registerSession("nix-daemon build", clientVersion)
+      let request = resourceRequest(options.label, milliCpu(options.cpuMilli),
+        bytes(options.memoryBytes))
+      lease = session.requestLeaseWaiting(request,
+        pollMillis = HolderGrantPollMillis)
+    except CatchableError as failure:
+      discard emit("refused " & failure.msg.replace('\n', ' '))
+      return 1
+    var line = ""
+    let answer =
+      if emit("granted " & $lease.resources.cpu.value):
+        waitForLine(options.unclaimedMillis, line)
+      else: -1
+    if answer != 1 or not line.startsWith("claim "):
+      # Never claimed: the derivation was built by someone else, the worker
+      # went away, or it is still waiting for a local build slot. Give the
+      # capacity back; the next try asks again.
       try:
-        let fd = parseInt(extractFilename(path))
-        if fd > 2: fds.add(cint(fd))
-      except ValueError:
+        lease.release()
+        session.closeSession()
+      except CatchableError:
         discard
-  except OSError:
-    discard
-  for fd in fds:
-    discard posix.close(fd)   # the listing's own fd is already closed: EBADF
-
-when defined(linux):
-  proc prctlCall(option: cint; arg2: culong): cint {.
-    varargs, importc: "prctl", header: "<sys/prctl.h>".}
-
-  const
-    PrSetPdeathsig = cint(1)
-    PrSetNoNewPrivs = cint(38)
-
-proc tieToHook(tied: bool; hook: Pid) =
-  ## While its grant is unclaimed a holder dies with the hook that started
-  ## it, so no queued request outlives the hook (`PR_SET_PDEATHSIG`,
-  ## https://man7.org/linux/man-pages/man2/prctl.2.html; set after the
-  ## privilege drop, which clears it). Once claimed it must outlive the hook,
-  ## which the worker kills as soon as its build operation is over.
-  when defined(linux):
-    discard prctlCall(PrSetPdeathsig,
-      culong(if tied: SIGKILL else: cint(0)))
-    if tied and getppid() != hook:
-      quit(0)
-
-proc waitForLine(timeoutMillis: int; line: var string): int =
-  ## One line on standard input: 1 read, 0 timeout, -1 end of input.
-  var fds = [TPollfd(fd: 0, events: POLLIN)]
-  let ready = poll(addr fds[0], Tnfds(1), cint(timeoutMillis))
-  if ready == 0: return 0
-  if ready < 0: return -1
-  try:
-    if stdin.readLine(line): return 1
-  except IOError:
-    discard
-  -1
-
-proc runHolder*(args: seq[string]; clientVersion: string): int =
-  ## `runquota nix-build-hook --hold ...`: one lease for one derivation
-  ## build. Speaks to the hook in lines on standard input and output:
-  ## it writes `granted <milli>`, `unavailable <why>` or `refused <why>`;
-  ## the hook writes `claim <worker pid> <lock path>...` (tab separated),
-  ## which the holder confirms with `claimed`.
-  closeInheritedFds()
-  var options: HoldOptions
-  if not parseHoldArgs(args, options):
-    discard emit("refused bad holder arguments")
-    return 2
-  let hook = getppid()
-  try:
-    discard dropPrivilegesWith(systemCredentialOps(), options.uid,
-      options.gid)
-  except CatchableError as failure:
-    discard emit("refused cannot act as the requester: " & failure.msg)
-    return 1
-  when defined(linux):
-    # Nothing this process could exec may gain privileges again.
-    discard prctlCall(PrSetNoNewPrivs, culong(1), culong(0), culong(0),
-      culong(0))
-  # Out of the hook's process group: the worker kills that group when its
-  # build operation ends, and a claimed holder still has to give its lease
-  # back after that.
-  discard setsid()
-  tieToHook(true, hook)
-  var client: RunQuotaClient
-  try:
-    client = connectDefault()
-  except CatchableError as failure:
-    discard emit("unavailable no RunQuota daemon reached (" &
-      failure.msg.replace('\n', ' ') & ")")
-    return 0
-  defer: client.close()
-  var session: RunQuotaSession
-  var lease: RunQuotaLease
-  try:
-    session = client.registerSession("nix-daemon build", clientVersion)
-    let request = resourceRequest(options.label, milliCpu(options.cpuMilli),
-      bytes(options.memoryBytes))
-    lease = session.requestLeaseWaiting(request,
-      pollMillis = HolderGrantPollMillis)
-  except CatchableError as failure:
-    discard emit("refused " & failure.msg.replace('\n', ' '))
-    return 1
-  var line = ""
-  let answer =
-    if emit("granted " & $lease.resources.cpu.value):
-      waitForLine(options.unclaimedMillis, line)
-    else: -1
-  if answer != 1 or not line.startsWith("claim "):
-    # Never claimed: the derivation was built by someone else, the worker
-    # went away, or it is still waiting for a local build slot. Give the
-    # capacity back; the next try asks again.
+      return 0
+    let fields = line["claim ".len .. ^1].split('\t')
+    var worker = 0
+    try: worker = parseInt(fields[0])
+    except ValueError: return 1
+    let locks = fields[1 .. ^1]
+    tieToHook(false, hook)
+    discard emit("claimed")
+    try:
+      lease.markStarting()
+      # The worker stands in for the build: if this holder dies, the daemon
+      # keeps the reservation until the worker is gone.
+      lease.markRunning(childProcessId = uint64(worker))
+    except CatchableError:
+      discard
+    var misses = 0
+    while misses < ReleaseMisses:
+      sleep(ProbeMillis)
+      if not dirExists("/proc" / $worker):
+        break
+      if anyLockHeldBy(locks, worker):
+        misses = 0
+      else:
+        inc misses
     try:
       lease.release()
       session.closeSession()
     except CatchableError:
       discard
-    return 0
-  let fields = line["claim ".len .. ^1].split('\t')
-  var worker = 0
-  try: worker = parseInt(fields[0])
-  except ValueError: return 1
-  let locks = fields[1 .. ^1]
-  tieToHook(false, hook)
-  discard emit("claimed")
-  try:
-    lease.markStarting()
-    # The worker stands in for the build: if this holder dies, the daemon
-    # keeps the reservation until the worker is gone.
-    lease.markRunning(childProcessId = uint64(worker))
-  except CatchableError:
-    discard
-  var misses = 0
-  while misses < ReleaseMisses:
-    sleep(ProbeMillis)
-    if not dirExists("/proc" / $worker):
-      break
-    if anyLockHeldBy(locks, worker):
-      misses = 0
-    else:
-      inc misses
-  try:
-    lease.release()
-    session.closeSession()
-  except CatchableError:
-    discard
-  0
+    0
 
 # ---------------------------------------------------------------------------
 # The hook
 # ---------------------------------------------------------------------------
-
-type
-  Holder = ref object
-    process: Process
-    fd: cint
-    buffer: string
-    event: string     ## The first event line, once read.
-
-  HookState = object
-    settings: HookSettings
-    requester: Requester
-    requesterKnown: bool
-    workerPid: int
-    pending: Table[string, Holder]
-    claimed: seq[Holder]
-    unavailableUntil: MonoTime
-    warned: bool
 
 proc holderEnv*(requester: Requester): StringTableRef =
   ## A holder's environment: the RunQuota endpoint variables of the hook's
@@ -1167,216 +1166,249 @@ proc holderEnv*(requester: Requester): StringTableRef =
     if requester.cacheTtl.len > 0:
       result[SessionCacheTtlEnvVar] = requester.cacheTtl
 
-proc nextLine(holder: Holder; waitMillis: int; line: var string): int =
-  ## The holder's next line: 1 read, 0 nothing within `waitMillis`, -1 the
-  ## holder closed its output (or wrote something that is not a line).
-  let deadline = getMonoTime() + initDuration(milliseconds = waitMillis)
-  while true:
-    let nl = holder.buffer.find('\n')
-    if nl >= 0:
-      line = holder.buffer[0 ..< nl]
-      holder.buffer = holder.buffer[nl + 1 .. ^1]
-      return 1
-    if holder.buffer.len > 4096:
-      return -1
-    var fds = [TPollfd(fd: holder.fd, events: POLLIN)]
-    let remaining = max(0, int((deadline - getMonoTime()).inMilliseconds))
-    let ready = poll(addr fds[0], Tnfds(1), cint(remaining))
-    if ready > 0:
-      var chunk = newString(512)
-      let got = posix.read(holder.fd, addr chunk[0], chunk.len)
-      if got <= 0:
+when defined(posix):
+  type
+    Holder = ref object
+      process: Process
+      fd: cint
+      buffer: string
+      event: string     ## The first event line, once read.
+
+    HookState = object
+      settings: HookSettings
+      requester: Requester
+      requesterKnown: bool
+      workerPid: int
+      pending: Table[string, Holder]
+      claimed: seq[Holder]
+      unavailableUntil: MonoTime
+      warned: bool
+
+  proc nextLine(holder: Holder; waitMillis: int; line: var string): int =
+    ## The holder's next line: 1 read, 0 nothing within `waitMillis`, -1 the
+    ## holder closed its output (or wrote something that is not a line).
+    let deadline = getMonoTime() + initDuration(milliseconds = waitMillis)
+    while true:
+      let nl = holder.buffer.find('\n')
+      if nl >= 0:
+        line = holder.buffer[0 ..< nl]
+        holder.buffer = holder.buffer[nl + 1 .. ^1]
+        return 1
+      if holder.buffer.len > 4096:
         return -1
-      holder.buffer.add(chunk[0 ..< got])
-    elif ready < 0 and osLastError() != OSErrorCode(EINTR):
-      return -1
-    elif getMonoTime() >= deadline:
-      return 0
+      var fds = [TPollfd(fd: holder.fd, events: POLLIN)]
+      let remaining = max(0, int((deadline - getMonoTime()).inMilliseconds))
+      let ready = poll(addr fds[0], Tnfds(1), cint(remaining))
+      if ready > 0:
+        var chunk = newString(512)
+        let got = posix.read(holder.fd, addr chunk[0], chunk.len)
+        if got <= 0:
+          return -1
+        holder.buffer.add(chunk[0 ..< got])
+      elif ready < 0 and osLastError() != OSErrorCode(EINTR):
+        return -1
+      elif getMonoTime() >= deadline:
+        return 0
 
-proc readEvent(holder: Holder; waitMillis: int): bool =
-  ## Reads what the holder has written; true once its first event is in.
-  if holder.event.len > 0: return true
-  var line = ""
-  case holder.nextLine(waitMillis, line)
-  of 1: holder.event = (if line.len > 0: line else: "exited")
-  of -1: holder.event = "exited"
-  else: return false
-  true
-
-proc spawnHolder(state: HookState; drvPath: string): Holder =
-  let cpus = leaseCpusFor(state.settings.cores, hostCpuCount())
-  let unclaimed = 2 * state.settings.pollIntervalSecs * 1000 + 1000
-  var args = @[HookVerb, HoldFlag,
-    "--label", "nix " & extractFilename(drvPath),
-    "--cpu-milli", $(cpus * 1000),
-    "--memory-bytes", $(DefaultHookMemoryPerSlot * uint64(cpus)),
-    "--unclaimed-millis", $unclaimed]
-  if state.requester.uid >= 0:
-    args.add(["--uid", $state.requester.uid])
-    args.add(["--gid", $(if state.requester.gid >= 0: state.requester.gid
-                         else: NoGroupGid)])
-  let process = startProcess(getAppFilename(), args = args,
-    env = holderEnv(state.requester), options = {poStdErrToStdOut})
-  Holder(process: process, fd: cint(process.outputHandle))
-
-proc endHolder(holder: Holder) =
-  ## Ends a holder this hook started (its own child, by its pid, which
-  ## cannot be reused before it is waited for). SIGKILL, so a stopped
-  ## holder cannot hold the worker here.
-  try:
-    if holder.process.running:
-      holder.process.kill()
-      discard holder.process.waitForExit(2000)
-    holder.process.close()
-  except CatchableError:
-    discard
-
-proc claim(holder: Holder; workerPid: int; locks: seq[string]): bool =
-  ## Hands a granted holder its build; true once it has confirmed. A holder
-  ## that already gave its grant back (its unclaimed time ran out) never
-  ## confirms, and the build is not run on its lease.
-  try:
-    holder.process.inputStream.write("claim " & $workerPid & "\t" &
-      locks.join("\t") & "\n")
-    holder.process.inputStream.flush()
-  except CatchableError:
-    return false
-  var line = ""
-  holder.nextLine(ClaimConfirmMillis, line) == 1 and line == "claimed"
-
-proc reapClaimed(state: var HookState) =
-  var kept: seq[Holder] = @[]
-  for holder in state.claimed:
-    if holder.process.running: kept.add(holder)
-    else:
-      try: holder.process.close()
-      except CatchableError: discard
-  state.claimed = kept
-
-proc warn(state: var HookState; message: string) =
-  if not state.warned:
-    stderr.write(nixLogLine("runquota: " & message) & "\n")
-    state.warned = true
-
-proc decide*(state: var HookState; request: TryRequest): string =
-  ## The reply to one `try`.
-  state.reapClaimed()
-  if state.settings.maxJobs <= 0:
-    # `max-jobs = 0`: this worker never builds locally, so no lease would
-    # ever be used. Declining lets Nix say so instead of postponing forever.
-    return "decline"
-  if request.drvPath.len == 0:
-    return "decline"
-  if getMonoTime() < state.unavailableUntil:
-    return "decline"
-  if not state.requesterKnown:
-    state.requester = findRequester(state.workerPid)
-    state.requesterKnown = true
-    # Talkative (`-v`): who the leases are for, and how that was found.
-    stderr.write(nixLogLine("runquota: leases for uid " &
-      $state.requester.uid & " in group '" &
-      (if state.requester.group.len > 0: state.requester.group
-       else: "interactive") & "' (" & state.requester.how & ")",
-      level = 4) & "\n")
-  var holder = state.pending.getOrDefault(request.drvPath)
-  if holder == nil:
-    let cap = max(1, min(state.settings.maxJobs, hostCpuCount()))
-    if not request.amWilling or state.pending.len >= cap:
-      return "postpone"
-    try:
-      holder = state.spawnHolder(request.drvPath)
-    except CatchableError as failure:
-      state.warn("cannot start the lease holder (" & failure.msg &
-        "); building unadmitted")
-      return "decline"
-    state.pending[request.drvPath] = holder
-    discard holder.readEvent(ImmediateGrantMillis)
-  elif not holder.readEvent(0):
-    return "postpone"
-  if holder.event.len == 0:
-    return "postpone"
-  if holder.event.startsWith("granted "):
-    if not request.amWilling:
-      return "postpone"
-    var locks: seq[string] = @[]
-    try:
-      locks = outputLockPaths(request.drvPath,
-        parseDrvOutputs(readRegularFile(realStorePath(request.drvPath,
-          state.settings.store), DrvFileLimit)), state.settings.store)
-    except CatchableError as failure:
-      state.warn("cannot read " & request.drvPath & " (" & failure.msg &
-        "); building it unadmitted")
-    state.pending.del(request.drvPath)
-    if locks.len == 0:
-      holder.endHolder()
-      return "decline"
-    if not holder.claim(state.workerPid, locks):
-      # Its grant is gone; ask again on the next try.
-      holder.endHolder()
-      return "postpone"
-    state.claimed.add(holder)
-    return "decline"
-  # `unavailable`, `refused`, or the holder exited without a word.
-  state.pending.del(request.drvPath)
-  holder.endHolder()
-  if holder.event.startsWith("unavailable"):
-    state.unavailableUntil = getMonoTime() +
-      initDuration(milliseconds = UnavailableRetryMillis)
-    state.warn(holder.event["unavailable".len .. ^1].strip() &
-      "; nix-daemon builds run unadmitted")
-  else:
-    state.warn("no lease for " & request.drvPath & " (" & holder.event &
-      "); building it unadmitted")
-  "decline"
-
-proc reply(answer: string): bool =
-  try:
-    stderr.write("# " & answer & "\n")
-    stderr.flushFile()
+  proc readEvent(holder: Holder; waitMillis: int): bool =
+    ## Reads what the holder has written; true once its first event is in.
+    if holder.event.len > 0: return true
+    var line = ""
+    case holder.nextLine(waitMillis, line)
+    of 1: holder.event = (if line.len > 0: line else: "exited")
+    of -1: holder.event = "exited"
+    else: return false
     true
-  except IOError:
-    false
 
-proc runNixBuildHook*(args: seq[string]; clientVersion: string): int =
-  ## The `nix-build-hook` verb: `build-hook = <runquota> nix-build-hook` in
-  ## `nix.conf` (Nix appends the verbosity), or `--hold` for a holder.
-  if args.len >= 1 and args[0] == HoldFlag:
-    return runHolder(args[1 .. ^1], clientVersion)
-  let input = newFileStream(stdin)
-  var state = HookState(workerPid: int(getppid()))
-  try:
-    state.settings = readHookSettings(input)
-  except CatchableError:
-    # The worker went away before its first `try`: nothing to answer.
-    return 0
-  var request: TryRequest
-  while true:
-    var more = false
+  proc spawnHolder(state: HookState; drvPath: string): Holder =
+    let cpus = leaseCpusFor(state.settings.cores, hostCpuCount())
+    let unclaimed = 2 * state.settings.pollIntervalSecs * 1000 + 1000
+    var args = @[HookVerb, HoldFlag,
+      "--label", "nix " & extractFilename(drvPath),
+      "--cpu-milli", $(cpus * 1000),
+      "--memory-bytes", $(DefaultHookMemoryPerSlot * uint64(cpus)),
+      "--unclaimed-millis", $unclaimed]
+    if state.requester.uid >= 0:
+      args.add(["--uid", $state.requester.uid])
+      args.add(["--gid", $(if state.requester.gid >= 0: state.requester.gid
+                           else: NoGroupGid)])
+    let process = startProcess(getAppFilename(), args = args,
+      env = holderEnv(state.requester), options = {poStdErrToStdOut})
+    Holder(process: process, fd: cint(process.outputHandle))
+
+  proc endHolder(holder: Holder) =
+    ## Ends a holder this hook started (its own child, by its pid, which
+    ## cannot be reused before it is waited for). SIGKILL, so a stopped
+    ## holder cannot hold the worker here.
     try:
-      more = readTry(input, request)
-    except EOFError:
-      break
-    except CatchableError as failure:
-      # The stream cannot be followed any more. Stop being asked, so the
-      # rest of this build operation runs without the hook rather than on
-      # a misread request.
-      state.warn("build hook stopped (" & failure.msg &
-        "); building unadmitted")
-      discard reply("decline-permanently")
-      break
-    if not more: break
-    var answer = "decline"
+      if holder.process.running:
+        holder.process.kill()
+        discard holder.process.waitForExit(2000)
+      holder.process.close()
+    except CatchableError:
+      discard
+
+  proc claim(holder: Holder; workerPid: int; locks: seq[string]): bool =
+    ## Hands a granted holder its build; true once it has confirmed. A holder
+    ## that already gave its grant back (its unclaimed time ran out) never
+    ## confirms, and the build is not run on its lease.
     try:
-      answer = state.decide(request)
-    except CatchableError, Defect:
-      # EVERY `try` IS ANSWERED. An error here must not leave the worker
-      # reading a reply that never comes (the build would fail); declining
-      # runs the build as it would run without the hook.
-      state.warn("build hook error (" & getCurrentExceptionMsg() &
-        "); building unadmitted")
-      answer = "decline"
-    if not reply(answer): break
-  # The worker is done with this hook: no queued request outlives it.
-  for _, holder in state.pending:
+      holder.process.inputStream.write("claim " & $workerPid & "\t" &
+        locks.join("\t") & "\n")
+      holder.process.inputStream.flush()
+    except CatchableError:
+      return false
+    var line = ""
+    holder.nextLine(ClaimConfirmMillis, line) == 1 and line == "claimed"
+
+  proc reapClaimed(state: var HookState) =
+    var kept: seq[Holder] = @[]
+    for holder in state.claimed:
+      if holder.process.running: kept.add(holder)
+      else:
+        try: holder.process.close()
+        except CatchableError: discard
+    state.claimed = kept
+
+  proc warn(state: var HookState; message: string) =
+    if not state.warned:
+      stderr.write(nixLogLine("runquota: " & message) & "\n")
+      state.warned = true
+
+  proc decide*(state: var HookState; request: TryRequest): string =
+    ## The reply to one `try`.
+    state.reapClaimed()
+    if state.settings.maxJobs <= 0:
+      # `max-jobs = 0`: this worker never builds locally, so no lease would
+      # ever be used. Declining lets Nix say so instead of postponing forever.
+      return "decline"
+    if request.drvPath.len == 0:
+      return "decline"
+    if getMonoTime() < state.unavailableUntil:
+      return "decline"
+    if not state.requesterKnown:
+      state.requester = findRequester(state.workerPid)
+      state.requesterKnown = true
+      # Talkative (`-v`): who the leases are for, and how that was found.
+      stderr.write(nixLogLine("runquota: leases for uid " &
+        $state.requester.uid & " in group '" &
+        (if state.requester.group.len > 0: state.requester.group
+         else: "interactive") & "' (" & state.requester.how & ")",
+        level = 4) & "\n")
+    var holder = state.pending.getOrDefault(request.drvPath)
+    if holder == nil:
+      let cap = max(1, min(state.settings.maxJobs, hostCpuCount()))
+      if not request.amWilling or state.pending.len >= cap:
+        return "postpone"
+      try:
+        holder = state.spawnHolder(request.drvPath)
+      except CatchableError as failure:
+        state.warn("cannot start the lease holder (" & failure.msg &
+          "); building unadmitted")
+        return "decline"
+      state.pending[request.drvPath] = holder
+      discard holder.readEvent(ImmediateGrantMillis)
+    elif not holder.readEvent(0):
+      return "postpone"
+    if holder.event.len == 0:
+      return "postpone"
+    if holder.event.startsWith("granted "):
+      if not request.amWilling:
+        return "postpone"
+      var locks: seq[string] = @[]
+      try:
+        locks = outputLockPaths(request.drvPath,
+          parseDrvOutputs(readRegularFile(realStorePath(request.drvPath,
+            state.settings.store), DrvFileLimit)), state.settings.store)
+      except CatchableError as failure:
+        state.warn("cannot read " & request.drvPath & " (" & failure.msg &
+          "); building it unadmitted")
+      state.pending.del(request.drvPath)
+      if locks.len == 0:
+        holder.endHolder()
+        return "decline"
+      if not holder.claim(state.workerPid, locks):
+        # Its grant is gone; ask again on the next try.
+        holder.endHolder()
+        return "postpone"
+      state.claimed.add(holder)
+      return "decline"
+    # `unavailable`, `refused`, or the holder exited without a word.
+    state.pending.del(request.drvPath)
     holder.endHolder()
-  0
+    if holder.event.startsWith("unavailable"):
+      state.unavailableUntil = getMonoTime() +
+        initDuration(milliseconds = UnavailableRetryMillis)
+      state.warn(holder.event["unavailable".len .. ^1].strip() &
+        "; nix-daemon builds run unadmitted")
+    else:
+      state.warn("no lease for " & request.drvPath & " (" & holder.event &
+        "); building it unadmitted")
+    "decline"
+
+  proc reply(answer: string): bool =
+    try:
+      stderr.write("# " & answer & "\n")
+      stderr.flushFile()
+      true
+    except IOError:
+      false
+
+  proc runNixBuildHook*(args: seq[string]; clientVersion: string): int =
+    ## The `nix-build-hook` verb: `build-hook = <runquota> nix-build-hook` in
+    ## `nix.conf` (Nix appends the verbosity), or `--hold` for a holder.
+    if args.len >= 1 and args[0] == HoldFlag:
+      return runHolder(args[1 .. ^1], clientVersion)
+    let input = newFileStream(stdin)
+    var state = HookState(workerPid: int(getppid()))
+    try:
+      state.settings = readHookSettings(input)
+    except CatchableError:
+      # The worker went away before its first `try`: nothing to answer.
+      return 0
+    var request: TryRequest
+    while true:
+      var more = false
+      try:
+        more = readTry(input, request)
+      except EOFError:
+        break
+      except CatchableError as failure:
+        # The stream cannot be followed any more. Stop being asked, so the
+        # rest of this build operation runs without the hook rather than on
+        # a misread request.
+        state.warn("build hook stopped (" & failure.msg &
+          "); building unadmitted")
+        discard reply("decline-permanently")
+        break
+      if not more: break
+      var answer = "decline"
+      try:
+        answer = state.decide(request)
+      except CatchableError, Defect:
+        # EVERY `try` IS ANSWERED. An error here must not leave the worker
+        # reading a reply that never comes (the build would fail); declining
+        # runs the build as it would run without the hook.
+        state.warn("build hook error (" & getCurrentExceptionMsg() &
+          "); building unadmitted")
+        answer = "decline"
+      if not reply(answer): break
+    # The worker is done with this hook: no queued request outlives it.
+    for _, holder in state.pending:
+      holder.endHolder()
+    0
+
+else:
+  proc unsupportedPlatformMessage*(): string =
+    ## What the verb says where the hook cannot run.
+    const platform = when defined(windows): "Windows" else: hostOS
+    "runquota " & HookVerb & ": not supported on " & platform &
+      ": the nix-daemon build hook runs on POSIX hosts only"
+
+  proc runNixBuildHook*(args: seq[string]; clientVersion: string): int =
+    ## The `nix-build-hook` verb where the hook cannot run (see PLATFORMS in
+    ## the module header). It refuses, naming the platform, and exits 1: a
+    ## hook that answered without admitting anything would let builds run
+    ## unadmitted while looking installed.
+    stderr.writeLine(unsupportedPlatformMessage())
+    1
