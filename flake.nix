@@ -214,29 +214,40 @@
               );
             in
             builtins.elemAt (builtins.head versionMatches) 0;
-          # git-hooks.nix installs `.pre-commit-config.yaml` and git hooks into
-          # `git rev-parse --show-toplevel` of the directory the shell is entered
-          # from, so `nix develop /path/to/<this repo>` run inside another checkout
-          # would plant this repository's hooks there. `ownRepoOnly` runs a snippet
-          # only when that toplevel is this repository, recognised by a `flake.nix`
-          # identical to the one this shell was evaluated from; anything it cannot
-          # establish counts as another repository, so it fails safe.
+          # The shell hook installs this repository's git hook (the committed
+          # `.pre-commit-config.yaml`, run by the flake's pre-commit:
+          # scripts/install-git-hooks.sh) into the repository at
+          # `git rev-parse --show-toplevel` of the directory the shell is
+          # entered from, so `nix develop /path/to/<this repo>` run inside
+          # another checkout would plant this repository's hooks there.
+          # `ownRepoOnly` runs a snippet only when that toplevel is this
+          # repository, recognised by a `flake.nix` identical to the one this
+          # shell was evaluated from; anything it cannot establish counts as
+          # another repository, so it fails safe.
           # tests/test_dev_shell_writes_nothing_elsewhere.sh
+          #
+          # It also does nothing under RUNQUOTA_DEV_SHELL_NO_HOOK_INSTALL, which
+          # scripts/pre_commit_lint.sh sets when the commit-time lint enters
+          # this shell: a commit must not rewrite the hooks that are running it.
           ownRepoOnly = script: ''
             _own_repo_root="$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || true)"
-            if [ -n "$_own_repo_root" ] && [ -f "$_own_repo_root/flake.nix" ] \
+            if [ -z "''${RUNQUOTA_DEV_SHELL_NO_HOOK_INSTALL:-}" ] \
+              && [ -n "$_own_repo_root" ] && [ -f "$_own_repo_root/flake.nix" ] \
               && [ "$(${pkgs.coreutils}/bin/sha256sum "$_own_repo_root/flake.nix" | ${pkgs.coreutils}/bin/cut -d' ' -f1)" \
                 = "${builtins.hashFile "sha256" ./flake.nix}" ]; then
-            ${script}
-            # git-hooks.nix's installer leaves core.hooksPath as the RELATIVE
-            # `.git/hooks`, in the config every worktree shares. A linked worktree
-            # cannot resolve it (there `.git` is a file), so git silently runs no
-            # hooks there. Point it at the common hooks directory instead.
+            # The two repairs below undo what git-hooks.nix's installer did in
+            # checkouts whose dev shell installed the hooks before the config
+            # was committed.
+            #
+            # It left core.hooksPath as the RELATIVE `.git/hooks`, in the config
+            # every worktree shares. A linked worktree cannot resolve it (there
+            # `.git` is a file), so git silently runs no hooks there. Point it at
+            # the common hooks directory instead.
             if [ "$(${pkgs.git}/bin/git config --local --get core.hooksPath 2>/dev/null)" = .git/hooks ]; then
               ${pkgs.git}/bin/git config --local core.hooksPath "$(${pkgs.git}/bin/git rev-parse --path-format=absolute --git-common-dir)/hooks"
             fi
-            # The installer moves each Reprobuild hook dispatcher aside to
-            # `<hook>.legacy` and puts pre-commit's shim in its slot, so the managed
+            # It moved each Reprobuild hook dispatcher aside to
+            # `<hook>.legacy` and put pre-commit's shim in its slot, so the managed
             # hook (for pre-push, the publication gate) runs only by accident. Put the
             # dispatcher back and chain the shim as `<hook>.repro-local`, which the
             # dispatcher runs: the layout `repro hooks ensure --vcs` produces.
@@ -258,6 +269,7 @@
               fi
             done
             unset _hooks _legacy _slot
+            ${script}
             fi
             unset _own_repo_root
           '';
@@ -653,7 +665,16 @@
             RELEASE_PACKAGING_SRC = inputs.release-packaging-src;
             RELEASE_NIMCRYPTO_SRC = inputs.release-nimcrypto-src;
             RELEASE_BEARSSL_SRC = inputs.release-bearssl-src;
-            shellHook = ownRepoOnly pre-commit-check.shellHook;
+            # The committed .pre-commit-config.yaml is the pre-commit hook, run
+            # by this shell's pre-commit. git-hooks.nix's installer
+            # (`pre-commit-check.shellHook`) is not used: it refuses to replace
+            # a committed config and then installs nothing. `pre-commit-check`
+            # stays a flake check. Never fails the shell, but says so loudly.
+            shellHook = ownRepoOnly ''
+              PATH=${pkgs.git}/bin:${pkgs.coreutils}/bin:$PATH ${pkgs.bash}/bin/bash \
+                ${./scripts/install-git-hooks.sh} ${pkgs.lib.getExe pkgs.pre-commit} \
+                || echo "warning: the pre-commit hook was not installed; read the diagnostic above, then run 'bash scripts/install-git-hooks.sh \"\$(command -v pre-commit)\"' from this shell." >&2
+            '';
           };
         };
     };

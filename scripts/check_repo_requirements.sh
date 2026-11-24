@@ -71,16 +71,26 @@ require_contains flake.nix "packages.default"
 require_contains flake.nix "checks ="
 require_contains flake.nix "static-helpers"
 require_contains flake.nix "git-hooks.lib"
-require_contains flake.nix "shellHook = ownRepoOnly pre-commit-check.shellHook"
+require_contains flake.nix "shellHook = ownRepoOnly"
+require_contains flake.nix "scripts/install-git-hooks.sh"
 
-# ONE PRE-COMMIT HOOK, WRITTEN DOWN TWICE. git-hooks.nix generates the
-# Linux/macOS hook config from flake.nix; prek.toml carries the same hook for
-# prek, which is how a Windows repro shell runs it (nothing generates the
-# YAML there). Both must run `just lint`, so changing one without the other
-# fails here.
-require_file prek.toml
+# ONE PRE-COMMIT CONFIG, COMMITTED. `.pre-commit-config.yaml` is tracked, so
+# every worktree carries it (a linked worktree shares the hook the main
+# checkout installed, and a config only a dev-shell entry generated refused
+# every commit there), and it is the file both pre-commit and prek read. A
+# `prek.toml` would be read by prek INSTEAD of it, so its rules would silently
+# stop applying to prek. The flake's git-hooks.nix `pre-commit-check` runs the
+# same `just lint` under `nix flake check`.
+require_file .pre-commit-config.yaml
+[ ! -L .pre-commit-config.yaml ] || fail ".pre-commit-config.yaml must be the committed file, not a symlink"
+git ls-files --error-unmatch .pre-commit-config.yaml >/dev/null 2>&1 \
+  || fail ".pre-commit-config.yaml must be tracked"
+forbid_path prek.toml "prek reads it instead of .pre-commit-config.yaml; keep the hooks in the committed YAML"
+require_contains .pre-commit-config.yaml "entry: scripts/pre_commit_lint.sh"
+require_contains .pre-commit-config.yaml "id: check-added-large-files"
+require_contains .pre-commit-config.yaml "id: ban-added-ct-recordings"
+require_contains scripts/pre_commit_lint.sh 'just --justfile "$repo_root/Justfile" lint'
 require_contains flake.nix 'entry = "just lint";'
-require_contains prek.toml 'entry = "just lint"'
 
 for recipe in build test lint format fmt t bump-version build-package verify-package bench bench-quick bench-runquota-process-execution bench-runquota-ipc repomix check-repo-requirements check-static-helpers; do
   just --summary | tr ' ' '\n' | grep -Fxq "${recipe}" || fail "missing Justfile recipe ${recipe}"

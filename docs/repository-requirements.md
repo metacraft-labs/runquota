@@ -2,14 +2,20 @@
 
 RunQuota implements the Metacraft repository requirements locally through:
 
-- `flake.nix` for dev shells, default package output, Nix checks, and
-  pre-commit hook configuration through `git-hooks.nix`.
-- `prek.toml`, the same pre-commit hook (`just lint`) for prek, which the
-  reprobuild dev shell provides on every platform. It is how the hook runs on
-  Windows, where nothing generates git-hooks.nix's `.pre-commit-config.yaml`:
-  `repro exec -- prek install` once, then commit from `repro shell`.
-  `scripts/check_repo_requirements.sh` requires both definitions to run
-  `just lint`.
+- `flake.nix` for dev shells, default package output and Nix checks. Its
+  dev shell installs the pre-commit hook (`scripts/install-git-hooks.sh`),
+  and `git-hooks.nix` runs the same `just lint` as the `pre-commit-check`
+  flake check.
+- `.pre-commit-config.yaml`, the committed pre-commit hooks, read by both
+  pre-commit (the flake shell's) and prek (the reprobuild dev shell's, on
+  every platform): the two committed-binary refusals and `just lint`, which
+  `scripts/pre_commit_lint.sh` runs inside the flake's dev shell where Nix is
+  available. Because the file is tracked, every worktree has it. The hook is
+  shared by every linked worktree (`git worktree add`), so a commit there is
+  graded on its content without that worktree's dev shell ever being entered.
+  On Windows, install the hook with `repro exec -- prek install` and commit
+  from `repro shell`. There is no `prek.toml`: prek would read it instead of
+  the YAML. `scripts/check_repo_requirements.sh` enforces this.
 - `repro.nim`'s `uses:` for the reprobuild dev shell's tools, including the
   flake shell's lint and formatting tools (`shellcheck`, `shfmt`, `typos`,
   `prek`, `repomix`; `nixfmt` on Linux and macOS only). On Windows, where

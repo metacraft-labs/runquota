@@ -21,7 +21,6 @@ bench-results/
 
 .DS_Store
 .repro/
-.pre-commit-config.yaml
 
 # Agent tooling scratch. `claude --isolation worktree` materialises one git
 # worktree per agent under this path, inside the repo. They are disposable and

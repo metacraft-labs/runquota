@@ -152,11 +152,11 @@ package runquota:
     "shellcheck"
     "shfmt"
     "typos"
-    # ``prek`` runs ``prek.toml`` -- the same ``just lint`` hook the flake's
-    # git-hooks.nix installs through pre-commit on Linux and macOS -- so the
-    # pre-commit hook also works from a Windows ``repro shell`` (install it
-    # once with ``repro exec -- prek install``). pre-commit itself stays the
-    # flake shell's: it is a Python application with no release binary.
+    # ``prek`` runs the committed ``.pre-commit-config.yaml`` -- the hooks the
+    # flake's dev shell installs through pre-commit on Linux and macOS -- so
+    # the pre-commit hook also works from a Windows ``repro shell`` (install
+    # it once with ``repro exec -- prek install``). pre-commit itself stays
+    # the flake shell's: it is a Python application with no release binary.
     "prek"
     # ``repomix`` everywhere: on Windows, where nobody publishes a binary, it
     # is upstream's npm package with its pinned dependency closure
