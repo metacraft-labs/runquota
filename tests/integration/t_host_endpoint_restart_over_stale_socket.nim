@@ -35,6 +35,16 @@
 ##      reprobuild-pm `spec/RunQuota-Host-Configuration.md` gives the
 ##      per-user launcher: "Anything else at the path is refused with an
 ##      error naming it, and is never removed").
+##   4. **The bind is serialised by the start lock** (`<socket>.start`).
+##      Between `bind(2)` and `listen(2)` a daemon's socket answers a connect
+##      with `ECONNREFUSED`, exactly as a stale one does, so a second daemon
+##      probing in that window would unlink a live daemon's socket and bind
+##      its own. The test holds the lock itself and asserts the daemon
+##      creates nothing at the path until it is released, then serves. A
+##      bind that does not take the lock binds at once and fails this case.
+##      The lock is taken with `flock(2)` directly
+##      (`private_daemon_fixture.holdExclusiveLock`, the file name spelled as
+##      a literal), not through the library under test.
 ##
 ## ISOLATION. Every daemon gets an explicit `--socket` inside a fresh scratch
 ## directory and an environment with every redirecting variable removed
@@ -58,6 +68,8 @@ when defined(posix):
       ## Generous, as the fixture's own waits are: the host these run on is
       ## shared and often loaded, and a daemon that exits ends the wait at
       ## once, so a refusal costs nothing.
+    HeldLockMillis = 5_000
+      ## How long the start lock is held before it is released.
 
   type Inode = tuple[device, inode: uint64]
 
@@ -198,6 +210,43 @@ when defined(posix):
       check expandSymlink(socket) == target
       # Nothing was bound through the link either.
       check not pathExists(target)
+    test "a host-scope daemon does not bind while another holds the endpoint's start lock":
+      let root = scratchDir("rqst")
+      defer: removeDir(root)
+      let (socket, env) = hostScopeEndpoint(root)
+      var lock = holdExclusiveLock(socket & ".start")
+      defer:
+        if lock >= 0: discard posix.close(lock)
+
+      let daemon = launch(root, socket, env)
+      defer: stopOwned(daemon)
+      # LONG ENOUGH FOR AN UNSERIALISED DAEMON TO HAVE BOUND: one that does
+      # not take the lock binds well inside a second even on a loaded host
+      # (this file's other cases measure that), so five seconds with no
+      # socket is the lock, not a slow start.
+      var appeared = false
+      var waited = 0
+      while waited < HeldLockMillis:
+        if pathExists(socket):
+          appeared = true
+          break
+        if not daemon.running:
+          break
+        sleep(50)
+        waited += 50
+      checkpoint daemon.startupContext("the daemon while the start lock was held")
+      check not appeared
+      check daemon.running
+
+      discard posix.close(lock)
+      lock = -1
+      let served = awaitServing(daemon, socket, env)
+      checkpoint daemon.startupContext("the daemon after the start lock was released")
+      check served
+      if served:
+        daemon.terminate()
+        check daemon.exitWithin(ExitBudgetMillis) == 0
+        check not pathExists(socket)
 else:
   echo "t_host_endpoint_restart_over_stale_socket: POSIX only (the endpoint " &
     "is a named pipe on Windows, reached by name and never left behind)"

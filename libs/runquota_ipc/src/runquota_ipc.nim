@@ -1343,8 +1343,10 @@ when defined(posix):
 
   proc startLockPath*(socketPath: string): string =
     ## ``<socket>.start``: held by a launcher while it adopts or starts, so
-    ## that concurrent invocations never start two daemons. The daemon never
-    ## takes it.
+    ## that concurrent invocations never start two daemons. A private-scope
+    ## daemon never takes it (its launcher holds it while starting it); a
+    ## host-scope daemon holds it only for the duration of its bind
+    ## (``bindEndpoint``).
     socketPath & startLockSuffix
 
   proc userEndpointDirRefusal(directory, problem: string): string =
@@ -1836,6 +1838,15 @@ when defined(posix):
     ## (reprobuild-pm `spec/RunQuota-Host-Configuration.md`, "Adopt or
     ## start"): what the daemon did not create is evidence, not debris.
     ##
+    ## THE CALLER HOLDS THE START LOCK (`bindEndpoint`), and the probe is
+    ## only sound under it. A daemon that has bound but not yet listened
+    ## answers `ECONNREFUSED` exactly as a stale socket does; without the
+    ## lock a second daemon probing in that window would unlink the first
+    ## one's socket and bind its own, leaving the first listening on an
+    ## inode no client can reach. Under the lock every socket probed here
+    ## either belongs to a daemon that finished `listen` before releasing
+    ## it (accepted: refused as live) or to one that is gone (stale).
+    ##
     ## Raises `EndpointTrustError` for every refusal, which `serve` turns
     ## into `endpointRefusedExitCode` with the message on stdout.
     var found: Stat
@@ -1874,10 +1885,10 @@ when defined(posix):
         " exists and could not be probed (" & $strerror(code) &
         "); refusing to remove it")
     # STALE. Unlinked only while the path still names the inode that was
-    # probed: a daemon that bound a fresh socket there meanwhile is not
-    # ours to remove. The window between this `lstat` and the `unlink`
-    # remains; a second daemon that wins it fails the bind below, which is
-    # also a refusal.
+    # probed. Another DAEMON cannot have bound there meanwhile -- the
+    # caller holds the endpoint's start lock (`bindEndpoint`), and every
+    # host-scope bind takes it -- so this guards against anything else that
+    # writes the directory, such as an operator replacing the file by hand.
     var again: Stat
     if lstat(path.cstring, again) != 0:
       if errno == ENOENT:
@@ -1901,49 +1912,91 @@ proc bindEndpoint*(endpoint: Endpoint;
       raise newException(OSError, "Unix-socket endpoints are not supported on Windows")
     else:
       ensureEndpointDir(endpoint, policy)
+      # THE HOST ENDPOINT'S START LOCK (`<socket>.start`), held from the
+      # stale-socket probe until the listener is listening and its inode is
+      # recorded, and released on every path out, refusals included. It is
+      # what makes the probe sound: see `clearStaleSharedEndpoint`. Blocking,
+      # because the holder is another daemon that releases it within one
+      # bind. Never for the private scope: there the LAUNCHER holds this
+      # same lock while it starts the daemon (reprobuild-pm
+      # `spec/RunQuota-Host-Configuration.md`, "The shared per-user daemon
+      # (POSIX)"), so a private daemon that took it would wait for its own
+      # launcher forever; its lifetime lock and its refusal of any existing
+      # endpoint already serialise it.
+      var startLock = cint(-1)
       when defined(posix):
-        if policy.scope == rendezvousPrivate:
-          var existing: Stat
-          if lstat(endpoint.path.cstring, existing) == 0:
-            raise newException(EndpointTrustError,
-              "private RunQuota endpoint already exists: " & endpoint.path)
-          if errno != ENOENT:
-            raiseOSError(osLastError())
-        else:
-          clearStaleSharedEndpoint(endpoint.path)
-      var socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE)
-      setCloseOnExec(cint(socket.getFd()))
-      try:
-        socket.bindUnix(endpoint.path)
-      except OSError as error:
-        socket.close()
-        when defined(posix):
-          # A daemon that bound the path after the check above -- two
-          # starting at once -- is a refusal like any other live endpoint,
-          # not an unhandled exception.
-          if error.errorCode == EADDRINUSE:
+        if policy.scope != rendezvousPrivate:
+          try:
+            startLock = acquireStartLock(endpoint.path)
+          except EndpointTrustError:
+            raise
+          except OSError as error:
+            # A lock that cannot be opened or taken is a refusal to start,
+            # not an unhandled exception: `serve` reports only
+            # `EndpointTrustError` as one.
             raise newException(EndpointTrustError, "RunQuota endpoint " &
-              endpoint.path & " was bound by another daemon while this one " &
-              "was starting; refusing to start a second daemon on it")
-        raise
-      # 0660, group `runquota`: a member may connect, a non-member is
-      # refused by the filesystem rather than by anything this process
-      # runs.
-      applySocketMode(endpoint.path, policy)
-      socket.listen()
-      var bound: Stat
-      var device, inode: uint64
-      if lstat(endpoint.path.cstring, bound) == 0 and S_ISSOCK(bound.st_mode):
-        device = uint64(bound.st_dev)
-        inode = uint64(bound.st_ino)
-      LocalListener(kind: endpointUnixSocket, socket: socket, endpoint: endpoint,
-        boundDevice: device, boundInode: inode)
+              endpoint.path & ": " & error.msg & "; refusing to bind it")
+      try:
+        when defined(posix):
+          if policy.scope == rendezvousPrivate:
+            var existing: Stat
+            if lstat(endpoint.path.cstring, existing) == 0:
+              raise newException(EndpointTrustError,
+                "private RunQuota endpoint already exists: " & endpoint.path)
+            if errno != ENOENT:
+              raiseOSError(osLastError())
+          else:
+            clearStaleSharedEndpoint(endpoint.path)
+        var socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE)
+        setCloseOnExec(cint(socket.getFd()))
+        var listening = false
+        try:
+          try:
+            socket.bindUnix(endpoint.path)
+          except OSError as error:
+            when defined(posix):
+              # Under the start lock no other host-scope daemon can have
+              # bound the path since the probe; a private one, or a daemon
+              # of a build that predates the lock, still can. Either way it
+              # is a refusal, not an unhandled exception.
+              if error.errorCode == EADDRINUSE:
+                raise newException(EndpointTrustError, "RunQuota endpoint " &
+                  endpoint.path & " was bound by another daemon while this " &
+                  "one was starting; refusing to start a second daemon on it")
+            raise
+          # 0660, group `runquota`: a member may connect, a non-member is
+          # refused by the filesystem rather than by anything this process
+          # runs.
+          applySocketMode(endpoint.path, policy)
+          socket.listen()
+          listening = true
+        finally:
+          if not listening:
+            socket.close()
+        # THE INODE THIS LISTENER CREATED, which `close` compares before it
+        # unlinks. By `lstat` of the path and not `fstat` of the descriptor:
+        # `fstat` on a socket describes the socket object, not the
+        # filesystem entry `bind` created, so its dev/inode never match what
+        # `lstat` reports at the path. The path is read while the start lock
+        # is still held, so (for the host scope) no other daemon can have
+        # replaced it since this one bound it; a private endpoint's path is
+        # guarded by its lifetime lock the same way.
+        var bound: Stat
+        var device, inode: uint64
+        if lstat(endpoint.path.cstring, bound) == 0 and S_ISSOCK(bound.st_mode):
+          device = uint64(bound.st_dev)
+          inode = uint64(bound.st_ino)
+        result = LocalListener(kind: endpointUnixSocket, socket: socket,
+          endpoint: endpoint, boundDevice: device, boundInode: inode)
+      finally:
+        when defined(posix):
+          releaseEndpointLock(startLock)
   of endpointNamedPipe:
     when defined(windows):
       # Windows: pre-create the first pipe instance so the listener has an
       # instance ready for the very first accept call.
       let handle = createServerPipe(endpoint.path, first = true)
-      LocalListener(
+      result = LocalListener(
         kind: endpointNamedPipe,
         pendingPipeHandle: int(handle),
         endpoint: endpoint
@@ -2293,9 +2346,6 @@ proc close*(connection: var LocalConnection) =
 proc close*(listener: var LocalListener) =
   case listener.kind
   of endpointUnixSocket:
-    if listener.socket != nil:
-      listener.socket.close()
-      listener.socket = nil
     # THE SOCKET INODE IS UNLINKED, which `fileExists` never did: it answers
     # false for a socket, so the path used to outlive every daemon that
     # bound it, and a client dialling it got ECONNREFUSED instead of "no
@@ -2305,6 +2355,15 @@ proc close*(listener: var LocalListener) =
     # one leaves that to its launcher.) Only while the path still names the
     # inode this listener created: a socket another daemon has bound there
     # since is not ours to remove.
+    #
+    # UNLINKED WHILE STILL LISTENING, and only then closed. A host-scope
+    # `bindEndpoint` takes a socket that refuses a connect for stale and
+    # replaces it; this shutdown does not hold the start lock. Were the
+    # descriptor closed first, a daemon starting in the gap between the
+    # `lstat` below and the `unlink` could probe this socket (refused),
+    # replace it and listen, and this `unlink` would then remove that live
+    # daemon's socket. While this one still listens, a probe is accepted and
+    # the starter refuses, so the path cannot change under the comparison.
     when defined(posix):
       if listener.endpoint.path.len > 0 and listener.boundInode != 0:
         var current: Stat
@@ -2314,6 +2373,9 @@ proc close*(listener: var LocalListener) =
             uint64(current.st_ino) == listener.boundInode:
           discard posix.unlink(listener.endpoint.path.cstring)
       listener.boundInode = 0
+    if listener.socket != nil:
+      listener.socket.close()
+      listener.socket = nil
   of endpointNamedPipe:
     when defined(windows):
       if listener.pendingPipeHandle != 0:

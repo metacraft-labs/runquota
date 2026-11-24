@@ -8300,8 +8300,12 @@ proc takeLifetimeLock(endpoint: Endpoint): cint =
   ##
   ## ONLY THE PRIVATE SCOPE. The host endpoint is provisioned and supervised
   ## -- a service manager, not a lock, decides who serves it -- and the
-  ## provisioned service's behaviour does not change. The rendezvous
-  ## directory is created and verified first, because the lock lives in it.
+  ## provisioned service's behaviour does not change. (A host-scope bind
+  ## does take the endpoint's START lock, `<socket>.start`, but only for the
+  ## moments of the bind itself, inside `runquota_ipc.bindEndpoint`: it
+  ## serialises the stale-socket probe, and says nothing about whether a
+  ## daemon is alive afterwards.) The rendezvous directory is created and
+  ## verified first, because the lock lives in it.
   ##
   ## Raises `OSError` (an `EndpointTrustError` when the lock is held or the
   ## lock file is not ours); `serve` turns either into a refusal.
@@ -8373,8 +8377,9 @@ proc serve*(config: DaemonConfig): int =
   except EndpointTrustError as error:
     # Reachable when the directory changed underneath the pre-check above,
     # and when the endpoint PATH cannot be taken: another daemon is serving
-    # it, or something that is not a stale socket of ours is there
-    # (`runquota_ipc.clearStaleSharedEndpoint`). Still a refusal rather
+    # it, something that is not a stale socket of ours is there
+    # (`runquota_ipc.clearStaleSharedEndpoint`), or the host endpoint's
+    # start lock cannot be opened or taken. Still a refusal rather
     # than a fallback, and the background threads `initDaemon` started are
     # stopped rather than stranded.
     echo error.msg
