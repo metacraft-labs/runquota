@@ -34,6 +34,31 @@ proc handshakeTimeoutMs(): int =
 
 type
   RunQuotaClientError* = object of CatchableError
+  RunQuotaRefusedError* = object of RunQuotaClientError
+    ## THE DAEMON ANSWERED, AND ITS ANSWER WAS NO. Raised when a request --
+    ## the opening `Hello` included -- is answered with an RQSP `Error`
+    ## frame, so a caller can tell a daemon that is serving and refuses this
+    ## client (a denied `Hello`, an incompatible protocol, a rejected
+    ## request) from one it could not reach or that never answered (no
+    ## listener, a closed connection, a response deadline): those raise the
+    ## plain `RunQuotaClientError`, or the endpoint's own `OSError`.
+    ##
+    ## The difference decides what a launcher may do next. A daemon that
+    ## does not answer may be shutting down, and waiting or restarting it is
+    ## reasonable; one that refuses is alive and serving its other clients,
+    ## and neither waiting nor stopping it changes its answer. `diagnostic`
+    ## is the daemon's own, as decoded from the frame; `msg` is its message.
+    diagnostic*: Diagnostic
+
+template raiseRefused(refusal: Diagnostic) =
+  ## Raises the daemon's refusal as a `RunQuotaRefusedError`. A template, not
+  ## a proc returning the exception: this library is a static helper
+  ## (`libs/static_helpers.txt`), and the static-helper gate refuses any `ref`
+  ## type token in its source, a return type included.
+  let refused = refusal
+  var error = newException(RunQuotaRefusedError, refused.message)
+  error.diagnostic = refused
+  raise error
 
 proc libraryInfo*(): clientTypes.LibraryInfo =
   clientTypes.LibraryInfo(name: libraryName)
@@ -173,7 +198,7 @@ proc readResponse(client: var RunQuotaClient; requestId: uint64;
     var errorMessage: ProtocolErrorMessage
     if decodeProtocolError(result.payload, errorMessage):
       client.lastDiagnostic = errorMessage.diagnostic
-      raise newException(RunQuotaClientError, errorMessage.diagnostic.message)
+      raiseRefused(errorMessage.diagnostic)
     client.lastDiagnostic = diagnostic(diagProtocol, "invalid RQSP error payload")
     raise newException(RunQuotaClientError, client.lastDiagnostic.message)
 
@@ -731,7 +756,7 @@ proc pollNextGrantBounded*(session: var RunQuotaSession;
     var errorMessage: ProtocolErrorMessage
     if decodeProtocolError(frame.payload, errorMessage):
       session.client[].lastDiagnostic = errorMessage.diagnostic
-      raise newException(RunQuotaClientError, errorMessage.diagnostic.message)
+      raiseRefused(errorMessage.diagnostic)
     session.client[].lastDiagnostic =
       diagnostic(diagProtocol, "invalid RQSP error payload")
     raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
