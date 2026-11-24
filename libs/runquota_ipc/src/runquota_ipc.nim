@@ -1766,6 +1766,133 @@ proc connectEndpoint*(endpoint: Endpoint): LocalConnection =
 proc connectDefault*(): LocalConnection =
   connectEndpoint(defaultEndpoint())
 
+when defined(posix):
+  const
+    staleProbeAttempts =
+      when defined(linux): 1
+      else: 5
+      ## How many refused connects make a socket STALE. One on Linux, where
+      ## a non-blocking `connect(2)` to a live listener whose backlog is full
+      ## answers `EAGAIN`, so `ECONNREFUSED` means nobody is listening. More
+      ## elsewhere: on macOS a full backlog answers `ECONNREFUSED` too
+      ## (reprobuild-pm `spec/RunQuota-Host-Configuration.md`, the lifetime
+      ## lock), so a single refusal could be a busy live daemon. Repeated
+      ## refusals across `staleProbeIntervalMillis` narrow that to a daemon
+      ## whose backlog stayed full the whole time; they cannot close it.
+    staleProbeIntervalMillis = 100
+
+  proc fileKindText(mode: Mode): string =
+    if S_ISREG(mode): "a regular file"
+    elif S_ISLNK(mode): "a symbolic link"
+    elif S_ISDIR(mode): "a directory"
+    elif S_ISFIFO(mode): "a FIFO"
+    else: "a file of another type"
+
+  proc probeUnixListener(path: string): cint =
+    ## One NON-BLOCKING `connect(2)` to the socket at `path`; 0 when it was
+    ## accepted (or queued), the errno otherwise. Non-blocking because a
+    ## blocking connect to a live listener with a full backlog waits on
+    ## Linux, and a daemon start must not hang on another daemon's load.
+    ## The connection is closed at once, before any frame: the daemon that
+    ## owns it sees a client that left without a `Hello`.
+    var address: Sockaddr_un
+    if path.len >= sizeof(address.sun_path):
+      return ENAMETOOLONG
+    address.sun_family = TSa_Family(AF_UNIX)
+    for i, ch in path: address.sun_path[i] = ch
+    let fd = posix.socket(AF_UNIX, SOCK_STREAM, 0)
+    if fd == SocketHandle(-1):
+      return errno
+    defer: discard posix.close(fd)
+    setCloseOnExec(cint(fd))
+    let flags = fcntl(cint(fd), F_GETFL)
+    if flags < 0 or fcntl(cint(fd), F_SETFL, flags or O_NONBLOCK) < 0:
+      return errno
+    if connect(fd, cast[ptr SockAddr](addr address),
+        SockLen(sizeof(address))) == 0:
+      return 0
+    errno
+
+  proc clearStaleSharedEndpoint(path: string) =
+    ## THE HOST (non-private) ENDPOINT IS CLEARED ONLY OF A STALE SOCKET.
+    ## A daemon killed with `SIGKILL` -- systemd does that to one that
+    ## overruns its stop timeout -- never unlinks its socket, and until this
+    ## existed every restart then died in `bind(2)` with `EADDRINUSE`: the
+    ## old code cleared the path with `fileExists`, which is false for a
+    ## socket, so the one leftover that really occurs was never removed
+    ## (reprobuild-pm `issues/2026-11-24-runquotad-cannot-restart-over-its-own-stale-socket.md`).
+    ##
+    ## WHY A CONNECT AND NOT A LOCK. The private scope takes a lifetime lock
+    ## (`runquota_daemon.takeLifetimeLock`); the host endpoint deliberately
+    ## has none -- a service manager decides who serves it -- so the socket
+    ## itself is asked. Accepted: a daemon is serving, and this one is
+    ## REFUSED rather than allowed to unlink a live daemon's endpoint out
+    ## from under it. Refused: nobody listens, and the socket is debris.
+    ##
+    ## ANYTHING ELSE AT THE PATH IS REFUSED AND NEVER REMOVED -- a regular
+    ## file, a symbolic link, a directory, a socket another uid owns, or one
+    ## the probe could not reach for any other reason (its errno is named).
+    ## The same rule the per-user launcher follows for its stale socket
+    ## (reprobuild-pm `spec/RunQuota-Host-Configuration.md`, "Adopt or
+    ## start"): what the daemon did not create is evidence, not debris.
+    ##
+    ## Raises `EndpointTrustError` for every refusal, which `serve` turns
+    ## into `endpointRefusedExitCode` with the message on stdout.
+    var found: Stat
+    if lstat(path.cstring, found) != 0:
+      let code = errno
+      if code == ENOENT:
+        return
+      raise newException(EndpointTrustError, "RunQuota endpoint " & path &
+        " cannot be inspected (" & $strerror(code) & "); refusing to bind it")
+    if not S_ISSOCK(found.st_mode):
+      raise newException(EndpointTrustError, "RunQuota endpoint " & path &
+        " exists and is not a socket (it is " & fileKindText(found.st_mode) &
+        "); refusing to bind over it, and leaving it in place")
+    if found.st_uid != geteuid():
+      raise newException(EndpointTrustError, "RunQuota endpoint " & path &
+        " is a socket owned by uid " & $found.st_uid & ", not by this " &
+        "daemon's uid " & $geteuid() & "; refusing to remove it")
+    var attempt = 0
+    while true:
+      let code = probeUnixListener(path)
+      if code == ENOENT:
+        # Gone between the `lstat` and the probe: nothing left to clear.
+        return
+      if code == ECONNREFUSED:
+        inc attempt
+        if attempt >= staleProbeAttempts:
+          break
+        sleep(staleProbeIntervalMillis)
+        continue
+      if code == 0 or code == EAGAIN or code == EWOULDBLOCK or
+          code == EINPROGRESS:
+        raise newException(EndpointTrustError, "RunQuota endpoint " & path &
+          " is live: another runquotad is serving it (a connect to it was " &
+          "accepted); refusing to start a second daemon on it")
+      raise newException(EndpointTrustError, "RunQuota endpoint " & path &
+        " exists and could not be probed (" & $strerror(code) &
+        "); refusing to remove it")
+    # STALE. Unlinked only while the path still names the inode that was
+    # probed: a daemon that bound a fresh socket there meanwhile is not
+    # ours to remove. The window between this `lstat` and the `unlink`
+    # remains; a second daemon that wins it fails the bind below, which is
+    # also a refusal.
+    var again: Stat
+    if lstat(path.cstring, again) != 0:
+      if errno == ENOENT:
+        return
+      raise newException(EndpointTrustError, "RunQuota endpoint " & path &
+        " cannot be inspected (" & $strerror(errno) & "); refusing to bind it")
+    if again.st_dev != found.st_dev or again.st_ino != found.st_ino:
+      raise newException(EndpointTrustError, "RunQuota endpoint " & path &
+        " was replaced while its stale socket was being probed; refusing " &
+        "to remove the replacement")
+    if posix.unlink(path.cstring) != 0 and errno != ENOENT:
+      raise newException(EndpointTrustError, "RunQuota endpoint " & path &
+        " is a stale socket that could not be removed (" &
+        $strerror(errno) & ")")
+
 proc bindEndpoint*(endpoint: Endpoint;
                    policy: RendezvousPolicy): LocalListener =
   case endpoint.kind
@@ -1782,11 +1909,23 @@ proc bindEndpoint*(endpoint: Endpoint;
               "private RunQuota endpoint already exists: " & endpoint.path)
           if errno != ENOENT:
             raiseOSError(osLastError())
-      if fileExists(endpoint.path):
-        removeFile(endpoint.path)
+        else:
+          clearStaleSharedEndpoint(endpoint.path)
       var socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE)
       setCloseOnExec(cint(socket.getFd()))
-      socket.bindUnix(endpoint.path)
+      try:
+        socket.bindUnix(endpoint.path)
+      except OSError as error:
+        socket.close()
+        when defined(posix):
+          # A daemon that bound the path after the check above -- two
+          # starting at once -- is a refusal like any other live endpoint,
+          # not an unhandled exception.
+          if error.errorCode == EADDRINUSE:
+            raise newException(EndpointTrustError, "RunQuota endpoint " &
+              endpoint.path & " was bound by another daemon while this one " &
+              "was starting; refusing to start a second daemon on it")
+        raise
       # 0660, group `runquota`: a member may connect, a non-member is
       # refused by the filesystem rather than by anything this process
       # runs.
@@ -2160,9 +2299,12 @@ proc close*(listener: var LocalListener) =
     # THE SOCKET INODE IS UNLINKED, which `fileExists` never did: it answers
     # false for a socket, so the path used to outlive every daemon that
     # bound it, and a client dialling it got ECONNREFUSED instead of "no
-    # daemon here" -- which also kept the next daemon from binding the path.
-    # Only while the path still names the inode this listener created: a
-    # socket another daemon has bound there since is not ours to remove.
+    # daemon here". (A daemon that never reaches this -- one killed with
+    # SIGKILL -- still leaves its socket; the next host-scope `bindEndpoint`
+    # probes it and replaces it when nothing accepts, and a private-scope
+    # one leaves that to its launcher.) Only while the path still names the
+    # inode this listener created: a socket another daemon has bound there
+    # since is not ours to remove.
     when defined(posix):
       if listener.endpoint.path.len > 0 and listener.boundInode != 0:
         var current: Stat

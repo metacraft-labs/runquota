@@ -8371,9 +8371,12 @@ proc serve*(config: DaemonConfig): int =
     if not activated:
       listener = bindEndpoint(config.endpoint)
   except EndpointTrustError as error:
-    # Only reachable if the directory changed underneath the pre-check
-    # above. Still a refusal rather than a fallback, and the background
-    # threads `initDaemon` started are stopped rather than stranded.
+    # Reachable when the directory changed underneath the pre-check above,
+    # and when the endpoint PATH cannot be taken: another daemon is serving
+    # it, or something that is not a stale socket of ours is there
+    # (`runquota_ipc.clearStaleSharedEndpoint`). Still a refusal rather
+    # than a fallback, and the background threads `initDaemon` started are
+    # stopped rather than stranded.
     echo error.msg
     flushFile(stdout)
     stopEstimateStore(sharedDaemon.daemon.estimateStore)
