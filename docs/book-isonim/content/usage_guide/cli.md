@@ -40,7 +40,7 @@ The `stats` verbs have a page of their own:
 
 | Command | What it tells you |
 |---|---|
-| `runquota status [--json]` | Live counters: sessions, leases, `supervisor_lost_leases`, finished and granted totals, the memory-pressure reading, the starvation bound, and one row per [session group](/getting_started/concepts#session-group) with its counters (below). `--json` also carries the capacity figures (below). Both end with what is enforced below admission on this host ([below](#priority-below-admission)). |
+| `runquota status [--json]` | Live counters: sessions, leases, `supervisor_lost_leases`, finished and granted totals, the host id and the refusal and wait totals ([below](#admission-counters-budget-and-host-identity)), the memory-pressure reading, the starvation bound, and one row per [session group](/getting_started/concepts#session-group) with its counters (below). `--json` also carries the capacity figures (below). Both end with what is enforced below admission on this host ([below](#priority-below-admission)). |
 | `runquota sessions --json` | The registered sessions. |
 | `runquota leases --json` | Every lease the daemon is tracking. |
 | `runquota topology --json` | The configured machines and CPU share groups — the budget, as the daemon sees it. |
@@ -98,6 +98,25 @@ has been idle for an hour.
 | `grants`, `wait_millis` | Leases granted, and the time they had spent queued. |
 | `cpu_busy_pct`, `cpu_foreign_pct`, `ambient_reading_unix_millis` | (`host` only) The ambient sampler's latest reading, or `null` while it has none. |
 | `textfile` | `null` without `--metrics-textfile`; otherwise its `path`, `interval_millis`, `writes`, `failures` and `last_error` (`null` after a successful write). |
+
+### Admission counters, budget and host identity
+
+`runquota status` prints `host_id:`, `total_rejected:` and
+`total_wait_micros:` right after `total_finished:` (`host_id: none` when the
+daemon has none). `status --json` carries these members beside the counters
+above, so one call gives a capacity tool refusal rates, admission delay and
+occupancy. Every counter counts from daemon start and saturates rather than
+wraps.
+
+| Field | Meaning |
+|---|---|
+| `host_id` | The daemon's observation host id, the one every observation row carries; `null` while it has none (capture off, the identity refused, or the store still being verified). |
+| `total_rejected` | Lease requests refused since start: `RequestLease`, each entry of a batch request, `RequestSubLease` and VM registrations, whether refused at once or after queueing. A refused resize is not counted. |
+| `rejected` | The same count by reason, adding up to `total_rejected`: `budget` (can never fit the host, a pool, a class or the parent lease), `wait_limit` (queued and then dropped: a benchmark past `[benchmark] max-queue-wait`, a sub-lease whose parent ended, a `RequestLease`, which never waits, on a host with no room now), `refused` (a policy refusal: a benchmark the session may not take, a session another connection registered, another owner's parent lease), `invalid` (an unreadable request or malformed arguments). |
+| `total_wait_micros` | The monotonic time the grants in `total_granted` (sub-leases included) spent queued, summed. `Δtotal_wait_micros / Δtotal_granted` between two scrapes is the mean admission delay. |
+| `lease_wait_histogram` | The same waits as a cumulative Prometheus-style histogram: `le_micros` (1 ms to 10 min), `buckets[i]` (waits at most `le_micros[i]`), `count` (= `total_granted`) and `sum_micros` (= `total_wait_micros`). |
+| `budget` | What the daemon enforces now, after any reload: `cpu_milli`, `memory_bytes`, `io_slots` and `pools` (the host-wide pools, name to units; pools a session declared are per owner and listed by `topology --json`). |
+| `reserved` | What granted host leases hold of it now, in the same shape (CPU at each lease's current charge). Sub-leases are part of their parent and are not added again. |
 
 ## `runquota session set`
 

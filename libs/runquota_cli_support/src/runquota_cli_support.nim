@@ -116,6 +116,24 @@ proc parseMemory(value: string): uint64 =
     return parseUInt(lower[0 ..< lower.len - 2]) * 1000'u64
   parseUInt(lower)
 
+proc printAdmissionCounters(statusJson: string) =
+  ## `host_id:`, `total_rejected:` and `total_wait_micros:`, from the `status`
+  ## inspection JSON, for a daemon that reports them (an older one does not,
+  ## and prints nothing here). `host_id: none` when the daemon has no
+  ## observation host id (capture off, the identity refused, or the store
+  ## still being verified).
+  let parsed = parseJson(statusJson)
+  if parsed.kind != JObject or not parsed.hasKey("total_rejected"):
+    return
+  let hostId = parsed{"host_id"}
+  echo "host_id: " &
+    (if not hostId.isNil and hostId.kind == JString: hostId.getStr()
+     else: "none")
+  # `$` and not `getBiggestInt`: a saturated counter is past `int64`, and
+  # std/json keeps such a number as its own text, which `$` prints as is.
+  echo "total_rejected: " & $parsed["total_rejected"]
+  echo "total_wait_micros: " & $parsed["total_wait_micros"]
+
 proc printSessionGroups(statusJson: string) =
   ## One line per session group, from the `status` inspection JSON.
   let parsed = parseJson(statusJson)
@@ -266,6 +284,11 @@ proc printStatus(json: bool): int =
     echo "total_granted: " & $status.totalGranted
     echo "total_finished: " & $status.totalFinished
     if statusJson.len > 0:
+      try:
+        printAdmissionCounters(statusJson)
+      except JsonParsingError, KeyError, ValueError:
+        stderr.writeLine("runquota status: could not read the admission " &
+          "counters: " & getCurrentExceptionMsg())
       try:
         printVirtualMachines(statusJson)
       except JsonParsingError, KeyError, ValueError:

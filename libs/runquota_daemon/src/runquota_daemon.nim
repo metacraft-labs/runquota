@@ -998,6 +998,15 @@ proc elapsedSince(start: int64): uint64 =
   let now = monoMillis()
   if now > start: uint64(now - start) else: 0'u64
 
+proc monoMicros(): int64 =
+  ## Monotonic microseconds, on the same clock as `monoMillis`: what the
+  ## lease-wait counter and histogram are measured in.
+  getMonoTime().ticks div 1_000
+
+proc elapsedMicrosSince(start: int64): uint64 =
+  let now = monoMicros()
+  if now > start: uint64(now - start) else: 0'u64
+
 proc ownerKeyOf(peer: PeerIdentity): string =
   ## The owner as admission keys it: the owner id from peer credentials, or
   ## `?` for a transport that reported none. Never the uid a client declared.
@@ -2374,15 +2383,79 @@ proc admissionClassesJson(daemon: RunQuotaDaemon): string =
     ",\"classes_untracked\":" & $daemon.classesUntracked &
     ",\"classes\":" & daemon.classesJson()
 
+proc budgetAndReservedJson(daemon: RunQuotaDaemon): string =
+  ## `"budget":{...},"reserved":{...}` (members): what the daemon enforces
+  ## now and what granted host leases hold of it, in one shape, so a
+  ## capacity tool reads occupancy as `reserved / budget` per member.
+  ##
+  ## THE BUDGET IN FORCE, read from `daemon.config` -- what admission reads --
+  ## so a host-configuration reload shows here at once. The local machine
+  ## (`DefaultMachineId`), which `normalizeTopology` copies into
+  ## `cpuSlots`/`memoryBytes`/`ioSlots`; the CPU is the configured budget,
+  ## not the oversubscribed grant limit (`cpu_grant_limit_milli`).
+  ##
+  ## POOLS ARE THE HOST-WIDE ONES (the host file's and `--pool`'s). A pool a
+  ## session declared is its owner's own (`recomputePoolCaps`): two owners'
+  ## `serial` are two pools with two caps, and one object of name to units
+  ## cannot hold both. `topology --json` lists those per owner. `reserved`
+  ## carries the units every owner holds of each host-wide pool.
+  ##
+  ## RESERVED is the ledger admission keeps (`applyLeaseResourceUsage`,
+  ## `setLeaseCharge`): each host lease at its current charge. Sub-leases are
+  ## carved out of their parent and never reach it, so they are not added
+  ## twice.
+  var names: seq[string] = @[]
+  for name in daemon.config.namedPoolCaps.keys:
+    names.add(name)
+  names.sort()
+  var budgetPools: seq[string] = @[]
+  var reservedPools: seq[string] = @[]
+  for name in names:
+    budgetPools.add(jsonEscape(name) & ":" &
+      $daemon.config.namedPoolCaps[name])
+    reservedPools.add(jsonEscape(name) & ":" &
+      $daemon.namedPoolUsage.getOrDefault(name, 0'u32))
+  let usage = daemon.machineUsage.getOrDefault(DefaultMachineId,
+    MachineUsage())
+  "\"budget\":{\"cpu_milli\":" & $daemon.config.cpuSlots.value &
+    ",\"memory_bytes\":" & $daemon.config.memoryBytes.value &
+    ",\"io_slots\":" & $daemon.config.ioSlots &
+    ",\"pools\":{" & budgetPools.join(",") & "}}" &
+    ",\"reserved\":{\"cpu_milli\":" & $usage.cpu &
+    ",\"memory_bytes\":" & $usage.memory &
+    ",\"io_slots\":" & $usage.ioSlots &
+    ",\"pools\":{" & reservedPools.join(",") & "}}"
+
+proc observationCaptureEnabled(daemon: RunQuotaDaemon): bool
+
+proc hostIdJson(daemon: RunQuotaDaemon): string =
+  ## The observation host id every row this daemon writes carries, or `null`
+  ## when it has none: capture off, the identity refused, or the store still
+  ## being verified (`installCapture` has not run). Never invented here.
+  if daemon.observationCaptureEnabled(): jsonEscape(daemon.observationHostId)
+  else: "null"
+
 proc statusJson(daemon: RunQuotaDaemon): string =
   ## The `status` inspection subject: the wire status, as JSON, with the
   ## session groups and the capacity figures beside it.
+  ##
+  ## The admission counters, the budget and the host id are members HERE and
+  ## not fields of the binary `DaemonStatus`: that message's decoder refuses
+  ## trailing bytes, so growing it would stop an older client reading a newer
+  ## daemon's status (Build-Engine-And-Scheduler.md §"Admission counters,
+  ## budget and host identity in `status --json`"). `host_id` comes first
+  ## after the wire members, so a reader scanning the text for it meets this
+  ## one before any nested object.
   var base = inspectionStatusJson(daemon.status())
   base.setLen(base.len - 1)
   var order: seq[string] = @[]
   for key in daemon.config.admissionOrder:
     order.add(jsonEscape($key))
-  base & ",\"admission_max_wait_millis\":" &
+  base & ",\"host_id\":" & daemon.hostIdJson() &
+    "," & daemon.admission.rejectedJson() &
+    "," & daemon.admission.waitJson() &
+    "," & daemon.budgetAndReservedJson() &
+    ",\"admission_max_wait_millis\":" &
     $daemon.config.admissionMaxWaitMillis &
     ",\"admission_order\":[" & order.join(",") & "]" &
     ",\"admission_share_between_users\":" &
@@ -3536,6 +3609,7 @@ proc createQueuedLease(daemon: var RunQuotaDaemon; sessionId: SessionId;
     groupKey: session.groupKey,
     className: daemon.groupFor(session.groupKey).className,
     queuedAtMillis: monoMillis(),
+    queuedAtMicros: monoMicros(),
     requestedAtUnixMillis: unixMillisNow()
   )
   daemon.leases[id.value] = result
@@ -4315,6 +4389,10 @@ proc grantQueuedLease(daemon: var RunQuotaDaemon; id: uint64; delivered: bool) =
   lease.delivered = delivered
   daemon.leases[id] = lease
   inc daemon.totalGranted
+  # EVERY GRANT `totalGranted` COUNTS, sub-leases included, so that
+  # `lease_wait_histogram.count == total_granted` and the mean admission
+  # delay between two scrapes is Δtotal_wait_micros / Δtotal_granted.
+  daemon.admission.noteGrantWait(elapsedMicrosSince(lease.queuedAtMicros))
   # A sub-lease's wait is a wait inside its parent's tree, not a wait of the
   # group on the host, so it stays out of the group's wait figures.
   if lease.parentLeaseId == 0'u64:
@@ -4459,7 +4537,8 @@ proc subLeaseFit(parent: LeaseRow; minimum, preferred: uint32;
 
 proc subLeaseRefusal(daemon: RunQuotaDaemon; peer: PeerIdentity;
                      msg: RequestSubLeaseMessage;
-                     code: var DiagnosticCode): string =
+                     code: var DiagnosticCode;
+                     reason: var RejectionReason): string =
   ## Why this sub-lease can never be granted, or "" when it can wait.
   ##
   ## TWO CODES, AND THE CLIENT ACTS ON THE DIFFERENCE. `invalid argument`
@@ -4468,7 +4547,14 @@ proc subLeaseRefusal(daemon: RunQuotaDaemon; peer: PeerIdentity;
   ## is stale or foreign, and there is no parent to wait behind.
   ## `denied` says the REQUEST is larger than the parent can ever hold, which
   ## a host lease would not fix.
+  ##
+  ## `reason` is how `status` counts the refusal (`admission_counters`): a
+  ## malformed range, or a parent that is unknown or no longer holding, is an
+  ## `invalid` argument; another owner's parent is `refused` (the lease id is
+  ## a capability only for its owner); a request larger than the parent is
+  ## `budget`.
   code = diagInvalidArgument
+  reason = rejectInvalid
   if msg.cpuMinMilli == 0'u32 or msg.cpuPreferredMilli < msg.cpuMinMilli:
     return "sub-lease CPU range must have 0 < minimum <= preferred " &
       "(requested " & $msg.cpuMinMilli & "m.." & $msg.cpuPreferredMilli & "m)"
@@ -4479,12 +4565,14 @@ proc subLeaseRefusal(daemon: RunQuotaDaemon; peer: PeerIdentity;
     # The lease id is a capability only for the uid that holds the parent:
     # another user could otherwise run inside a reservation that is not
     # theirs simply by guessing a small integer.
+    reason = rejectRefused
     return "parent lease " & $msg.parentLeaseId.value &
       " belongs to another owner"
   if not parent.parentHolds():
     return "parent lease " & $msg.parentLeaseId.value & " is not running (" &
       parent.state.stateName & ")"
   code = diagDenied
+  reason = rejectBudget
   if msg.cpuMinMilli > parent.resources.cpu.value:
     return "sub-lease exceeds its parent's CPU: lease " &
       $msg.parentLeaseId.value & " (requested at least " &
@@ -4528,6 +4616,9 @@ proc promoteQueuedSubLeases(daemon: var RunQuotaDaemon): seq[uint64] =
         lease.leaseDecision(leaseDecisionDenied, diagnostic(
           diagInvalidArgument, why,
           "a queued sub-lease is denied when its parent ends")))
+      # Queued, then dropped from the queue: what it waited for cannot
+      # happen any more.
+      daemon.admission.noteRejected(rejectWaitLimit)
       daemon.removeLeaseFromTable(id)
       continue
     if parentId in blockedParents:
@@ -4847,6 +4938,7 @@ proc enforceBenchmarkBounds(daemon: var RunQuotaDaemon) =
         "a queued benchmark may stop other grants for at most " &
         $(daemon.config.benchmarkMaxQueueWaitMillis div 1000) &
         " s ([benchmark] max-queue-wait); " & daemon.refusedByText())))
+    daemon.admission.noteRejected(rejectWaitLimit)
     daemon.removeLeaseFromTable(id)
   for id in expiredHeld:
     var lease = daemon.leases[id]
@@ -5073,6 +5165,9 @@ proc rebudgetQueuedLeases(daemon: var RunQuotaDaemon;
     daemon.pendingDenials.mgetOrPut(lease.sessionId.value, @[]).add(
       lease.leaseDecision(leaseDecisionDenied, diagnostic(diagDenied, reason,
         deniedBecause & "; " & daemon.refusedByText())))
+    # Refused after queueing, but for the reason a fresh request of its size
+    # would be: it can never fit the budget now in force.
+    daemon.admission.noteRejected(rejectBudget)
     daemon.removeLeaseFromTable(id)
   daemon.tryPromoteQueued()
 
@@ -5932,22 +6027,26 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
   of rqRequestLease:
     var msg: LeaseRequestMessage
     if not decodeLeaseRequest(frame.payload, msg):
+      daemon.admission.noteRejected(rejectInvalid)
       connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
           "invalid RequestLease payload"))
       return
     if not daemon.requireOwnedSession(context, connection,
         frame.header.requestId, msg.sessionId):
+      daemon.admission.noteRejected(rejectRefused)
       return
     let effective = daemon.effectiveResources(msg.sessionId,
         msg.commandStatsId, msg.resources, msg.estimate)
     let malformed = widthRefusal(msg.width)
     if malformed.len > 0:
+      daemon.admission.noteRejected(rejectInvalid)
       connection.sendResponse(rqLeaseDenied, frame.header.requestId,
         encodeLeaseDenied(LeaseDeniedMessage(sessionId: msg.sessionId,
           diagnostic: diagnostic(diagInvalidArgument, malformed))))
       return
     if msg.purpose == leasePurposeBenchmark and
         not daemon.benchmarkPermitted(msg.sessionId):
+      daemon.admission.noteRejected(rejectRefused)
       connection.sendResponse(rqLeaseDenied, frame.header.requestId,
         encodeLeaseDenied(LeaseDeniedMessage(sessionId: msg.sessionId,
           diagnostic: daemon.benchmarkRefusal())))
@@ -5958,6 +6057,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     if not daemon.possible(effective.rangedResources(msg.width),
         ownerKeyOf(daemon.sessions[msg.sessionId.value].peer), reason,
         daemon.sessionClass(msg.sessionId)):
+      daemon.admission.noteRejected(rejectBudget)
       let denied = LeaseDeniedMessage(
         sessionId: msg.sessionId,
         diagnostic: diagnostic(diagDenied, reason, daemon.refusedByText())
@@ -5978,6 +6078,9 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     discard daemon.tryPromoteQueued(defaultFlowControlLimits().maxLeaseDecisionsPerBatch)
     if daemon.leases[queued.id.value].state != leaseStateGranted:
       let deniedDiagnostic = daemon.leases[queued.id.value].queueDiagnostic
+      # `RequestLease` does not wait: a request that fits the budget but not
+      # what is free now was queued and is dropped from the queue at once.
+      daemon.admission.noteRejected(rejectWaitLimit)
       daemon.removeLeaseFromTable(queued.id.value)
       let denied = LeaseDeniedMessage(
         sessionId: msg.sessionId,
@@ -6000,6 +6103,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
   of rqRequestSubLease:
     var msg: RequestSubLeaseMessage
     if not decodeRequestSubLease(frame.payload, msg):
+      daemon.admission.noteRejected(rejectInvalid)
       connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
           "invalid RequestSubLease payload"))
       return
@@ -6014,13 +6118,16 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       if id.value == msg.sessionId.value:
         owned = true
     if not owned or not daemon.sessions.hasKey(msg.sessionId.value):
+      daemon.admission.noteRejected(rejectRefused)
       connection.sendError(frame.header.requestId, diagnostic(
           diagInvalidArgument, "unknown session id"))
       return
     var code = diagOk
-    let refusal = daemon.subLeaseRefusal(context.peer, msg, code)
+    var rejection = rejectInvalid
+    let refusal = daemon.subLeaseRefusal(context.peer, msg, code, rejection)
     var decision: LeaseDecision
     if refusal.len > 0:
+      daemon.admission.noteRejected(rejection)
       decision = LeaseDecision(
         clientCandidateId: msg.clientCandidateId,
         leaseId: leaseId(0),
@@ -6061,6 +6168,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
         queueDiagnostic: okDiagnostic(),
         groupKey: session.groupKey,
         queuedAtMillis: monoMillis(),
+        queuedAtMicros: monoMicros(),
         requestedAtUnixMillis: unixMillisNow(),
         parentLeaseId: msg.parentLeaseId.value,
         subCpuMinMilli: msg.cpuMinMilli)
@@ -6174,11 +6282,17 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
   of rqOfferCandidates:
     var msg: CandidateOfferMessage
     if not decodeCandidateOffer(frame.payload, msg):
+      # The entries cannot be counted when the batch cannot be read: one
+      # unreadable request.
+      daemon.admission.noteRejected(rejectInvalid)
       connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
           "invalid OfferCandidates payload"))
       return
     let flow = defaultFlowControlLimits()
     if uint32(msg.candidates.len) > flow.maxCandidatesPerBatch:
+      # Every entry of the batch is refused, each counted once.
+      daemon.admission.noteRejected(rejectInvalid,
+        uint64(msg.candidates.len))
       connection.sendError(frame.header.requestId, diagnostic(
         diagProtocol,
         "candidate batch exceeds negotiated flow-control limit",
@@ -6187,6 +6301,8 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       return
     if not daemon.requireOwnedSession(context, connection,
         frame.header.requestId, msg.sessionId):
+      daemon.admission.noteRejected(rejectRefused,
+        uint64(msg.candidates.len))
       return
     var offeredIds: seq[uint64] = @[]
     var decisions: seq[LeaseDecision] = @[]
@@ -6196,6 +6312,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           candidate.commandStatsId, candidate.resources, candidate.estimate)
       let malformed = widthRefusal(candidate.width)
       if malformed.len > 0:
+        daemon.admission.noteRejected(rejectInvalid)
         decisions.add(LeaseDecision(
           clientCandidateId: candidate.clientCandidateId,
           leaseId: leaseId(0),
@@ -6204,6 +6321,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           diagnostic: diagnostic(diagInvalidArgument, malformed)))
       elif candidate.purpose == leasePurposeBenchmark and
           not daemon.benchmarkPermitted(msg.sessionId):
+        daemon.admission.noteRejected(rejectRefused)
         decisions.add(LeaseDecision(
           clientCandidateId: candidate.clientCandidateId,
           leaseId: leaseId(0),
@@ -6213,6 +6331,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       elif not daemon.possible(effective.rangedResources(candidate.width),
           ownerKeyOf(daemon.sessions[msg.sessionId.value].peer), reason,
           daemon.sessionClass(msg.sessionId)):
+        daemon.admission.noteRejected(rejectBudget)
         decisions.add(LeaseDecision(
           clientCandidateId: candidate.clientCandidateId,
           leaseId: leaseId(0),
@@ -6518,7 +6637,10 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       inc daemon.observationExtensionRowsRefused
   of rqRegisterVirtualMachine:
     var msg: RegisterVirtualMachineMessage
+    # A REGISTRATION IS A LEASE REQUEST: it queues a host lease whose grant
+    # `total_granted` counts, so its refusals are counted beside the others.
     if not decodeRegisterVirtualMachine(frame.payload, msg):
+      daemon.admission.noteRejected(rejectInvalid)
       connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
           "invalid RegisterVirtualMachine payload"))
       return
@@ -6526,6 +6648,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     # the registration is recorded under that session's owner.
     if not daemon.requireOwnedSession(context, connection,
         frame.header.requestId, msg.sessionId):
+      daemon.admission.noteRejected(rejectRefused)
       return
     let session = daemon.sessions[msg.sessionId.value]
     let owner = ownerKeyOf(session.peer)
@@ -6536,10 +6659,12 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       if msg.resources.machineId.len == 0: DefaultMachineId
       else: msg.resources.machineId
     var code = diagInvalidArgument
+    var rejection = rejectInvalid
     var refusal = virtualMachineNameProblem(msg.name)
     if refusal.len == 0:
       for row in daemon.virtualMachines.values:
         if row.ownerKey == owner and row.name == msg.name:
+          rejection = rejectRefused
           refusal = "a virtual machine named '" & msg.name &
             "' is already registered by this user (lease " & $row.leaseId &
             ")"
@@ -6550,8 +6675,10 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           daemon.sessionClass(msg.sessionId)):
         refusal = reason
         code = diagDenied
+        rejection = rejectBudget
     var decision: LeaseDecision
     if refusal.len > 0:
+      daemon.admission.noteRejected(rejection)
       decision = LeaseDecision(clientCandidateId: msg.clientCandidateId,
         leaseId: leaseId(0), kind: leaseDecisionDenied, resources: resources,
         diagnostic: diagnostic(code, refusal,

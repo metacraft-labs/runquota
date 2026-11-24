@@ -10,6 +10,7 @@ import runquota_stats_table/publisher
 import ./owners
 import ./cpu_shape
 import ./capacity_metrics
+import ./admission_counters
 import ./cpu_pressure
 import ./peer_namespaces
 import ./vm_records
@@ -19,6 +20,7 @@ export cpu_shape
 export vm_records
 export cpu_pressure
 export capacity_metrics
+export admission_counters
 export peer_namespaces
 
 export owners
@@ -433,6 +435,12 @@ type
       ## Monotonic milliseconds (`monoMillis`) at which the request was queued
       ## and granted; what the starvation bound and the group counters are
       ## measured from.
+    queuedAtMicros*: int64
+      ## Monotonic microseconds (`monoMicros`) at which the request was
+      ## queued: what `total_wait_micros` and the lease-wait histogram
+      ## (`admission_counters`) are measured from. Separate from
+      ## `queuedAtMillis` because a millisecond clock reads 0 for every
+      ## lease granted within the millisecond it asked, and most are.
     requestedAtUnixMillis*: int64
       ## When the daemon received the request (Unix ms): the execution's
       ## ready time for sizing replay. 0 when unknown.
@@ -816,6 +824,11 @@ type
     vmLinkListening*: bool
     vmLinkError*: string
       ## Whether the vsock listener is up, or why it could not start.
+    admission*: AdmissionCounters
+      ## Lease requests refused, by reason, and how long granted leases
+      ## waited (`admission_counters`): `total_rejected`, `rejected`,
+      ## `total_wait_micros` and `lease_wait_histogram` in
+      ## `runquota status --json`.
     capacity*: CapacityLedger
       ## The per-host and per-session-group counters capacity tools read
       ## (`capacity_metrics`): CPU used by finished leases, grants and
