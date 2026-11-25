@@ -1010,15 +1010,22 @@ proc runDebugAcquire(args: seq[string]): int =
   # nothing wrong with it. This supersedes the M7 rule under which a
   # direct-mode `--write-stats` failed clearly.
   var client: RunQuotaClient
-  try:
-    client = connectDefault()
-  except CatchableError as error:
-    # WHY, AND BEFORE THE COMMAND RUNS: the report at exit says that the run
-    # was standalone, but not what the connection attempt hit, and a run
-    # that is killed never reaches its exit. Behind the same opt-in.
-    if getEnv(StandaloneReportEnv).len > 0:
-      stderr.writeLine("runquota acquire: no daemon reached at " &
-        defaultEndpoint().path & ": " & error.msg)
+  var failure: ConnectFailure
+  if not tryConnectDefault(client, failure):
+    # AN ENDPOINT THAT EXISTS AND REFUSES IS NOT A MISSING DAEMON: it is
+    # warned about whatever the opt-in says, and `RUNQUOTA_STRICT` refuses
+    # any failure (`unleasedFallback`).
+    let fallback = unleasedFallback("runquota acquire", failure)
+    if fallback.message.len > 0:
+      stderr.writeLine(fallback.message)
+    elif getEnv(StandaloneReportEnv).len > 0:
+      # WHY, AND BEFORE THE COMMAND RUNS: the report at exit says that the
+      # run was standalone, but not what the connection attempt hit, and a
+      # run that is killed never reaches its exit. Behind the same opt-in.
+      stderr.writeLine("runquota acquire: no daemon reached: " &
+        failureReason(failure))
+    if not fallback.run:
+      return StrictRefusalExitCode
     return runStandaloneAcquire(label, statsKey, command)
   defer: client.close()
   var session = client.registerSession("runquota acquire", versionString(),

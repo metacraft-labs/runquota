@@ -212,6 +212,14 @@ client exits. RunQuota reports this only if you ask
 RunQuota and failed loudly on a host without a daemon would be a tool nobody
 could adopt incrementally.
 
+A daemon that is *there but cannot be used* is a different case and is always
+reported. When the endpoint exists and refuses the client (no permission on
+the socket, nothing listening on it, a failed ownership or mode check, or a
+daemon that refuses the client's handshake) the launcher prints one warning
+line naming the endpoint, the error and the usual remedy, then runs the
+command unleased. Set `RUNQUOTA_STRICT=1` to have every launcher refuse
+instead, in both cases: no lease, no run, exit 1.
+
 `runquota stats` is the exception: it distinguishes "the question has no
 answer" (exit 3) from "the instrument is not working" (exit 4) precisely so a
 daemonless host is never mistaken for a fast one. See

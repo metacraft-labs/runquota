@@ -1,4 +1,7 @@
 import std/[options, os, tables, strutils, monotimes, times]
+when defined(posix):
+  from std/posix import EACCES, EPERM, ECONNREFUSED, ENOENT, ENOTDIR,
+    ENAMETOOLONG, ETIMEDOUT, ECONNRESET, EPIPE, EAGAIN
 
 import runquota_client/types as clientTypes
 import runquota_client/standalone as clientStandalone
@@ -260,6 +263,187 @@ proc connect*(endpoint: Endpoint; clientName = "runquota-nim";
 
 proc connectDefault*(): RunQuotaClient =
   connect(defaultEndpoint())
+
+# ---------------------------------------------------------------------------
+# Why a launcher has no session, and what it may do about it.
+#
+# A launcher (`runquota run`, `acquire -- CMD`, `jobserver`, an embedding
+# build engine) that cannot get a session runs its command UNLEASED. That is
+# right when no daemon exists at all -- standalone mode, which stays quiet so
+# a wrapper can be adopted on hosts without RunQuota -- and wrong to do in
+# silence when an endpoint EXISTS and refuses the client: a process started
+# before its user joined the rendezvous group is refused by the socket's mode
+# (`EACCES`), and then competed for the host outside every budget without a
+# word. So the failure is classified here, once, for every launcher:
+#
+# * every kind but `cfkAbsent` is warned about, always, in one line naming
+#   the endpoint, the error and what it usually means;
+# * `RUNQUOTA_STRICT` turns every kind, absence included, into a refusal:
+#   the launcher exits 1 and the command is not started.
+# ---------------------------------------------------------------------------
+
+const
+  StrictEnvVar* = "RUNQUOTA_STRICT"
+    ## Set to anything but empty or `0`: a launcher that cannot get a lease
+    ## refuses to run its command instead of running it unleased.
+  StrictRefusalExitCode* = 1
+    ## The status a strict launcher exits with. It is the one `run`,
+    ## `acquire` and `jobserver` already use when no lease could be had and
+    ## the command did not run.
+
+type
+  ConnectFailureKind* = enum
+    cfkNone          ## connected: there is no failure
+    cfkAbsent        ## no endpoint at the path (ENOENT, ENOTDIR)
+    cfkRefused       ## the endpoint exists and may not be used (EACCES, EPERM)
+    cfkNotListening  ## a socket file with nothing listening (ECONNREFUSED)
+    cfkUntrusted     ## the endpoint failed the trust checks
+    cfkDenied        ## a daemon answered and refused this client at Hello
+    cfkOther         ## anything else: a handshake timeout, a transport error
+
+  ConnectFailure* = object
+    ## Why `tryConnectDefault` got no session.
+    kind*: ConnectFailureKind
+    endpoint*: string
+      ## The path (or pipe name) that was tried; empty when even the
+      ## endpoint could not be resolved.
+    errorName*: string
+      ## `EACCES`, `ECONNREFUSED`, ... for an OS error; otherwise a short
+      ## name of the failure (`trust check`, `Hello refused`, ...).
+    detail*: string
+      ## The error's own text.
+
+  UnleasedFallback* = object
+    ## What a launcher does after `tryConnectDefault` failed.
+    run*: bool
+      ## Run the command unleased (`true`), or refuse and exit
+      ## `StrictRefusalExitCode` without starting it (`false`).
+    message*: string
+      ## One line for standard error, or empty when there is nothing to say
+      ## (an absent endpoint outside strict mode: standalone mode).
+
+proc osErrorName(code: int32): string =
+  ## The symbolic name of the OS errors a connect can end in. Anything else
+  ## is spelled by number; its text still comes from the OS.
+  when defined(windows):
+    case code
+    of 2: "ERROR_FILE_NOT_FOUND"
+    of 3: "ERROR_PATH_NOT_FOUND"
+    of 5: "ERROR_ACCESS_DENIED"
+    of 231: "ERROR_PIPE_BUSY"
+    else: "error " & $code
+  else:
+    if code == EACCES: "EACCES"
+    elif code == EPERM: "EPERM"
+    elif code == ECONNREFUSED: "ECONNREFUSED"
+    elif code == ENOENT: "ENOENT"
+    elif code == ENOTDIR: "ENOTDIR"
+    elif code == ENAMETOOLONG: "ENAMETOOLONG"
+    elif code == ETIMEDOUT: "ETIMEDOUT"
+    elif code == ECONNRESET: "ECONNRESET"
+    elif code == EPIPE: "EPIPE"
+    elif code == EAGAIN: "EAGAIN"
+    else: "errno " & $code
+
+proc osErrorKind(code: int32): ConnectFailureKind =
+  when defined(windows):
+    case code
+    of 2, 3: cfkAbsent
+    of 5: cfkRefused
+    else: cfkOther
+  else:
+    if code == ENOENT or code == ENOTDIR: cfkAbsent
+    elif code == EACCES or code == EPERM: cfkRefused
+    elif code == ECONNREFUSED: cfkNotListening
+    else: cfkOther
+
+proc oneLine(text: string): string =
+  text.replace('\n', ' ').replace('\r', ' ').strip()
+
+proc tryConnectDefault*(client: var RunQuotaClient;
+                        failure: var ConnectFailure): bool =
+  ## `connectDefault` that answers instead of raising: `true` with `client`
+  ## connected, or `false` with `failure` saying why. Nothing it can raise
+  ## escapes, so a launcher's fallback sees every failure classified.
+  failure = ConnectFailure(kind: cfkNone)
+  var endpoint = ""
+  try:
+    let resolved = defaultEndpoint()
+    endpoint = resolved.path
+    client = connect(resolved)
+    return true
+  except RunQuotaRefusedError as error:
+    failure = ConnectFailure(kind: cfkDenied, endpoint: endpoint,
+      errorName: "Hello refused", detail: oneLine(error.msg))
+  except EndpointTrustError as error:
+    failure = ConnectFailure(kind: cfkUntrusted, endpoint: endpoint,
+      errorName: "trust check", detail: oneLine(error.msg))
+  except OSError as error:
+    let code = error.errorCode
+    var text = ""
+    if code != 0:
+      text = osErrorMsg(OSErrorCode(code)).oneLine()
+    if text.len == 0:
+      text = oneLine(error.msg)
+    failure = ConnectFailure(
+      kind: (if code != 0: osErrorKind(code) else: cfkOther),
+      endpoint: endpoint,
+      errorName: (if code != 0: osErrorName(code) else: "error"),
+      detail: text)
+  except CatchableError as error:
+    failure = ConnectFailure(kind: cfkOther, endpoint: endpoint,
+      errorName: "error", detail: oneLine(error.msg))
+  false
+
+proc strictRequested*(): bool =
+  ## Whether `RUNQUOTA_STRICT` asks for strict mode: any value but empty or
+  ## `0`. A typo must not quietly mean "off", so anything set counts.
+  let value = getEnv(StrictEnvVar).strip()
+  value.len > 0 and value != "0"
+
+proc failureHint*(failure: ConnectFailure): string =
+  ## What the failure usually means, and what to do about it.
+  case failure.kind
+  of cfkRefused:
+    "This process does not carry the group that may connect to the " &
+      "socket (for example, its user was added to the group after the " &
+      "session started); start a new login session."
+  of cfkNotListening:
+    "No daemon is listening there: it is stopped, or exited and left its " &
+      "socket behind; start it (`runquota daemon start` or the host service)."
+  of cfkAbsent:
+    "No daemon is provisioned at that path."
+  of cfkUntrusted, cfkDenied, cfkOther, cfkNone:
+    ""
+
+proc failureReason*(failure: ConnectFailure): string =
+  ## `cannot use the RunQuota daemon at <path>: <NAME> (<text>)` -- the part
+  ## of the warning and of the strict refusal that names what went wrong.
+  result = "cannot use the RunQuota daemon at " &
+    (if failure.endpoint.len > 0: failure.endpoint
+     else: "an endpoint that could not be resolved") &
+    ": " & failure.errorName
+  if failure.detail.len > 0:
+    result.add " (" & failure.detail & ")"
+
+proc withHint(text: string; failure: ConnectFailure): string =
+  let hint = failureHint(failure)
+  if hint.len > 0: text & " " & hint else: text
+
+proc unleasedFallback*(launcher: string; failure: ConnectFailure;
+                       strict = strictRequested()): UnleasedFallback =
+  ## The one decision every launcher takes after `tryConnectDefault` failed:
+  ## whether to run the command unleased, and the line to print first.
+  ## `launcher` prefixes the line (`runquota run`, `repro`).
+  if strict:
+    return UnleasedFallback(run: false, message: withHint(launcher & ": " &
+      StrictEnvVar & " is set and no lease can be had: " &
+      failureReason(failure) & "; not running the command.", failure))
+  if failure.kind in {cfkNone, cfkAbsent}:
+    return UnleasedFallback(run: true, message: "")
+  UnleasedFallback(run: true, message: withHint(launcher & ": warning: " &
+    failureReason(failure) & "; running the command without a lease.",
+    failure) & " Set " & StrictEnvVar & "=1 to refuse instead.")
 
 proc close*(client: var RunQuotaClient) =
   if client.state == csConnected:

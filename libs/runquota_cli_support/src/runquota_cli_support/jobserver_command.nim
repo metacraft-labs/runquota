@@ -851,12 +851,16 @@ proc runJobserver*(args: seq[string];
       else: deriveStatsKey(command, getCurrentDir())
 
     var client: RunQuotaClient
-    try:
-      client = connectDefault()
-    except CatchableError as failure:
-      if options.verbose:
+    var failure: ConnectFailure
+    if not tryConnectDefault(client, failure):
+      let fallback = unleasedFallback("runquota jobserver", failure)
+      if fallback.message.len > 0:
+        stderr.writeLine(fallback.message)
+      elif options.verbose:
         stderr.writeLine("runquota jobserver: no daemon reached (" &
-          failure.msg & "); running the command unchanged")
+          failureReason(failure) & "); running the command unchanged")
+      if not fallback.run:
+        return StrictRefusalExitCode
       return runUnbridged(command)
     defer: client.close()
 
@@ -992,12 +996,16 @@ proc runJobserver*(args: seq[string];
       else: deriveStatsKey(command, getCurrentDir())
 
     var client: RunQuotaClient
-    try:
-      client = connectDefault()
-    except CatchableError as failure:
-      if options.verbose:
+    var failure: ConnectFailure
+    if not tryConnectDefault(client, failure):
+      let fallback = unleasedFallback("runquota jobserver", failure)
+      if fallback.message.len > 0:
+        stderr.writeLine(fallback.message)
+      elif options.verbose:
         stderr.writeLine("runquota jobserver: no daemon reached (" &
-          failure.msg & "); running the command unchanged")
+          failureReason(failure) & "); running the command unchanged")
+      if not fallback.run:
+        return StrictRefusalExitCode
       return runUnbridged(command)
     defer: client.close()
 

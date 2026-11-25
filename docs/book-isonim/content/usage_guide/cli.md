@@ -211,6 +211,15 @@ Set `RUNQUOTA_REPORT_STANDALONE` to any non-empty value to have that printed to
 stderr, and `RUNQUOTA_REPORT_ESTIMATE_SOURCE` to see which of the three
 estimate paths answered.
 
+**An endpoint that exists but cannot be used is not "no daemon".** When the
+socket refuses the connection (`EACCES`: this process lacks the group that may
+connect), nothing listens on it (`ECONNREFUSED`), it fails the ownership or
+mode checks, or the daemon refuses the handshake, `acquire`, `run` and
+`jobserver` print one `warning:` line naming the socket and the error before
+they run the command unleased. With `RUNQUOTA_STRICT=1` they refuse instead,
+for a missing daemon too: the command is not started and the exit status is
+**1**.
+
 ## `runquota run`
 
 Run a command under a CPU lease, and tell the command how wide it may be.
@@ -273,7 +282,8 @@ the lease so the command never ran; **127** when the command could not be
 started. The lease is released when the command ends, whatever its status.
 
 **With no daemon, it still runs your command**, unchanged and unbounded, as
-`acquire` does.
+`acquire` does, with the same warning when the endpoint exists but cannot be
+used and the same refusal under `RUNQUOTA_STRICT`.
 
 The command's standard streams are the terminal's: its output is not captured
 and replayed, unlike `acquire`.

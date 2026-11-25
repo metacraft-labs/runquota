@@ -102,6 +102,22 @@ There is no daemon, and RunQuota let the work through anyway. That is
 [standalone mode](/getting_started/concepts#standalone-mode) and it is
 deliberate. Set `RUNQUOTA_REPORT_STANDALONE=1` to be told each time it happens.
 
+## A launcher warns "cannot use the RunQuota daemon at ..."
+
+The endpoint exists, the launcher could not get a session from it, and the
+command ran without a lease. The line names the socket and the error:
+
+| Error | What it means |
+|---|---|
+| `EACCES (Permission denied)` / `EPERM` | This process does not carry the group that may connect to the socket. The usual cause is a process started before its user was added to the `runquota` group: group membership is fixed when a login session starts. Start a new login session (or `newgrp runquota`) and run it again. |
+| `ECONNREFUSED (Connection refused)` | A socket file is there and nothing listens on it: the daemon is stopped, or exited and left its socket behind. Start it (`runquota daemon start`, or the host service). |
+| `trust check (...)` | The socket or its directory failed the ownership, group or mode checks; the text says which ([above](#the-daemon-exits-immediately-with-status-3)). |
+| `Hello refused (...)` | A daemon answered and refused this client; the text is the daemon's. |
+
+Set `RUNQUOTA_STRICT=1` to make the launcher refuse instead (exit 1, the
+command is not started), for example in CI, where work outside the budget is
+worse than work that does not start.
+
 ## `runquota <something>` printed the usage text and exited 0
 
 The CLI has no `--help`; usage is what you get for anything it does not

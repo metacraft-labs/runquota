@@ -22,7 +22,11 @@
 ## SIGINT is left to the terminal, which delivers it to the command itself.
 ## No daemon answering is NOT an error: the command runs unchanged and
 ## unbounded, as `acquire` does, because the absence of an authority is not a
-## failure of the work.
+## failure of the work. An endpoint that EXISTS and cannot be used (no
+## permission, nothing listening, a failed trust check, a refused Hello) is
+## said in one warning line first, and with `RUNQUOTA_STRICT` set any failure
+## to get a lease exits 1 without starting the command
+## (`runquota_client.unleasedFallback`).
 ##
 ## BELOW ADMISSION (Linux). The command's tree is created in its session
 ## group's cgroup, whose `cpu.weight` follows the group's priority, or in the
@@ -361,12 +365,18 @@ proc runRun*(args: seq[string];
   let adapters = registry()
 
   var client: RunQuotaClient
-  try:
-    client = connectDefault()
-  except CatchableError as failure:
-    if options.verbose:
-      stderr.writeLine("runquota run: no daemon reached (" & failure.msg &
-        "); running the command unchanged")
+  var failure: ConnectFailure
+  if not tryConnectDefault(client, failure):
+    # An endpoint that exists and refuses is warned about; strict mode
+    # refuses instead (`unleasedFallback`, shared by every launcher).
+    let fallback = unleasedFallback("runquota run", failure)
+    if fallback.message.len > 0:
+      stderr.writeLine(fallback.message)
+    elif options.verbose:
+      stderr.writeLine("runquota run: no daemon reached (" &
+        failureReason(failure) & "); running the command unchanged")
+    if not fallback.run:
+      return StrictRefusalExitCode
     if options.cap:
       # No grant, so no width to cap at; never silently.
       stderr.writeLine("runquota run: --cap not enforced: no daemon " &
