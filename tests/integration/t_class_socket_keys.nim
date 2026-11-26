@@ -14,7 +14,7 @@
 ##   `"0666"`, an unknown user or group, and a key of the other platform,
 ##   each naming the file and line. A real daemon refuses such a file at
 ##   start (exit 2) and on reload, with the class sockets and reservations in
-##   force unchanged. Mutation: dropping the mode check accepts `"0644"`
+##   force unchanged. A decimal id above 4294967294 is refused too. Mutation: dropping the mode check accepts `"0644"`
 ##   (through which no group member could connect) and fails the refusal
 ##   case.
 ## * `runquota config set` writes the keys through the same reader, and
@@ -56,6 +56,10 @@ suite "class_socket_keys":
     check set.socketOwnerUid == 0
     check set.socketGroupGid == 0
     check set.socketMode == 0o660
+    # The largest id chown(2) can apply is accepted.
+    check parseHostConfig(Head & "[reservation.ci]\n" &
+      "socket-group = \"4294967294\"\n", "host.toml",
+      hcpPosix).reservations["ci"].socketGroupGid == 4294967294'i64
     for mode, bits in {"0600": 0o600, "0660": 0o660, "0666": 0o666}.toTable:
       check parseHostConfig(Head & "[reservation.ci]\nsocket-mode = \"" &
         mode & "\"\n", "host.toml", hcpPosix).reservations["ci"].socketMode ==
@@ -77,6 +81,10 @@ suite "class_socket_keys":
           "names no user"),
         ("[reservation.ci]\nsocket-group = \"rq-no-such-group-x\"\n", 3,
           "names no group"),
+        ("[reservation.ci]\nsocket-owner = \"4294967295\"\n", 3,
+          "out of range"),
+        ("[reservation.ci]\nsocket-group = \"99999999999999999999\"\n", 3,
+          "out of range"),
         ("[reservation.ci]\ncpu-milli = 1\nallowed-users = [\"alice\"]\n", 4,
           "Windows key"),
         ("[reservation.ci]\nallowed-groups = [\"ci\"]\n", 3, "Windows key")]:

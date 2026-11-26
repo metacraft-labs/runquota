@@ -197,6 +197,30 @@
               }
             ];
           };
+          # Class sockets the daemon binds itself: its account joins each
+          # class's named group, which it must be in to apply it.
+          nixosClassGroupEval = inputs.nixos-modules.inputs.nixpkgs.lib.nixosSystem {
+            modules = [
+              self.nixosModules.runquotad
+              {
+                nixpkgs.hostPlatform = "x86_64-linux";
+                boot.loader.grub.devices = [ "/dev/sda" ];
+                fileSystems."/" = {
+                  device = "/dev/sda1";
+                  fsType = "ext4";
+                };
+                system.stateVersion = "24.05";
+                services.runquotad.enable = true;
+                services.runquotad.hostConfig.reservations = {
+                  ci = {
+                    socketGroup = "ci";
+                    socketMode = "0660";
+                  };
+                  gpu.socketGroup = "2000";
+                };
+              }
+            ];
+          };
           # The idle period without socket activation must be refused: nothing
           # would start the daemon again after it idled out.
           nixosIdleWithoutSocketEval = inputs.nixos-modules.inputs.nixpkgs.lib.nixosSystem {
@@ -532,6 +556,12 @@
                         ) nixosSocketEval.config.systemd.sockets
                       )
                   );
+                  nixosClassGroups =
+                    builtins.toJSON
+                      nixosClassGroupEval.config.users.users.${hostState.user}.extraGroups;
+                  nixosSocketGroups =
+                    builtins.toJSON
+                      nixosSocketEval.config.users.users.${hostState.user}.extraGroups;
                   nixosSocketSockets = builtins.toJSON nixosSocketEval.config.systemd.services.runquotad.serviceConfig.Sockets;
                   nixosSocketService = builtins.toJSON {
                     inherit (nixosSocketEval.config.systemd.services.runquotad) wantedBy requires after;
@@ -633,6 +663,10 @@
                   printf '%s' "$nixosClassSockets" > nixos-class-sockets
                   grep -F '"runquotad-class-ci":{"FileDescriptorName":"class-ci","Service":"runquotad.service","SocketGroup":"ci","SocketMode":"0660","SocketUser":"${hostState.user}","listenStreams":["${hostState.endpointDirectories.linux}/class-ci.sock"],"wantedBy":["sockets.target"]}' nixos-class-sockets
                   grep -F '"runquotad-class-gpu":{"FileDescriptorName":"class-gpu","Service":"runquotad.service","SocketGroup":"${hostState.group}","SocketMode":"0600","SocketUser":"${hostState.user}","listenStreams":["${hostState.endpointDirectories.linux}/class-gpu.sock"],"wantedBy":["sockets.target"]}' nixos-class-sockets
+                  # The account joins a named class group when the daemon
+                  # binds the socket, and needs none under socket activation.
+                  test "$nixosClassGroups" = '["ci"]'
+                  test "$nixosSocketGroups" = '[]'
                   test "$nixosSocketSockets" = '["runquotad.socket","runquotad-class-ci.socket","runquotad-class-gpu.socket"]'
                   # The service is started only through the socket, serves
                   # the same endpoint, and carries the idle period.

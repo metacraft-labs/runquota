@@ -459,6 +459,10 @@ proc classSocketModeText*(mode: int): string =
   ## `0o660` -> `"0660"`.
   "0" & toOct(mode and 0o777, 3)
 
+const MaxAccountId* = 4294967294'i64
+  ## The largest uid or gid a socket can be given: `(uid_t)-1` is chown's
+  ## "leave unchanged".
+
 proc resolveAccountId(raw: string; group: bool): int64 =
   ## A decimal id as written, or the id of the user (group) of that name,
   ## or -1 when there is none. A decimal id is taken without a lookup: an id
@@ -470,10 +474,12 @@ proc resolveAccountId(raw: string; group: bool): int64 =
     if ch notin {'0' .. '9'}:
       allDigits = false
   if allDigits:
+    if raw.len > 12:
+      return MaxAccountId + 1
     try:
       return int64(parseBiggestUInt(raw))
     except ValueError:
-      return -1
+      return MaxAccountId + 1
   when defined(posix):
     if group:
       let entry = getgrnam(raw.cstring)
@@ -715,6 +721,10 @@ proc parseHostConfig*(text, path: string;
             let raw = parseQuoted(value, path, lineNo)
             let isGroup = key == "socket-group"
             let id = resolveAccountId(raw, isGroup)
+            if id > MaxAccountId:
+              fail(path, lineNo, key & " " & value & " in [" & section &
+                "] is out of range: an id is at most " & $MaxAccountId &
+                " (4294967295 means \"unchanged\" to chown)")
             if id < 0:
               fail(path, lineNo, key & " " & value & " in [" & section &
                 "] names no " & (if isGroup: "group" else: "user") &

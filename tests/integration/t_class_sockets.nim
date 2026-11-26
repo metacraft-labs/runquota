@@ -60,7 +60,7 @@
 
 when defined(linux):
   import std/[json, os, osproc, posix, sets, streams, strtabs,
-    strutils, tempfiles, times, unittest]
+    strutils, tables, tempfiles, times, unittest]
 
   import runquota_client
   import runquota_core
@@ -172,19 +172,34 @@ when defined(linux):
     var seen = initHashSet[string]()
     var reads = 0
     var round = 0
+    # Per path: how many reads found it, and how many times it APPEARED
+    # (absent, then present) -- each appearance is a creation the reader
+    # watched, which is what the never-wider check needs to have seen.
+    var found = newSeq[int](paths.len)
+    var appeared = newSeq[int](paths.len)
+    var present = newSeq[bool](paths.len)
     while true:
       inc round
       if round mod 256 == 0 and fileExists(stopFile):
         break
-      for path in paths:
+      for i, path in paths:
         var info: Stat
         if lstat(path.cstring, info) == 0:
           inc reads
+          inc found[i]
+          if not present[i]:
+            inc appeared[i]
+          present[i] = true
           seen.incl(path.extractFilename & " " &
             toOct(int(info.st_mode) and 0o7777, 4) & " " & $info.st_uid & " " &
             $info.st_gid)
+        else:
+          present[i] = false
     for state in seen:
       echo "seen " & state
+    for i, path in paths:
+      echo "found " & path.extractFilename & " " & $found[i] & " " &
+        $appeared[i]
     echo "reads " & $reads
     0
 
@@ -194,6 +209,9 @@ when defined(linux):
 
   type
     Host = object
+      daemonAccount: Account
+        ## Whom the daemon runs as: `rqd`, or root for the cases about a
+        ## root daemon.
       root, bin, run, state, socket, hostFile: string
       daemon: Process
       daemonOutput: string
@@ -216,15 +234,16 @@ when defined(linux):
     result["HOME"] = host.state
     result["RUNQUOTA_ENDPOINT_SCOPE"] = "host"
     result["RUNQUOTA_ENDPOINT_GROUP"] = RendezvousGroup.name
-    result["RUNQUOTA_ENDPOINT_OWNER_UID"] = $RqdAccount.uid
+    result["RUNQUOTA_ENDPOINT_OWNER_UID"] = $host.daemonAccount.uid
     result["RUNQUOTA_SOCKET"] = host.socket
     result["RUNQUOTA_CGROUP_ROOT"] = "off"
 
-  proc newHost(tag: string): Host =
+  proc newHost(tag: string; daemonAccount = RqdAccount): Host =
     ## A scratch host: binaries every account can run, a state directory
     ## for the daemon, and the rendezvous directory provisioned as the
     ## install step would (owner the daemon's account, group the rendezvous
     ## group, `0750`).
+    result.daemonAccount = daemonAccount
     result.root = createTempDir("rqcs-" & tag & "-", "", "/tmp")
     setFilePermissions(result.root, {fpUserRead, fpUserWrite, fpUserExec,
       fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
@@ -240,11 +259,11 @@ when defined(linux):
       fpGroupRead, fpGroupExec, fpOthersRead, fpOthersExec})
     result.state = result.root / "state"
     createDir(result.state)
-    chownTo(result.state, RqdAccount)
+    chownTo(result.state, daemonAccount)
     setFilePermissions(result.state, {fpUserRead, fpUserWrite, fpUserExec})
     result.run = result.root / "run"
     createDir(result.run)
-    chownTo(result.run, RqdAccount, RendezvousGroup.gid)
+    chownTo(result.run, daemonAccount, RendezvousGroup.gid)
     setFilePermissions(result.run, {fpUserRead, fpUserWrite, fpUserExec,
       fpGroupRead, fpGroupExec})
     result.socket = result.run / "runquotad.sock"
@@ -270,7 +289,7 @@ when defined(linux):
     ## Start `runquotad` as the daemon's account; true once its endpoint and
     ## every path in `waitFor` exist, false when it exited first (its output
     ## is then in `daemonOutput`).
-    host.daemon = startAs(RqdAccount, host.bin / "runquotad",
+    host.daemon = startAs(host.daemonAccount, host.bin / "runquotad",
       host.daemonArguments(cpuMilli), host.baseEnv())
     let deadline = epochTime() + 30.0
     while epochTime() < deadline:
@@ -521,11 +540,25 @@ when defined(linux):
     discard poller.waitForExit(30_000)
     poller.close()
     var observed: seq[string] = @[]
+    var appearances = initTable[string, int]()
+    var reads = initTable[string, int]()
     for line in pollOutput.splitLines():
       if line.startsWith("seen "):
         observed.add(line[5 .. ^1])
-      elif line.startsWith("reads "):
+      elif line.startsWith("found "):
+        let fields = line.split(' ')
+        reads[fields[1]] = parseInt(fields[2])
+        appearances[fields[1]] = parseInt(fields[3])
         echo "  reader: " & line
+    # THE READER MUST HAVE WATCHED, or "never saw a wider mode" is vacuous:
+    # every socket read many times, and the cycling class seen appearing in
+    # most of its 41 creations (the initial one and 40 re-adds).
+    for name in ["class-ci.sock", "class-gpu.sock", "class-cycle.sock"]:
+      expect reads.getOrDefault(name) >= 1000, "the reader read " & name &
+        " at least 1000 times (" & $reads.getOrDefault(name) & ")"
+    expect appearances.getOrDefault("class-cycle.sock") >= 30,
+      "the reader saw class-cycle.sock appear at least 30 times (" &
+      $appearances.getOrDefault("class-cycle.sock") & ")"
     echo "  states seen: " & observed.join("; ")
     let rqd = $RqdAccount.uid
     for state in observed:
@@ -592,6 +625,79 @@ when defined(linux):
       expect not fileExists(host.socket) and
         not socketState(host.socket).found, "and leaves no endpoint behind"
 
+  proc scenarioRootDaemonRestarts() =
+    ## A ROOT daemon gives class ci's socket to `member` (`socket-owner`).
+    ## Killed with SIGKILL it leaves that socket behind, owned by `member`;
+    ## the next start must take it for its own stale socket, as it does for
+    ## the shared endpoint, not refuse it as another user's.
+    var host = newHost("rootrestart", RootAccount)
+    defer:
+      host.stopDaemon()
+      removeDir(host.root)
+    host.writeHostFile("[reservation.ci]\nsocket-owner = \"member\"\n" &
+      "socket-group = \"ci\"\nsocket-mode = \"0660\"\n")
+    let ciSocket = host.run / "class-ci.sock"
+    expect host.startDaemon(waitFor = [ciSocket]),
+      "the root daemon starts: " & host.daemonOutput
+    let first = socketState(ciSocket)
+    expect first.ownerUid == MemberAccount.uid and
+      first.groupGid == ClassGroup.gid and first.mode == 0o660,
+      "class-ci.sock belongs to member, group ci, 0660"
+    discard posix.kill(Pid(host.daemon.processID), SIGKILL)
+    discard host.daemon.waitForExit(30_000)
+    host.daemon.close()
+    host.daemon = nil
+    expect socketState(ciSocket).found, "SIGKILL left the class socket"
+    expect host.startDaemon(waitFor = []),
+      "the root daemon starts again over its stale class socket: " &
+      host.daemonOutput
+    sleep(500)
+    expect host.daemon != nil and host.daemon.running,
+      "and keeps running"
+    let again = socketState(ciSocket)
+    expect again.ownerUid == MemberAccount.uid and again.mode == 0o660,
+      "the new class-ci.sock is member's again"
+    var member = host.startClient(MemberAccount, "claim", "ci")
+    let line = member.readUntil(["registered", "register-refused",
+      "connect-failed"])
+    member.finish()
+    echo "  member after the restart: " & line
+    expect line.startsWith("registered"), "member claims ci after the restart"
+
+  proc scenarioRefusedReloadChangesNothing() =
+    ## A reload that re-applies two classes' keys, the second of which the
+    ## kernel refuses (a gid the host has no such id for), changes neither:
+    ## the first class's socket keeps its owner, group and mode.
+    var host = newHost("reloadundo", RootAccount)
+    defer:
+      host.stopDaemon()
+      removeDir(host.root)
+    let before = "[reservation.ci]\nsocket-group = \"ci\"\n" &
+      "socket-mode = \"0600\"\n[reservation.gpu]\n"
+    host.writeHostFile(before)
+    let ciSocket = host.run / "class-ci.sock"
+    let gpuSocket = host.run / "class-gpu.sock"
+    expect host.startDaemon(waitFor = [ciSocket, gpuSocket]),
+      "the root daemon starts: " & host.daemonOutput
+    let ciBefore = socketState(ciSocket)
+    let gpuBefore = socketState(gpuSocket)
+    # gid 70000 is outside the ids this host maps, so chown(2) fails.
+    let refused = host.reload("[reservation.ci]\nsocket-group = \"ci\"\n" &
+      "socket-mode = \"0660\"\n[reservation.gpu]\n" &
+      "socket-group = \"70000\"\n")
+    echo "  refused reload: " & oneLine(refused.output)
+    expect refused.code != 0, "the reload is refused"
+    expect "unchanged" in refused.output, "saying nothing changed"
+    let ciAfter = socketState(ciSocket)
+    let gpuAfter = socketState(gpuSocket)
+    expect ciAfter.mode == ciBefore.mode and
+      ciAfter.groupGid == ciBefore.groupGid and
+      ciAfter.ownerUid == ciBefore.ownerUid,
+      "class-ci.sock is unchanged (mode " & toOct(ciAfter.mode, 4) &
+      ", gid " & $ciAfter.groupGid & ")"
+    expect gpuAfter.mode == gpuBefore.mode and
+      gpuAfter.groupGid == gpuBefore.groupGid, "class-gpu.sock is unchanged"
+
   proc insideMain(scenario: string): int =
     ## The accounts host's root: arrange the accounts, run one scenario.
     echo "RAN ON: " & accountsPlatform()
@@ -603,6 +709,8 @@ when defined(linux):
       of "permitted_claim": scenarioPermittedClaim()
       of "shared_socket_refuses": scenarioSharedSocketRefuses()
       of "created_as_declared": scenarioCreatedAsDeclared()
+      of "root_daemon_restarts": scenarioRootDaemonRestarts()
+      of "refused_reload_changes_nothing": scenarioRefusedReloadChangesNothing()
       else: failures.add("unknown scenario " & scenario)
     except CatchableError as error:
       failures.add("the scenario raised: " & error.msg)
@@ -645,6 +753,10 @@ when defined(linux):
       runScenario("shared_socket_refuses")
     test "class_sockets_created_as_declared":
       runScenario("created_as_declared")
+    test "a root daemon restarts over a class socket it gave away":
+      runScenario("root_daemon_restarts")
+    test "a refused reload changes no class socket":
+      runScenario("refused_reload_changes_nothing")
 else:
   import std/unittest
 
@@ -652,7 +764,9 @@ else:
     for name in ["class_socket_refuses_unpermitted_user",
                  "class_socket_permitted_claim",
                  "shared_socket_refuses_class_claim",
-                 "class_sockets_created_as_declared"]:
+                 "class_sockets_created_as_declared",
+                 "a root daemon restarts over a class socket it gave away",
+                 "a refused reload changes no class socket"]:
       test name:
         # No two-account helper for this platform yet
         # (`tests/support/class_socket_accounts`).

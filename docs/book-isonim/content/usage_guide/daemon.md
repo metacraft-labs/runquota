@@ -214,7 +214,10 @@ that would join a group that has a class; everything else on the shared
 socket is unchanged. The client never falls back from a class socket that
 refuses it to the shared one: it stops with an error naming the socket and
 the class, and a launcher (`runquota run`, `acquire`, `jobserver`) does not
-run the command unleased instead. When the class's socket does not exist the
+run the command unleased instead. That holds for every way of failing to
+reach the class -- an invalid class name, a socket nobody listens on, a
+daemon that does not answer, and no daemon at all -- since the work asked for
+a reservation. When the class's socket does not exist the
 client asks the shared socket, and the daemon answers that the host declares
 no such class: declare `[reservation.<class>]`, or unset `RUNQUOTA_CLASS`.
 A daemon older than class sockets (protocol minor 12) keeps its earlier

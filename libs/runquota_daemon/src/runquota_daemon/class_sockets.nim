@@ -74,8 +74,14 @@ proc accessText*(plan: ClassSocketPlan): string =
 
 proc planClassSockets*(reservations: OrderedTable[string, ClassReservation];
                        shared: Endpoint;
-                       scope: RendezvousScope): seq[ClassSocketPlan] =
-  ## The socket of every declared class, in file order. Raises
+                       scope: RendezvousScope;
+                       activated = false): seq[ClassSocketPlan] =
+  ## The socket of every declared class, in file order. Under socket
+  ## ACTIVATION (`activated`) systemd creates the sockets and applies their
+  ## owner, group and mode, and the daemon only verifies them
+  ## (`adoptClassSockets`), so whether this process could apply them is not
+  ## asked: a daemon outside a class's `socket-group` serves the socket
+  ## systemd gave that group. Otherwise it raises
   ## `ClassSocketProblem` naming the class, the socket and what is missing
   ## when one cannot be created as declared -- before anything is created.
   when ClassSocketsServed and defined(posix):
@@ -104,8 +110,11 @@ proc planClassSockets*(reservations: OrderedTable[string, ClassReservation];
         plan.mode =
           if reservation.socketMode != 0: reservation.socketMode
           else: DefaultClassSocketMode
-        let problem = classSocketAccessProblem(ClassSocketAccess(
-          ownerUid: plan.ownerUid, groupGid: plan.groupGid, mode: plan.mode))
+        let problem =
+          if activated: ""
+          else: classSocketAccessProblem(ClassSocketAccess(
+            ownerUid: plan.ownerUid, groupGid: plan.groupGid,
+            mode: plan.mode))
         if problem.len > 0:
           raise newException(ClassSocketProblem, "class " & className &
             ": cannot create its socket " & endpoint.path & " as declared: " &
@@ -271,6 +280,16 @@ proc classSocketsServing*(): bool =
   else:
     false
 
+proc classSocketsAdopted*(): bool =
+  ## Whether the class sockets in force are systemd's (socket activation).
+  when ClassSocketsServed and defined(posix):
+    if not registryReady: return false
+    acquire(registryLock)
+    try: activatedRegistry
+    finally: release(registryLock)
+  else:
+    false
+
 proc reconcileClassSockets*(plans: seq[ClassSocketPlan]) =
   ## Put a reloaded host file's class sockets in force. Raises
   ## `ClassSocketProblem` with nothing changed when they cannot be: under
@@ -324,19 +343,42 @@ proc reconcileClassSockets*(plans: seq[ClassSocketPlan]) =
           entry.listener.closeRawListener()
         raise newException(ClassSocketProblem, error.msg)
       # CHANGED KEYS, re-applied in place: the socket keeps its inode and
-      # every connection accepted on it.
+      # every connection accepted on it. ALL OR NOTHING: what this process
+      # may apply is judged for every changed socket before any is touched,
+      # and a re-apply the kernel still refuses (a `chown` that fails) puts
+      # back the ones already applied, so a refused reload changes no
+      # socket.
+      var changes: seq[tuple[index: int, after: ClassSocketPlan]] = @[]
       for plan in plans:
         if current.hasKey(plan.className):
           let index = current[plan.className]
           if not sameAccess(entries[index].plan, plan):
-            let problem = reapplyClassSocket(plan.endpoint.path,
-              entries[index].plan.toAccess, plan.toAccess)
+            let problem = classSocketAccessProblem(plan.toAccess)
             if problem.len > 0:
               for entry in added.mitems:
                 entry.listener.closeRawListener()
               raise newException(ClassSocketProblem, "class " &
                 plan.className & ": " & problem)
-            entries[index].plan = plan
+            changes.add((index: index, after: plan))
+      var applied: seq[int] = @[]
+      for (index, after) in changes:
+        let problem = reapplyClassSocket(after.endpoint.path,
+          entries[index].plan.toAccess, after.toAccess)
+        if problem.len > 0:
+          # The failed one may be half-applied too: restore it with the rest.
+          for undo in countdown(changes.high, 0):
+            let (undoIndex, undoAfter) = changes[undo]
+            if undoIndex in applied or undoIndex == index:
+              discard reapplyClassSocket(undoAfter.endpoint.path,
+                undoAfter.toAccess, entries[undoIndex].plan.toAccess)
+          for entry in added.mitems:
+            entry.listener.closeRawListener()
+          raise newException(ClassSocketProblem, "class " &
+            after.className & ": " & problem &
+            "; the class sockets in force are unchanged")
+        applied.add(index)
+      for (index, after) in changes:
+        entries[index].plan = after
       # DROPPED TABLES lose their socket now: the name goes at once, so no
       # new connection reaches it, and the accept loop closes the
       # descriptor when it next wakes. Connections already accepted on it

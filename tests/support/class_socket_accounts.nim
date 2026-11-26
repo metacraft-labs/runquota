@@ -58,6 +58,8 @@ const
     groups: @[1002, 1500, 2000, 2001])
   OutsiderAccount* = Account(name: "outsider", uid: 1003, gid: 1003,
     groups: @[1003, 1500])
+  RootAccount* = Account(name: "root", uid: 0, gid: 0, groups: @[0])
+    ## The accounts host's root, for a daemon that runs as root.
   RendezvousGroup* = (name: "rqgrp", gid: 1500)
   ClassGroup* = (name: "ci", gid: 2000)
   ForeignGroup* = (name: "gputeam", gid: 2001)

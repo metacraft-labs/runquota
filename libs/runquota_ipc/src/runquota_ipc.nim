@@ -1935,7 +1935,7 @@ when defined(posix):
       return 0
     errno
 
-  proc clearStaleSharedEndpoint(path: string) =
+  proc clearStaleSharedEndpoint(path: string; declaredOwner = -1'i64) =
     ## THE HOST (non-private) ENDPOINT IS CLEARED ONLY OF A STALE SOCKET.
     ## A daemon killed with `SIGKILL` -- systemd does that to one that
     ## overruns its stop timeout -- never unlinks its socket, and until this
@@ -1980,10 +1980,16 @@ when defined(posix):
       raise newException(EndpointTrustError, "RunQuota endpoint " & path &
         " exists and is not a socket (it is " & fileKindText(found.st_mode) &
         "); refusing to bind over it, and leaving it in place")
-    if found.st_uid != geteuid():
+    # `declaredOwner`: a CLASS socket the host file gives to another owner
+    # (`socket-owner`, which only a root daemon can apply) is this daemon's
+    # own leftover when it is owned by that uid, and is probed like one.
+    if found.st_uid != geteuid() and
+        (declaredOwner < 0 or int64(found.st_uid) != declaredOwner):
       raise newException(EndpointTrustError, "RunQuota endpoint " & path &
         " is a socket owned by uid " & $found.st_uid & ", not by this " &
-        "daemon's uid " & $geteuid() & "; refusing to remove it")
+        "daemon's uid " & $geteuid() &
+        (if declaredOwner >= 0: " or the declared owner uid " &
+          $declaredOwner else: "") & "; refusing to remove it")
     var attempt = 0
     while true:
       let code = probeUnixListener(path)
@@ -2253,6 +2259,13 @@ when defined(posix):
     ## may change its group only to a group it is in -- its effective gid or
     ## one of its supplementary groups (`getgroups(2)`), which is the
     ## kernel's own test.
+    const maxId = 4294967294'i64
+      ## `(uid_t)-1` (4294967295) means "leave unchanged" to `chown(2)`.
+    for (id, what) in [(access.ownerUid, "owner uid"), (access.groupGid,
+        "group gid")]:
+      if id > maxId:
+        return "the " & what & " " & $id & " is out of range (at most " &
+          $maxId & ")"
     let euid = int64(geteuid())
     if euid == 0:
       return ""
@@ -2345,7 +2358,7 @@ when defined(posix):
     var socket: Socket = nil
     var done = false
     try:
-      clearStaleSharedEndpoint(endpoint.path)
+      clearStaleSharedEndpoint(endpoint.path, access.ownerUid)
       # THE STAGING DIRECTORY: short, so the staged path is no longer than
       # the class path itself for any class name of two bytes or more.
       while true:

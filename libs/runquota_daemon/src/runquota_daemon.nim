@@ -5314,7 +5314,8 @@ proc reloadHostConfig*(daemon: var RunQuotaDaemon; owner = ""):
   if classSocketsServing():
     try:
       reconcileClassSockets(planClassSockets(next.reservations,
-        next.endpoint, rendezvousPolicy().scope))
+        next.endpoint, rendezvousPolicy().scope,
+        activated = classSocketsAdopted()))
     except ClassSocketProblem as error:
       raise newException(HostConfigError, host.sourcePath & ": " & error.msg)
     except EndpointTrustError as error:
@@ -8460,7 +8461,7 @@ proc serve*(config: DaemonConfig): int =
   var classPlans: seq[ClassSocketPlan] = @[]
   try:
     classPlans = planClassSockets(config.reservations, config.endpoint,
-      rendezvousPolicy().scope)
+      rendezvousPolicy().scope, activated = activated)
     if activated:
       adoptClassSockets(classPlans, config.socketActivation.classFds,
         rendezvousPolicy())

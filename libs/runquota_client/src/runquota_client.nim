@@ -315,7 +315,8 @@ type
     className*: string
 
 proc classSocketRefusal(path, className, why: string): string =
-  "cannot claim class " & className & " at its socket " & path & ": " & why &
+  "cannot claim class " & className &
+    (if path.len > 0: " at its socket " & path else: "") & ": " & why &
     ". Who may claim a class is decided by the host file's [reservation." &
     className & "] (socket-owner, socket-group and socket-mode; " &
     "allowed-users and allowed-groups on Windows); the client does not " &
@@ -354,27 +355,41 @@ proc connectForClass*(className: string; endpoint = defaultEndpoint();
                       clientName = "runquota-nim";
                       clientVersion = "0.1.0"): RunQuotaClient =
   ## Connect for work in `className` ("" for none): to the class's socket
-  ## beside `endpoint` when it exists, else to `endpoint` itself. Raises
-  ## `ClassSocketRefusedError` when the class's socket refuses this process,
-  ## `RunQuotaClientError` for a class outside the class-name rule or a
-  ## socket path too long for this platform, and what `connect` raises
-  ## otherwise.
+  ## beside `endpoint` when it exists, else to `endpoint` itself.
+  ##
+  ## ONCE A CLASS IS NAMED, EVERY FAILURE IS A CLASS REFUSAL
+  ## (`ClassSocketRefusedError`, naming the socket and the class): a class
+  ## outside the class-name rule, a socket path too long for the platform,
+  ## a socket that refuses the connect, a Hello refused or unanswered there,
+  ## a `HelloOk` for another class, and -- when the class has no socket --
+  ## no daemon at the shared endpoint either. Work that asked for a
+  ## reservation must not end up running unleased, outside every budget,
+  ## because the daemon that would have refused it was not reachable. With
+  ## no class, it raises what `connect` raises.
   if className.len == 0:
     return connect(endpoint, clientName, clientVersion)
   let problem = classNameProblem(className)
   if problem.len > 0:
-    raise newException(RunQuotaClientError, "invalid class " &
-      classEnvVarName & ": " & problem)
+    raiseClassRefused("", className, "the class " & classEnvVarName &
+      " names is invalid: " & problem)
   var classSocket: Endpoint
   try:
     classSocket = classEndpoint(endpoint, className)
   except ClassEndpointError as error:
-    raise newException(RunQuotaClientError, "class " & className & ": " &
-      error.msg)
+    raiseClassRefused(classSocketPathFor(endpoint.path, className,
+      endpoint.kind, endpoint.rendezvousPath), className, error.msg)
   if not classSocketExists(classSocket):
     # NO SOCKET FOR THE CLASS: the shared endpoint, where a daemon with
-    # class sockets answers that the host declares no such class.
-    return connect(endpoint, clientName, clientVersion)
+    # class sockets answers that the host declares no such class and one
+    # that predates them serves the class as at minor 12. No daemon there
+    # either is a refusal, not standalone mode: see above.
+    try:
+      return connect(endpoint, clientName, clientVersion)
+    except CatchableError as error:
+      raiseClassRefused(classSocket.path, className,
+        "there is no socket for the class, and no daemon answered at the " &
+        "shared endpoint " & endpoint.path & " either (" &
+        error.msg.strip() & ")")
   when defined(posix):
     if classSocket.kind == endpointUnixSocket:
       var info: Stat
@@ -385,16 +400,16 @@ proc connectForClass*(className: string; endpoint = defaultEndpoint();
           "so it is not the daemon's")
   try:
     result = connect(classSocket, clientName, clientVersion)
-  except RunQuotaClientError:
-    # The daemon answered (a refused Hello, a protocol error): its own words
-    # are the better message.
-    raise
   except OSError as error:
     let code = error.errorCode
     let why =
       if code != 0: osErrorMsg(OSErrorCode(code)).strip()
       else: error.msg.strip()
     raiseClassRefused(classSocket.path, className, why)
+  except CatchableError as error:
+    # The daemon answered and refused, never answered, or answered with
+    # something that is not a `HelloOk`: its own words are the reason.
+    raiseClassRefused(classSocket.path, className, error.msg.strip())
   if result.socketClass != className:
     let answered = result.socketClass
     result.connection.close()
@@ -546,6 +561,15 @@ proc tryConnectDefault*(client: var RunQuotaClient;
   except CatchableError as error:
     failure = ConnectFailure(kind: cfkOther, endpoint: endpoint,
       errorName: "error", detail: oneLine(error.msg))
+  # WITH A CLASS NAMED, NOTHING THAT FAILED IS RUN UNLEASED -- not even a
+  # failure before `connectForClass` was reached (an endpoint that could not
+  # be resolved): the work asked for a reservation.
+  let className = getEnv(classEnvVarName).strip()
+  if className.len > 0 and failure.kind != cfkClassRefused:
+    failure = ConnectFailure(kind: cfkClassRefused, endpoint: failure.endpoint,
+      errorName: "class " & className & " refused",
+      detail: failure.errorName & (if failure.detail.len > 0:
+        ": " & failure.detail else: ""))
   false
 
 proc strictRequested*(): bool =

@@ -36,6 +36,14 @@ let
   # checks it against its own reading of the host file.
   classSockets = if cfg.hostConfig == null then [ ] else hostConfigLib.classSockets cfg.hostConfig;
   classSocketUnit = class: "runquotad-class-${class.name}";
+  # The named groups of the class sockets (a decimal gid names no group).
+  classSocketGroups = lib.unique (
+    map (class: class.group) (
+      builtins.filter (
+        class: class.group != null && builtins.match "[0-9]+" class.group == null
+      ) classSockets
+    )
+  );
   activationSockets = [
     "runquotad.socket"
   ]
@@ -189,6 +197,12 @@ in
       isSystemUser = true;
       group = cfg.group;
       description = "RunQuota lease authority";
+      # A DAEMON THAT BINDS ITS CLASS SOCKETS ITSELF can give a socket only a
+      # group its account is in, and refuses to start otherwise: so the
+      # account joins every class's named `socketGroup`. Under socket
+      # activation systemd applies the group and the daemon only checks it,
+      # so no membership is needed (and none is given).
+      extraGroups = lib.optionals (!cfg.socketActivation) classSocketGroups;
     };
     users.groups.${cfg.group} = lib.mkIf (cfg.group == hostState.group) { };
 
