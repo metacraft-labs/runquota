@@ -15,6 +15,12 @@
 ##   trailing class, and a minor-12 client never connects to one. Written
 ##   field by field here, not through the current encoder, so the case
 ##   cannot pass by the encoder agreeing with itself;
+## * on a real daemon with a declared class, the shared socket's `HelloOk`
+##   carries no class to any client -- a class-aware client with
+##   `RUNQUOTA_CLASS` unset and a minor-12-shaped Hello alike. A Hello
+##   carries no protocol minor, so the daemon cannot tell the two apart, and
+##   the shared socket must never write the class; the class socket's
+##   `HelloOk` on the same daemon does carry it (the positive control);
 ## * the `RegisterSession` class block is the minor-12 block, unchanged;
 ## * cross-run: a new client against a minor-12 daemon (no class sockets)
 ##   sends the class block as at minor 12 and is served in its class; a
@@ -187,3 +193,90 @@ when defined(posix):
         let (statusCode, statusOutput) = cli(env, ["status", "--json"])
         check statusCode == 0
         check "\"total_granted\":1," in statusOutput
+
+  import std/posix
+
+  import runquota_client
+  import runquota_ipc
+  import runquota_protocol/client_namespaces
+
+  proc helloOkPayload(socketPath: string; hello: HelloMessage): string =
+    ## The raw `HelloOk` payload a real daemon answers `hello` with on
+    ## `socketPath`. Spoken on the wire directly, because the client library
+    ## decodes the answer and keeps no bytes; a decoder that accepts the
+    ## trailing class would hide exactly the field this case is about.
+    var connection = connectEndpoint(endpointForPath(socketPath))
+    defer: connection.close()
+    connection.sendFrame(encodeFrame(rqHello, FrameFlagRequest, 1'u64,
+      encodeHello(hello)))
+    var frame: RqspFrame
+    var diagnostic = okDiagnostic()
+    check connection.receiveFrame(frame, diagnostic, 5000)
+    check frame.header.messageKind == rqHelloOk
+    frame.payload
+
+  proc classAwareHello(): HelloMessage =
+    ## The Hello the current client library sends (`runquota_client.connect`).
+    HelloMessage(clientName: "runquota-nim", clientVersion: "0.1.0",
+      minProtocolMajor: RqspProtocolMajor, maxProtocolMajor: RqspProtocolMajor,
+      processId: uint64(getCurrentProcessId()),
+      userId: uint64(getuid()),
+      desiredCapabilities: withNamespaceTokens("m1-lease",
+        currentNamespaces()))
+
+  proc minor12Hello(): HelloMessage =
+    ## A Hello as a minor-12 client writes it. A Hello carries no protocol
+    ## minor, so the daemon cannot tell this client from a new one: the
+    ## shared socket's answer must suit both.
+    HelloMessage(clientName: "runquota-nim", clientVersion: "0.0.12",
+      minProtocolMajor: RqspProtocolMajor, maxProtocolMajor: RqspProtocolMajor,
+      processId: uint64(getCurrentProcessId()),
+      userId: uint64(getuid()), desiredCapabilities: "m1-lease")
+
+  suite "class_socket_hello_on_a_real_daemon":
+    test "the shared socket's HelloOk never carries the class":
+      let root = scratchDir("clscompat-hello")
+      defer: removeDir(root)
+      let socket = root / "rq.sock"
+      let env = privateEnv(socket)
+      writeFile(root / "host.toml", Head & "[reservation.ci]\n")
+      let daemon = startWith(daemonPath(), root, socket, env)
+      defer: stopOwned(daemon)
+      check isSocket(socket)
+      when not ClassSocketsServed:
+        echo "SKIPPED: this platform's daemon serves no class sockets yet"
+        skip()
+      else:
+        check isSocket(root / "class-ci.sock")
+        # This process is the client: it reaches the private daemon under the
+        # private policy, as every client the per-user launcher starts does,
+        # and with RUNQUOTA_CLASS unset.
+        putEnv("RUNQUOTA_ENDPOINT_SCOPE", "private")
+        putEnv("RUNQUOTA_SOCKET", socket)
+        delEnv("RUNQUOTA_CLASS")
+        for hello in [classAwareHello(), minor12Hello()]:
+          let payload = helloOkPayload(socket, hello)
+          var decoded: HelloOkMessage
+          check decodeHelloOk(payload, decoded)
+          check decoded.connectionClass == ""
+          # Byte for byte what a minor-12 daemon sends, rebuilt field by
+          # field from the decoded values: a trailing class would differ.
+          check payload == minor12HelloOk(decoded)
+
+        # The client library itself, with RUNQUOTA_CLASS unset, reaches the
+        # shared socket and is told no class.
+        var client = runquota_client.connectDefault()
+        check client.socketClass == ""
+        client.close()
+
+        # POSITIVE CONTROL: the same daemon's class socket does name the
+        # class, after the minor-12 fields, so the comparison above can
+        # tell the two answers apart.
+        let classPayload = helloOkPayload(root / "class-ci.sock",
+          classAwareHello())
+        var classDecoded: HelloOkMessage
+        check decodeHelloOk(classPayload, classDecoded)
+        check classDecoded.connectionClass == "ci"
+        var trailer = writer()
+        trailer.writeString("ci")
+        check classPayload == minor12HelloOk(classDecoded) & trailer.data
