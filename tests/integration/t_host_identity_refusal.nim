@@ -436,6 +436,11 @@ suite "host_identity_provisioning":
     # The INSTALL, not just the reference.
     check "rendezvous directory" in darwin
     check "-m ${hostState.endpointDirectoryMode}" in darwin
+    # The job provisions as root and runs the daemon as the account clients
+    # accept (`rendezvousPolicy`): the module creates that account and drops
+    # to it. `checks.module-eval` asserts the same on the evaluated output.
+    check "users.knownUsers" in darwin
+    check "chroot --userspec=" in darwin
 
     # The flake exposes them, so `imports = [ ... ]` can reach them.
     let flakeText = contents(flake)

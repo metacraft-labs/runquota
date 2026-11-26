@@ -110,6 +110,7 @@
                 system.stateVersion = 5;
                 system.primaryUser = hostState.user;
                 services.runquotad.enable = true;
+                services.runquotad.members = [ "alice" ];
                 services.runquotad.hostConfig.memoryBytes = 25769803776;
               }
             ];
@@ -409,7 +410,28 @@
                   # Context discarded: with `hostConfig` set the script calls
                   # `runquota config reload` from the aarch64-darwin package,
                   # and this EVALUATION check must not demand that build.
-                  darwinActivation = builtins.unsafeDiscardStringContext darwinEval.config.system.activationScripts.runquotadStateDir.text;
+                  darwinActivation = builtins.unsafeDiscardStringContext darwinEval.config.system.activationScripts.postActivation.text;
+                  # THE SCRIPT NIX-DARWIN ACTUALLY RUNS. It assembles `activate`
+                  # from a fixed list of script names, so a step is real only
+                  # if it reaches this text; the module's old
+                  # `runquotadStateDir` was evaluated and never ran.
+                  darwinAssembled = builtins.unsafeDiscardStringContext darwinEval.config.system.activationScripts.script.text;
+                  # The job's script: provisioning as root, then the drop to
+                  # the daemon's account.
+                  darwinJobScript = builtins.unsafeDiscardStringContext darwinEval.config.launchd.daemons.runquotad.script;
+                  # The account clients look for, with its ids and members.
+                  darwinAccounts = builtins.toJSON {
+                    user = {
+                      inherit (darwinEval.config.users.users.${hostState.user}) uid gid isHidden;
+                    };
+                    group = {
+                      inherit (darwinEval.config.users.groups.${hostState.group}) gid members;
+                    };
+                    # Membership, not equality: nix-darwin lists its own Nix
+                    # build users and group here too.
+                    knownUser = builtins.elem hostState.user darwinEval.config.users.knownUsers;
+                    knownGroup = builtins.elem hostState.group darwinEval.config.users.knownGroups;
+                  };
                   # The VALUES, not the attribute names: nix-darwin
                   # declares every launchd key whether or not it was set,
                   # so a grep over the names would pass against a module
@@ -504,14 +526,26 @@
                 }
                 ''
                   printf '%s' "$darwinActivation" > darwin-activation
-                  grep -F '${hostState.directories.darwin}' darwin-activation
-                  grep -F '${hostState.endpointDirectories.darwin}' darwin-activation
-                  grep -F '${hostState.mode}' darwin-activation
-                  grep -F '${hostState.endpointDirectoryMode}' darwin-activation
+                  printf '%s' "$darwinAssembled" > darwin-assembled
+                  # Both activation steps reach the script nix-darwin runs.
+                  grep -F 'install -d -m 0755 -o root -g wheel /etc/runquota' darwin-assembled
+                  grep -F 'config reload' darwin-assembled
+                  # The job provisions both directories, owned by the
+                  # daemon's account, then drops to it.
+                  printf '%s' "$darwinJobScript" > darwin-job
+                  grep -F -- "-m ${hostState.mode}" darwin-job
+                  grep -F -- "-o '${hostState.user}' -g '${hostState.group}' '${hostState.directories.darwin}'" darwin-job
+                  grep -F -- "-m ${hostState.endpointDirectoryMode}" darwin-job
+                  grep -F -- "-o '${hostState.user}' -g '${hostState.group}' '${hostState.endpointDirectories.darwin}'" darwin-job
+                  grep -E -- "^exec /nix/store/[^ ]*-coreutils-[^ ]*/bin/chroot --userspec='${hostState.user}:${hostState.group}' / " darwin-job
+                  # The job itself runs as root: no UserName, no GroupName.
                   printf '%s' "$darwinLaunchd" > darwin-launchd
-                  grep -F '"GroupName":"wheel"' darwin-launchd
-                  grep -F '"UserName":"root"' darwin-launchd
+                  grep -F '"GroupName":null' darwin-launchd
+                  grep -F '"UserName":null' darwin-launchd
                   grep -F 'org.metacraft-labs.runquotad' darwin-launchd
+                  # The account and group, with the default ids and members.
+                  test "$darwinAccounts" = '{"group":{"gid":502,"members":["alice"]},"knownGroup":true,"knownUser":true,"user":{"gid":502,"isHidden":true,"uid":390}}' \
+                    || { echo "darwin accounts: $darwinAccounts" >&2; exit 1; }
 
                   printf '%s' "$nixosTmpfiles" > nixos-tmpfiles
                   grep -F '${hostState.directories.linux}' nixos-tmpfiles

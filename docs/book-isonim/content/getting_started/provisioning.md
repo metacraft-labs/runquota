@@ -202,12 +202,20 @@ config reload`), never by restarting it. Because the file is a store link,
 Left `null`, no file is written and `/etc/runquota` is still created (root,
 `0755`) for `runquota config set`.
 
-The nix-darwin module installs a `launchd` daemon labelled
-`org.metacraft-labs.runquotad` with `RunAtLoad` and `KeepAlive`, and an
-activation script that creates both directories and `/etc/runquota`, and asks
-a running daemon to reload when `hostConfig` is set. Note that it defaults to
-running as **`root`:`wheel`** rather than a dedicated account — nix-darwin has
-no system-user abstraction to hang one on.
+The nix-darwin module creates a hidden `runquota` user and a `runquota`
+group, as the NixOS module does, so clients accept the daemon with no
+environment set. nix-darwin needs explicit ids: `services.runquotad.uid`
+(default `390`) and `services.runquotad.gid` (default `502`); set them on a
+Mac where either is taken. List the accounts that may use RunQuota in
+`services.runquotad.members`; the rendezvous directory admits only that
+group.
+
+It installs a `launchd` daemon labelled `org.metacraft-labs.runquotad` with
+`RunAtLoad` and `KeepAlive`. The job runs as root: at every start it creates
+both directories for the `runquota` account (macOS empties `/var/run` at
+boot), then runs `runquotad` as that account through coreutils `chroot
+--userspec`. Activation creates `/etc/runquota` and asks a running daemon to
+reload when `hostConfig` is set.
 
 The machine-readable copy of every path, mode, user and group on this page is
 `nix/host-state.nix` in the RunQuota repository, and a test asserts that the

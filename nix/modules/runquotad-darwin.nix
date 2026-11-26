@@ -1,16 +1,15 @@
-# nix-darwin module: `runquotad` as a launchd daemon, with its host-wide
-# state directory provisioned by the install step.
+# nix-darwin module: `runquotad` as a launchd daemon, with its account and
+# its host-wide directories provisioned by the module.
 #
 # Exposed as `darwinModules.runquotad` (and `.default`) from the flake.
 #
-# THE POINT OF THIS FILE IS THE DIRECTORY, not the launchd job. On macOS
-# the path is `/var/db/runquota`, and `/var/db` is `root:wheel 0755`, so an
-# unprivileged daemon cannot create it. That is the whole defect M13c-fix
-# repairs: nothing provisioned it, so `resolveHostIdentity()` failed and
-# the old code answered by minting a fresh id on every invocation.
-#
-# `launchd.daemons` runs as root, so the activation script below can chown
-# the directory to the account the daemon actually runs under.
+# THE POINT OF THIS FILE IS THE DIRECTORIES AND THEIR OWNER, not the launchd
+# job. On macOS the state directory is `/var/db/runquota` and the rendezvous
+# directory `/var/run/runquota`; both parents are `root:wheel`, so an
+# unprivileged daemon cannot create them, and a directory owned by anyone
+# but the `runquota` account is refused by every client. The module
+# therefore creates that account, and its launchd job creates both
+# directories as root at every start before it drops to the account.
 { self }:
 {
   config,
@@ -38,37 +37,67 @@ in
 
     user = lib.mkOption {
       type = lib.types.str;
-      default = "root";
+      default = hostState.user;
       description = ''
         The account `runquotad` runs as, and the OWNER of the host-wide
-        state directory. The daemon writes the machine's `host_id` there
-        on first start, so a directory owned by anyone else leaves the
-        host unprovisioned in practice.
+        state directory and the rendezvous directory. A client accepts the
+        rendezvous directory only when its owner is
+        `RUNQUOTA_ENDPOINT_OWNER_UID`, else the `${hostState.user}` account,
+        else the client itself, so the default is that account: with it the
+        daemon is accepted by every client with no environment set.
 
-        Defaults to `root` because nix-darwin has no system-user
-        abstraction comparable to NixOS's; set it to a dedicated account
-        if one exists on the host.
+        While this keeps its default the module creates the account (see
+        `uid`); a host that names another account provisions it itself.
       '';
     };
 
     group = lib.mkOption {
       type = lib.types.str;
-      default = "wheel";
+      default = hostState.group;
       description = ''
         The group owning the host-wide state directory AND the rendezvous
-        directory. Membership in it is the admission control for "may you
+        directory. Membership in it is the admission list for "may you
         participate in the managed-resource system on this host": the
         rendezvous directory is `${hostState.endpointDirectoryMode}` and
         the socket is `${hostState.endpointSocketMode}`, so a non-member is
         refused by the KERNEL rather than by anything the daemon runs.
 
-        Defaults to `wheel` for the same reason `user` defaults to `root`
-        — nix-darwin has no system-group abstraction comparable to
-        NixOS's. A host that wants a real admission list should create a
-        `${hostState.group}` group with `dscl` and set this to it;
-        leaving it at `wheel` makes the admission list "the
-        administrators", which is a decision rather than a default worth
-        inheriting silently.
+        While this keeps its default the module creates the group (see
+        `gid`) and fills it from `members`.
+      '';
+    };
+
+    uid = lib.mkOption {
+      type = lib.types.int;
+      default = 390;
+      description = ''
+        The uid of the `${hostState.user}` account the module creates.
+        nix-darwin creates an account only with an explicit id. 390 is free
+        on the Macs this default was chosen against: Apple's accounts are
+        below 300 or users from 501, and Nix's build users take 301-332
+        (older installs) or 351-382. Set it on a host where 390 is taken.
+      '';
+    };
+
+    gid = lib.mkOption {
+      type = lib.types.int;
+      default = 502;
+      description = ''
+        The gid of the `${hostState.group}` group the module creates. Set
+        it on a host where 502 is taken by another group.
+      '';
+    };
+
+    members = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "alice" ];
+      description = ''
+        The accounts allowed to use RunQuota on this host: they become the
+        members of the `${hostState.group}` group, which the rendezvous
+        directory and socket admit. An account that is not listed gets no
+        lease. Ignored when `group` is not the default; add members to that
+        group yourself.
       '';
     };
 
@@ -135,34 +164,42 @@ in
       )
     );
 
-    # THE PROVISIONING. It runs at activation, before any `runquotad` has
-    # started, so the directory's owner and mode are the ones written down
-    # in `nix/host-state.nix` rather than the ones whichever process
-    # started first happened to have. `install -d` is idempotent and also
-    # corrects the mode and owner of a directory that already exists,
-    # which matters on a host where somebody once created it by hand.
-    #
-    # THE RENDEZVOUS DIRECTORY IS PROVISIONED HERE TOO, and for a sharper
-    # reason: its GROUP is the admission list for the whole
-    # managed-resource system. A directory created by whichever process
-    # started first carries whatever group that process had -- either
-    # nobody, so the daemon is unreachable, or the wrong population, so
-    # anyone may participate.
-    #
-    # `/var/run` is cleared on boot on macOS, so this rule has to run at
-    # every activation AND the directory has to be re-created after a
-    # reboot. `launchd.daemons` below runs as root and `RunAtLoad` fires
-    # after activation on a booted system; on a fresh boot the daemon's
-    # own refusal names the provisioning command.
-    system.activationScripts.runquotadStateDir.text = ''
-      printf 'provisioning RunQuota host-wide state directory %s\n' '${stateDir}'
-      /usr/bin/install -d -m ${hostState.mode} \
-        -o '${cfg.user}' -g '${cfg.group}' '${stateDir}'
-      printf 'provisioning RunQuota rendezvous directory %s\n' '${endpointDir}'
-      /usr/bin/install -d -m ${hostState.endpointDirectoryMode} \
-        -o '${cfg.user}' -g '${cfg.group}' '${endpointDir}'
-      # The host budget file's directory: root-owned 0755, like the rest of
-      # /etc. `runquota config set` writes into it and never creates it.
+    # THE ACCOUNT. A client accepts the rendezvous directory only when its
+    # owner is RUNQUOTA_ENDPOINT_OWNER_UID, else the `runquota` account,
+    # else the client itself (`rendezvousPolicy` in libs/runquota_ipc). With
+    # no `runquota` account every client expected to own the directory
+    # itself, so a daemon run as anyone else was refused by all of them.
+    # nix-darwin creates an account only when it is listed in `knownUsers`
+    # / `knownGroups` and carries an explicit id, hence `uid` and `gid`.
+    users.users = lib.mkIf (cfg.user == hostState.user) {
+      ${hostState.user} = {
+        uid = cfg.uid;
+        gid = cfg.gid;
+        home = "/var/empty";
+        shell = "/usr/bin/false";
+        isHidden = true;
+        description = "RunQuota host-wide lease authority";
+      };
+    };
+    users.groups = lib.mkIf (cfg.group == hostState.group) {
+      ${hostState.group} = {
+        gid = cfg.gid;
+        members = cfg.members;
+        description = "RunQuota admission list";
+      };
+    };
+    users.knownUsers = lib.optional (cfg.user == hostState.user) hostState.user;
+    users.knownGroups = lib.optional (cfg.group == hostState.group) hostState.group;
+
+    # ACTIVATION. nix-darwin assembles its activate script from a FIXED list
+    # of script names (modules/system/activation-scripts.nix); a script under
+    # any other name is evaluated and never run, which is what happened to
+    # this module's old `runquotadStateDir`. `postActivation` is in the list
+    # and runs last, after `users` and `launchd`. `/etc/runquota` is root's
+    # and is created here too, for `runquota config set`, which never creates
+    # it. The two daemon-owned directories are the launchd job's (below):
+    # /var/run is emptied at every boot, and activation does not run at boot.
+    system.activationScripts.postActivation.text = ''
       printf 'provisioning RunQuota host configuration directory %s\n' /etc/runquota
       /usr/bin/install -d -m 0755 -o root -g wheel /etc/runquota
     ''
@@ -180,21 +217,39 @@ in
       ${hostConfigLib.etcName}.text = hostConfigLib.render cfg.hostConfig;
     };
 
+    # THE JOB RUNS AS ROOT AND THE DAEMON DOES NOT. A job with `UserName`
+    # drops privileges before its script runs, so it could not create
+    # /var/run/runquota (root's /var/run, emptied at every boot). So the
+    # script provisions first, as root, at every start: `install -d` creates
+    # each directory or corrects the owner and mode of one that exists
+    # (a root-owned leftover included). Then it replaces itself with the
+    # daemon as the daemon's account through coreutils `chroot --userspec`:
+    # changing a root process's root to `/` changes nothing, and coreutils
+    # then sets the supplementary groups, the gid and the uid, in that
+    # order, and execs (src/chroot.c). No sudo, so the job does not depend
+    # on the host's sudoers.
     launchd.daemons.runquotad = {
-      script = lib.escapeShellArgs (
-        [ "${cfg.package}/bin/runquotad" ]
-        ++ lib.optionals (cfg.observationDb != null) [
-          "--observation-db"
-          cfg.observationDb
-        ]
-        ++ cfg.extraArgs
-      );
+      script = ''
+        /usr/bin/install -d -m ${hostState.mode} \
+          -o '${cfg.user}' -g '${cfg.group}' '${stateDir}'
+        /usr/bin/install -d -m ${hostState.endpointDirectoryMode} \
+          -o '${cfg.user}' -g '${cfg.group}' '${endpointDir}'
+        /usr/bin/install -d -m 0755 -o root -g wheel /etc/runquota
+        exec ${pkgs.coreutils}/bin/chroot --userspec='${cfg.user}:${cfg.group}' / ${
+          lib.escapeShellArgs (
+            [ "${cfg.package}/bin/runquotad" ]
+            ++ lib.optionals (cfg.observationDb != null) [
+              "--observation-db"
+              cfg.observationDb
+            ]
+            ++ cfg.extraArgs
+          )
+        }
+      '';
       serviceConfig = {
         Label = "org.metacraft-labs.runquotad";
         RunAtLoad = true;
         KeepAlive = true;
-        UserName = cfg.user;
-        GroupName = cfg.group;
       };
     };
   };

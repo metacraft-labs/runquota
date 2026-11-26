@@ -37,8 +37,9 @@ exist: single-user mode" for what a host without a `runquota` group gets: a
 ## What has actually been evaluated
 
 Both modules are put through their **real** module systems by
-`checks.module-eval` in `flake.nix`, which forces the darwin activation script,
-the launchd `serviceConfig` values, the NixOS `systemd.tmpfiles` rules and the
+`checks.module-eval` in `flake.nix`, which forces the activation script
+nix-darwin assembles (so a step that never reaches it fails the check), the
+launchd job's script and `serviceConfig` values, the `runquota` account, the NixOS `systemd.tmpfiles` rules and the
 unit's `serviceConfig`, and greps the resulting strings for the two directories,
 their modes and the group. Run it with:
 

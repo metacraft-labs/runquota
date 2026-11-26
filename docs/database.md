@@ -513,14 +513,19 @@ The flake ships the install step:
   `/etc/runquota` (`root`, `0755`); `services.runquotad.hostConfig` renders
   the host budget file into it as a store link, and a changed budget reloads
   the unit (`ExecReload`, `runquota config reload`) instead of restarting it.
-- `darwinModules.runquotad` — a launchd daemon plus an activation script that
-  `install -d`s `/var/db/runquota`, `/var/run/runquota` and `/etc/runquota`,
-  renders `hostConfig` the same way, and asks a running daemon to reload.
+- `darwinModules.runquotad` — a `runquota` user and group (uid
+  `services.runquotad.uid`, default `390`; gid `services.runquotad.gid`,
+  default `502`; members from `services.runquotad.members`), and a launchd
+  job that runs as root, `install -d`s `/var/db/runquota` and
+  `/var/run/runquota` for that account at every start, then runs the daemon
+  as the account through coreutils `chroot --userspec`. nix-darwin's
+  `postActivation` step creates `/etc/runquota`, and asks a running daemon to
+  reload when `hostConfig` (rendered the same way) changes.
 
 Both modules are **evaluated** by `checks.module-eval` in `flake.nix`, which
 puts each through its real module system — nix-darwin is reached transitively
 via `inputs.nixos-modules.inputs.nix-darwin` — and asserts on the resulting
-activation script, launchd `serviceConfig`, tmpfiles rules and unit
+assembled activation script, launchd job and `serviceConfig`, accounts, tmpfiles rules and unit
 `serviceConfig`. Run it with `nix build .#checks.<system>.module-eval`. Neither
 module has been *activated* on a real host by this repository's tests;
 evaluation is what is claimed, and it is claimed equally for both.
@@ -600,7 +605,8 @@ of any `host-id` or `observations.sqlite3` it holds before trusting them.
 
 `/run` (and `/var/run` on macOS) is cleared on boot, so the rendezvous
 directory has to be re-created at every boot — which is what
-`RuntimeDirectory=` and the activation script do on a Nix-managed host, and
+`RuntimeDirectory=` does on NixOS and the launchd job's start step does on
+nix-darwin, and
 what an init script or a `tmpfiles.d` drop-in has to do elsewhere.
 
 The daemon's own refusal message prints this command with the uid already
