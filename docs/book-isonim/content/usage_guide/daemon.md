@@ -143,16 +143,85 @@ from capacity no other class's reservation protects. Lent CPU comes back
 only as the borrowers' leases finish, so a class that must have its cores
 the moment it asks should set `lend = false`. The admission order's
 starvation bound still holds for other work, over the capacity the
-reservations leave it. A class is not a permission: any process that
-reaches the daemon may export any class and be admitted under its
-reservation, so a reservation protects a class's capacity from work that
-does not name it, not from a user who does. The reservations
+reservations leave it. The reservations
 together must fit the budget itself (the target does not make room for
 them): a file that breaks this does not start the daemon, and a reload of
 it is refused. `oversubscription` is a fraction from `"0"` to `"1"`; memory
 is never oversubscribed. `runquota status` shows each class's reservation,
 what it holds and borrows, and what is held for it; `runquota pressure`
 shows each class's queue time (see [Build-wait pressure](#build-wait-pressure)).
+
+**Who may claim a class: its socket.** Every `[reservation.<class>]` table
+gets its own daemon socket, `class-<class>.sock` beside the daemon's endpoint
+(`/run/runquota/class-ci.sock` on a provisioned Linux host,
+`/var/run/runquota/class-ci.sock` on macOS, the pipe
+`\\.\pipe\runquota\class-ci` on Windows, and beside `--socket` or
+`RUNQUOTA_SOCKET` when one is given). A client whose `RUNQUOTA_CLASS` names
+the class connects there, and the operating system's access check on that
+socket is what decides whether it may claim the class: `connect(2)` on a Unix
+socket needs write permission on it. The table says who that is:
+
+```toml
+[reservation.ci]
+cpu-milli    = 8000
+socket-owner = "runquota"   # user name or decimal uid; default: the daemon's user
+socket-group = "ci"         # group name or decimal gid; default: the daemon's primary group
+socket-mode  = "0660"       # "0600" | "0660" | "0666"; default "0600"
+```
+
+- The default, `"0600"`, lets only the daemon's own account (and root) claim
+  the class, so a host that declares a reservation and nothing else has
+  capacity no other user can claim. `"0660"` lets the members of
+  `socket-group` claim it, and `"0666"` every local user who can reach the
+  rendezvous. No other mode is accepted: read and execute bits decide
+  nothing for a socket.
+- The socket is in the rendezvous directory, so a claimant must also be able
+  to reach the daemon at all (on a provisioned Linux host, be in the
+  `runquota` group). A class socket narrows who may claim; it never widens who
+  reaches the daemon.
+- The daemon's account must be able to apply what is declared: a daemon
+  that is not root can give the socket only a group it is a member of, and
+  cannot give it away to another owner. A start whose class socket cannot be
+  created as declared fails (exit 2, naming the class, the socket and what is
+  missing, for example that the daemon's account is not in group `ci`), and
+  such a reload is refused with everything in force unchanged.
+- The socket is created with exactly the declared owner, group and mode; it
+  never appears at its path with a wider mode or another group, even for an
+  instant.
+- A table added on reload gets its socket, a table dropped loses it, and
+  changed keys are applied to the existing socket. A connection accepted
+  before the reload keeps its class: a reload revokes nothing.
+- A class with no table has no socket and cannot be claimed. A table with
+  only socket keys is a class with no reservation, claimable through its
+  socket.
+- On Windows the keys are `allowed-users` and `allowed-groups` (names or
+  SIDs), the principals the class pipe's access list allows besides `SYSTEM`,
+  Administrators and the daemon's account. A file read on Windows refuses the
+  Linux and macOS keys and the reverse, naming the platform.
+- `runquota config set reservation.ci.socket-group ci`,
+  `reservation.ci.socket-mode 0660` and `reservation.ci.socket-owner runquota`
+  write them (on Windows `reservation.ci.allowed-groups "CI Runners"`, with
+  commas between several), and `unset` removes one. A mode outside the three,
+  an unknown user or group, or the other platform's key is refused before
+  anything is written.
+
+On the class's socket a session gets the class whether or not it names it.
+A session there that names *another* class is refused, and so is one that
+would join an existing group of another class, or of no class. On the shared
+socket a session that names a class is refused, with an error naming the
+class's socket (or saying the host declares no such class), and so is one
+that would join a group that has a class; everything else on the shared
+socket is unchanged. The client never falls back from a class socket that
+refuses it to the shared one: it stops with an error naming the socket and
+the class, and a launcher (`runquota run`, `acquire`, `jobserver`) does not
+run the command unleased instead. When the class's socket does not exist the
+client asks the shared socket, and the daemon answers that the host declares
+no such class: declare `[reservation.<class>]`, or unset `RUNQUOTA_CLASS`.
+A daemon older than class sockets (protocol minor 12) keeps its earlier
+behaviour, where any client may name any class. `runquota pressure report
+--class C` reports into `C` from `C`'s socket. The per-user daemon (below)
+gives every declared class a socket that only its user can reach and ignores
+the socket keys: its directory is the user's alone.
 
 The reader accepts exactly this shape: a `schema` string, positive integers in
 `[machine]` and `[pools]`, `_` between digits, the `[admission]` keys above
@@ -603,10 +672,16 @@ systemd hands it on descriptor 3 instead of binding one: with `LISTEN_PID`
 equal to its pid and `LISTEN_FDS=1`
 ([`sd_listen_fds(3)`](https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html)).
 It removes the three `LISTEN_*` variables from its environment first, and
-refuses (exit 3) any `LISTEN_FDS` other than 1, a descriptor that is not a
-listening Unix stream socket, and one bound at a path other than its
-configured endpoint (`--socket`, else the default) -- its clients would be
-looking somewhere else. It never removes the socket (systemd owns it), takes no
+refuses (exit 3) a descriptor that is not a listening Unix stream socket, and
+one bound at a path other than its configured endpoint (`--socket`, else the
+default) -- its clients would be looking somewhere else. With class sockets
+there is one descriptor more per declared class, each named `class-<class>`
+in `LISTEN_FDNAMES` (the socket unit's `FileDescriptorName=`), and the
+shared socket carries any other name. A declared class without a descriptor,
+a descriptor for a class the host file does not declare, or a class socket
+whose owner, group or mode differs from the file's declaration refuses the
+start; and since the sockets are systemd's, a reload that would add, drop or
+change one is refused, naming the module as the place to change it. It never removes the socket (systemd owns it), takes no
 lifetime lock, and never dials its own socket to wake its accept loop, so it
 leaves no queued connection behind that would make systemd start it again at
 once. With `--idle-exit-after` it exits when idle and systemd starts it again
@@ -614,7 +689,12 @@ on the next connection, which systemd holds queued meanwhile.
 
 The NixOS module turns this on with `services.runquotad.socketActivation =
 true`, and `services.runquotad.idleExitAfter = SECONDS` adds the idle period
-(it requires socket activation). The nix-darwin service keeps running
+(it requires socket activation). It declares one socket unit, and so one
+`ListenStream`, per `services.runquotad.hostConfig.reservations` entry, with
+the class's `socketOwner`, `socketGroup` and `socketMode` as its
+`SocketUser`, `SocketGroup` and `SocketMode`; a host file written with
+`runquota config set` instead cannot declare them, so a socket-activated
+daemon refuses one that declares a class. The nix-darwin service keeps running
 unconditionally.
 
 ## When things go wrong at runtime
