@@ -205,6 +205,11 @@ proc readResponse(client: var RunQuotaClient; requestId: uint64;
     client.lastDiagnostic = diagnostic(diagProtocol, "invalid RQSP error payload")
     raise newException(RunQuotaClientError, client.lastDiagnostic.message)
 
+proc close*(client: var RunQuotaClient) =
+  if client.state == csConnected:
+    client.connection.close()
+  client.state = csClosed
+
 proc connect*(endpoint: Endpoint; clientName = "runquota-nim";
               clientVersion = "0.1.0"): RunQuotaClient =
   result = RunQuotaClient(
@@ -247,19 +252,37 @@ proc connect*(endpoint: Endpoint; clientName = "runquota-nim";
     # (`runquota_protocol/client_namespaces`).
     desiredCapabilities: withNamespaceTokens("m1-lease", currentNamespaces())
   )
-  let requestId = result.requestFrame(rqHello, encodeHello(hello), handshakeTimeoutMs())
-  let frame = result.readResponse(requestId, handshakeTimeoutMs())
-  if frame.header.messageKind != rqHelloOk:
-    result.lastDiagnostic = diagnostic(diagProtocol, "daemon did not answer Hello with HelloOk")
-    raise newException(RunQuotaClientError, result.lastDiagnostic.message)
-  var helloOk: HelloOkMessage
-  if not decodeHelloOk(frame.payload, helloOk):
-    result.lastDiagnostic = diagnostic(diagProtocol, "invalid HelloOk payload")
-    raise newException(RunQuotaClientError, result.lastDiagnostic.message)
-  result.daemonId = helloOk.daemonId
-  result.daemonVersion = helloOk.daemonVersion
-  result.capabilities = helloOk.capabilities
-  result.flow = helloOk.flow
+  # THE CONNECTION IS OPEN FROM HERE ON, AND A FAILED HELLO CLOSES IT. Every
+  # step below can raise: the send, the bounded read (a handshake timeout, a
+  # daemon that closes), a refusal, an answer that is not `HelloOk`, a
+  # `HelloOk` that does not decode. The caller never receives the half-built
+  # client on those paths, so nobody else could close it: the descriptor
+  # would stay open until the process exits, and the daemon would hold the
+  # accepted connection until it noticed the peer was gone. A connection's
+  # life is Hello, then requests, then close (reprobuild-pm
+  # `spec/RunQuota-Protocol-And-Client-Libraries.md`), so a session that is
+  # never established is closed at once. `finally` rather than `except`, so
+  # the close also covers anything that is not a `CatchableError`, and the
+  # original exception propagates unchanged.
+  var established = false
+  try:
+    let requestId = result.requestFrame(rqHello, encodeHello(hello), handshakeTimeoutMs())
+    let frame = result.readResponse(requestId, handshakeTimeoutMs())
+    if frame.header.messageKind != rqHelloOk:
+      result.lastDiagnostic = diagnostic(diagProtocol, "daemon did not answer Hello with HelloOk")
+      raise newException(RunQuotaClientError, result.lastDiagnostic.message)
+    var helloOk: HelloOkMessage
+    if not decodeHelloOk(frame.payload, helloOk):
+      result.lastDiagnostic = diagnostic(diagProtocol, "invalid HelloOk payload")
+      raise newException(RunQuotaClientError, result.lastDiagnostic.message)
+    result.daemonId = helloOk.daemonId
+    result.daemonVersion = helloOk.daemonVersion
+    result.capabilities = helloOk.capabilities
+    result.flow = helloOk.flow
+    established = true
+  finally:
+    if not established:
+      result.close()
 
 proc connectDefault*(): RunQuotaClient =
   connect(defaultEndpoint())
@@ -444,11 +467,6 @@ proc unleasedFallback*(launcher: string; failure: ConnectFailure;
   UnleasedFallback(run: true, message: withHint(launcher & ": warning: " &
     failureReason(failure) & "; running the command without a lease.",
     failure) & " Set " & StrictEnvVar & "=1 to refuse instead.")
-
-proc close*(client: var RunQuotaClient) =
-  if client.state == csConnected:
-    client.connection.close()
-  client.state = csClosed
 
 const
   ProjectEnvVar* = "RUNQUOTA_PROJECT"
