@@ -1073,8 +1073,16 @@ proc runDebugAcquire(args: seq[string]): int =
   # the diagnostic's detail is gone with it.
   try:
     if command.len > 0:
+      # A REQUEST THAT DOES NOT FIT RIGHT NOW WAITS. A queue is not a
+      # refusal (reprobuild-pm spec/RunQuota-Protocol-And-Client-Libraries.md
+      # § What A Budget Refusal Says), and `acquire` "starts the command
+      # after grant". This waited only for `--benchmark`, so every other
+      # request that had to queue exited 1 unrun, and a script that leased
+      # each of its jobs through `acquire` could not be bounded by RunQuota
+      # at all -- its jobs beyond the free budget failed instead of waiting.
+      # A budget refusal, a later denial and a lost connection still raise.
       let execution = session.runWithLease(request, command,
-          waitForQueued = benchmark, cgroupRoot = launcherCgroupRoot(),
+          waitForQueued = true, cgroupRoot = launcherCgroupRoot(),
           jobPriorityOn = launcherJobPriorityOn(),
           qosOn = launcherQosOn())
       stdout.write(execution.process.stdout)
@@ -1085,11 +1093,8 @@ proc runDebugAcquire(args: seq[string]): int =
       if execution.process.signaled:
         return 128 + execution.process.signal
       return 1
-    var lease =
-      if benchmark:
-        session.requestLeaseWaiting(request)
-      else:
-        session.requestLease(request)
+    # The no-command form waits for a queued grant too, for the same reason.
+    var lease = session.requestLeaseWaiting(request)
     echo "lease " & $lease.id & " granted"
     lease.release()
     session.closeSession()
