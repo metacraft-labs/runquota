@@ -532,6 +532,7 @@
                   nixosSocket = builtins.toJSON {
                     inherit (nixosSocketEval.config.systemd.sockets.runquotad) listenStreams wantedBy;
                     inherit (nixosSocketEval.config.systemd.sockets.runquotad.socketConfig)
+                      FileDescriptorName
                       SocketUser
                       SocketGroup
                       SocketMode
