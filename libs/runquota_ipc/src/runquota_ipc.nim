@@ -460,6 +460,126 @@ const statsTableSegmentName* = "stats-table"
   ## the state directory: that holds durable identity, and this is a
   ## working set that may be dropped, resized or zeroed at any moment.
 
+# ---------------------------------------------------------------------------
+# One socket per reservation class.
+#
+# Each `[reservation.<class>]` table of the host file gets its own daemon
+# socket, and the socket's permissions (owner, group and mode on POSIX, the
+# pipe's DACL on Windows) decide who may claim the class: the kernel's access
+# check at `connect(2)` / `CreateFile` is the authorisation, not anything the
+# client says. The socket is found by one rule, on every platform and for
+# every endpoint the daemon can serve: REPLACE THE ENDPOINT'S LAST COMPONENT
+# with `class-<class>.sock` (on Windows, with `class-<class>` beside the
+# daemon's pipe). The daemon binds there and the client connects there, so
+# both call `classEndpoint` and cannot disagree.
+# ---------------------------------------------------------------------------
+
+const
+  classSocketPrefix* = "class-"
+  classSocketSuffix* = ".sock"
+  unixSocketPathLimit* =
+    when defined(macosx) or defined(freebsd) or defined(openbsd) or
+        defined(netbsd): 104
+    else: 108
+    ## `sizeof(sockaddr_un.sun_path)`: 104 bytes on the BSD family (macOS),
+    ## 108 on Linux. A path must be shorter than this by its NUL.
+  windowsPipeNameLimit* = 256
+    ## The longest pipe name `CreateNamedPipeW` accepts, `\\.\pipe\`
+    ## included.
+
+type
+  ClassEndpointError* = object of EndpointTrustError
+    ## A class's socket path cannot be used: it does not fit the platform's
+    ## limit. Raised by `classEndpoint` for the daemon at bind and for the
+    ## client at connect, naming the path and its length.
+
+proc classSocketName*(className: string): string =
+  ## `class-<class>.sock`, the file name of a class's socket.
+  classSocketPrefix & className & classSocketSuffix
+
+proc replaceLastComponent(path: string; separators: set[char];
+                          name: string): string =
+  ## `path` with everything after its last separator replaced by `name`.
+  ## Only the final component goes: the spelling of the directory is kept
+  ## exactly (an ancestor symbolic link followed by `..` still names the
+  ## directory the kernel bound the endpoint in), as for the stats table.
+  var cut = -1
+  for i in countdown(path.high, 0):
+    if path[i] in separators:
+      cut = i
+      break
+  if cut < 0: name
+  else: path[0 .. cut] & name
+
+proc classSocketPathFor*(endpointPath: string; className: string;
+                         kind: EndpointKind;
+                         rendezvousPath = ""): string =
+  ## The path (Unix socket) or pipe name (Windows) of `className`'s socket
+  ## beside the endpoint `endpointPath`. Pure, and the same on every host,
+  ## so a test on one platform can check the derivation for another:
+  ##
+  ## * a Unix socket: `class-<class>.sock` in the endpoint's directory;
+  ## * a pipe named outright (`\\.\pipe\runquota\runquotad`): the pipe
+  ##   `class-<class>` beside it;
+  ## * a pipe mapped from a filesystem path (`rendezvousPath`, a `--socket`
+  ##   given as a `.sock` path on Windows): the pipe `endpointForPath` maps
+  ##   `class-<class>.sock` in that path's directory onto, so two daemons
+  ##   with different `--socket` directories never share a class pipe.
+  ##
+  ## The class name is not checked here (`classNameProblem` is); the length
+  ## is (`classEndpointProblem`).
+  case kind
+  of endpointNamedPipe:
+    if rendezvousPath.len > 0:
+      replaceLastComponent(rendezvousPath, {'/', '\\'},
+        classSocketName(className))
+    else:
+      replaceLastComponent(endpointPath, {'\\'}, classSocketPrefix & className)
+  of endpointUnixSocket, endpointUnsupported:
+    replaceLastComponent(endpointPath, {'/'}, classSocketName(className))
+
+proc classEndpointProblem*(path: string; kind: EndpointKind;
+                           limit = -1): string =
+  ## Why `path` cannot be a class socket on this platform (it does not fit),
+  ## or "". `limit` overrides the platform's bound, for tests of another
+  ## platform's rule.
+  case kind
+  of endpointNamedPipe:
+    let bound = if limit > 0: limit else: windowsPipeNameLimit
+    if path.len > bound:
+      return "the class pipe name " & path & " is " & $path.len &
+        " characters long, longer than the " & $bound & " a pipe name may be"
+  of endpointUnixSocket, endpointUnsupported:
+    let bound = if limit > 0: limit else: unixSocketPathLimit
+    if path.len >= bound:
+      return "the class socket path " & path & " is " & $path.len &
+        " bytes long; a Unix socket path must be shorter than " & $bound &
+        " bytes on this platform (shorten the endpoint's directory, for " &
+        "example RUNQUOTA_USER_ENDPOINT_DIR or --socket)"
+  ""
+
+proc classEndpoint*(endpoint: Endpoint; className: string): Endpoint =
+  ## The endpoint of `className`'s socket beside `endpoint`. Raises
+  ## `ClassEndpointError` when the derived path does not fit the platform.
+  case endpoint.kind
+  of endpointNamedPipe:
+    let derived = classSocketPathFor(endpoint.path, className,
+      endpointNamedPipe, endpoint.rendezvousPath)
+    result =
+      if endpoint.rendezvousPath.len > 0: endpointForPath(derived)
+      else: Endpoint(kind: endpointNamedPipe, path: derived)
+  of endpointUnixSocket:
+    let derived = classSocketPathFor(endpoint.path, className,
+      endpointUnixSocket)
+    result = Endpoint(kind: endpointUnixSocket, path: derived,
+      rendezvousPath: derived)
+  of endpointUnsupported:
+    raise newException(ClassEndpointError,
+      "an unsupported endpoint has no class sockets")
+  let problem = classEndpointProblem(result.path, result.kind)
+  if problem.len > 0:
+    raise newException(ClassEndpointError, problem)
+
 when defined(posix):
   proc socketDirectorySpelling(path: string): string =
     # `parentDir` and `/` normalize `..` before looking at symlinks, so
@@ -2091,6 +2211,258 @@ when defined(posix):
     LocalListener(kind: endpointUnixSocket,
       socket: newSocket(SocketHandle(fd), AF_UNIX, SOCK_STREAM, IPPROTO_NONE),
       endpoint: endpoint, boundDevice: 0, boundInode: 0)
+
+when defined(posix):
+  proc renameCall(oldPath, newPath: cstring): cint {.importc: "rename",
+    header: "<stdio.h>".}
+    ## `rename(2)`; `std/posix` does not export it.
+
+  type
+    ClassSocketAccess* = object
+      ## The owner, group and mode a class socket is given (the host file's
+      ## `socket-owner`, `socket-group`, `socket-mode`, resolved).
+      ownerUid*: int64
+        ## -1: whoever created it (the daemon's effective uid).
+      groupGid*: int64
+        ## -1: whatever group it was created with (the daemon's).
+      mode*: int
+        ## `0o600`, `0o660` or `0o666`.
+
+    ClassSocketState* = object
+      ## What a class socket is, read with `lstat` at its path.
+      found*: bool
+      isSocket*: bool
+      ownerUid*: int64
+      groupGid*: int64
+      mode*: int
+
+  proc inspectClassSocket*(path: string): ClassSocketState =
+    ## `lstat` of `path`: whether it exists, is a socket (not a symbolic
+    ## link), and its owner, group and permission bits.
+    var info: Stat
+    if lstat(path.cstring, info) != 0:
+      return ClassSocketState(found: false, ownerUid: -1, groupGid: -1,
+        mode: -1)
+    ClassSocketState(found: true, isSocket: S_ISSOCK(info.st_mode),
+      ownerUid: int64(info.st_uid), groupGid: int64(info.st_gid),
+      mode: int(info.st_mode) and 0o7777)
+
+  proc classSocketAccessProblem*(access: ClassSocketAccess): string =
+    ## Why THIS PROCESS cannot give a socket `access`, or "". A process that
+    ## is not root may not give a file away (`chown(2)` of the owner), and
+    ## may change its group only to a group it is in -- its effective gid or
+    ## one of its supplementary groups (`getgroups(2)`), which is the
+    ## kernel's own test.
+    let euid = int64(geteuid())
+    if euid == 0:
+      return ""
+    if access.ownerUid >= 0 and access.ownerUid != euid:
+      return "the daemon's account (uid " & $euid & ") cannot make uid " &
+        $access.ownerUid & " the socket's owner; only root can give a " &
+        "file away"
+    if access.groupGid >= 0 and access.groupGid != int64(getegid()):
+      var groups: array[0 .. 255, Gid]
+      let count = getgroups(cint(groups.len), addr groups)
+      var member = false
+      for i in 0 ..< max(count, 0):
+        if int64(groups[i]) == access.groupGid:
+          member = true
+      if not member:
+        var name = ""
+        let entry = getgrgid(Gid(access.groupGid))
+        if entry != nil: name = $entry.gr_name
+        return "the daemon's account (uid " & $euid & ") is not in group " &
+          (if name.len > 0: "`" & name & "` (gid " & $access.groupGid & ")"
+           else: "gid " & $access.groupGid) &
+          ", so it cannot give the socket that group"
+    ""
+
+  proc applyAccessAt(path: string; access: ClassSocketAccess): string =
+    ## chown and chmod `path` to `access`; the error, or "".
+    if access.ownerUid >= 0 or access.groupGid >= 0:
+      if posix.chown(path.cstring,
+          (if access.ownerUid >= 0: Uid(access.ownerUid) else: cast[Uid](-1'i32)),
+          (if access.groupGid >= 0: Gid(access.groupGid) else: cast[Gid](-1'i32))) != 0:
+        return "chown " & path & ": " & $strerror(errno)
+    if posix.chmod(path.cstring, Mode(access.mode)) != 0:
+      return "chmod " & path & ": " & $strerror(errno)
+    ""
+
+  var classSocketStagingCounter = 0
+    ## Distinguishes this process's staging directories; touched only by
+    ## the thread that binds class sockets, which holds the class-socket
+    ## registry's lock.
+
+  proc bindClassSocket*(endpoint: Endpoint; access: ClassSocketAccess;
+                        policy: RendezvousPolicy): LocalListener =
+    ## A listening class socket at `endpoint.path` with exactly `access`,
+    ## NEVER WIDER THAN `access` AT ANY MOMENT ANOTHER PROCESS COULD SEE IT.
+    ##
+    ## WHY NOT BIND IN PLACE. `bind(2)` creates the socket with the
+    ## process's umask applied to 0777, and its group is the creator's; a
+    ## `chown` and `chmod` afterwards leave a window in which a polling
+    ## reader sees a wider mode, or the default group, at the class's path.
+    ## The umask cannot be narrowed instead: it is per process, and the
+    ## daemon's other threads create files (the published table, the
+    ## observation store) while a reload runs. So the socket is BOUND IN A
+    ## PRIVATE `0700` STAGING DIRECTORY inside the rendezvous directory,
+    ## given its owner, group and mode there, put in the listening state,
+    ## and only then `rename(2)`d onto the class's path: the path names
+    ## nothing until it names the finished socket. Nothing else can create
+    ## files in the rendezvous directory (it is the daemon's, or the user's
+    ## own), so nothing can intervene at the rename.
+    ##
+    ## A PATH ALREADY OCCUPIED is treated as the shared endpoint's is: a
+    ## stale socket of this daemon's uid nobody accepts on is replaced, and
+    ## anything else -- a live daemon's socket, a regular file, a symbolic
+    ## link, another uid's socket -- refuses (`EndpointTrustError`). A host
+    ## scope bind holds the path's start lock (`<path>.start`) meanwhile, as
+    ## `bindEndpoint` does; the private scope's lifetime lock already
+    ## serialises its daemons.
+    ##
+    ## Raises `EndpointTrustError` for every refusal.
+    if endpoint.kind != endpointUnixSocket or endpoint.path.len == 0:
+      raise newException(EndpointTrustError,
+        "a class socket needs a Unix-socket path")
+    let lengthProblem = classEndpointProblem(endpoint.path, endpointUnixSocket)
+    if lengthProblem.len > 0:
+      raise newException(ClassEndpointError, lengthProblem)
+    let accessProblem = classSocketAccessProblem(access)
+    if accessProblem.len > 0:
+      raise newException(EndpointTrustError, accessProblem)
+    let directory = socketDirectorySpelling(endpoint.path)
+    var startLock = cint(-1)
+    if policy.scope != rendezvousPrivate:
+      try:
+        startLock = acquireStartLock(endpoint.path)
+      except EndpointTrustError:
+        raise
+      except OSError as error:
+        raise newException(EndpointTrustError, "RunQuota class socket " &
+          endpoint.path & ": " & error.msg & "; refusing to bind it")
+    var staging = ""
+    var staged = ""
+    var socket: Socket = nil
+    var done = false
+    try:
+      clearStaleSharedEndpoint(endpoint.path)
+      # THE STAGING DIRECTORY: short, so the staged path is no longer than
+      # the class path itself for any class name of two bytes or more.
+      while true:
+        inc classSocketStagingCounter
+        staging = besideSocket(endpoint.path, ".rq" &
+          toHex(classSocketStagingCounter and 0xffff, 4))
+        if posix.mkdir(staging.cstring, Mode(0o700)) == 0:
+          break
+        if errno != EEXIST or classSocketStagingCounter > 0x10000:
+          let code = errno
+          staging = ""
+          raise newException(EndpointTrustError, "RunQuota class socket " &
+            endpoint.path & ": cannot create a staging directory in " &
+            directory & " (" & $strerror(code) & ")")
+      staged = staging & "/s"
+      if staged.len >= unixSocketPathLimit:
+        raise newException(ClassEndpointError, classEndpointProblem(staged,
+          endpointUnixSocket))
+      socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_NONE)
+      setCloseOnExec(cint(socket.getFd()))
+      socket.bindUnix(staged)
+      let applied = applyAccessAt(staged, access)
+      if applied.len > 0:
+        raise newException(EndpointTrustError, "RunQuota class socket " &
+          endpoint.path & ": " & applied)
+      socket.listen()
+      if renameCall(staged.cstring, endpoint.path.cstring) != 0:
+        raise newException(EndpointTrustError, "RunQuota class socket " &
+          endpoint.path & ": cannot move it into place (" &
+          $strerror(errno) & ")")
+      staged = ""
+      var bound: Stat
+      var device, inode: uint64
+      if lstat(endpoint.path.cstring, bound) == 0 and S_ISSOCK(bound.st_mode):
+        device = uint64(bound.st_dev)
+        inode = uint64(bound.st_ino)
+      result = LocalListener(kind: endpointUnixSocket, socket: socket,
+        endpoint: endpoint, boundDevice: device, boundInode: inode)
+      done = true
+    finally:
+      if staged.len > 0:
+        discard posix.unlink(staged.cstring)
+      if staging.len > 0:
+        discard posix.rmdir(staging.cstring)
+      if not done and socket != nil:
+        socket.close()
+      releaseEndpointLock(startLock)
+
+  type
+    RawListener* = object
+      ## A listening Unix socket held by its descriptor alone, for a daemon
+      ## that waits on several listeners from one thread and changes the set
+      ## from another (the class sockets, which a reload adds and drops).
+      ## Plain data, so it can sit in a registry shared between threads
+      ## without a reference type in it.
+      fd*: cint
+      path*: string
+      boundDevice*: uint64
+      boundInode*: uint64
+        ## The inode this process created at `path`, 0 for a socket it did
+        ## not create (systemd's) or one already unlinked: only that inode
+        ## is ever unlinked.
+
+  proc rawListener*(listener: LocalListener): RawListener =
+    ## The descriptor and identity of a bound or adopted Unix listener. The
+    ## caller takes over the descriptor and must not also `close` the
+    ## `LocalListener` (its `Socket` holds no destructor that closes it).
+    RawListener(fd: cint(listener.socket.getFd()),
+      path: listener.endpoint.path, boundDevice: listener.boundDevice,
+      boundInode: listener.boundInode)
+
+  proc acceptRaw*(listener: RawListener): AcceptedConnection =
+    ## `acceptNativeConnection` for a `RawListener`.
+    let accepted = nativesockets.accept(SocketHandle(listener.fd))
+    if accepted[0] == osInvalidSocket:
+      raiseOSError(osLastError())
+    setCloseOnExec(cint(accepted[0]))
+    AcceptedConnection(kind: endpointUnixSocket, handle: accepted[0])
+
+  proc unlinkRawListener*(listener: var RawListener) =
+    ## Remove the socket's name, if it still names the inode this process
+    ## created, and keep listening: a client can no longer connect, and the
+    ## descriptor stays valid for whoever waits on it until `closeRawListener`.
+    if listener.path.len > 0 and listener.boundInode != 0:
+      var current: Stat
+      if lstat(listener.path.cstring, current) == 0 and
+          S_ISSOCK(current.st_mode) and
+          uint64(current.st_dev) == listener.boundDevice and
+          uint64(current.st_ino) == listener.boundInode:
+        discard posix.unlink(listener.path.cstring)
+    listener.boundInode = 0
+
+  proc closeRawListener*(listener: var RawListener) =
+    ## `close` for a `RawListener`: unlinked first (only its own inode), then
+    ## closed, in that order for the reason `close` gives.
+    listener.unlinkRawListener()
+    if listener.fd >= 0:
+      discard posix.close(listener.fd)
+      listener.fd = -1
+
+  proc reapplyClassSocket*(path: string; before, after: ClassSocketAccess):
+      string =
+    ## Change a live class socket from `before` to `after` without it ever
+    ## being wider than either: first the mode both allow (less the group
+    ## bits when the group changes, less the owner bits when the owner
+    ## does), then the owner and group, then `after`'s mode. The error, or
+    ## "". A connection already accepted is not touched: permissions are
+    ## checked at `connect(2)` only.
+    let problem = classSocketAccessProblem(after)
+    if problem.len > 0:
+      return problem
+    var narrow = before.mode and after.mode
+    if before.groupGid != after.groupGid: narrow = narrow and not 0o070
+    if before.ownerUid != after.ownerUid: narrow = narrow and not 0o700
+    if posix.chmod(path.cstring, Mode(narrow)) != 0:
+      return "chmod " & path & ": " & $strerror(errno)
+    applyAccessAt(path, after)
 
 proc acceptWaitHandle*(listener: LocalListener): int =
   ## THE DESCRIPTOR A CALLER MAY WAIT ON for "there is a connection to

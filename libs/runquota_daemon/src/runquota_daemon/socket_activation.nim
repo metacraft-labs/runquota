@@ -10,13 +10,17 @@
 ## that function, written out rather than linked from `libsystemd`: RunQuota
 ## builds on hosts without systemd, and the protocol is three variables.
 ##
-## WHAT THE DAEMON DOES WITH IT is specified in reprobuild-pm
-## `spec/RunQuota-Host-Configuration.md`, "Socket activation (systemd)":
-## exactly ONE descriptor is accepted (`LISTEN_FDS` other than 1 is refused);
-## it must be a listening `AF_UNIX` stream socket bound at the configured
-## endpoint (`runquota_ipc.adoptListeningSocket`); the daemon never unlinks
-## it, takes no lifetime lock, and never dials its own endpoint to wake its
-## accept loop -- a dialled connection left queued after it exits would make
+## WHAT THE DAEMON DOES WITH IT: the shared socket, and one socket per
+## reservation class the host file declares. A single descriptor is the
+## shared socket. With more, each is named (`LISTEN_FDNAMES`, from the
+## socket unit's `FileDescriptorName=`): `class-<class>` is that class's
+## socket, and exactly one other name is the shared one. Each must be a
+## listening `AF_UNIX` stream socket bound at the path the daemon would
+## bind (`runquota_ipc.adoptListeningSocket`), and `serve` refuses a
+## declared class with no descriptor or a descriptor for an undeclared
+## class. The daemon never unlinks or changes a socket systemd owns, takes
+## no lifetime lock, and never dials its own endpoint to wake its accept
+## loop -- a dialled connection left queued after it exits would make
 ## systemd start it again at once.
 ##
 ## THE VARIABLES ARE REMOVED FROM THE DAEMON'S OWN ENVIRONMENT as soon as they
@@ -33,6 +37,8 @@ when defined(posix):
   import std/posix
   import runquota_core/fd_hygiene
 
+import runquota_core
+import runquota_ipc
 import runquota_daemon/types
 
 const
@@ -46,7 +52,7 @@ const
     ## malformed `LISTEN_FDS`, so a huge value costs nothing.
 
 proc socketActivationFrom*(listenPid, listenFds: string; hasListenPid: bool;
-                           ownPid: int): SocketActivation =
+                           ownPid: int; listenFdNames = ""): SocketActivation =
   ## The decision, from the variables' values, kept pure so its table can be
   ## tested without starting a process under a forged `LISTEN_PID`.
   result = SocketActivation(requested: false, fd: -1, refusal: "")
@@ -66,14 +72,58 @@ proc socketActivationFrom*(listenPid, listenFds: string; hasListenPid: bool;
     count = parseInt(listenFds.strip())
   except ValueError:
     count = -1
-  if count != 1:
+  let remedy = "Declare one ListenStream= for the shared socket in " &
+    "runquotad.socket, and one socket unit per reservation class with " &
+    "FileDescriptorName=class-<class> (the NixOS module does both)"
+  if count < 1 or count > maxHandedDescriptors:
     result.refusal = "runquotad: socket activation hands over " &
       (if count < 0: "an unreadable LISTEN_FDS=" & listenFds.escape
        else: "LISTEN_FDS=" & $count) &
-      " descriptors; runquotad serves exactly one listening socket " &
-      "(LISTEN_FDS=1). Declare one ListenStream= in the runquotad.socket unit"
+      " descriptors; runquotad serves one shared listening socket and one " &
+      "per declared reservation class. " & remedy
     return
-  result.fd = sdListenFdsStart
+  var names = listenFdNames.strip()
+  var named: seq[string] = @[]
+  if names.len > 0:
+    named = names.split(':')
+  if count == 1 and (named.len == 0 or
+      not named[0].startsWith(classSocketPrefix)):
+    result.fd = sdListenFdsStart
+    return
+  if named.len != count:
+    result.refusal = "runquotad: socket activation hands over LISTEN_FDS=" &
+      $count & " descriptors with " & $named.len & " names in " &
+      "LISTEN_FDNAMES=" & names.escape & "; with more than one socket " &
+      "every descriptor must be named. " & remedy
+    return
+  for offset, name in named:
+    let fd = sdListenFdsStart + offset
+    if name.startsWith(classSocketPrefix):
+      let className = name[classSocketPrefix.len .. ^1]
+      let problem = classNameProblem(className)
+      if problem.len > 0:
+        result.refusal = "runquotad: socket activation hands over a " &
+          "descriptor named " & name.escape & ", which names no valid " &
+          "class (" & problem & ")"
+        return
+      for (seen, _) in result.classFds:
+        if seen == className:
+          result.refusal = "runquotad: socket activation hands over two " &
+            "descriptors named " & name.escape
+          return
+      result.classFds.add((className: className, fd: fd))
+    elif result.fd >= 0:
+      result.refusal = "runquotad: socket activation hands over two " &
+        "descriptors that are not class sockets (" &
+        named.join(":").escape & "); exactly one is the shared socket. " &
+        remedy
+      return
+    else:
+      result.fd = fd
+  if result.fd < 0:
+    result.refusal = "runquotad: socket activation hands over only class " &
+      "sockets (" & named.join(":").escape & ") and no shared socket. " &
+      remedy
 
 proc takeSocketActivation*(): SocketActivation =
   ## Reads and REMOVES `LISTEN_PID`, `LISTEN_FDS` and `LISTEN_FDNAMES`, and
@@ -83,11 +133,12 @@ proc takeSocketActivation*(): SocketActivation =
     let hasListenPid = existsEnv(listenPidEnvVar)
     let listenPid = getEnv(listenPidEnvVar)
     let listenFds = getEnv(listenFdsEnvVar)
+    let listenFdNames = getEnv(listenFdNamesEnvVar)
     delEnv(listenPidEnvVar)
     delEnv(listenFdsEnvVar)
     delEnv(listenFdNamesEnvVar)
     result = socketActivationFrom(listenPid, listenFds, hasListenPid,
-      int(getpid()))
+      int(getpid()), listenFdNames)
     if result.requested:
       # CLOSE-ON-EXEC FIRST, even for a hand-over about to be refused: a
       # listener inherited by a child would keep systemd's socket open

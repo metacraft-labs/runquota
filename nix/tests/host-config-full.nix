@@ -45,6 +45,9 @@
       cpuMilli = 8000;
       memoryBytes = 34359738368;
       lend = false;
+      socketOwner = "1001";
+      socketGroup = "2000";
+      socketMode = "0660";
     };
     interactive = { };
   };

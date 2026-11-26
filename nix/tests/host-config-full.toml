@@ -36,5 +36,8 @@ qos = "on"
 cpu-milli = 8000
 memory-bytes = 34359738368
 lend = false
+socket-owner = "1001"
+socket-group = "2000"
+socket-mode = "0660"
 
 [reservation.interactive]

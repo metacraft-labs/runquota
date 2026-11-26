@@ -67,11 +67,18 @@ type
       ## `LISTEN_PID` named this process: the descriptors are addressed to
       ## it, so it must serve them or refuse, never bind a second socket.
     fd*: int
-      ## The descriptor to serve (`SD_LISTEN_FDS_START`, 3) when `refusal`
-      ## is empty.
+      ## The shared socket's descriptor when `refusal` is empty: 3
+      ## (`SD_LISTEN_FDS_START`) for a single descriptor, else the one not
+      ## named `class-<class>`.
+    classFds*: seq[tuple[className: string, fd: int]]
+      ## The class sockets systemd created, one per `class-<class>`
+      ## descriptor name (`LISTEN_FDNAMES`, the socket unit's
+      ## `FileDescriptorName=`), in hand-over order. `serve` checks them
+      ## against the classes the host file declares.
     refusal*: string
-      ## Non-empty when the hand-over is unusable (`LISTEN_FDS` other than
-      ## 1); `serve` prints it and exits `endpointRefusedExitCode`.
+      ## Non-empty when the hand-over is unusable (no descriptor, several
+      ## without names, two shared ones); `serve` prints it and exits
+      ## `endpointRefusedExitCode`.
 
   BudgetFlags* = object
     ## The budget the COMMAND LINE pinned. A reload re-reads the host file and
@@ -500,6 +507,10 @@ type
       ## the ledger like any grant; predicted at its charge thereafter.
 
   ConnectionContext* = object
+    socketClass*: string
+      ## The reservation class of the socket the connection arrived on, ""
+      ## for the shared socket. Fixed at accept: a connection claims the
+      ## class of its socket and no other (`runquota_daemon/class_claims`).
     supervisorProcessId*: uint64
     supervisorUserId*: uint64
     peer*: PeerIdentity

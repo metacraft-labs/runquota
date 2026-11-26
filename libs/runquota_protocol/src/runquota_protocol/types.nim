@@ -175,6 +175,10 @@ type
     daemonVersion*: string
     capabilities*: CapabilityRecord
     flow*: FlowControlLimits
+    connectionClass*: string
+      ## The reservation class of the socket this connection arrived on
+      ## (`ClassSocketsMinor`), or empty on the shared socket. Sent as an
+      ## optional trailing string, only when non-empty.
 
   SessionGroupDeclaration* = object
     ## The session group a session joins, and the attributes the group

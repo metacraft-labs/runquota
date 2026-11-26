@@ -72,12 +72,24 @@ suite "the Nix modules' host budget file covers the daemon's reader":
   test "every key of a reservation table is set away from its default":
     # Fails when a key is added to `[reservation.<class>]` and the module
     # does not render it, or when the module stops rendering one of these.
-    check ReservationKeys == ["cpu-milli", "memory-bytes", "lend"]
+    # The Windows keys (`allowed-users`, `allowed-groups`) are refused in a
+    # file read for Linux or macOS, the only hosts the modules configure, so
+    # the modules do not render them; every POSIX key is rendered.
+    check ReservationKeys == ["cpu-milli", "memory-bytes", "lend",
+      "socket-owner", "socket-group", "socket-mode", "allowed-users",
+      "allowed-groups"]
+    check PosixClassSocketKeys == ["socket-owner", "socket-group",
+      "socket-mode"]
     check cfg.reservations.hasKey("ci")
     let ci = cfg.reservations.getOrDefault("ci")
     check ci.cpuMilli == 8000'u64
     check ci.memoryBytes == 34359738368'u64
     check ci.lend == false
+    check ci.socketOwner == "1001"
+    check ci.socketOwnerUid == 1001
+    check ci.socketGroup == "2000"
+    check ci.socketGroupGid == 2000
+    check ci.socketMode == 0o660
 
   test "a class declared without a key reserves nothing and lends":
     # Fails when the module stops writing the header of a class that sets no
@@ -87,6 +99,9 @@ suite "the Nix modules' host budget file covers the daemon's reader":
     check interactive.cpuMilli == 0'u64
     check interactive.memoryBytes == 0'u64
     check interactive.lend == true
+    check interactive.socketMode == DefaultClassSocketMode
+    check interactive.socketOwnerUid == -1
+    check interactive.socketGroupGid == -1
 
   test "the values arrive as the module's options spell them":
     # Fails when the module renders a key under another name, in another
@@ -147,3 +162,5 @@ suite "the Nix modules' host budget file covers the daemon's reader":
     check reservationClassProblem(repeat('a', 64)) == ""
     check reservationClassProblem(repeat('a', 65)) != ""
     check reservationClassProblem("a.b") != ""
+    # `classSocketModes` of nix/host-config.nix.
+    check ClassSocketModes == ["0600", "0660", "0666"]

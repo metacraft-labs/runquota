@@ -37,6 +37,11 @@
 ##   the class; a wait longer than the reporting session has existed is
 ##   clamped. The 90 s pool case is gosti's `t_pool_class_queue_wait`.
 ##
+## A session of a class connects on that class's own socket
+## (`class-<class>.sock` beside the daemon's), because that is where a class
+## is claimed: the private daemon gives every declared class one, owner-only,
+## and a class with no `[reservation.<class>]` table cannot be claimed.
+##
 ## NO MOCKS. Every case runs the built `runquotad` on a private socket in a
 ## scratch `0700` directory (`RUNQUOTA_ENDPOINT_SCOPE=private`, through
 ## `tests/support/private_daemon_fixture`), with its own state files and host
@@ -106,8 +111,10 @@ when defined(posix):
 
   proc party(fixture: Fixture; name: string; group: string;
              class = ""): Party =
+    ## A session in `group`, in `class` when one is named: connected on the
+    ## class's own socket, which is where a class is claimed.
     result = Party(nextCandidate: 1'u64)
-    result.client = connect(unixEndpoint(fixture.socket), name)
+    result.client = connectForClass(class, unixEndpoint(fixture.socket), name)
     result.session = result.client.registerSession(name, "0",
       SessionGroupDeclaration(name: group, priority: sessionPriorityNormal,
         className: class))
@@ -118,7 +125,7 @@ when defined(posix):
     putEnv(ClassEnvVar, class)
     defer: delEnv(ClassEnvVar)
     result = Party(nextCandidate: 1'u64)
-    result.client = connect(unixEndpoint(fixture.socket), name)
+    result.client = runquota_client.connectDefault()
     result.session = result.client.registerSession(name, "0")
 
   proc offer(p: Party; slots = 1; memory = 64'u64 * MiB): bool =
@@ -385,7 +392,9 @@ when defined(posix):
       check fixture.statusJson().groupsHeld().memory == int64(4'u64 * GiB)
 
     test "reload_applies_and_revokes_nothing":
-      var fixture = startFixture("clsreload", "")
+      # A table with no figures: a class with no reservation yet, which has
+      # its socket (a class with no table could not be claimed at all).
+      var fixture = startFixture("clsreload", "[reservation.ci]\n")
       defer: stopFixture(fixture)
       let other = fixture.party("other", "cls-other")
       let ci = fixture.party("ci", "cls-ci", "ci")

@@ -817,7 +817,8 @@ proc runPressureReport(args: seq[string]): int =
   ## how long each job waited for a slot as a `class-queue` wait. It starts
   ## this once and keeps it for its life: the session joins the group
   ## `RUNQUOTA_SESSION` names (else the group named after the class) in
-  ## CLASS (`--class`, else `RUNQUOTA_CLASS`), prints `ready <session>`,
+  ## CLASS (`--class`, else `RUNQUOTA_CLASS`) -- connecting on that class's
+  ## socket when the daemon serves one -- prints `ready <session>`,
   ## and then reads one line per finished wait on stdin:
   ##
   ##     class-queue <started-unix-millis> <length-millis>
@@ -853,9 +854,12 @@ proc runPressureReport(args: seq[string]): int =
   if problem.len > 0:
     stderr.writeLine("runquota pressure report: " & problem)
     return 2
+  # THE CLASS'S OWN SOCKET: a pool reports into its class only from there
+  # (the socket's permissions decide who may), so `--class` picks the socket
+  # exactly as `RUNQUOTA_CLASS` does for every other client.
   var client: RunQuotaClient
   try:
-    client = connectDefault()
+    client = connectForClass(className)
   except CatchableError as error:
     stderr.writeLine("runquota pressure report: " & error.msg)
     return 1

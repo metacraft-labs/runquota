@@ -18,6 +18,8 @@ import runquota_daemon/reload_report
 import runquota_daemon/child_identity
 import runquota_daemon/parent_watch
 import runquota_daemon/socket_activation
+import runquota_daemon/class_claims
+import runquota_daemon/class_sockets
 import runquota_daemon/prediction
 import runquota_daemon/host_link
 import runquota_admission
@@ -58,6 +60,8 @@ export reload_report
 export parent_watch
 # And systemd's `LISTEN_*` hand-over through this one.
 export socket_activation
+# The class-socket rule, for tests and for the platform legs that reuse it.
+export class_claims
 
 const libraryName* = "runquota_daemon"
 
@@ -3530,7 +3534,10 @@ proc handleHello(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     daemonId: daemon.config.daemonId,
     daemonVersion: daemon.config.version,
     capabilities: effectiveCaps,
-    flow: defaultFlowControlLimits()
+    flow: defaultFlowControlLimits(),
+    # THE CONNECTION'S CLASS, on a class socket only: the shared socket's
+    # answer stays the bytes a minor-12 client decodes.
+    connectionClass: context.socketClass
   )
   connection.sendResponse(rqHelloOk, frame.header.requestId, encodeHelloOk(helloOk))
   context.supervisorProcessId = hello.processId
@@ -5300,6 +5307,18 @@ proc reloadHostConfig*(daemon: var RunQuotaDaemon; owner = ""):
   if reservationRefusal.len > 0:
     raise newException(HostConfigError, host.sourcePath & ": " &
       reservationRefusal)
+  # THE CLASS SOCKETS LAST, because they are the one part of a reload with
+  # an effect outside this process: every check above has passed, so a
+  # refusal here is the only way the reload can still fail, and it leaves
+  # the sockets, the reservations and the target in force unchanged.
+  if classSocketsServing():
+    try:
+      reconcileClassSockets(planClassSockets(next.reservations,
+        next.endpoint, rendezvousPolicy().scope))
+    except ClassSocketProblem as error:
+      raise newException(HostConfigError, host.sourcePath & ": " & error.msg)
+    except EndpointTrustError as error:
+      raise newException(HostConfigError, host.sourcePath & ": " & error.msg)
   daemon.config = next
   inc daemon.hostConfigReloads
 
@@ -5878,7 +5897,7 @@ proc retirementAnswer*(daemon: RunQuotaDaemon; peer: PeerIdentity;
 # includes "no lease": leases live in sessions and sessions on connections.
 #
 # A SLEEPING THREAD, NOT A TIMER IN THE ACCEPT LOOP. The accept loop parks in
-# `poll` with no timeout on purpose (see `waitForAcceptOrShutdown`), and
+# `poll` with no timeout on purpose (see `waitForAnyConnection`), and
 # Windows parks in `ConnectNamedPipe`, which has none to give. So a thread of
 # its own sleeps until the earliest moment the period could end -- in slices
 # of at most `idleWatchSliceMillis`, so that `serve`'s shutdown, which joins
@@ -5975,6 +5994,34 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           diagInvalidArgument, "invalid session group: " & problem,
           "the group comes from RUNQUOTA_SESSION"))
         return
+    when ClassSocketsServed:
+      # WHO MAY CLAIM A CLASS IS THE SOCKET THE CONNECTION ARRIVED ON
+      # (`runquota_daemon/class_claims`): the kernel decided at `connect(2)`,
+      # and every registration on the connection is held to that class. The
+      # group the session would join is named exactly as `joinSessionGroup`
+      # names it, with the socket's class standing in for an absent block.
+      let effectiveClass =
+        if msg.group.className.len > 0: msg.group.className
+        else: context.socketClass
+      let groupName =
+        if msg.group.name.len > 0: msg.group.name
+        elif effectiveClass.len > 0: effectiveClass
+        else: InteractiveSessionGroup
+      let existingKey = sessionGroupKey(context.peer, groupName)
+      let existingClass =
+        if daemon.sessionGroups.hasKey(existingKey):
+          some(daemon.sessionGroups[existingKey].className)
+        else: none(string)
+      let claim = classClaim(context.socketClass, msg.group.className,
+        existingClass, declaredClassNames(daemon.config.reservations),
+        daemon.config.endpoint)
+      if claim.refusal.len > 0:
+        connection.sendError(frame.header.requestId, diagnostic(
+          diagInvalidArgument, claim.refusal,
+          "who may claim a class is decided by its socket's permissions, " &
+            "which the host file's [reservation.<class>] declares"))
+        return
+      msg.group.className = claim.className
     let id = sessionId(daemon.nextSessionId)
     inc daemon.nextSessionId
     let groupKey = daemon.joinSessionGroup(context.peer, msg.group)
@@ -6912,8 +6959,11 @@ proc drainBeforeAnswering(frame: RqspFrame) =
     discard
 
 proc handleConnection*(daemon: var RunQuotaDaemon;
-    connection: var LocalConnection) =
+    connection: var LocalConnection; socketClass = "") =
+  ## Serve one connection in this thread. `socketClass` is the class of the
+  ## socket it arrived on, "" for the shared one.
   var context = ConnectionContext(
+    socketClass: socketClass,
     supervisorProcessId: 0'u64,
     supervisorUserId: 0'u64,
     peer: PeerIdentity(
@@ -6946,11 +6996,16 @@ type
     lock: Lock
     daemon: RunQuotaDaemon
 
+  QueuedConnection = object
+    accepted: AcceptedConnection
+    socketClass: string
+      ## The class of the socket it was accepted on, "" for the shared one.
+
   ConnectionQueue = object
     lock: Lock
     ready: Cond
     stopping: bool
-    items: seq[AcceptedConnection]
+    items: seq[QueuedConnection]
 
 var sharedDaemon: SharedDaemon
 var connectionQueue: ConnectionQueue
@@ -7207,17 +7262,18 @@ proc deinitConnectionQueue() =
   deinitCond(connectionQueue.ready)
   deinitLock(connectionQueue.lock)
 
-proc enqueueConnection(accepted: AcceptedConnection) =
+proc enqueueConnection(accepted: AcceptedConnection; socketClass = "") =
   acquire(connectionQueue.lock)
   try:
     if connectionQueue.stopping:
       return
-    connectionQueue.items.add(accepted)
+    connectionQueue.items.add(QueuedConnection(accepted: accepted,
+      socketClass: socketClass))
     signal(connectionQueue.ready)
   finally:
     release(connectionQueue.lock)
 
-proc dequeueConnection(accepted: var AcceptedConnection): bool {.gcsafe.} =
+proc dequeueConnection(accepted: var QueuedConnection): bool {.gcsafe.} =
   {.cast(gcsafe).}:
     acquire(connectionQueue.lock)
     try:
@@ -7500,10 +7556,12 @@ else:
     "the host link needs vsock, which this platform does not have"
   proc stopVmLinkListener() = discard
 
-proc handleSharedConnection(accepted: AcceptedConnection) {.thread, gcsafe.} =
+proc handleSharedConnection(accepted: AcceptedConnection;
+                            socketClass: string) {.thread, gcsafe.} =
   {.cast(gcsafe).}:
     var localConnection = accepted.localConnection()
     var context = ConnectionContext(
+      socketClass: socketClass,
       supervisorProcessId: 0'u64,
       supervisorUserId: 0'u64,
       peer: PeerIdentity(
@@ -7606,11 +7664,12 @@ proc connectionWorker() {.thread, gcsafe.} =
   ## stops.
   {.cast(gcsafe).}:
    while true:
-    var accepted: AcceptedConnection
-    if not dequeueConnection(accepted):
+    var queued: QueuedConnection
+    if not dequeueConnection(queued):
       break
+    let accepted = queued.accepted
     try:
-      handleSharedConnection(accepted)
+      handleSharedConnection(accepted, queued.socketClass)
     except CatchableError as error:
       # The descriptor is ours to release: `handleSharedConnection` closes
       # its `LocalConnection` on every path it reaches, so anything arriving
@@ -7631,6 +7690,17 @@ proc connectionWorker() {.thread, gcsafe.} =
       # ended: a retiring daemon waits for this count to reach zero, and a
       # connection that raised is as finished as one that returned.
       connectionEnded()
+
+type
+  ListenerReadiness = object
+    ## What one wait of the accept loop found.
+    shared: bool
+      ## The shared listener has a connection queued (or the wait gave up,
+      ## and the caller goes to the shared `accept` as it always did).
+    readyClass: seq[tuple[className: string, fd: cint]]
+      ## Class sockets with a connection queued.
+    failedClass: seq[tuple[className: string, fd: cint]]
+      ## Class sockets whose descriptor reports an error.
 
 # ---------------------------------------------------------------------------
 # SIGTERM, and the orderly shutdown it now reaches.
@@ -7892,7 +7962,9 @@ when defined(posix):
         discard write(acceptWakePipe[1], addr token, 1)
       dialOwnEndpoint(endpointPath)
 
-  proc waitForAcceptOrShutdown(acceptHandle: int) =
+  proc waitForAnyConnection(acceptHandle: int;
+      classListeners: seq[tuple[className: string, fd: cint]];
+      changeFd: cint): ListenerReadiness =
     ## PARK UNTIL THERE IS A CONNECTION TO ACCEPT, OR UNTIL WE ARE STOPPING.
     ## Returns with no answer of its own: the caller re-reads the flag and
     ## calls `accept`, and both of those are the authority they always were.
@@ -7922,26 +7994,39 @@ when defined(posix):
     ## EINTR IS A RETRY AND NOT A RESULT. Every other error returns, which
     ## hands the caller back to `accept` and to the consecutive-failure
     ## accounting that has always decided whether a listener is really dead.
-    if acceptHandle < 0:
-      # NOTHING TO WAIT ON, so the caller blocks in `accept` as it did
-      # before this existed -- the Windows named-pipe shape, and a listener
-      # with no socket. Never a spin: `accept` is still what follows.
-      return
-    var descriptors: array[0 .. 1, TPollfd]
-    descriptors[0].fd = cint(acceptHandle)
-    descriptors[0].events = POLLIN
-    descriptors[0].revents = 0
-    var counted = 1
+    ##
+    ## SEVERAL LISTENERS, ONE WAIT. The shared listener AND every class
+    ## socket (`runquota_daemon/class_sockets`) are waited on together, with
+    ## the pipe a reload writes when the class sockets change. The answer
+    ## says which listeners have a connection queued and which report an
+    ## error; without class sockets it is one more descriptor that is never
+    ## readable.
+    if acceptHandle < 0 and classListeners.len == 0:
+      return ListenerReadiness(shared: true)
+    var descriptors = newSeq[TPollfd]()
+    descriptors.add(TPollfd(fd: cint(acceptHandle), events: POLLIN))
     if acceptWakePipe[0] >= 0:
-      descriptors[1].fd = acceptWakePipe[0]
-      descriptors[1].events = POLLIN
-      descriptors[1].revents = 0
-      counted = 2
+      descriptors.add(TPollfd(fd: acceptWakePipe[0], events: POLLIN))
+    if changeFd >= 0:
+      descriptors.add(TPollfd(fd: changeFd, events: POLLIN))
+    let firstClass = descriptors.len
+    for listener in classListeners:
+      descriptors.add(TPollfd(fd: listener.fd, events: POLLIN))
     while true:
-      if poll(addr descriptors[0], Tnfds(counted), -1.cint) >= 0:
-        return
+      if poll(addr descriptors[0], Tnfds(descriptors.len), -1.cint) >= 0:
+        break
       if errno != EINTR:
-        return
+        # As before: hand the caller back to the shared `accept`.
+        return ListenerReadiness(shared: true)
+    result.shared = (descriptors[0].revents and
+      (POLLIN or POLLERR or POLLHUP or POLLNVAL)) != 0
+    for i in firstClass ..< descriptors.len:
+      let events = descriptors[i].revents
+      let listener = classListeners[i - firstClass]
+      if (events and (POLLERR or POLLNVAL)) != 0:
+        result.failedClass.add(listener)
+      elif (events and POLLIN) != 0:
+        result.readyClass.add(listener)
 
   proc installShutdownHandler(endpointPath: string) =
     ## Arms SIGTERM. Called after the endpoint is bound, because the waker
@@ -8061,16 +8146,16 @@ else:
       shutdownRequested.store(true, moRelease)
       dialOwnEndpoint(endpointPath)
 
-  proc waitForAcceptOrShutdown(acceptHandle: int) =
-    ## NOTHING TO WAIT ON HERE, and that is a property of the transport
-    ## rather than an omission. A named-pipe listener has no descriptor
-    ## whose readability means "a client is waiting": `ConnectNamedPipe` IS
-    ## the wait, and the stop watcher wakes it by opening the pipe -- which
-    ## needs the pipe NAME and not a file on disk, so the hazard the POSIX
-    ## gate exists for (an unlinked socket) has no Windows form.
-    ## `acceptWaitHandle` answers -1 for every named-pipe listener, so this
-    ## is reached with nothing to do.
+  proc waitForAnyConnection(acceptHandle: int;
+      classListeners: seq[tuple[className: string, fd: cint]];
+      changeFd: cint): ListenerReadiness =
+    ## No class sockets are served here yet
+    ## (`runquota_protocol.ClassSocketsServed`), and `ConnectNamedPipe` is
+    ## the wait: hand the caller straight to the shared accept.
     discard acceptHandle
+    discard classListeners
+    discard changeFd
+    ListenerReadiness(shared: true)
 
   proc installShutdownHandler(endpointPath: string) =
     ## Arms the SCM stop watch. Called after the endpoint is bound, because
@@ -8366,14 +8451,54 @@ proc serve*(config: DaemonConfig): int =
     echo error.msg
     flushFile(stdout)
     return endpointRefusedExitCode
+  # THE CLASS SOCKETS ARE PLANNED BEFORE ANYTHING STARTS: an owner or group
+  # the daemon cannot apply refuses the start (exit 2, like reservations
+  # that do not fit) naming the class, the socket and what is missing, and
+  # a refusal should not have to stop threads. Under socket activation they
+  # are adopted here too, beside the shared socket, and checked against the
+  # plan.
+  var classPlans: seq[ClassSocketPlan] = @[]
+  try:
+    classPlans = planClassSockets(config.reservations, config.endpoint,
+      rendezvousPolicy().scope)
+    if activated:
+      adoptClassSockets(classPlans, config.socketActivation.classFds,
+        rendezvousPolicy())
+  except ClassSocketProblem as error:
+    echo "runquotad: " &
+      (if config.hostConfigSource.len > 0: config.hostConfigSource & ": "
+       else: "") & error.msg
+    flushFile(stdout)
+    if activated: listener.close()
+    when defined(posix):
+      releaseEndpointLock(lifetimeLock)
+    return 2
+  except EndpointTrustError as error:
+    echo error.msg
+    flushFile(stdout)
+    stopClassSockets()
+    if activated: listener.close()
+    when defined(posix):
+      releaseEndpointLock(lifetimeLock)
+    return endpointRefusedExitCode
   initLock(sharedDaemon.lock)
   initConnectionQueue()
   # THE STORE IS NOT OPENED HERE. See `captureOpenerMain`.
   sharedDaemon.daemon = initDaemon(config, deferCapture = true)
   captureCreateParent = config.observationDbPath.len > 0
+  var sharedBound = false
+  var startRefusal = endpointRefusedExitCode
   try:
     if not activated:
       listener = bindEndpoint(config.endpoint)
+      sharedBound = true
+      # AFTER THE SHARED ENDPOINT, as the design orders it: the class
+      # sockets sit in its directory, which binding it has verified.
+      try:
+        startClassSockets(classPlans, rendezvousPolicy())
+      except ClassSocketProblem as error:
+        startRefusal = 2
+        raise newException(EndpointTrustError, "runquotad: " & error.msg)
   except EndpointTrustError as error:
     # Reachable when the directory changed underneath the pre-check above,
     # and when the endpoint PATH cannot be taken: another daemon is serving
@@ -8384,6 +8509,9 @@ proc serve*(config: DaemonConfig): int =
     # stopped rather than stranded.
     echo error.msg
     flushFile(stdout)
+    if sharedBound:
+      listener.close()
+    stopClassSockets()
     stopEstimateStore(sharedDaemon.daemon.estimateStore)
     stopAmbientSampler()
     stopRetentionSweeper()
@@ -8392,7 +8520,7 @@ proc serve*(config: DaemonConfig): int =
     deinitConnectionQueue()
     when defined(posix):
       releaseEndpointLock(lifetimeLock)
-    return endpointRefusedExitCode
+    return startRefusal
   sharedDaemon.daemon.state = dsServing
   # AFTER the rendezvous directory exists and has been verified, because the
   # published table lives in it and is discovered the same way the socket is.
@@ -8420,7 +8548,8 @@ proc serve*(config: DaemonConfig): int =
   echo "runquotad listening " & config.endpoint.path &
     rendezvousDegradationReport() &
     (if activated: " (socket activation: descriptor " &
-       $config.socketActivation.fd & ")" else: "") & "; " &
+       $config.socketActivation.fd & ")" else: "") &
+    classSocketReport() & "; " &
     statsPublisherReport(sharedDaemon.daemon.statsPublisher)
   # The report is the "clear report" half of OS-4: a store that will not
   # open says so on stdout and the daemon carries on serving leases.
@@ -8533,6 +8662,8 @@ proc serve*(config: DaemonConfig): int =
     # descriptor does not change; re-deriving it per iteration would only
     # add a variant-field read to the hot path.
     let acceptHandle = listener.acceptWaitHandle
+    var classListeners = liveClassListeners()
+    let classChangeFd = classSocketChangeFd()
     while true:
       # THE WAIT THAT MAKES THE FLAG OBSERVABLE. `accept` cannot be woken by
       # anything that does not arrive over the endpoint, so the loop waits
@@ -8542,7 +8673,12 @@ proc serve*(config: DaemonConfig): int =
       # dialled wake cannot be delivered then, and before this gate existed
       # the daemon stayed parked in `accept` until SIGKILL. See the section
       # headed "SIGTERM, and the orderly shutdown it now reaches".
-      waitForAcceptOrShutdown(acceptHandle)
+      #
+      # THE CLASS SOCKETS ARE WAITED ON IN THE SAME CALL, so the loop stays
+      # one thread that parks once: a connection on any of them, the stop,
+      # or a reload that changed them wakes it.
+      let readiness = waitForAnyConnection(acceptHandle, classListeners,
+        classChangeFd)
       # SIGTERM LEAVES BY THE SAME DOOR AS A DEAD LISTENER: it breaks the
       # loop, and everything below `finally` then happens exactly as it does
       # for every other way of ending. The flag is checked three times
@@ -8550,6 +8686,35 @@ proc serve*(config: DaemonConfig): int =
       # wait above and the `accept` below.
       if shutdownWasRequested():
         break
+      var stopNow = false
+      for failed in readiness.failedClass:
+        let line = markClassListenerDead(failed.fd, "its descriptor " &
+          "reported an error")
+        if line.len > 0:
+          noteConnectionFailure(line)
+      for ready in readiness.readyClass:
+        var accepted: AcceptedConnection
+        try:
+          accepted = acceptOnClassSocket(ready.fd)
+        except CatchableError as error:
+          # A failed accept on a class socket is the peer's or the host's
+          # problem, as on the shared one; it does not end the loop.
+          noteConnectionFailure("runquota accept failed on the socket of " &
+            "class " & ready.className & ": " & error.msg)
+          continue
+        if shutdownWasRequested() or not admitConnection():
+          accepted.close()
+          stopNow = true
+          break
+        enqueueConnection(accepted, ready.className)
+      if stopNow:
+        break
+      # THE SET IS RE-READ AFTER EVERY WAKE: a reload may have added a
+      # socket or retired one (closed here, by this thread, which is the
+      # only one that waits on it).
+      classListeners = liveClassListeners()
+      if not readiness.shared:
+        continue
       var accepted: AcceptedConnection
       try:
         accepted = listener.acceptNativeConnection()
@@ -8595,6 +8760,7 @@ proc serve*(config: DaemonConfig): int =
     var listenerClosed = false
     if retirementWasDecided():
       listener.close()
+      stopClassSockets()
       listenerClosed = true
     # THE SCM'S STOP GRACE IS RE-ARMED BEFORE THE LONG PART BEGINS. What
     # follows joins a worker pool, stops four background threads and lets a
@@ -8690,6 +8856,7 @@ proc serve*(config: DaemonConfig): int =
       stopImageDigest()
       if not listenerClosed:
         listener.close()
+        stopClassSockets()
       deinitLock(sharedDaemon.lock)
       deinitConnectionQueue()
       # THE LIFETIME LOCK GOES LAST: until here this process still holds the

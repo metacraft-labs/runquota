@@ -11,7 +11,14 @@ export virtual_machines
 const libraryName* = "runquota_protocol"
 const RqspMagic* = "RQSP"
 const RqspProtocolMajor* = 2'u16
-const RqspProtocolMinor* = 12'u16
+const ClassSocketsServed* = defined(linux)
+  ## Whether this build's daemon serves ONE SOCKET PER RESERVATION CLASS
+  ## (`ClassSocketsMinor`). Linux first: the claim rests on the kernel
+  ## refusing `connect(2)` without write permission on the socket, which
+  ## each platform has to be shown to do before its daemon relies on it.
+  ## Until then a daemon elsewhere announces `ClassesMinor` and keeps that
+  ## minor's behaviour (the class block accepted on its one socket).
+const RqspProtocolMinor* = (when ClassSocketsServed: 13'u16 else: 12'u16)
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -144,6 +151,18 @@ const ClassesMinor* = 12'u16
   ## a client sends the class block only at this minor or above, and below
   ## it the session is served without a class -- outside every reservation,
   ## as that daemon serves every session.
+const ClassSocketsMinor* = 13'u16
+  ## The first daemon minor that serves ONE SOCKET PER RESERVATION CLASS:
+  ## `class-<class>.sock` beside the endpoint (`runquota_ipc.classEndpoint`),
+  ## whose permissions decide who may claim the class. A connection on a
+  ## class socket carries the class, and `HelloOk` there names it
+  ## (`HelloOkMessage.connectionClass`, an optional trailing string written
+  ## only on a class socket, so the shared socket's `HelloOk` is the bytes
+  ## minor 12 sent). On the shared socket a `RegisterSession` with a class
+  ## block is refused, naming the class socket. No existing message
+  ## changed. A client below this minor sends the class block as at minor
+  ## 12 (it knows no class socket); a client at it finds the class's socket
+  ## by `RUNQUOTA_CLASS` and does not fall back to the shared one.
 const MaxPressureWaitsPerReport* = 64
   ## The most waits one `PressureReport` carries. A client with more keeps
   ## the rest for its next report; the daemon refuses a longer list, so a
@@ -350,6 +369,13 @@ proc encodeHelloOk*(msg: HelloOkMessage): string =
   w.writeU32(msg.flow.maxFrameBytes)
   w.writeU32(msg.flow.maxCandidatesPerBatch)
   w.writeU32(msg.flow.maxLeaseDecisionsPerBatch)
+  # THE CONNECTION'S CLASS, only when there is one: a `HelloOk` on the
+  # shared socket stays byte-identical to minor 12's, which a minor-12
+  # client decodes strictly (no trailing bytes). Only a class socket names
+  # a class, and a client that predates class sockets never connects to
+  # one.
+  if msg.connectionClass.len > 0:
+    w.writeString(msg.connectionClass)
   w.data
 
 proc decodeHelloOk*(payload: string; msg: var HelloOkMessage): bool =
@@ -372,8 +398,14 @@ proc decodeHelloOk*(payload: string; msg: var HelloOkMessage): bool =
   if not r.readU32(maxFrameBytes): return false
   if not r.readU32(maxCandidatesPerBatch): return false
   if not r.readU32(maxLeaseDecisionsPerBatch): return false
+  var connectionClass = ""
+  if r.remaining != 0:
+    if not r.readString(connectionClass): return false
+    # Written only when there is a class, and only a valid one.
+    if classNameProblem(connectionClass).len > 0: return false
   if r.remaining != 0: return false
   msg = HelloOkMessage(
+    connectionClass: connectionClass,
     selectedProtocolMajor: selectedProtocolMajor,
     selectedProtocolMinor: selectedProtocolMinor,
     daemonId: daemonId,

@@ -51,6 +51,16 @@ let
   fraction = types.strMatching "(0(\\.[0-9]{1,3})?|1(\\.0{1,3})?)";
   # A string of the subset: no quote, no escape. An array item is split at
   # commas, so it carries none either.
+  # A user or group name, or a decimal id: no quote, no escape, no space.
+  accountName = types.strMatching "[A-Za-z0-9_][A-Za-z0-9_.-]*" // {
+    description = "user or group name, or decimal id";
+  };
+  # `ClassSocketModes` of the daemon's reader.
+  classSocketModes = [
+    "0600"
+    "0660"
+    "0666"
+  ];
   arrayItem = types.strMatching "[^\"\\\\,\n\r]+" // {
     description = "non-empty string without a quote, a backslash, a comma or a line break";
   };
@@ -100,6 +110,21 @@ let
 in
 {
   path = "/etc/runquota/runquotad.toml";
+
+  # The class sockets a configuration declares, for a module that has
+  # systemd create them (socket activation): one entry per reservation, with
+  # the values the daemon would apply itself. The daemon checks the socket
+  # it is handed against its own reading of the file, so these must agree.
+  inherit classSocketModes;
+  classSockets =
+    cfg:
+    lib.mapAttrsToList (name: class: {
+      inherit name;
+      fileName = "class-${name}.sock";
+      owner = class.socketOwner;
+      group = class.socketGroup;
+      mode = if class.socketMode == null then "0600" else class.socketMode;
+    }) cfg.reservations;
 
   # Relative to /etc, for `environment.etc`.
   etcName = "runquota/runquotad.toml";
@@ -203,6 +228,22 @@ in
               lend = nullable types.bool ''
                 `lend`: whether the class's idle reserved CPU may be lent
                 (the daemon's default is true).
+              '';
+              socketOwner = nullable accountName ''
+                `socket-owner`: the owner of the class's socket, a user name
+                or decimal uid (the daemon's default: its own user). Only a
+                daemon running as root can give the socket to another user.
+              '';
+              socketGroup = nullable accountName ''
+                `socket-group`: the group of the class's socket, a group name
+                or decimal gid (the daemon's default: its primary group). The
+                daemon's account must be in it.
+              '';
+              socketMode = nullable (types.enum classSocketModes) ''
+                `socket-mode`: who may claim the class by connecting to its
+                socket: `"0600"` the owner only (the daemon's default),
+                `"0660"` the owner and the group, `"0666"` every local user
+                who can reach the rendezvous.
               '';
             };
           }
@@ -331,6 +372,9 @@ in
           ++ entry "cpu-milli" class.cpuMilli toString
           ++ entry "memory-bytes" class.memoryBytes toString
           ++ entry "lend" class.lend lib.boolToString
+          ++ entry "socket-owner" class.socketOwner quoted
+          ++ entry "socket-group" class.socketGroup quoted
+          ++ entry "socket-mode" class.socketMode quoted
         ) cfg.reservations
       )
     )

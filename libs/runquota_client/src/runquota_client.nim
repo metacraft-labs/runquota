@@ -1,7 +1,8 @@
 import std/[options, os, tables, strutils, monotimes, times]
 when defined(posix):
   from std/posix import EACCES, EPERM, ECONNREFUSED, ENOENT, ENOTDIR,
-    ENAMETOOLONG, ETIMEDOUT, ECONNRESET, EPIPE, EAGAIN
+    ENAMETOOLONG, ETIMEDOUT, ECONNRESET, EPIPE, EAGAIN, Stat, lstat, errno,
+    S_ISSOCK
 
 import runquota_client/types as clientTypes
 import runquota_client/standalone as clientStandalone
@@ -279,13 +280,134 @@ proc connect*(endpoint: Endpoint; clientName = "runquota-nim";
     result.daemonVersion = helloOk.daemonVersion
     result.capabilities = helloOk.capabilities
     result.flow = helloOk.flow
+    result.socketClass = helloOk.connectionClass
     established = true
   finally:
     if not established:
       result.close()
 
+# ---------------------------------------------------------------------------
+# Which socket: the shared one, or the socket of the class `RUNQUOTA_CLASS`
+# names.
+#
+# Each `[reservation.<class>]` of the host file has its own daemon socket
+# beside the shared endpoint (`runquota_ipc.classEndpoint`), and the socket's
+# permissions decide who may claim the class. So the client picks the socket
+# by the class: when the class's socket exists it connects THERE, and a
+# refusal is an error naming the socket and the class -- never a quiet
+# fallback to the shared socket, where the work would run outside its
+# reservation. When it does not exist the client connects to the shared
+# endpoint: a daemon with class sockets then refuses the class there and says
+# the host declares no such class, and a daemon that predates class sockets
+# (`ClassSocketsMinor`) is sent the class block as at minor 12, since it has
+# no other trust model to offer.
+# ---------------------------------------------------------------------------
+
+const classEnvVarName = "RUNQUOTA_CLASS"
+
+type
+  ClassSocketRefusedError* = object of RunQuotaClientError
+    ## The class's socket exists and this process may not use it (or it
+    ## failed its trust check). Carries the socket and the class in its
+    ## message; a launcher must not run the work unleased or on the shared
+    ## socket instead.
+    socketPath*: string
+    className*: string
+
+proc classSocketRefusal(path, className, why: string): string =
+  "cannot claim class " & className & " at its socket " & path & ": " & why &
+    ". Who may claim a class is decided by the host file's [reservation." &
+    className & "] (socket-owner, socket-group and socket-mode; " &
+    "allowed-users and allowed-groups on Windows); the client does not " &
+    "fall back to the shared socket. Unset " & classEnvVarName &
+    " to run without the class"
+
+template raiseClassRefused(path, className, why: string) =
+  var error = newException(ClassSocketRefusedError,
+    classSocketRefusal(path, className, why))
+  error.socketPath = path
+  error.className = className
+  raise error
+
+proc classSocketExists(endpoint: Endpoint): bool =
+  ## Whether there is anything at the class socket's path. Only a plain
+  ## absence counts as "no socket": a path that cannot be looked at (a
+  ## directory this user cannot search) is a socket the user is refused,
+  ## and the connect that follows names that.
+  case endpoint.kind
+  of endpointUnixSocket:
+    when defined(posix):
+      var info: Stat
+      if lstat(endpoint.path.cstring, info) == 0:
+        return true
+      return errno != ENOENT and errno != ENOTDIR
+    else:
+      fileExists(endpoint.path)
+  of endpointNamedPipe:
+    # A pipe cannot be listed cheaply here; the connect decides, and a
+    # missing pipe (ERROR_FILE_NOT_FOUND) is the shared-socket case.
+    true
+  of endpointUnsupported:
+    false
+
+proc connectForClass*(className: string; endpoint = defaultEndpoint();
+                      clientName = "runquota-nim";
+                      clientVersion = "0.1.0"): RunQuotaClient =
+  ## Connect for work in `className` ("" for none): to the class's socket
+  ## beside `endpoint` when it exists, else to `endpoint` itself. Raises
+  ## `ClassSocketRefusedError` when the class's socket refuses this process,
+  ## `RunQuotaClientError` for a class outside the class-name rule or a
+  ## socket path too long for this platform, and what `connect` raises
+  ## otherwise.
+  if className.len == 0:
+    return connect(endpoint, clientName, clientVersion)
+  let problem = classNameProblem(className)
+  if problem.len > 0:
+    raise newException(RunQuotaClientError, "invalid class " &
+      classEnvVarName & ": " & problem)
+  var classSocket: Endpoint
+  try:
+    classSocket = classEndpoint(endpoint, className)
+  except ClassEndpointError as error:
+    raise newException(RunQuotaClientError, "class " & className & ": " &
+      error.msg)
+  if not classSocketExists(classSocket):
+    # NO SOCKET FOR THE CLASS: the shared endpoint, where a daemon with
+    # class sockets answers that the host declares no such class.
+    return connect(endpoint, clientName, clientVersion)
+  when defined(posix):
+    if classSocket.kind == endpointUnixSocket:
+      var info: Stat
+      if lstat(classSocket.path.cstring, info) == 0 and
+          not S_ISSOCK(info.st_mode):
+        raiseClassRefused(classSocket.path, className,
+          "it is not a socket (a symbolic link or another kind of file), " &
+          "so it is not the daemon's")
+  try:
+    result = connect(classSocket, clientName, clientVersion)
+  except RunQuotaClientError:
+    # The daemon answered (a refused Hello, a protocol error): its own words
+    # are the better message.
+    raise
+  except OSError as error:
+    let code = error.errorCode
+    let why =
+      if code != 0: osErrorMsg(OSErrorCode(code)).strip()
+      else: error.msg.strip()
+    raiseClassRefused(classSocket.path, className, why)
+  if result.socketClass != className:
+    let answered = result.socketClass
+    result.connection.close()
+    result.state = csClosed
+    raiseClassRefused(classSocket.path, className,
+      "the daemon there answered " &
+      (if answered.len > 0: "for class " & answered else: "for no class") &
+      ", so it is not that class's socket")
+
 proc connectDefault*(): RunQuotaClient =
-  connect(defaultEndpoint())
+  ## Connect for this process's work: the socket of the class
+  ## `RUNQUOTA_CLASS` names, or the shared endpoint (`connectForClass`).
+  connectForClass(getEnv(classEnvVarName).strip())
 
 # ---------------------------------------------------------------------------
 # Why a launcher has no session, and what it may do about it.
@@ -322,6 +444,8 @@ type
     cfkNotListening  ## a socket file with nothing listening (ECONNREFUSED)
     cfkUntrusted     ## the endpoint failed the trust checks
     cfkDenied        ## a daemon answered and refused this client at Hello
+    cfkClassRefused  ## the socket of the class RUNQUOTA_CLASS names refused
+                     ## this process: never run unleased instead
     cfkOther         ## anything else: a handshake timeout, a transport error
 
   ConnectFailure* = object
@@ -393,8 +517,14 @@ proc tryConnectDefault*(client: var RunQuotaClient;
   try:
     let resolved = defaultEndpoint()
     endpoint = resolved.path
-    client = connect(resolved)
+    client = connectForClass(getEnv(classEnvVarName).strip(), resolved)
     return true
+  except ClassSocketRefusedError as error:
+    # NEVER RUN UNLEASED FOR THIS: the work named a class, and running it
+    # outside the class's reservation is exactly what the refusal is for.
+    failure = ConnectFailure(kind: cfkClassRefused, endpoint: error.socketPath,
+      errorName: "class " & error.className & " refused",
+      detail: oneLine(error.msg))
   except RunQuotaRefusedError as error:
     failure = ConnectFailure(kind: cfkDenied, endpoint: endpoint,
       errorName: "Hello refused", detail: oneLine(error.msg))
@@ -436,6 +566,9 @@ proc failureHint*(failure: ConnectFailure): string =
       "socket behind; start it (`runquota daemon start` or the host service)."
   of cfkAbsent:
     "No daemon is provisioned at that path."
+  of cfkClassRefused:
+    "The host file decides who may claim the class; ask its operator, or " &
+      "unset RUNQUOTA_CLASS to run the work without the class."
   of cfkUntrusted, cfkDenied, cfkOther, cfkNone:
     ""
 
@@ -458,6 +591,12 @@ proc unleasedFallback*(launcher: string; failure: ConnectFailure;
   ## The one decision every launcher takes after `tryConnectDefault` failed:
   ## whether to run the command unleased, and the line to print first.
   ## `launcher` prefixes the line (`runquota run`, `repro`).
+  if failure.kind == cfkClassRefused:
+    # A CLASS THAT MAY NOT BE CLAIMED IS NOT A DAEMON THAT IS NOT THERE: the
+    # work asked for a reservation it is not allowed, and running it
+    # unleased would put it outside every budget instead.
+    return UnleasedFallback(run: false, message: withHint(launcher & ": " &
+      failureReason(failure) & "; not running the command.", failure))
   if strict:
     return UnleasedFallback(run: false, message: withHint(launcher & ": " &
       StrictEnvVar & " is set and no lease can be had: " &
@@ -484,7 +623,7 @@ const
   SessionCacheTtlEnvVar* = "RUNQUOTA_SESSION_CACHE_TTL"
     ## Seconds until the group's provider prompt cache expires: the group's
     ## cache deadline (now + TTL) if this session creates it.
-  ClassEnvVar* = "RUNQUOTA_CLASS"
+  ClassEnvVar* = classEnvVarName
     ## The class of the session's group (`ci`, a VM pool's class): the
     ## class the group joins if this session creates it. A class may hold a
     ## reservation in the host file. Unset or empty: no class.

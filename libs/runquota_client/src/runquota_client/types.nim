@@ -33,6 +33,10 @@ type
     lastDiagnostic*: Diagnostic
     responseBuffer*: Table[uint64, RqspFrame]
     inflightRequestIds*: seq[uint64]
+    socketClass*: string
+      ## The reservation class whose socket this client connected to
+      ## (`connectForClass`), or "" for the shared socket. The daemon's
+      ## `HelloOk` on a class socket names the same class.
 
   RunQuotaSession* = object
     client*: ptr RunQuotaClient

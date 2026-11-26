@@ -33,11 +33,17 @@
 ## A PRIVATE DAEMON, ALWAYS, on an explicit scratch socket
 ## (`tests/support/private_daemon_fixture`).
 ##
+## * with one descriptor more per reservation class, named `class-<class>`,
+##   it serves each as that class's socket, refuses a reload that would
+##   change them (they are systemd's), and refuses a declared class that was
+##   handed no socket.
+##
 ## NO MOCKS of anything RunQuota ships: the built `runquotad` and `runquota`.
 
 when defined(posix):
-  import std/[os, osproc, posix, strtabs, strutils, unittest]
+  import std/[os, osproc, posix, streams, strtabs, strutils, unittest]
 
+  import runquota_protocol
   import daemon_binary
   import private_daemon_fixture
 
@@ -70,7 +76,7 @@ when defined(posix):
 
   proc launchActivated(root, configured: string; fds: openArray[cint];
                        env: StringTableRef; extra: openArray[string] = [];
-                       listenFds = -1): Process =
+                       listenFds = -1; fdNames = "runquotad"): Process =
     ## The daemon, started as systemd starts it: the handed descriptors at
     ## 3, 4, ... and `LISTEN_PID` naming the process that runs `runquotad`.
     ##
@@ -90,7 +96,7 @@ when defined(posix):
         $(8 + index) & "<&-; ")
     let count = if listenFds >= 0: listenFds else: fds.len
     script.add("LISTEN_PID=$$ LISTEN_FDS=" & $count &
-      " LISTEN_FDNAMES=runquotad exec \"$0\" \"$@\"")
+      " LISTEN_FDNAMES=" & fdNames & " exec \"$0\" \"$@\"")
     var args = @["-c", script, daemonPath()]
     for arg in daemonArgs(root, configured, extra): args.add(arg)
     startProcess("/bin/sh", env = env, args = args,
@@ -188,5 +194,69 @@ when defined(posix):
       check "LISTEN_FDS" in log
       check isSocket(socket)
       check not queuedConnections(first)
+
+    when ClassSocketsServed:
+      test "serves a class socket handed over under its name, and keeps it":
+        # One descriptor more per declared class, named `class-<class>`
+        # (the socket unit's `FileDescriptorName=`). The daemon serves it as
+        # the class's socket, and a reload that would change the class
+        # sockets is refused, naming the module: they are systemd's.
+        let root = scratchDir("rqsc")
+        defer: removeDir(root)
+        let socket = root / "ep" / "d.sock"
+        let classSocket = root / "ep" / "class-ci.sock"
+        writeFile(root / "host.toml",
+          "schema = \"runquota.host-config.v1\"\n[reservation.ci]\n")
+        let shared = listenAt(socket)
+        defer: discard posix.close(shared)
+        let classListener = listenAt(classSocket)
+        defer: discard posix.close(classListener)
+        let env = privateEnv(socket)
+        let daemon = launchActivated(root, socket, [shared, classListener],
+          env, fdNames = "runquotad:class-ci")
+        defer: stopOwned(daemon)
+        prerequisite awaitAnswer(daemon, env),
+          daemon.startupContext("the activated daemon never answered on " &
+            socket)
+        let report = startProcess(cliPath(), env = env,
+          args = ["pressure", "report", "--class", "ci"],
+          options = {poStdErrToStdOut})
+        report.inputStream.close()
+        let reported = report.outputStream.readAll()
+        check report.waitForExit() == 0
+        report.close()
+        checkpoint reported
+        check reported.startsWith("ready ")
+        writeFile(root / "host.toml", "schema = \"runquota.host-config.v1\"" &
+          "\n[reservation.ci]\n[reservation.gpu]\n")
+        let reload = cli(env, ["config", "reload"])
+        checkpoint reload.output
+        check reload.code != 0
+        check "socket activation" in reload.output
+        check "NixOS module" in reload.output
+        check not pathExists(root / "ep" / "class-gpu.sock")
+        daemon.terminate()
+        check daemon.exitWithin(ExitBudgetMillis) == 0
+        # systemd's sockets are left where they are.
+        check isSocket(socket)
+        check isSocket(classSocket)
+
+      test "refuses a declared class that was handed no socket":
+        let root = scratchDir("rqsn")
+        defer: removeDir(root)
+        let socket = root / "ep" / "d.sock"
+        writeFile(root / "host.toml",
+          "schema = \"runquota.host-config.v1\"\n[reservation.ci]\n")
+        let listener = listenAt(socket)
+        defer: discard posix.close(listener)
+        let daemon = launchActivated(root, socket, [listener],
+          privateEnv(socket))
+        defer: stopOwned(daemon)
+        let code = daemon.exitWithin(ExitBudgetMillis)
+        let log = daemon.output
+        checkpoint "daemon output:\n" & log
+        check code == 3
+        check "class-ci" in log
+        check not pathExists(root / "ep" / "class-ci.sock")
 else:
   echo "t_socket_activation: POSIX only (systemd socket activation)"

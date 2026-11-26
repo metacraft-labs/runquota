@@ -105,8 +105,27 @@ const
     ## bound as `runquota_core.MaxClassNameBytes`, restated here because
     ## this module imports only the standard library.
 
-  ReservationKeys* = ["cpu-milli", "memory-bytes", "lend"]
-    ## The keys of a `[reservation.<class>]` table.
+  ReservationKeys* = ["cpu-milli", "memory-bytes", "lend", "socket-owner",
+    "socket-group", "socket-mode", "allowed-users", "allowed-groups"]
+    ## The keys of a `[reservation.<class>]` table, of every platform: the
+    ## reader parses them all everywhere and refuses the other platform's
+    ## (`PosixClassSocketKeys`, `WindowsClassSocketKeys`).
+  PosixClassSocketKeys* = ["socket-owner", "socket-group", "socket-mode"]
+    ## Who may claim a class on Linux and macOS: its socket's owner, group
+    ## and mode. Refused in a file read for Windows.
+  WindowsClassSocketKeys* = ["allowed-users", "allowed-groups"]
+    ## Who may claim a class on Windows: the principals the class pipe's DACL
+    ## allows. Refused in a file read for Linux or macOS.
+  ClassSocketModes* = ["0600", "0660", "0666"]
+    ## The `socket-mode` values. `connect(2)` on a Unix socket needs write
+    ## permission on it, so these are the three meaningful choices: the
+    ## owner only, the owner and the group, every local user who can reach
+    ## the rendezvous. Read and execute bits decide nothing, so a mode such
+    ## as `0644` -- through which no group member could connect -- is a
+    ## mistake to refuse, not a setting.
+  DefaultClassSocketMode* = 0o600
+    ## Owner only: a host that declares a reservation and nothing else has
+    ## reserved capacity only the daemon's own account (and root) can claim.
 
   HostConfigTemplate* = """# RunQuota host budget. One file per host: every workspace and every user on
 # this machine shares the one runquotad that reads it.
@@ -132,15 +151,45 @@ schema = "runquota.host-config.v1"
     ## the empty configuration, so seeding it changes no budget.
 
 type
+  HostConfigPlatform* = enum
+    ## Which platform's class-socket keys a file is read for. The keys of
+    ## both are parsed everywhere, and the other platform's are refused
+    ## naming it, so a file written for one host fails loudly on another
+    ## instead of granting nothing.
+    hcpPosix    ## Linux and macOS: `socket-owner`, `socket-group`, `socket-mode`
+    hcpWindows  ## Windows: `allowed-users`, `allowed-groups`
+
   ClassReservation* = object
     ## `[reservation.<class>]`: the capacity a class of work holds that
     ## other work cannot be granted. An absent key reserves nothing of that
     ## dimension; `lend` (default true) lets the class's idle reserved CPU
     ## go to other work until the class asks for it. Reserved memory is
     ## never lent.
+    ##
+    ## Every table is also a CLASS SOCKET (`class-<class>.sock` beside the
+    ## daemon's endpoint), and the socket keys say who may claim the class
+    ## by connecting to it. Build them with `newClassReservation`, which
+    ## gives the owner-only defaults.
     cpuMilli*: uint64
     memoryBytes*: uint64
     lend*: bool
+    socketOwner*: string
+      ## `socket-owner` as written (a user name or a decimal uid), or "" for
+      ## the default: the daemon's own user.
+    socketOwnerUid*: int64
+      ## `socketOwner` resolved, or -1 for the default.
+    socketGroup*: string
+      ## `socket-group` as written (a group name or a decimal gid), or "" for
+      ## the default: the daemon's primary group.
+    socketGroupGid*: int64
+      ## `socketGroup` resolved, or -1 for the default.
+    socketMode*: int
+      ## `socket-mode`: one of `ClassSocketModes`, as a number;
+      ## `DefaultClassSocketMode` when absent.
+    allowedUsers*: seq[string]
+      ## Windows: `allowed-users`, names or SIDs the pipe's DACL allows.
+    allowedGroups*: seq[string]
+      ## Windows: `allowed-groups`.
 
   HostConfig* = object
     memoryBytes*: Option[uint64]
@@ -383,6 +432,58 @@ proc oversubscriptionText*(permille: uint32): string =
       frac.setLen(frac.len - 1)
     result.add("." & frac)
 
+proc newClassReservation*(): ClassReservation =
+  ## A `[reservation.<class>]` table with no keys: no reservation, lending,
+  ## and a socket only the daemon's account (and root) may claim.
+  ClassReservation(lend: true, socketOwnerUid: -1, socketGroupGid: -1,
+    socketMode: DefaultClassSocketMode)
+
+proc currentHostConfigPlatform*(): HostConfigPlatform =
+  when defined(windows): hcpWindows else: hcpPosix
+
+proc platformText(platform: HostConfigPlatform): string =
+  case platform
+  of hcpPosix: "Linux and macOS"
+  of hcpWindows: "Windows"
+
+proc classSocketModeOf*(text: string; mode: var int): bool =
+  ## `"0660"` -> `0o660`, for the three `ClassSocketModes` only.
+  if text notin ClassSocketModes:
+    return false
+  mode = 0
+  for ch in text:
+    mode = mode * 8 + (ord(ch) - ord('0'))
+  true
+
+proc classSocketModeText*(mode: int): string =
+  ## `0o660` -> `"0660"`.
+  "0" & toOct(mode and 0o777, 3)
+
+proc resolveAccountId(raw: string; group: bool): int64 =
+  ## A decimal id as written, or the id of the user (group) of that name,
+  ## or -1 when there is none. A decimal id is taken without a lookup: an id
+  ## need not have a name (a host whose directory service is down, a
+  ## systemd dynamic user), and the daemon still judges whether it can apply
+  ## it.
+  var allDigits = raw.len > 0
+  for ch in raw:
+    if ch notin {'0' .. '9'}:
+      allDigits = false
+  if allDigits:
+    try:
+      return int64(parseBiggestUInt(raw))
+    except ValueError:
+      return -1
+  when defined(posix):
+    if group:
+      let entry = getgrnam(raw.cstring)
+      if entry == nil: -1 else: int64(entry.gr_gid)
+    else:
+      let entry = getpwnam(raw.cstring)
+      if entry == nil: -1 else: int64(entry.pw_uid)
+  else:
+    -1
+
 proc reservationClassOf(section: string): string =
   ## The class a `reservation.<class>` table header names, or "" when the
   ## header is not one.
@@ -391,7 +492,10 @@ proc reservationClassOf(section: string): string =
   else:
     ""
 
-proc parseHostConfig*(text, path: string): HostConfig =
+proc parseHostConfig*(text, path: string;
+                      platform = currentHostConfigPlatform()): HostConfig =
+  ## The file at `path` (its text), read for `platform` -- this host's,
+  ## unless a test reads it as another platform would.
   result.pools = initOrderedTable[string, uint32]()
   result.reservations = initOrderedTable[string, ClassReservation]()
   result.sourcePath = path
@@ -413,7 +517,7 @@ proc parseHostConfig*(text, path: string): HostConfig =
           fail(path, lineNo, "table `[" & section & "]`: " & problem)
         if result.reservations.hasKey(reserved):
           fail(path, lineNo, "table `[" & section & "]` appears twice")
-        result.reservations[reserved] = ClassReservation(lend: true)
+        result.reservations[reserved] = newClassReservation()
         continue
       if section notin ["machine", "pools", "admission", "benchmark",
           "enforcement"]:
@@ -592,6 +696,50 @@ proc parseHostConfig*(text, path: string): HostConfig =
           of "false": entry.lend = false
           else:
             fail(path, lineNo, "lend must be true or false, got " & value)
+        of "socket-owner", "socket-group", "socket-mode", "allowed-users",
+            "allowed-groups":
+          # THE OTHER PLATFORM'S KEY IS REFUSED, naming the platform: a
+          # file written for a Windows host would otherwise leave a class
+          # here claimable by nobody, silently.
+          let windowsKey = key in WindowsClassSocketKeys
+          if windowsKey != (platform == hcpWindows):
+            let keyPlatform = if windowsKey: hcpWindows else: hcpPosix
+            fail(path, lineNo, "`" & key & "` in [" & section & "] is a " &
+              platformText(keyPlatform) & " key, and this file is read " &
+              "for " & platformText(platform) & ", where who may claim a " &
+              "class is set with " &
+              (if platform == hcpWindows: WindowsClassSocketKeys.join(", ")
+               else: PosixClassSocketKeys.join(", ")))
+          case key
+          of "socket-owner", "socket-group":
+            let raw = parseQuoted(value, path, lineNo)
+            let isGroup = key == "socket-group"
+            let id = resolveAccountId(raw, isGroup)
+            if id < 0:
+              fail(path, lineNo, key & " " & value & " in [" & section &
+                "] names no " & (if isGroup: "group" else: "user") &
+                " on this host; give a " &
+                (if isGroup: "group name or decimal gid"
+                 else: "user name or decimal uid"))
+            if isGroup:
+              entry.socketGroup = raw
+              entry.socketGroupGid = id
+            else:
+              entry.socketOwner = raw
+              entry.socketOwnerUid = id
+          of "socket-mode":
+            var mode = 0
+            if not classSocketModeOf(parseQuoted(value, path, lineNo), mode):
+              fail(path, lineNo, "socket-mode must be one of \"" &
+                ClassSocketModes.join("\", \"") & "\" (owner only, owner " &
+                "and group, every local user), got " & value &
+                "; connecting to a Unix socket needs write permission, " &
+                "so other modes grant nothing they seem to")
+            entry.socketMode = mode
+          of "allowed-users":
+            entry.allowedUsers = parseStringArray(value, path, lineNo)
+          else:
+            entry.allowedGroups = parseStringArray(value, path, lineNo)
         else:
           fail(path, lineNo, "unknown key `" & key & "` in [" & section &
             "]; expected " & ReservationKeys.join(", "))
@@ -606,7 +754,8 @@ proc parseHostConfig*(text, path: string): HostConfig =
       ") is above pressure-high (" & $high & "); the gate opens below " &
       "pressure-low and closes above pressure-high")
 
-proc readHostConfig*(path = hostConfigPath): HostConfig =
+proc readHostConfig*(path = hostConfigPath;
+                     platform = currentHostConfigPlatform()): HostConfig =
   ## The empty config when the file does not exist.
   if not fileExists(path):
     result.pools = initOrderedTable[string, uint32]()
@@ -617,7 +766,7 @@ proc readHostConfig*(path = hostConfigPath): HostConfig =
     except IOError as err:
       raise newException(HostConfigError,
         path & ": cannot read runquota host configuration: " & err.msg)
-  parseHostConfig(text, path)
+  parseHostConfig(text, path, platform)
 
 proc enforcementCgroupsOn*(problem: var string;
                            path = hostConfigPath): bool =
@@ -712,8 +861,8 @@ proc parseHostConfigKey*(key: string): HostConfigKey =
     let class = reservationClassOf(section)
     if last <= 0 or class.len == 0 or last == key.len - 1:
       raise newException(HostConfigError, "unknown key `" & key &
-        "`; a reservation is set as reservation.CLASS.cpu-milli, " &
-        "reservation.CLASS.memory-bytes or reservation.CLASS.lend")
+        "`; a reservation is set as reservation.CLASS.KEY, KEY one of " &
+        ReservationKeys.join(", "))
     let problem = reservationClassProblem(class)
     if problem.len > 0:
       raise newException(HostConfigError, "`" & key & "`: " & problem)
@@ -852,8 +1001,35 @@ proc renderAdmissionEntry(key: HostConfigKey; raw: string): string =
   else:
     key.name & " = \"" & text & "\""
 
+proc classSocketEntry(key: HostConfigKey; raw: string): string =
+  ## The line for a class-socket key: `socket-owner = "runquota"`,
+  ## `socket-mode = "0660"`, `allowed-groups = ["CI Runners", "Builders"]`
+  ## (from the comma-separated `CI Runners,Builders`). Whether the value is
+  ## acceptable -- a mode outside the three, an unknown user, a key of the
+  ## other platform -- is `parseHostConfig`'s decision over the edited file.
+  let text = raw.strip()
+  if '"' in text or '\\' in text:
+    raise newException(HostConfigError, "`" & $key &
+      "` takes a plain value without quotes, got `" & raw & "`")
+  if text.len == 0:
+    raise newException(HostConfigError, "`" & $key & "` needs a value")
+  if key.name in WindowsClassSocketKeys:
+    var quoted: seq[string] = @[]
+    for part in text.split(','):
+      if part.strip().len > 0:
+        quoted.add("\"" & part.strip() & "\"")
+    if quoted.len == 0:
+      raise newException(HostConfigError, "`" & $key &
+        "` needs at least one name or SID")
+    key.name & " = [" & quoted.join(", ") & "]"
+  else:
+    key.name & " = \"" & text & "\""
+
 proc hostConfigEntry*(key: HostConfigKey; raw: string): string =
   ## The `key = value` line `runquota config set KEY VALUE` writes.
+  if key.section.startsWith("reservation.") and
+      (key.name in PosixClassSocketKeys or key.name in WindowsClassSocketKeys):
+    return classSocketEntry(key, raw)
   if key.section.startsWith("reservation.") and key.name == "lend":
     # A TOML boolean, bare: `lend = true`.
     let text = raw.strip()

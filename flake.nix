@@ -185,6 +185,15 @@
                 services.runquotad.enable = true;
                 services.runquotad.socketActivation = true;
                 services.runquotad.idleExitAfter = 600;
+                # Two classes: one claimable by a group, one with the
+                # owner-only defaults. Each gets a socket unit of its own.
+                services.runquotad.hostConfig.reservations = {
+                  ci = {
+                    socketGroup = "ci";
+                    socketMode = "0660";
+                  };
+                  gpu = { };
+                };
               }
             ];
           };
@@ -460,12 +469,10 @@
                   );
                   hostConfigFailures = builtins.toJSON (
                     map (assertion: assertion.message) (
-                      builtins.filter
-                        (
-                          assertion:
-                          !assertion.assertion && pkgs.lib.hasPrefix "services.runquotad.hostConfig" assertion.message
-                        )
-                        (nixosEval.config.assertions ++ darwinEval.config.assertions)
+                      builtins.filter (
+                        assertion:
+                        !assertion.assertion && pkgs.lib.hasPrefix "services.runquotad.hostConfig" assertion.message
+                      ) (nixosEval.config.assertions ++ darwinEval.config.assertions)
                     )
                   );
                   nixosOverReservedFailures = builtins.toJSON (
@@ -493,9 +500,7 @@
                   # The default module keeps the always-running unit and
                   # passes no idle period.
                   nixosDefaultWantedBy = builtins.toJSON nixosEval.config.systemd.services.runquotad.wantedBy;
-                  nixosDefaultSocketEnabled = builtins.toJSON (
-                    nixosEval.config.systemd.sockets ? runquotad
-                  );
+                  nixosDefaultSocketEnabled = builtins.toJSON (nixosEval.config.systemd.sockets ? runquotad);
                   nixosDefaultExecStart = builtins.unsafeDiscardStringContext nixosEval.config.systemd.services.runquotad.serviceConfig.ExecStart;
                   # Socket activation: the socket unit's values, and the
                   # service's wiring and arguments. `ExecStart` with its
@@ -508,6 +513,26 @@
                       SocketMode
                       ;
                   };
+                  # One socket unit per class, named for its descriptor.
+                  nixosClassSockets = builtins.toJSON (
+                    pkgs.lib.mapAttrs
+                      (name: unit: {
+                        inherit (unit) listenStreams wantedBy;
+                        inherit (unit.socketConfig)
+                          Service
+                          FileDescriptorName
+                          SocketUser
+                          SocketGroup
+                          SocketMode
+                          ;
+                      })
+                      (
+                        pkgs.lib.filterAttrs (
+                          name: _: pkgs.lib.hasPrefix "runquotad-class-" name
+                        ) nixosSocketEval.config.systemd.sockets
+                      )
+                  );
+                  nixosSocketSockets = builtins.toJSON nixosSocketEval.config.systemd.services.runquotad.serviceConfig.Sockets;
                   nixosSocketService = builtins.toJSON {
                     inherit (nixosSocketEval.config.systemd.services.runquotad) wantedBy requires after;
                     inherit (nixosSocketEval.config.systemd.services.runquotad.environment) RUNQUOTA_SOCKET;
@@ -601,11 +626,19 @@
                   grep -F '"SocketGroup":"${hostState.group}"' nixos-socket
                   grep -F '"SocketMode":"0660"' nixos-socket
                   grep -F '"wantedBy":["sockets.target"]' nixos-socket
+                  grep -F '"FileDescriptorName":"runquotad"' nixos-socket
+                  # The class sockets: one unit each, beside the endpoint,
+                  # named class-<class>, with the class's keys or the
+                  # owner-only defaults, all handed to the one service.
+                  printf '%s' "$nixosClassSockets" > nixos-class-sockets
+                  grep -F '"runquotad-class-ci":{"FileDescriptorName":"class-ci","Service":"runquotad.service","SocketGroup":"ci","SocketMode":"0660","SocketUser":"${hostState.user}","listenStreams":["${hostState.endpointDirectories.linux}/class-ci.sock"],"wantedBy":["sockets.target"]}' nixos-class-sockets
+                  grep -F '"runquotad-class-gpu":{"FileDescriptorName":"class-gpu","Service":"runquotad.service","SocketGroup":"${hostState.group}","SocketMode":"0600","SocketUser":"${hostState.user}","listenStreams":["${hostState.endpointDirectories.linux}/class-gpu.sock"],"wantedBy":["sockets.target"]}' nixos-class-sockets
+                  test "$nixosSocketSockets" = '["runquotad.socket","runquotad-class-ci.socket","runquotad-class-gpu.socket"]'
                   # The service is started only through the socket, serves
                   # the same endpoint, and carries the idle period.
                   printf '%s' "$nixosSocketService" > nixos-socket-service
                   grep -F '"wantedBy":[]' nixos-socket-service
-                  grep -F '"requires":["runquotad.socket"]' nixos-socket-service
+                  grep -F '"requires":["runquotad.socket","runquotad-class-ci.socket","runquotad-class-gpu.socket"]' nixos-socket-service
                   grep -F 'runquotad.socket' nixos-socket-service
                   grep -F '"RUNQUOTA_SOCKET":"${hostState.endpointDirectories.linux}/${hostState.endpointSocketName}"' nixos-socket-service
                   printf '%s' "$nixosSocketExecStart" | grep -F -- "--idle-exit-after 600"

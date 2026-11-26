@@ -28,6 +28,18 @@ let
   # agree. Derived rather than written twice.
   endpointDirName = lib.removePrefix "/run/" endpointDir;
   endpointPath = "${endpointDir}/${hostState.endpointSocketName}";
+  # ONE SOCKET PER RESERVATION CLASS, beside the endpoint: its permissions
+  # decide who may claim the class. Under socket activation systemd creates
+  # each one, from a socket unit of its own -- `FileDescriptorName=`,
+  # `SocketUser=`, `SocketGroup=` and `SocketMode=` are per unit, not per
+  # `ListenStream=` -- and the daemon finds it by its descriptor name and
+  # checks it against its own reading of the host file.
+  classSockets = if cfg.hostConfig == null then [ ] else hostConfigLib.classSockets cfg.hostConfig;
+  classSocketUnit = class: "runquotad-class-${class.name}";
+  activationSockets = [
+    "runquotad.socket"
+  ]
+  ++ map (class: "${classSocketUnit class}.socket") classSockets;
 in
 {
   options.services.runquotad = {
@@ -151,28 +163,27 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    assertions =
-      [
-        {
-          assertion = cfg.idleExitAfter == null || cfg.socketActivation;
-          message = "services.runquotad.idleExitAfter requires services.runquotad.socketActivation: a daemon that exits when idle must have a socket unit to start it again.";
-        }
-      ]
-      # What the daemon's reader would refuse across keys, refused here.
-      ++ lib.optionals (cfg.hostConfig != null) (
-        map
-          (problem: {
-            assertion = false;
-            message = "services.runquotad.${problem}";
-          })
-          (
-            hostConfigLib.problems {
-              budgetFromFlags = lib.any (
-                arg: lib.any (flag: arg == flag || lib.hasPrefix "${flag}=" arg) hostConfigLib.budgetFlags
-              ) cfg.extraArgs;
-            } cfg.hostConfig
-          )
-      );
+    assertions = [
+      {
+        assertion = cfg.idleExitAfter == null || cfg.socketActivation;
+        message = "services.runquotad.idleExitAfter requires services.runquotad.socketActivation: a daemon that exits when idle must have a socket unit to start it again.";
+      }
+    ]
+    # What the daemon's reader would refuse across keys, refused here.
+    ++ lib.optionals (cfg.hostConfig != null) (
+      map
+        (problem: {
+          assertion = false;
+          message = "services.runquotad.${problem}";
+        })
+        (
+          hostConfigLib.problems {
+            budgetFromFlags = lib.any (
+              arg: lib.any (flag: arg == flag || lib.hasPrefix "${flag}=" arg) hostConfigLib.budgetFlags
+            ) cfg.extraArgs;
+          } cfg.hostConfig
+        )
+    );
 
     users.users.${cfg.user} = lib.mkIf (cfg.user == hostState.user) {
       isSystemUser = true;
@@ -226,29 +237,65 @@ in
     # The rendezvous directory is still the tmpfiles rule's, so its owner
     # and group stay the ones written down above rather than the socket
     # unit's default `DirectoryMode`.
-    systemd.sockets.runquotad = lib.mkIf cfg.socketActivation {
-      description = "RunQuota host-wide lease authority endpoint";
-      wantedBy = [ "sockets.target" ];
-      listenStreams = [ endpointPath ];
-      socketConfig = {
-        SocketUser = cfg.user;
-        SocketGroup = cfg.group;
-        # The group is the admission list, exactly as for a socket the
-        # daemon binds itself (`endpointSocketMode`).
-        SocketMode = hostState.endpointSocketMode;
-        DirectoryMode = hostState.endpointDirectoryMode;
-      };
-    };
+    #
+    # THE CLASS SOCKETS UNDER SOCKET ACTIVATION: one unit, and so one
+    # `ListenStream`, per `hostConfig.reservations` entry, each handed to
+    # the daemon under the descriptor name `class-<class>`. A host file
+    # written by `runquota config set` instead (`hostConfig = null`) cannot
+    # declare its class sockets here, and a socket-activated daemon refuses
+    # a file that declares a class it was handed no socket for.
+    systemd.sockets = lib.mkIf cfg.socketActivation (
+      {
+        runquotad = {
+          description = "RunQuota host-wide lease authority endpoint";
+          wantedBy = [ "sockets.target" ];
+          listenStreams = [ endpointPath ];
+          socketConfig = {
+            # Named, so the daemon tells it from the class sockets when it is
+            # handed more than one descriptor.
+            FileDescriptorName = "runquotad";
+            SocketUser = cfg.user;
+            SocketGroup = cfg.group;
+            # The group is the admission list, exactly as for a socket the
+            # daemon binds itself (`endpointSocketMode`).
+            SocketMode = hostState.endpointSocketMode;
+            DirectoryMode = hostState.endpointDirectoryMode;
+          };
+        };
+      }
+      // lib.listToAttrs (
+        map (class: {
+          name = classSocketUnit class;
+          value = {
+            description = "RunQuota socket of reservation class ${class.name}";
+            wantedBy = [ "sockets.target" ];
+            listenStreams = [ "${endpointDir}/${class.fileName}" ];
+            socketConfig = {
+              Service = "runquotad.service";
+              FileDescriptorName = "class-${class.name}";
+              SocketUser = if class.owner == null then cfg.user else class.owner;
+              SocketGroup = if class.group == null then cfg.group else class.group;
+              SocketMode = class.mode;
+              DirectoryMode = hostState.endpointDirectoryMode;
+            };
+          };
+        }) classSockets
+      )
+    );
 
     systemd.services.runquotad = {
       description = "RunQuota host-wide lease authority";
       # STARTED ONLY THROUGH THE SOCKET when it is activated: a boot-time
       # start beside it would race the socket unit for the endpoint.
       wantedBy = lib.optionals (!cfg.socketActivation) [ "multi-user.target" ];
-      requires = lib.optionals cfg.socketActivation [ "runquotad.socket" ];
-      after = [ "local-fs.target" ] ++ lib.optionals cfg.socketActivation [ "runquotad.socket" ];
+      requires = lib.optionals cfg.socketActivation activationSockets;
+      after = [ "local-fs.target" ] ++ lib.optionals cfg.socketActivation activationSockets;
       serviceConfig = {
         Type = "simple";
+        # Every socket unit whose descriptors the daemon inherits: the
+        # shared one, and the class sockets' (whose unit names differ from
+        # the service's, so systemd would not pass them otherwise).
+        Sockets = lib.mkIf cfg.socketActivation activationSockets;
         User = cfg.user;
         Group = cfg.group;
         StateDirectory = stateDirName;
