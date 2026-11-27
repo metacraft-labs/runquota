@@ -23,45 +23,20 @@ when defined(linux):
 
   var rootSequence = 0
 
-  proc noCgroupLimits(path: string): string {.nimcall, gcsafe, raises: [].} =
-    ## A reader that finds no limit anywhere: resolves the default root's
-    ## PATH without the limit check, which `delegatedTestRoot` then makes
-    ## against the test root itself (or, opted out, does not make).
-    ""
-
-  proc delegatedTestRoot*(reason: var string; checkLimits = true): string =
+  proc delegatedTestRoot*(reason: var string): string =
     ## A fresh, test-owned root below this user's delegated subtree, or ""
     ## with `reason` when this host gives the user no delegated cgroup v2
     ## subtree with the cpu controller (a CI container, a system service).
     ## The root is not created here: the first launch creates it, as in
     ## production, and `removeTestRoot` takes it away.
-    ##
-    ## THE CALLER'S LIMITS. The root is a sibling of the user's
-    ## `runquota.slice`, so placing a tree in it takes the tree out of every
-    ## cgroup between this process and `user@<uid>.service` -- the scope of
-    ## a `systemd-run --user --scope -p MemoryMax=...` around the suite, for
-    ## one. A launcher declines such a root (`limitLeftBehind`), so a
-    ## placement test run under a limit could not place anything: with
-    ## `checkLimits` (the default) this returns "" with the limit as the
-    ## reason, and the test reports SKIPPED. `checkLimits = false` is for
-    ## the test that asserts the decline itself: it starts its launcher in a
-    ## capped scope of its own and needs the root regardless of the limits
-    ## on its own process.
-    let own = readFile("/proc/self/cgroup")
-    let default = resolveCgroupRoot("", own, int(getuid()),
-      hostSwitchOn = true, read = noCgroupLimits)
+    let default = resolveCgroupRoot("", readFile("/proc/self/cgroup"),
+      int(getuid()), hostSwitchOn = true)
     if not default.usable:
       reason = default.reason
       return ""
     inc rootSequence
     let root = default.path.parentDir / ("runquota-test-" & $getCurrentProcessId() &
       "-" & $rootSequence & "-" & $int64(epochTime() * 1000) & ".slice")
-    if checkLimits:
-      let left = limitLeftBehind(parseOwnCgroup(own), root,
-        readCgroupInterfaceFile)
-      if left.len > 0:
-        reason = left
-        return ""
     let problem = probeRoot(CgroupRoot(state: crsExplicit, path: root))
     if problem.len > 0:
       reason = problem
