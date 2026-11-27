@@ -41,6 +41,7 @@
 import std/[os, strutils, tempfiles, unittest]
 
 import runquota_persistence
+from runquota_core/sqlite_inproc import closePooledConnections
 
 const
   Producers = 64
@@ -84,7 +85,9 @@ var
 suite "estimate queue ownership":
   test "rows queued by threads that have exited are drained without crashing":
     let dir = createTempDir("runquota_estimate_ownership_", "")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     for round in 0 ..< Rounds:
       # A STORE PER ROUND, so each round ends with the shutdown drain the
       # daemon performs: `stopEstimateStore` joins the writer, and the

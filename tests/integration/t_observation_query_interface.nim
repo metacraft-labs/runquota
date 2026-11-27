@@ -506,6 +506,7 @@ suite "observation_query_interface":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
   # -------------------------------------------------------------------------
   # THE ESTIMATE RULE: a supplied estimate is used unmodified; the daemon's
@@ -651,6 +652,7 @@ suite "observation_query_interface":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
   # -------------------------------------------------------------------------
   # THE READ PATH SEES WHAT THE DAEMON HAS ALREADY RECORDED. Not a
@@ -726,3 +728,4 @@ suite "observation_query_interface":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()

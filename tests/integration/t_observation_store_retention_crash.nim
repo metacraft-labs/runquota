@@ -665,3 +665,7 @@ suite "observation_store_retention_crash":
     check counts(path) == pruned
     check reopened.orphanReport().orphans == 0
     check reopened.captureEnabled
+    # `seedStore`/`counts`/`reopened` above (and `calibrate`'s `twin`)
+    # each opened a pooled connection under `dir`, which the bare
+    # `removeDir(dir)` above cannot wait out.
+    closePooledConnections()

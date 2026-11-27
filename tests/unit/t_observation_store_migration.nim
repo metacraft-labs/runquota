@@ -160,7 +160,9 @@ proc userVersion(path: string): int64 =
 suite "observation_store_migration":
   test "a database one version old migrates forward and keeps its rows":
     let dir = scratchDir("migrate")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
 
     let created = runSqlite(path,
@@ -201,7 +203,9 @@ suite "observation_store_migration":
     # Without this, a migration step could drift from table creation and
     # produce two different databases that both report the same version.
     let dir = scratchDir("converge")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let migratedPath = dir / "migrated.sqlite"
     let freshPath = dir / "fresh.sqlite"
 
@@ -218,7 +222,9 @@ suite "observation_store_migration":
 
   test "a database one version newer is refused, not degraded":
     let dir = scratchDir("newer")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
 
     block:
@@ -253,7 +259,9 @@ suite "observation_store_migration":
 
   test "a database at the current version is opened without migrating":
     let dir = scratchDir("current")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     block:
       let store = openObservationStore(path)
@@ -273,7 +281,9 @@ suite "observation_store_migration":
     # it: a host and its profile, an owner, a run, an execution with
     # totals, and its CPU profile.
     let dir = scratchDir("v7")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     var ladder = ""
     for i in 0 ..< 7:
@@ -366,7 +376,9 @@ pragma user_version = 7;
     # `begin immediate` leaves the columns added at version 7, and the
     # retry then fails on a duplicate column.
     let dir = scratchDir("v7int")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     var ladder = ""
     for i in 0 ..< 7:

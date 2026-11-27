@@ -84,7 +84,9 @@ if paramCount() >= 2 and paramStr(1) == noLibraryFlag:
 suite "observation_store_degradation":
   test "a truncated store degrades to no capture with a clear report":
     let dir = scratchDir("truncated")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     seed(path)
     let originalSize = int(getFileSize(path))
@@ -110,7 +112,9 @@ suite "observation_store_degradation":
 
   test "a store whose header was overwritten degrades the same way":
     let dir = scratchDir("header")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     seed(path)
     var data = readFile(path)
@@ -126,7 +130,9 @@ suite "observation_store_degradation":
 
   test "a store filled with unrelated bytes degrades rather than throwing":
     let dir = scratchDir("garbage")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     writeFile(path, "this is not a database, it is a note to self\n")
     let store = openObservationStore(path)
@@ -136,7 +142,9 @@ suite "observation_store_degradation":
 
   test "a corrupt page behind an intact header is still caught":
     let dir = scratchDir("midpage")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     seed(path)
     # Fold the WAL back so the damage below lands in the file SQLite reads.
@@ -198,7 +206,9 @@ suite "observation_store_degradation":
     # `RUNQUOTA_SQLITE_LIBRARY` naming a file that does not exist, which
     # makes it the only candidate. The child opens a store and reports.
     let dir = scratchDir("nosqlite")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let (text, code) = execCmdEx(quoteShell(getAppFilename()) & " " &
       noLibraryFlag & " " & quoteShell(dir / "observations.sqlite"),
       env = noLibraryEnv(dir / "no-such-libsqlite3.so"))
@@ -221,12 +231,18 @@ suite "observation_store_degradation":
     # candidate once `dlopen` succeeds, without resolving the bindings --
     # the child then calls a nil function pointer and dies.
     let dir = scratchDir("notsqlite")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     # The C library's name is per-OS: `libc.so.6` is a glibc soname and does
     # not load on macOS, where the always-present non-SQLite library is
-    # libSystem. The case needs one that LOADS and lacks the bindings.
+    # libSystem; Windows has no `.so`/glibc and no `dlopen` search for one,
+    # but `kernel32.dll` is, the same way, already mapped into every
+    # process. The case needs one that LOADS and lacks the bindings.
     when defined(macosx):
       const notSqlite = "/usr/lib/libSystem.B.dylib"
+    elif defined(windows):
+      const notSqlite = "kernel32.dll"
     else:
       const notSqlite = "libc.so.6"
     let (text, code) = execCmdEx(quoteShell(getAppFilename()) & " " &
@@ -246,7 +262,9 @@ suite "observation_store_degradation":
     check library.len > 0
     if library.len > 0:
       let dir = scratchDir("withsqlite")
-      defer: removeDir(dir)
+      defer:
+        closePooledConnections()
+        removeDir(dir)
       let (text, code) = execCmdEx(quoteShell(getAppFilename()) & " " &
         noLibraryFlag & " " & quoteShell(dir / "observations.sqlite"),
         env = noLibraryEnv(library))
@@ -259,7 +277,9 @@ suite "observation_store_degradation":
 
   test "an unwritable location degrades to no capture":
     let dir = scratchDir("unwritable")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     # The parent of the store path is a regular file, so the directory can
     # never be created.
     writeFile(dir / "blocker", "not a directory")
@@ -278,7 +298,9 @@ suite "observation_store_degradation":
 
   test "a healthy store is not degraded, which is what makes the rest mean something":
     let dir = scratchDir("control")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     seed(path)
     let store = openObservationStore(path)
@@ -293,7 +315,9 @@ suite "observation_store_degradation":
     # becomes a stable boundary. M15 gates them properly; this is the
     # primitive and the evidence that it produces a usable database.
     let dir = scratchDir("backup")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     seed(path)
     let store = openObservationStore(path)

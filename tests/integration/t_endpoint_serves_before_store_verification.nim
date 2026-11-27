@@ -275,3 +275,9 @@ suite "endpoint_serves_before_store_verification":
       if not daemon.isNil:
         stopDaemon(daemon)
       delEnv("RUNQUOTA_SOCKET")
+      # `fixture` and `runTools` each opened `dbPath` IN THIS PROCESS,
+      # beside the daemon's own connection: stopping the daemon does not
+      # close either, and `removeScratchRoot` cannot see a handle that is
+      # not writing, so it would retry its whole budget and still fail on
+      # Windows.
+      closePooledConnections(dbPath)

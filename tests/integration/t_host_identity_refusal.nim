@@ -354,6 +354,12 @@ suite "host_identity_refusal":
       check store.readHosts().len == 0
       check store.readExecutions().len == 0
       check not dirExists(absent)
+      # THIS TEST'S OWN pooled connection to `dbPath`, opened above, is a
+      # second handle on the store besides the daemon's: `daemon.stop()`
+      # below only stops the daemon, and `removeScratchRoot` cannot see an
+      # open handle that is not writing, so it would retry for its whole
+      # 30 s budget and still fail on Windows.
+      closePooledConnections(dbPath)
     finally:
       daemon.stop()
 

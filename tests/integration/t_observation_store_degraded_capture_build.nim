@@ -190,6 +190,7 @@ suite "observation_store_degraded_capture_build":
       profileId = profiles[0].profileId
     finally:
       daemon.stop()
+      closePooledConnections(dbPath)
 
     # Re-running with unchanged hardware must not accumulate. This is the
     # gate's "re-running" clause against a real daemon rather than against
@@ -216,6 +217,7 @@ suite "observation_store_degraded_capture_build":
       check restarted.startupLines[2].contains(profileId)
     finally:
       restarted.stop()
+      closePooledConnections(dbPath)
 
   test "a build over a corrupt store still succeeds, and capture is off":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -270,3 +272,4 @@ suite "observation_store_degraded_capture_build":
       check daemon.process.running
     finally:
       daemon.stop()
+      closePooledConnections(dbPath)

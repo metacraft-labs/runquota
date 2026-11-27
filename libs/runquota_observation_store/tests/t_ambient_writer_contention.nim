@@ -52,7 +52,9 @@ suite "ambient writer contention":
   for capacity in [128, 1]:
     test "sampling continues during SQLite contention, capacity " & $capacity:
       let dir = createTempDir("rq-ambient-writer-", "")
-      defer: removeDir(dir)
+      defer:
+        closePooledConnections()
+        removeDir(dir)
       let path = dir / "observations.sqlite"
       let store = openObservationStore(path)
       require store.captureEnabled
@@ -114,7 +116,9 @@ suite "ambient writer contention":
 
   test "rejected publication is counted and shutdown settles every sample":
     let dir = createTempDir("rq-ambient-rejected-", "")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     let store = openObservationStore(path)
     require store.captureEnabled

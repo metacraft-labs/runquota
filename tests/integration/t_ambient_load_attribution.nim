@@ -530,7 +530,13 @@ suite "ambient_load_attribution":
     let (store, _) = openSampledStore(dir, cadenceMillis)
     # Runs before the scratch removal above, so a fatal precondition below
     # never leaves the sampler writing into a directory being deleted.
-    defer: stopAmbientSampler()
+    # `closePooledConnections` runs AFTER the sampler is stopped (not in
+    # the `finally` below, which can fire while the sampler thread still
+    # holds its connection busy): only then is the pool's one connection
+    # to `dir` truly idle and visible to this close.
+    defer:
+      stopAmbientSampler()
+      closePooledConnections()
     check ambientSamplerActive()
     # Sampling is gated on a live lease, and this block declared one. Every
     # row asserted below therefore describes an interval in which work was
@@ -609,6 +615,7 @@ suite "ambient_load_attribution":
           fullScaleCeiling.formatFloat(ffDecimal, 0), "%); re-running"
     finally:
       load.stopLoad()
+      closePooledConnections()
     # Nothing below this line may run while a spinner is alive.
     check not load.running
     requireUnwinding busyBefore <= maxBusyForMeasurement,
@@ -782,6 +789,7 @@ suite "ambient_load_attribution":
         sleep(unmapSettleMillis)
     finally:
       memory.release()
+      closePooledConnections()
 
     sleep(cadenceMillis * 3)
     stopAmbientSampler()
@@ -898,6 +906,7 @@ suite "ambient_load_attribution":
     for row in fullRows:
       check row.selfRssBytes == 0
       check row.foreignRssBytes > 0
+    closePooledConnections()
 
   test "self is what admitted executions reported, foreign is the rest":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -1114,6 +1123,7 @@ suite "ambient_load_attribution":
       load.stopLoad()
       stopAmbientSampler()
       clearSelfReportedExecutions()
+      closePooledConnections()
       if daemon.running:
         daemon.terminate()
         discard daemon.waitForExit(5000)
@@ -1254,6 +1264,7 @@ suite "ambient_load_attribution":
       if daemon.running:
         daemon.terminate()
         discard daemon.waitForExit(5000)
+      closePooledConnections()
       daemon.close()
 
     # EVERY BOUND HERE IS DERIVED, none is a guess about the wall clock.
@@ -1377,6 +1388,7 @@ suite "ambient_load_attribution":
     let settled = openObservationStore(dbPath).readAmbientSamples()
     sleep(cadenceMillis * 4)
     check openObservationStore(dbPath).readAmbientSamples().len == settled.len
+    closePooledConnections(dbPath)
 
   test "an idle daemon writes NO ambient rows, a leased one writes rows":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -1445,6 +1457,7 @@ suite "ambient_load_attribution":
       if idleDaemon.running:
         idleDaemon.terminate()
         discard idleDaemon.waitForExit(5000)
+      closePooledConnections()
       idleDaemon.close()
 
     # THE ASSERTION THAT MATTERS. Not "few rows", not "fewer rows": none.
@@ -1505,6 +1518,7 @@ suite "ambient_load_attribution":
       if leasedDaemon.running:
         leasedDaemon.terminate()
         discard leasedDaemon.waitForExit(5000)
+      closePooledConnections()
       leasedDaemon.close()
 
     # THE CONTROL FOR ARM ONE. Same daemon, same cadence, same window; the

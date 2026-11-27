@@ -192,6 +192,7 @@ suite "observation_retention_schedule":
     let dir = scratchDir("idle")
     defer:
       quiesce()
+      closePooledConnections()
       removeDir(dir)
     let path = dir / "observations.sqlite"
     let host = "host-m15s-idle"
@@ -249,6 +250,7 @@ suite "observation_retention_schedule":
     let dir = scratchDir("age")
     defer:
       quiesce()
+      closePooledConnections()
       removeDir(dir)
     let path = dir / "observations.sqlite"
     let host = "host-m15s-age"
@@ -286,6 +288,7 @@ suite "observation_retention_schedule":
     let dir = scratchDir("off")
     defer:
       quiesce()
+      closePooledConnections()
       removeDir(dir)
     let path = dir / "observations.sqlite"
     let host = "host-m15s-off"
@@ -311,6 +314,7 @@ suite "observation_retention_schedule":
     let dir = scratchDir("nohost")
     defer:
       quiesce()
+      closePooledConnections()
       removeDir(dir)
     let path = dir / "observations.sqlite"
     seedStore(path, "host-m15s-nohost", 12, unixMillisNow() - 12)
@@ -335,6 +339,7 @@ suite "observation_retention_schedule":
     let dir = scratchDir("busy")
     defer:
       quiesce()
+      closePooledConnections()
       removeDir(dir)
     let path = dir / "observations.sqlite"
     let host = "host-m15s-busy"
@@ -369,6 +374,7 @@ suite "observation_retention_schedule":
     let dir = scratchDir("forced")
     defer:
       quiesce()
+      closePooledConnections()
       removeDir(dir)
     let path = dir / "observations.sqlite"
     let host = "host-m15s-forced"
@@ -406,6 +412,7 @@ suite "observation_retention_schedule":
     let path = dir / "observations.sqlite"
     defer:
       quiesce()
+      closePooledConnections()
       setFilePermissions(dir, {fpUserRead, fpUserWrite, fpUserExec})
       for suffix in ["", "-wal", "-shm"]:
         if fileExists(path & suffix):

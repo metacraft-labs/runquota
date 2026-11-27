@@ -82,7 +82,9 @@ suite "observation flush contract":
 
   test "a flush waits for a drain already in flight on another thread":
     let dir = createTempDir("runquota_flush_contract_", "")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite3"
     let store = openObservationStore(path)
     check store.captureEnabled
@@ -154,7 +156,9 @@ suite "observation flush contract":
     # counted as queued this case would HANG rather than fail, which is why
     # it is here and why it is small.
     let dir = createTempDir("runquota_flush_refusals_", "")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite3"
     let store = openObservationStore(path)
     check store.captureEnabled

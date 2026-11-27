@@ -36,7 +36,9 @@ proc seededStore(dir: string): ObservationStore =
 suite "observation_store_immutability":
   test "updating a written execution row fails and changes nothing":
     let dir = scratchDir("immutable")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = seededStore(dir)
     let path = store.path
 
@@ -52,7 +54,9 @@ suite "observation_store_immutability":
 
   test "the abort names the row, the rule and the invariant":
     let dir = scratchDir("message")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = seededStore(dir)
     let update = runSqlite(store.path,
       "update executions set peak_rss_bytes = 0;")
@@ -62,7 +66,9 @@ suite "observation_store_immutability":
 
   test "an update inside a transaction is rolled back whole":
     let dir = scratchDir("txn")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = seededStore(dir)
     let attempt = runSqlite(store.path, """
       begin immediate;
@@ -90,7 +96,9 @@ suite "observation_store_immutability":
     # extension tables; a trigger that blocked deletes would make the
     # store unbounded.
     let dir = scratchDir("delete")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = seededStore(dir)
     let deletion = runSqlite(store.path,
       "delete from executions where execution_id = 'e1';")
@@ -99,7 +107,9 @@ suite "observation_store_immutability":
 
   test "the trigger is part of the schema, not of the library":
     let dir = scratchDir("trigger")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = seededStore(dir)
     let triggers = runSqlite(store.path,
       "select name from sqlite_master where type = 'trigger' " &

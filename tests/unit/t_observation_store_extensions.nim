@@ -288,7 +288,9 @@ suite "observation_store_extensions":
 
   test "a synthetic extension registers, writes rows, and reads them back":
     let dir = scratchDir("register")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "o.sqlite"
     let store = openObservationStore(path)
     check store.captureEnabled
@@ -406,7 +408,9 @@ suite "observation_store_extensions":
     # mistake with a SOURCE SCAN, which is evidence about one repository at
     # one moment rather than a property of the store.
     let dir = scratchDir("extowner")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "o.sqlite"
     let store = openObservationStore(path)
     check store.captureEnabled
@@ -466,7 +470,9 @@ suite "observation_store_extensions":
 
   test "the extension migrates while the spine stands still":
     let dir = scratchDir("extmove")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "o.sqlite"
     let store = openObservationStore(path)
     check store.captureEnabled
@@ -559,7 +565,9 @@ suite "observation_store_extensions":
     # mechanism that moved the two schemas together would pass the arm
     # above and fail here.
     let dir = scratchDir("spinemove")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "o.sqlite"
 
     # A version-1 spine carrying an extension already at ITS version 2.
@@ -618,7 +626,9 @@ suite "observation_store_extensions":
 
   test "a client declaring a version this database cannot store is refused":
     let dir = scratchDir("refuse")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = openObservationStore(dir / "o.sqlite")
     check store.captureEnabled
     seedSpine(store, "host-a")
@@ -695,7 +705,9 @@ suite "observation_store_extensions":
 
   test "pruning an execution takes its extension rows with it":
     let dir = scratchDir("prune")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = openObservationStore(dir / "o.sqlite")
     check store.captureEnabled
     seedSpine(store, "host-a")
@@ -764,7 +776,9 @@ suite "observation_store_extensions":
     #   to stop retention for the whole host, and it is one statement in a
     #   single transaction away from doing exactly that.
     let dir = scratchDir("ghost")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = openObservationStore(dir / "o.sqlite")
     check store.captureEnabled
     seedSpine(store, "host-a")
@@ -823,7 +837,9 @@ suite "observation_store_extensions":
     # reach and no later pass would find, because the pass is driven by the
     # parent it just deleted.
     let dir = scratchDir("atomic")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = openObservationStore(dir / "o.sqlite")
     check store.captureEnabled
     seedSpine(store, "host-a")
@@ -896,7 +912,9 @@ insert into m12_probe_dependent values ('host-a', 'exec-old');
     # OS-4 on this path too: the extension mechanism is capture, and
     # capture that cannot run must not fail anything.
     let dir = scratchDir("closed")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "o.sqlite"
     block:
       let store = openObservationStore(path)

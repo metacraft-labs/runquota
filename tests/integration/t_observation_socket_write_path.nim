@@ -289,6 +289,7 @@ suite "observation_socket_write_path":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
     # The store exists because capture was on, not because anything asked.
     check fileExists(expectedDb)
@@ -416,6 +417,7 @@ suite "observation_socket_write_path":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
     # EVERY LEASE WAS GRANTED; THREE OF THE FOUR FINISHED. The fourth's
     # frame was refused, so nothing about it was recorded — and the
@@ -525,6 +527,7 @@ suite "observation_socket_write_path":
       sleep(1000)
     finally:
       daemon.stop()
+      closePooledConnections()
 
     check not fileExists(defaultDb)
     check not fileExists(identityFile)
@@ -570,6 +573,7 @@ suite "observation_socket_write_path":
       sleep(1000)
     finally:
       daemon.stop()
+      closePooledConnections()
 
     # NOT ONE BYTE ON DISK. Not an empty store, not a store with no rows:
     # the file was never created, and neither was the host identity, which
@@ -657,6 +661,7 @@ suite "observation_socket_write_path":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
     # THE NAMED STORE WAS NEVER OPENED. Not opened and refused -- not
     # opened: no path was configured at all, so there is no store path to
@@ -739,6 +744,7 @@ suite "observation_socket_write_path":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
     # NOTHING WAS CREATED. A path any caller can create is a path any
     # caller can create differently, so the daemon reports and stops.
@@ -813,6 +819,7 @@ suite "observation_socket_write_path":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
     check reported != nil
     check reported["capture_enabled"].getBool() == false
@@ -829,6 +836,7 @@ suite "observation_socket_write_path":
     check store.captureEnabled
     check store.readExecutions().len == 0
     check store.readRuns().len == 0
+    closePooledConnections(expectedDb)
 
   # -------------------------------------------------------------------------
   # REFUSAL: a hostile client reporting against somebody else's lease
@@ -990,6 +998,7 @@ suite "observation_socket_write_path":
       victim.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
   # -------------------------------------------------------------------------
   # REFUSAL: a malformed report is rejected whole, never applied in part
@@ -1115,6 +1124,7 @@ suite "observation_socket_write_path":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
   # -------------------------------------------------------------------------
   # THE CRASH EXIT: a client that dies mid-report leaks nothing
@@ -1211,6 +1221,7 @@ suite "observation_socket_write_path":
           discard child.waitForExit(5000)
         child.close()
       daemon.stop()
+      closePooledConnections()
 
   # -------------------------------------------------------------------------
   # DEGRADATION: the store becomes unwritable underneath a running daemon
@@ -1303,3 +1314,4 @@ suite "observation_socket_write_path":
         if fileExists(dbPath & suffix):
           setFilePermissions(dbPath & suffix, {fpUserRead, fpUserWrite})
       daemon.stop()
+      closePooledConnections()

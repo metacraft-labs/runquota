@@ -219,7 +219,9 @@ suite "observation_store_merge":
     # opposite orders. If the bytes matched, the gate would be satisfiable
     # as written and this whole substitution would be unnecessary.
     let dir = scratchDir("bytes")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let first = dir / "first.sqlite"
     let second = dir / "second.sqlite"
     const ddl = "create table t (k text primary key, v integer);"
@@ -262,7 +264,9 @@ suite "observation_store_merge":
     # identity clause by being blind, so each arm below changes ONE thing
     # and requires the digest to move.
     let dir = scratchDir("canon")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let base = dir / "base.sqlite"
     const ddl = "create table t (k text primary key, v, w text);"
     check runSqlite(base, ddl &
@@ -315,7 +319,9 @@ suite "observation_store_merge":
 
   test "merging the same source twice is merging it once":
     let dir = scratchDir("idempotent")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let source = dir / "a.sqlite"
     discard sourceA(source)
 
@@ -357,7 +363,9 @@ suite "observation_store_merge":
 
   test "two sources merge to the same database in either order":
     let dir = scratchDir("order")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let a = dir / "a.sqlite"
     let b = dir / "b.sqlite"
     discard sourceA(a)
@@ -420,7 +428,9 @@ suite "observation_store_merge":
 
   test "an extension schema the receiver does not know is carried, not dropped":
     let dir = scratchDir("carry")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let a = dir / "a.sqlite"
     let b = dir / "b.sqlite"
     discard sourceA(a)
@@ -491,7 +501,9 @@ suite "observation_store_merge":
 
   test "a merge without the host and hardware dimension is refused":
     let dir = scratchDir("refuse")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "dest.sqlite"
     let store = receiver(path)
 
@@ -566,7 +578,9 @@ suite "observation_store_merge":
     # paths, no socket, no rendezvous directory, no lease authority. The
     # entry point that says so in its signature is the one used here.
     let dir = scratchDir("daemonless")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let a = dir / "a.sqlite"
     let dest = dir / "dest.sqlite"
     discard sourceA(a)

@@ -78,7 +78,9 @@ var
 suite "observation writer ownership":
   test "rows queued by threads that have exited are drained without crashing":
     let dir = createTempDir("runquota_writer_ownership_", "")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     for round in 0 ..< Rounds:
       let path = dir / ("observations-" & $round & ".sqlite3")
       let store = openObservationStore(path)

@@ -206,7 +206,9 @@ proc burnCpu(state: ptr Spinner) {.thread.} =
 suite "ambient sample atomicity":
   test "a row's self figures are the ones live at its own timestamp":
     let dir = createTempDir("runquota_ambient_atomicity_", "")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     let store = openObservationStore(path)
     check store.captureEnabled

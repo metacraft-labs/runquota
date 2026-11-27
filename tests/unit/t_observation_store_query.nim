@@ -194,7 +194,9 @@ suite "observation_store_query":
 
   test "fixture invariants: two profiles, two uids, a key with and without":
     let root = scratch("fixture")
-    defer: removeDir(root)
+    defer:
+      closePooledConnections()
+      removeDir(root)
     let store = buildFixture(root / "observations.sqlite3")
 
     let profiles = store.readHostProfiles()
@@ -262,7 +264,9 @@ suite "observation_store_query":
 
   test "a query spanning two profiles answers per profile and never blends":
     let root = scratch("blend")
-    defer: removeDir(root)
+    defer:
+      closePooledConnections()
+      removeDir(root)
     let store = buildFixture(root / "observations.sqlite3")
 
     let answer = store.estimateFor(KeyWithHistory, spanAllProfiles)
@@ -317,7 +321,9 @@ suite "observation_store_query":
 
   test "the default span is one profile, and it is the one asked for":
     let root = scratch("span")
-    defer: removeDir(root)
+    defer:
+      closePooledConnections()
+      removeDir(root)
     let store = buildFixture(root / "observations.sqlite3")
 
     # NARROW BY DEFAULT: a caller that does not ask for cross-host data
@@ -341,7 +347,9 @@ suite "observation_store_query":
 
   test "a key with no history is UNKNOWN, distinguishably from known zero":
     let root = scratch("cold")
-    defer: removeDir(root)
+    defer:
+      closePooledConnections()
+      removeDir(root)
     let store = buildFixture(root / "observations.sqlite3")
 
     let unknown = store.estimateFor(KeyNeverSeen, spanSingleProfile,
@@ -389,7 +397,9 @@ suite "observation_store_query":
 
   test "row queries are uid-scoped by default and widen only when asked":
     let root = scratch("scope")
-    defer: removeDir(root)
+    defer:
+      closePooledConnections()
+      removeDir(root)
     let store = buildFixture(root / "observations.sqlite3")
 
     let mine = store.queryExecutions(RowQuery(
@@ -429,7 +439,9 @@ suite "observation_store_query":
 
   test "widening is available, which is the half a refusal must not eat":
     let root = scratch("widen")
-    defer: removeDir(root)
+    defer:
+      closePooledConnections()
+      removeDir(root)
     let store = buildFixture(root / "observations.sqlite3")
 
     # A CI administrator asking "what is slow on this machine" is a real
@@ -462,7 +474,9 @@ suite "observation_store_query":
 
   test "a uid-scoped query with no uid to scope to returns nothing":
     let root = scratch("nouid")
-    defer: removeDir(root)
+    defer:
+      closePooledConnections()
+      removeDir(root)
     let store = buildFixture(root / "observations.sqlite3")
 
     # THE DEGRADATION, NOT THE HAPPY PATH. A transport that cannot report
@@ -476,7 +490,9 @@ suite "observation_store_query":
 
   test "the estimate path is NOT uid-scoped, and cannot be given a uid":
     let root = scratch("estimate-scope")
-    defer: removeDir(root)
+    defer:
+      closePooledConnections()
+      removeDir(root)
     let store = buildFixture(root / "observations.sqlite3")
 
     # THE ASYMMETRY IS DELIBERATE. The cost of this work is a property of
@@ -508,7 +524,9 @@ suite "observation_store_query":
 
   test "extension rows answer under the SAME scope rules as the spine":
     let root = scratch("ext")
-    defer: removeDir(root)
+    defer:
+      closePooledConnections()
+      removeDir(root)
     let store = buildFixture(root / "observations.sqlite3")
     check store.declareExtension(ExtensionDeclaration(
       extensionId: ProbeExtensionId, owner: "runquota-m13a",
@@ -642,7 +660,9 @@ suite "observation_store_query":
 
   test "a degraded store answers rather than raising, and says it knows nothing":
     let root = scratch("degraded")
-    defer: removeDir(root)
+    defer:
+      closePooledConnections()
+      removeDir(root)
     # OS-4 REACHES THE READ PATH TOO. A store that could not open must not
     # turn a `repro stats` into a crash; it answers UNKNOWN and empty.
     #

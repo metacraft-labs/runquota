@@ -382,6 +382,9 @@ suite "extension_declaration_beside_a_prune":
       if declarerStarted:
         joinThread(declarer)
       daemon.stop()
+      # `seedStore`/`registryVersion` opened `dbPath` IN THIS PROCESS, on
+      # pooled connections `daemon.stop()` does not touch.
+      closePooledConnections(dbPath)
 
     echo "  prune window: " & $(passFinishedAt - passStartedAt) &
       " ms; B's lease answered at " & $(leaseAnsweredAt - passStartedAt) &
@@ -403,6 +406,7 @@ suite "extension_declaration_beside_a_prune":
     check declarationOutcome == ""
     check registryVersion(dbPath, declaredExtension) == 1
     check passFinishedAt - passStartedAt >= 300
+    closePooledConnections(dbPath)
 
   test "two first declarations of one extension during a prune are both accepted":
     ## THE SAFEGUARD THE MOVE NEEDED, PINNED. With the declaration's write
@@ -480,6 +484,7 @@ suite "extension_declaration_beside_a_prune":
       for i in 0 ..< started:
         joinThread(racers[i])
       daemon.stop()
+      closePooledConnections(dbPath)
 
     echo "  racers answered: '" & racerOutcome[0] & "', '" & racerOutcome[1] &
       "'; after: '" & captureAfter & "'"
@@ -488,3 +493,4 @@ suite "extension_declaration_beside_a_prune":
     check racerOutcome[1] == ""
     check captureAfter == ""
     check registryVersion(dbPath, declaredExtension) == 1
+    closePooledConnections(dbPath)

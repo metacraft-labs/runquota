@@ -440,6 +440,9 @@ suite "scope_boundary_enforcement_owner_uid":
     finally:
       daemon.stop()
       delEnv("RUNQUOTA_SOCKET")
+      # `store` above opened `dbPath` IN THIS PROCESS, on a pooled
+      # connection `daemon.stop()` does not touch.
+      closePooledConnections(dbPath)
 
   test "owner_uid is NULL rather than 0 when it was never established":
     # 0 is root. A row that could not learn its owner must say so, because
@@ -468,3 +471,4 @@ suite "scope_boundary_enforcement_owner_uid":
       "select count(*) from executions where owner_uid is null;")
     check raw.ok
     check raw.output.strip() == "1"
+    closePooledConnections(dbPath)

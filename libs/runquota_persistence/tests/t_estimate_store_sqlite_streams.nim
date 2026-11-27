@@ -53,6 +53,7 @@
 import std/[os, osproc, streams, strutils, tempfiles, unittest]
 
 import runquota_core/child_process
+from runquota_core/sqlite_inproc import closePooledConnections
 import runquota_persistence
 
 import ../../../tests/support/child_watchdog
@@ -156,7 +157,9 @@ suite "estimate store sqlite streams":
       skip()
     else:
       let work = createTempDir("runquota_estimate_streams_", "")
-      defer: removeDir(work)
+      defer:
+        closePooledConnections()
+        removeDir(work)
       let dbPath = work / "estimates.db"
       let resultPath = work / "result.txt"
 
@@ -220,7 +223,9 @@ suite "estimate store sqlite streams":
     ## only meaningful while the batch it builds is over the limit -- which is
     ## asserted rather than assumed.
     let work = createTempDir("runquota_estimate_argv_", "")
-    defer: removeDir(work)
+    defer:
+      closePooledConnections()
+      removeDir(work)
     let dbPath = work / "estimates.db"
 
     let sqlText = oversizedBatchSql(OversizedBatchRows)
@@ -236,7 +241,9 @@ suite "estimate store sqlite streams":
 
   test "a temporary reader does not discard the first estimate batch":
     let work = createTempDir("runquota_estimate_reader_", "")
-    defer: removeDir(work)
+    defer:
+      closePooledConnections()
+      removeDir(work)
     let dbPath = work / "estimates.db"
     let row = LearnedEstimateRow(scope: "reader-control",
       commandStatsId: "reader-command", conservativeMemoryBytes: 1024,
@@ -287,7 +294,9 @@ suite "estimate store sqlite streams":
     ## therefore cannot land, and the point is that the store SAYS SO instead
     ## of returning to the caller as though it had.
     let work = createTempDir("runquota_estimate_failure_", "")
-    defer: removeDir(work)
+    defer:
+      closePooledConnections()
+      removeDir(work)
     let dbPath = work / "not-a-database.db"
     writeFile(dbPath, repeat('Z', 4096))
 

@@ -211,7 +211,9 @@ suite "observation_store_host_profile":
 
   test "unchanged hardware reuses the profile row across many starts":
     let dir = scratchDir("reuse")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = openObservationStore(dir / "observations.sqlite")
     check store.captureEnabled
 
@@ -246,7 +248,9 @@ suite "observation_store_host_profile":
 
   test "a hardware change opens a new profile and bounds the old one":
     let dir = scratchDir("change")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = openObservationStore(dir / "observations.sqlite")
     check store.captureEnabled
     let hostId = resolveHostIdentity(dir / "host-id").hostId
@@ -311,7 +315,9 @@ suite "observation_store_host_profile":
 
   test "executions written before a hardware change still name the old profile":
     let dir = scratchDir("history")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = openObservationStore(dir / "observations.sqlite")
     check store.captureEnabled
     let hostId = resolveHostIdentity(dir / "host-id").hostId
@@ -390,7 +396,9 @@ suite "observation_store_host_profile":
     # code; one current profile per host is a property of the database,
     # and holds against a client reaching past this library.
     let dir = scratchDir("unique")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     let store = openObservationStore(path)
     check store.captureEnabled
@@ -423,7 +431,9 @@ suite "observation_store_host_profile":
 
   test "host_id is machine identity, not a name":
     let dir = scratchDir("identity")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
 
     # Each simulated machine gets a PROVISIONED state directory, because
     # that is now the precondition: `resolveHostIdentity` mints into a
@@ -486,7 +496,9 @@ suite "observation_store_host_profile":
     ## `reprobuild-specs/RunQuota-Observation-Store.md` §"The Execution
     ## Spine": an identity that cannot be persisted is a REFUSAL.
     let dir = scratchDir("nopersist")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
 
     # A file where a directory would have to be. The state directory is
     # provisioned by installation and never created here, so this is a
@@ -513,7 +525,9 @@ suite "observation_store_host_profile":
     # OS-4 on this path too: identity and profile writes are attempted
     # only behind `captureEnabled`, and refuse rather than raise.
     let dir = scratchDir("degraded")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     block:
       let healthy = openObservationStore(path)

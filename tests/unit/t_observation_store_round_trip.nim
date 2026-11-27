@@ -26,7 +26,9 @@ const hostileText = "a|b'c\"d\ne\\f\tg é中 ~ x"
 suite "observation_store_round_trip":
   test "every spine table round trips through a real database":
     let dir = scratchDir("roundtrip")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = openObservationStore(dir / "observations.sqlite")
     check store.status == ssOpen
     check store.captureEnabled
@@ -223,7 +225,9 @@ suite "observation_store_round_trip":
 
   test "a reopened store reads what an earlier process wrote":
     let dir = scratchDir("reopen")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     block:
       let store = openObservationStore(path)
@@ -237,7 +241,9 @@ suite "observation_store_round_trip":
 
   test "the schema refuses rows the specification forbids":
     let dir = scratchDir("constraints")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = openObservationStore(dir / "observations.sqlite")
     check store.insertHost(HostRow(hostId: "h1", createdAtUnixMillis: 1,
       lastBootId: "b1"))

@@ -322,6 +322,9 @@ suite "stats_cli_verbs":
       check liveExport.code == 0
     finally:
       onDaemon.stop()
+      # `waitForExecutions` opened `dbPath` IN THIS PROCESS, on a pooled
+      # connection `onDaemon.stop()` does not touch.
+      closePooledConnections(dbPath)
 
   # -------------------------------------------------------------------------
   # CLAUSE 2: stdout is JSON and nothing else, on every path.
@@ -371,6 +374,7 @@ suite "stats_cli_verbs":
       check "unknown-key" in absent.errText
     finally:
       daemon.stop()
+      closePooledConnections(dbPath)
 
   # -------------------------------------------------------------------------
   # A refused argument names itself; a valid verb is never "unrecognised".
@@ -449,6 +453,7 @@ suite "stats_cli_verbs":
       check "--limt" in badFlag.errText
     finally:
       daemon.stop()
+      closePooledConnections(dbPath)
 
   # -------------------------------------------------------------------------
   # Scope, hardware and the facts a row carries.
@@ -583,6 +588,7 @@ suite "stats_cli_verbs":
           check entry["cpu_model"].getStr == "CLI Retired Builder 64"
     finally:
       daemon.stop()
+      closePooledConnections(dbPath)
 
   # -------------------------------------------------------------------------
   # `top` still ranks within a profile and never across one.
@@ -643,3 +649,4 @@ suite "stats_cli_verbs":
       check "never combined" in wide.outText
     finally:
       daemon.stop()
+      closePooledConnections(dbPath)

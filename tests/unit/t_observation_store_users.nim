@@ -119,7 +119,9 @@ suite "observation_store_users":
 
   test "the schema refuses an unowned execution, a collision, and a Windows id in the uid range":
     let dir = scratchDir("schema")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite3"
     let store = openObservationStore(path)
     check store.captureEnabled
@@ -168,7 +170,9 @@ suite "observation_store_users":
 
   test "a rename refreshes the name, stamps it, never touches owner_uid, and an unresolvable account keeps its name":
     let dir = scratchDir("rename")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = openObservationStore(dir / "observations.sqlite3")
     check store.captureEnabled
     var ledger = initOwnerLedger()
@@ -230,7 +234,9 @@ suite "observation_store_users":
 
   test "the ledger refuses a principal whose id another principal holds":
     let dir = scratchDir("collide")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = openObservationStore(dir / "observations.sqlite3")
     var ledger = initOwnerLedger()
     resolverAnswer = some("CORP\\alice")
@@ -253,7 +259,9 @@ suite "observation_store_users":
 
   test "version 6 backfills every owner and un-attributes the root a Windows daemon recorded":
     let dir = scratchDir("migrate")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite3"
     # A VERSION-5 STORE, built by the shipped ladder's first five steps --
     # every one of them frozen once shipped -- and filled the way the
@@ -328,7 +336,9 @@ suite "observation_store_users":
 
   test "merge carries owners, collapses one principal seen twice, and does not depend on order":
     let dir = scratchDir("merge")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let alice = ownerIdFromSid(AliceSid)
     # Two hosts saw Alice, at different times and under different names.
     let a = openObservationStore(dir / "a.sqlite3")
@@ -383,7 +393,9 @@ suite "observation_store_users":
 
   test "merge refuses an owner id two principals claim, before writing anything":
     let dir = scratchDir("merge-collision")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let alice = ownerIdFromSid(AliceSid)
     let a = openObservationStore(dir / "a.sqlite3")
     a.hostFixture("host-a", "windows")
@@ -407,7 +419,9 @@ suite "observation_store_users":
 
   test "an older source is migrated on a private copy and the source is not written":
     let dir = scratchDir("merge-older")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let source = dir / "v5.sqlite3"
     var ddl = ""
     for step in 0 ..< 5:
@@ -447,7 +461,9 @@ suite "observation_store_users":
 
   test "export redacts owner names from default upward and records it":
     let dir = scratchDir("export")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let source = dir / "local.sqlite3"
     let store = openObservationStore(source)
     store.hostFixture("host-a", "windows")

@@ -376,6 +376,7 @@ suite "observation_retention_scheduled":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
     check removed == 4
     check reported != nil
@@ -397,6 +398,7 @@ suite "observation_retention_scheduled":
     let orphanage = after.orphanReport()
     check orphanage.checked
     check orphanage.orphans == 0
+    closePooledConnections(expectedDb)
 
   # -------------------------------------------------------------------------
   # THE CLAUSE M15 COULD NOT STATE: retention must not hold the write path
@@ -532,6 +534,7 @@ suite "observation_retention_scheduled":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
     echo "  prune window: " & $(passFinishedAt - passStartedAt) &
       " ms; admission " & $(admissionIssuedAt - passStartedAt) & ".." &
@@ -569,6 +572,7 @@ suite "observation_retention_scheduled":
     check kept.len <= 101
     check not kept[^1].executionId.startsWith("seed-")
     check after.orphanReport().orphans == 0
+    closePooledConnections(dbPath)
 
   # -------------------------------------------------------------------------
   # A QUERY THAT WAITS ON THE PRUNE WAITS ALONE
@@ -717,6 +721,7 @@ suite "observation_retention_scheduled":
       if statsStarted:
         joinThread(statsThread)
       daemon.stop()
+      closePooledConnections()
 
     echo "  prune window: " & $(passFinishedAt - passStartedAt) &
       " ms; stats issued at " & $(statsIssuedAtMillis - passStartedAt) &
@@ -781,6 +786,7 @@ suite "observation_retention_scheduled":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
     check reported != nil
     check reported["active"].getBool() == false
@@ -850,6 +856,7 @@ suite "observation_retention_scheduled":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
     check removed >= 41
     # KEEPS NOTHING, and the store is still a store: an emptied spine must
@@ -865,6 +872,7 @@ suite "observation_retention_scheduled":
     check orphanage.orphans == 0
     check status.totalGranted >= 1'u64
     check status.totalFinished >= 1'u64
+    closePooledConnections(dbPath)
 
   test "--no-write-stats leaves no store to sweep and no sweeper to do it":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -889,6 +897,7 @@ suite "observation_retention_scheduled":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
     check reported != nil
     check reported["active"].getBool() == false
@@ -940,6 +949,7 @@ suite "observation_retention_scheduled":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
     check reported != nil
     # NO SWEEPER AT ALL — not one that runs and fails. Six cadences have
@@ -1060,6 +1070,7 @@ suite "observation_retention_scheduled":
         if fileExists(dbPath & suffix):
           setFilePermissions(dbPath & suffix, {fpUserRead, fpUserWrite})
       daemon.stop()
+      closePooledConnections()
 
     check daemonStillUp
     check status.totalGranted >= 2'u64
@@ -1070,3 +1081,4 @@ suite "observation_retention_scheduled":
     check after.captureEnabled
     check after.readExecutions().len >= 50
     check after.orphanReport().orphans == 0
+    closePooledConnections(dbPath)

@@ -166,7 +166,9 @@ suite "observation_store_retention":
 
   test "the age bound removes what is older than the limit and nothing else":
     let dir = scratchDir("age")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = seedStore(dir / "o.sqlite",
       [10_000'i64, 20_000, 30_000, 40_000, 50_000],
       [10_000'i64, 20_000, 30_000, 40_000, 50_000])
@@ -219,7 +221,9 @@ suite "observation_store_retention":
     # doomed depends on how many other rows there are, so an implementation
     # that only ever computed a cutoff cannot enforce it at all.
     let dir = scratchDir("count")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = seedStore(dir / "o.sqlite",
       [10_000'i64, 20_000, 30_000, 40_000, 50_000],
       [10_000'i64, 20_000, 30_000, 40_000, 50_000])
@@ -267,7 +271,9 @@ suite "observation_store_retention":
     # to exist; it is one pass that applies both. Each arm below is
     # unreachable by the other bound alone.
     let dir = scratchDir("both")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     var times: seq[int64] = @[]
     for i in 1 .. 10:
       times.add(int64(i) * 10_000)
@@ -293,7 +299,9 @@ suite "observation_store_retention":
     # they are the same two only because the two orderings agree here — so
     # the discriminating figure is the SIX, asserted directly.
     let ageOnlyDir = scratchDir("ageonly")
-    defer: removeDir(ageOnlyDir)
+    defer:
+      closePooledConnections()
+      removeDir(ageOnlyDir)
     let ageOnly = seedStore(ageOnlyDir / "o.sqlite", times)
     var agePolicy = noRetention()
     agePolicy.maxExecutionAgeMillis = some(55_000'i64)
@@ -304,7 +312,9 @@ suite "observation_store_retention":
     # The clause's own trap: the CURRENT hardware profile is older than
     # every bound below, and every surviving execution points at it.
     let dir = scratchDir("orphan")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     var times: seq[int64] = @[]
     for i in 1 .. 8:
       times.add(int64(i) * 10_000)
@@ -379,7 +389,9 @@ suite "observation_store_retention":
     # edited past this library, or a copy taken by something that did not
     # enforce them.
     let dir = scratchDir("detector")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = seedStore(dir / "o.sqlite", [10_000'i64, 20_000],
       [10_000'i64])
     check store.orphanReport().orphans == 0
@@ -419,7 +431,9 @@ suite "observation_store_retention":
     # OS-4 on this path too. Retention is housekeeping for capture, and
     # housekeeping that cannot run must not fail anything.
     let dir = scratchDir("closed")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "o.sqlite"
     block:
       let store = seedStore(path, [10_000'i64])

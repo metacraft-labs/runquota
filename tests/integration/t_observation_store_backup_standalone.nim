@@ -200,6 +200,10 @@ suite "observation_store_backup_standalone":
       client.close()
     finally:
       daemon.stop()
+      # `live`, opened above, is a second handle on `dbPath` besides the
+      # daemon's own: `removeScratchRoot(root)` below cannot see it (it is
+      # not writing), so it would retry its whole budget and still fail.
+      closePooledConnections(dbPath)
 
     check copiedWhileRunning
     check fileExists(backupPath)
@@ -251,6 +255,7 @@ suite "observation_store_backup_standalone":
     check pruned.executionsRemoved == beforeCopy - 6
     check restored.readExecutions().len == 6
     check restored.orphanReport().orphans == 0
+    closePooledConnections(backupPath)
 
   test "a plain file copy of a live store loses rows the backup keeps":
     # THE CONTROL THAT DECIDES THE TEST ABOVE. Without a reader holding a
@@ -343,3 +348,7 @@ suite "observation_store_backup_standalone":
     check backupStore.status == ssOpen
     check backupStore.readExecutions().len == 25
     check backupStore.orphanReport().orphans == 0
+    # `store`/`path`, `baseline`, `plain` and `backup` above each opened a
+    # pooled connection under `dir`, which `removeScratchRoot(dir)` cannot
+    # see settle (none of them is writing); close every one of them.
+    closePooledConnections()

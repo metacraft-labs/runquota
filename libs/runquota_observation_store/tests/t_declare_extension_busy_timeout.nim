@@ -57,7 +57,9 @@ proc hold(path: string) {.thread.} =
 suite "declare_extension_busy_timeout":
   test "a declaration that outwaits the write lock is unavailable, not a degrade":
     let dir = createTempDir("rq-busy-", "")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite3"
     let store = openObservationStore(path)
     doAssert store.captureEnabled, store.report

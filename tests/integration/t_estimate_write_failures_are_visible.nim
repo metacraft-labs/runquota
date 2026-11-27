@@ -32,6 +32,7 @@ import std/[json, os, osproc, streams, strutils, times, unittest]
 from runquota_ipc import endpointDirectoryPermissions
 import runquota_client
 import runquota_core
+from runquota_core/sqlite_inproc import closePooledConnections
 import runquota_persistence
 import runquota_protocol
 import daemon_binary
@@ -189,6 +190,7 @@ suite "estimate_write_failures_are_visible":
     finally:
       daemon.stop()
       delEnv("RUNQUOTA_SOCKET")
+      closePooledConnections()
 
   test "a healthy store reports zero, so a non-zero count means something":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -234,3 +236,6 @@ suite "estimate_write_failures_are_visible":
     finally:
       daemon.stop()
       delEnv("RUNQUOTA_SOCKET")
+      # `loadLearnedEstimates` above opened `estimateDb` IN THIS PROCESS on
+      # a pooled connection; `daemon.stop()` only closes the daemon's own.
+      closePooledConnections()

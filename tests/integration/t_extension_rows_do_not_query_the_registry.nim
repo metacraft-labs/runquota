@@ -256,6 +256,7 @@ suite "extension_rows_do_not_query_the_registry":
     finally:
       daemon.stop()
       delEnv("RUNQUOTA_SOCKET")
+      closePooledConnections()
 
   test "an undeclared extension still costs a read and is still refused":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -298,6 +299,7 @@ suite "extension_rows_do_not_query_the_registry":
     finally:
       daemon.stop()
       delEnv("RUNQUOTA_SOCKET")
+      closePooledConnections()
 
   test "a row claiming a version the registry does not carry is still refused":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -344,6 +346,7 @@ suite "extension_rows_do_not_query_the_registry":
     finally:
       daemon.stop()
       delEnv("RUNQUOTA_SOCKET")
+      closePooledConnections()
 
   test "after a restart an up-to-date declaration still furnishes the rows":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -377,6 +380,7 @@ suite "extension_rows_do_not_query_the_registry":
       client.close()
     finally:
       first.stop()
+      closePooledConnections()
 
     var daemon = startDaemon(socketPath, state)
     try:
@@ -404,3 +408,4 @@ suite "extension_rows_do_not_query_the_registry":
     finally:
       daemon.stop()
       delEnv("RUNQUOTA_SOCKET")
+      closePooledConnections()

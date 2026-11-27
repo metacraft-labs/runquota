@@ -45,7 +45,9 @@ proc execution(i: int): ExecutionRow =
 suite "observation_store_writer":
   test "a batch far larger than the argument limit is written whole":
     let dir = scratchDir("bigbatch")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = seededStore(dir)
     var rows: seq[ExecutionRow] = @[]
     for i in 0 ..< 6000:
@@ -61,7 +63,9 @@ suite "observation_store_writer":
 
   test "enqueued rows reach the database and none are dropped":
     let dir = scratchDir("drain")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = seededStore(dir)
     startObservationWriter(store.path, 8192)
     check observationWriterActive()
@@ -74,7 +78,9 @@ suite "observation_store_writer":
 
   test "a full queue drops and counts rather than blocking":
     let dir = scratchDir("bounded")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = seededStore(dir)
     # A capacity of one with the drain paused by sheer volume: some rows
     # must be refused, and every refusal must be counted.
@@ -91,7 +97,9 @@ suite "observation_store_writer":
 
   test "a degraded store leaves the writer inactive and enqueues counted":
     let dir = scratchDir("degraded")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     # The daemon starts the writer only for a store that opened; this is
     # that case expressed directly.
     startObservationWriter("", 1024)

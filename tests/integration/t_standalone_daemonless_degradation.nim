@@ -500,6 +500,7 @@ suite "standalone_daemonless_degradation":
     let store = openObservationStore(storePath)
     check store.captureEnabled
     check store.readExecutions().len == Runs
+    closePooledConnections(storePath)
 
   # -------------------------------------------------------------------------
   # 2. A build, with no daemon
@@ -691,6 +692,7 @@ suite "standalone_daemonless_degradation":
           check row.durationMillis >= 0
     finally:
       daemon.stop()
+      closePooledConnections(dbPath)
 
   # -------------------------------------------------------------------------
   # 5. The verdict the daemon will not take on trust
@@ -759,6 +761,7 @@ suite "standalone_daemonless_degradation":
       check "m14-liar" notin tools
     finally:
       daemon.stop()
+      closePooledConnections(dbPath)
 
   test "one self-contradicting record is dropped, and the rest of its batch is not":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -865,6 +868,7 @@ suite "standalone_daemonless_degradation":
             check row.termination == tOomKilled
     finally:
       daemon.stop()
+      closePooledConnections(dbPath)
 
   # -------------------------------------------------------------------------
   # 6. Unavailable rather than faked

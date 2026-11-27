@@ -234,6 +234,7 @@ suite "observation_extension_write_path":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
   test "a row naming another session's lease is refused":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -285,6 +286,7 @@ suite "observation_extension_write_path":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
   test "a row from a connection that never registered the session is refused":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -336,6 +338,7 @@ suite "observation_extension_write_path":
       owner.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
   test "a row for a lease with no recorded execution is refused, not fatal":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -395,6 +398,7 @@ suite "observation_extension_write_path":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
   test "a row for an extension nobody declared is refused":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -437,6 +441,7 @@ suite "observation_extension_write_path":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
   test "a declaration from a connection that never registered the session is refused":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -486,6 +491,7 @@ suite "observation_extension_write_path":
       owner.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
   test "a declaration naming a version its ladder cannot reach is refused":
     let privateOwner = bindPrivateBrokerOwnerToCaller()
@@ -513,6 +519,7 @@ suite "observation_extension_write_path":
       client.close()
     finally:
       daemon.stop()
+      closePooledConnections()
 
 suite "observation_extension_write_path_codec":
 

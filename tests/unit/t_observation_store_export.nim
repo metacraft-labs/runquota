@@ -325,7 +325,7 @@ proc buildLocalStore(dir, path: string): ObservationStore =
   ## another.
   if localStoreTemplate.len == 0:
     let templateDir = scratchDir("template")
-    addExitProc(proc () = removeDir(templateDir))
+    addExitProc(proc () = (closePooledConnections(); removeDir(templateDir)))
     localStoreTemplate = buildLocalStoreTemplate(templateDir)
   copyFile(localStoreTemplate, path)
   result = openObservationStore(path)
@@ -461,7 +461,9 @@ suite "observation_store_export":
   # -------------------------------------------------------------------
   test "the applied policy is recorded, and a store that never was exported says so":
     let dir = scratchDir("manifest")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let local = dir / "local.sqlite"
     discard buildLocalStore(dir, local)
 
@@ -547,7 +549,9 @@ suite "observation_store_export":
   # -------------------------------------------------------------------
   test "the default policy redacts its categories and keeps everything else":
     let dir = scratchDir("default")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let local = dir / "local.sqlite"
     let store = buildLocalStore(dir, local)
     let artifact = dir / "export.sqlite"
@@ -738,7 +742,9 @@ suite "observation_store_export":
   # -------------------------------------------------------------------
   test "none really is none, and strict is strictly more than default":
     let dir = scratchDir("policies")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let local = dir / "local.sqlite"
     discard buildLocalStore(dir, local)
 
@@ -837,7 +843,9 @@ suite "observation_store_export":
   # -------------------------------------------------------------------
   test "redaction is applied at export and never at capture":
     let dir = scratchDir("capture")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let local = dir / "local.sqlite"
     let store = buildLocalStore(dir, local)
 
@@ -885,7 +893,9 @@ suite "observation_store_export":
   # -------------------------------------------------------------------
   test "an export is deterministic, and refuses what it cannot do":
     let dir = scratchDir("determinism")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let local = dir / "local.sqlite"
     discard buildLocalStore(dir, local)
 
@@ -937,7 +947,9 @@ suite "observation_store_export":
     # expensive to reach on purpose. An arm nothing exercises is an arm
     # nobody knows the shape of.
     let dir = scratchDir("refusals")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let local = dir / "local.sqlite"
     discard buildLocalStore(dir, local)
     let digest = canonicalDigest(local)
@@ -994,7 +1006,9 @@ suite "observation_store_export":
     # everywhere, which is the quiet failure this milestone exists to
     # forbid; so the export refuses as a whole and leaves nothing behind.
     let dir = scratchDir("norowid")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let local = dir / "local.sqlite"
     discard buildLocalStore(dir, local)
 
@@ -1049,7 +1063,9 @@ create table ext_m16x_rowidless (
     # them before they had asserted anything.
     block:
       let dir = scratchDir("keptwal")
-      defer: removeDir(dir)
+      defer:
+        closePooledConnections()
+        removeDir(dir)
       let templateDir = dir / "template"
       createDir(templateDir)
       let copyable = buildLocalStoreTemplate(templateDir, holdLog = true)

@@ -391,7 +391,9 @@ suite "observation_store_ambient_attribution":
     # it: the schema refuses a negative, so an unclamped value would be
     # rejected on write and the sample lost entirely.
     let dir = scratchDir("clamp")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let store = openObservationStore(dir / "observations.sqlite")
     check store.captureEnabled
     let hostId = resolveHostIdentity(dir / "host-id").hostId
@@ -758,7 +760,10 @@ suite "observation_store_ambient_attribution":
     check fileExists(linuxTreeSource)
     let macosHits = scannedFor(macosTreeSource, perProcessInterfaces)
     check macosHits.len >= 3
-    check "proc_listpids" in macosHits
+    # `proc_listchildpids`, not `proc_listpids`: the implementation walks
+    # each tree breadth-first from its root pid (see process_telemetry.nim's
+    # own header), which is the per-process API it actually imports.
+    check "proc_listchildpids" in macosHits
     check "proc_pidinfo" in macosHits
     let linuxHits = scannedFor(linuxTreeSource, perProcessInterfaces)
     check linuxHits.len >= 2
