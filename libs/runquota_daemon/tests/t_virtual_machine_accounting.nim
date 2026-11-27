@@ -220,31 +220,36 @@ suite "what a registered VM is charged":
     check daemon.cpuFits(BudgetCpu)
     check not daemon.memoryFits(6'u64 * GiB + 1)
 
-  test "a VM restarted in place stays registered, watched on its new process":
-    var daemon = testDaemon("restart")
-    let id = daemon.registerVm(memoryBytes = 3'u64 * GiB)
-    discard daemon.link()
-    check daemon.virtualMachines[id].linked
-    # A guest reboot: a new hypervisor process for the same VM. The parent
-    # of this test stands in for it (alive, and not the first one).
-    let next = uint64(getppid())
-    check daemon.startVirtualMachine(id, next, vmLinkVsock, VmCid) == ""
-    check daemon.leases[id].state == leaseStateRunning
-    check daemon.leases[id].childProcessId == next
-    check daemon.virtualMachines[id].processId == next
-    check daemon.virtualMachines[id].restarts == 1'u64
-    # The old process's link is dropped: full shape until the guest relinks.
-    check not daemon.virtualMachines[id].linked
-    check daemon.leases[id].resources.cpu.value == VmCpu
-    check not daemon.memoryFits(5'u64 * GiB + 1)
-    let (again, _) = daemon.link(linkId = 9)
-    check again.accepted
-    check daemon.cpuFits(BudgetCpu)
-    # Neither a pid of 0 nor a CID another VM holds is accepted.
-    check daemon.startVirtualMachine(id, 0'u64, vmLinkVsock, VmCid).len > 0
-    let other = daemon.registerVm(memoryBytes = 1'u64 * GiB, cid = VmCid + 1)
-    check daemon.startVirtualMachine(other, next, vmLinkVsock, VmCid).len > 0
-    check daemon.virtualMachines[other].vsockCid == VmCid + 1
+  # This case takes the test's PARENT process as "another live process" for
+  # the restarted VM (`getppid`), and the standard library has no portable
+  # parent query: it exists only where `defined(posix)`. The Windows legs build
+  # this file, so the case is POSIX-only rather than inventing a process id.
+  when defined(posix):
+    test "a VM restarted in place stays registered, watched on its new process":
+      var daemon = testDaemon("restart")
+      let id = daemon.registerVm(memoryBytes = 3'u64 * GiB)
+      discard daemon.link()
+      check daemon.virtualMachines[id].linked
+      # A guest reboot: a new hypervisor process for the same VM. The parent
+      # of this test stands in for it (alive, and not the first one).
+      let next = uint64(getppid())
+      check daemon.startVirtualMachine(id, next, vmLinkVsock, VmCid) == ""
+      check daemon.leases[id].state == leaseStateRunning
+      check daemon.leases[id].childProcessId == next
+      check daemon.virtualMachines[id].processId == next
+      check daemon.virtualMachines[id].restarts == 1'u64
+      # The old process's link is dropped: full shape until the guest relinks.
+      check not daemon.virtualMachines[id].linked
+      check daemon.leases[id].resources.cpu.value == VmCpu
+      check not daemon.memoryFits(5'u64 * GiB + 1)
+      let (again, _) = daemon.link(linkId = 9)
+      check again.accepted
+      check daemon.cpuFits(BudgetCpu)
+      # Neither a pid of 0 nor a CID another VM holds is accepted.
+      check daemon.startVirtualMachine(id, 0'u64, vmLinkVsock, VmCid).len > 0
+      let other = daemon.registerVm(memoryBytes = 1'u64 * GiB, cid = VmCid + 1)
+      check daemon.startVirtualMachine(other, next, vmLinkVsock, VmCid).len > 0
+      check daemon.virtualMachines[other].vsockCid == VmCid + 1
 
 for root in scratchRoots:
   removeDir(root)

@@ -138,30 +138,34 @@ suite "following a moving width":
     check slotsForTarget(0) == 1
     check slotsForTarget(high(uint32)) == int(high(uint32) div 1000'u32)
 
-  test "widening issues tokens at once; narrowing takes only returned ones":
-    var fifo = openJobserverFifo(1)
-    defer: fifo.closeJobserverFifo()
-    check fifo.served == 1
-    check fifo.issueTokens(6) == 6
-    check fifo.served == 7
-    # A client takes five tokens, as five running jobs would.
-    let reader = posix.open(fifo.path.cstring, O_RDONLY or O_NONBLOCK)
-    check reader >= 0
-    var held: array[5, char]
-    check posix.read(reader, addr held[0], held.len) == 5
-    # Narrowing to 2 slots (1 token) owes 6, but only the 2 tokens back in
-    # the FIFO can be taken: the five held are not the bridge's to take.
-    check fifo.withholdTokens(6) == 2
-    check fifo.served == 5
-    # Nothing more is there; a bounded wait returns empty-handed.
-    check fifo.withholdTokens(4, waitMillis = 20) == 0
-    # Three jobs finish and hand their tokens back: the bridge keeps them.
-    let writer = posix.open(fifo.path.cstring, O_WRONLY or O_NONBLOCK)
-    check posix.write(writer, addr held[0], 3) == 3
-    check fifo.withholdTokens(4, waitMillis = 20) == 3
-    check fifo.served == 2
-    discard posix.close(reader)
-    discard posix.close(writer)
+  # The bridge is a POSIX FIFO (`openJobserverFifo` exists only where
+  # `defined(posix)`), so this case has no Windows form: the Windows legs build
+  # this file and must not reference it.
+  when defined(posix):
+    test "widening issues tokens at once; narrowing takes only returned ones":
+      var fifo = openJobserverFifo(1)
+      defer: fifo.closeJobserverFifo()
+      check fifo.served == 1
+      check fifo.issueTokens(6) == 6
+      check fifo.served == 7
+      # A client takes five tokens, as five running jobs would.
+      let reader = posix.open(fifo.path.cstring, O_RDONLY or O_NONBLOCK)
+      check reader >= 0
+      var held: array[5, char]
+      check posix.read(reader, addr held[0], held.len) == 5
+      # Narrowing to 2 slots (1 token) owes 6, but only the 2 tokens back in
+      # the FIFO can be taken: the five held are not the bridge's to take.
+      check fifo.withholdTokens(6) == 2
+      check fifo.served == 5
+      # Nothing more is there; a bounded wait returns empty-handed.
+      check fifo.withholdTokens(4, waitMillis = 20) == 0
+      # Three jobs finish and hand their tokens back: the bridge keeps them.
+      let writer = posix.open(fifo.path.cstring, O_WRONLY or O_NONBLOCK)
+      check posix.write(writer, addr held[0], 3) == 3
+      check fifo.withholdTokens(4, waitMillis = 20) == 3
+      check fifo.served == 2
+      discard posix.close(reader)
+      discard posix.close(writer)
 
 suite "a range asked of an older daemon":
   test "below the negotiated-widths minor, the range becomes one value":
