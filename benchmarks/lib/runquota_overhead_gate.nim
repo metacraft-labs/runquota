@@ -283,6 +283,43 @@ proc memoryCapConfigProblem*(arms: array[Arm, MemoryCapArm];
          else: "")
   ""
 
+proc envValue(env: openArray[string]; key: string): string =
+  ## The value of `key` in a `KEY=VALUE` environment list, or "".
+  for entry in env:
+    if entry.startsWith(key & "="):
+      return entry[key.len + 1 .. ^1]
+  ""
+
+proc memoryCapSpawnPath*(arm: MemoryCapArm; launcherEnv: openArray[string]):
+    string =
+  ## How the arm's launchers create a capped tree, from the arm's stage and
+  ## the environment they run with: `clone3` (into the leaf) from the
+  ## `limits` stage on; `fork` (and the child's own join) below that stage
+  ## or when `LD_PRELOAD` is set in the launcher's environment, because a
+  ## raw clone3 skips the C library's fork handlers that preload shims
+  ## rely on; `uncapped` for an arm with no cap. Derived, not observed: a
+  ## kernel or seccomp filter that refuses clone3 also falls back to fork,
+  ## which the tree cannot see from inside.
+  if arm.level == mclNone:
+    return "uncapped"
+  if arm.level != mclLimits:
+    return "fork"
+  if envValue(launcherEnv, "LD_PRELOAD").len > 0: "fork" else: "clone3"
+
+proc ldPreloadWarning*(gateEnv: openArray[string]): string =
+  ## The warning the gate prints when its own environment sets
+  ## `LD_PRELOAD` (an agent harness's command-trace shim, for one): its
+  ## clients inherit it, so their capped trees take the fork path, and a
+  ## `limits` or `classify` verdict is then a verdict on the fork, not on
+  ## clone3. "" when it is not set.
+  let preload = envValue(gateEnv, "LD_PRELOAD")
+  if preload.len == 0:
+    return ""
+  "WARNING: LD_PRELOAD is set in the gate's environment (" & preload &
+    "); the launchers inherit it and create capped trees with the " &
+    "ordinary fork instead of clone3, so a limits or classify verdict " &
+    "from this run is a verdict on the fork path"
+
 proc nrDyingDescendants*(root: string): int =
   ## `nr_dying_descendants` of `root`'s `cgroup.stat`, -1 when unreadable.
   try:
@@ -971,6 +1008,12 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
   # refused (never a pass).
   var memoryCapJson = newJNull()
   if memoryCapOn:
+    var gateEnv: seq[string]
+    for key, value in envPairs():
+      gateEnv.add(key & "=" & value)
+    let warning = ldPreloadWarning(gateEnv)
+    if warning.len > 0:
+      stderr.writeLine(warning)
     var observed: array[Arm, MemoryCapLevel]
     var outputs: array[Arm, string]
     for arm in Arm:
@@ -987,6 +1030,13 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
       "stage": {"off": memoryArms[armOff].stage,
         "on": memoryArms[armOn].stage},
       "observed_level": {"off": $observed[armOff], "on": $observed[armOn]},
+      "spawn_path": {
+        "off": memoryCapSpawnPath(memoryArms[armOff], armEnv(armOff)),
+        "on": memoryCapSpawnPath(memoryArms[armOn], armEnv(armOn))},
+      "spawn_path_basis": "derived from each arm's stage and its " &
+        "launchers' LD_PRELOAD; a kernel that refuses clone3 also falls " &
+        "back to fork, which this does not see",
+      "warning": warning,
       "nr_dying_descendants": {
         "before": {"off": nrDyingDescendants(cgroupRoots[armOff]),
           "on": nrDyingDescendants(cgroupRoots[armOn])},

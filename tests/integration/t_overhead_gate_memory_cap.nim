@@ -22,6 +22,12 @@
 ##   compare two identical arms. Mutation: a check that accepts any level
 ##   (or only looks at the OFF arm) passes the vacuous arm here.
 ##
+## * The report's spawn path (`memoryCapSpawnPath`): `clone3` for a capped
+##   arm at the `limits` stage or later, `fork` below it or when
+##   `LD_PRELOAD` is set in the launchers' environment, and the warning
+##   (`ldPreloadWarning`) the gate prints when its own environment sets it.
+##   Mutation: ignoring the environment.
+##
 ## WHAT IS NOT YET RUN: the gate end to end with the cap ON. Turning
 ## `RUNQUOTA_MEMORY_CAP=1G` into a launch's cap is the launching client's
 ## resolver, which this tree does not have yet; until it does, the real ON
@@ -104,6 +110,30 @@ when defined(linux):
       check memoryCapConfigProblem(arms, [mclLimits, mclLimits]).len > 0
       check memoryCapConfigProblem(memoryCapArms("memory-cap:leaf"),
         [mclController, mclController]).len > 0
+
+    test "the report names the spawn path, and LD_PRELOAD is warned about":
+      # The launcher creates a capped tree with clone3 from the `limits`
+      # stage on, unless LD_PRELOAD is set in ITS environment, which the
+      # gate's clients inherit from the gate. Mutation: ignoring the
+      # environment (every limits arm then reads clone3).
+      let whole = memoryCapArms("memory-cap")
+      let preload = @["PATH=/bin", "LD_PRELOAD=/x/shim.so"]
+      let clean = @["PATH=/bin", "LD_PRELOAD="]
+      check memoryCapSpawnPath(whole[armOn], clean) == "clone3"
+      check memoryCapSpawnPath(whole[armOn], preload) == "fork"
+      check memoryCapSpawnPath(whole[armOff], clean) == "uncapped"
+      let leafArms = memoryCapArms("memory-cap:leaf")
+      check memoryCapSpawnPath(leafArms[armOn], clean) == "fork"
+      check memoryCapSpawnPath(leafArms[armOff], clean) == "fork"
+      check memoryCapSpawnPath(memoryCapArms("memory-cap:controller")[armOff],
+        clean) == "uncapped"
+      check memoryCapSpawnPath(memoryCapArms("memory-cap:classify")[armOff],
+        preload) == "fork"
+      check ldPreloadWarning(clean) == ""
+      let warning = ldPreloadWarning(preload)
+      check "LD_PRELOAD" in warning
+      check "/x/shim.so" in warning
+      check "fork" in warning
 
     var reason = ""
     let root = delegatedMemoryTestRoot(reason)

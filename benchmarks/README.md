@@ -78,8 +78,18 @@ launches apply no cap would compare two identical arms. The `classify`
 stage's reads are invisible from inside the tree, so for
 `memory-cap:classify` the check can only confirm that both arms are at
 `limits`. `case_details.memory_cap` carries the arms, what each probe saw,
-and each root's `nr_dying_descendants` before the first round and after the
-latest run. `run-64` only.
+the spawn path each arm's launchers use (`clone3` from the `limits` stage
+on, `fork` below it), and each root's `nr_dying_descendants` before the
+first round and after the latest run. `run-64` only.
+
+A launcher with `LD_PRELOAD` set keeps the ordinary fork, because a raw
+`clone3` skips the C library's fork handlers that preload shims rely on.
+The gate's clients inherit its environment, so when `LD_PRELOAD` is set
+there (an agent harness's command-trace shim, for one) the gate prints a
+warning and reports `fork`: a `limits` or `classify` verdict from that run
+is a verdict on the fork path. The spawn path is derived from the stage and
+the environment; a kernel that refuses `clone3` also falls back to the fork,
+which the report cannot see.
 
 Exit status: 0 pass, 1 fail, 2 usage, 3 inconclusive, 4 case unavailable,
 5 a run could not be measured. The JSON report goes to
