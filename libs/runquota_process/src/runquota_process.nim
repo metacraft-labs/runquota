@@ -733,6 +733,30 @@ when defined(windows):
       addr ret) != 0:
       result = uint64(info.PeakJobMemoryUsed)
 
+  proc readOwnJobMemoryCapLimit*(): tuple[hasLimit: bool; limitBytes: uint64] =
+    ## What THIS calling process's own job currently carries for
+    ## `JOB_OBJECT_LIMIT_JOB_MEMORY` (`JobMemoryLimit`, active only when
+    ## `LimitFlags` names it) -- Windows's analogue of a tree reading its own
+    ## `/proc/self/cgroup` and `memory.max` from inside. A NULL job handle to
+    ## `QueryInformationJobObject` means "the calling process's own job, or
+    ## its immediate job if nested" (Microsoft Learn,
+    ## QueryInformationJobObject, the `hJob` parameter); atomic placement
+    ## (`PROC_THREAD_ATTRIBUTE_JOB_LIST`) means any cap the launcher set is
+    ## already in force by the time a child can call this. `(false, 0)` when
+    ## the query fails, including "this process is in no job at all".
+    var info: JobExtendedLimitW
+    var ret: int32 = 0
+    if queryInformationJobObject(
+      Handle(0),
+      JobObjectExtendedLimitInformation,
+      addr info,
+      int32(sizeof(JobExtendedLimitW)),
+      addr ret) == 0:
+      return (false, 0'u64)
+    let active = (info.BasicLimitInformation.LimitFlags and
+      int32(JOB_OBJECT_LIMIT_JOB_MEMORY)) != 0
+    (active, uint64(info.JobMemoryLimit))
+
   const
     MemoryCapWatcherStopSentinel = 0xFFFF_FFFF'u32
       ## Not a real `JOB_OBJECT_MSG_*` value (the highest documented one is

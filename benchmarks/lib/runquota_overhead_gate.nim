@@ -45,6 +45,27 @@
 ## the latest run: a removed leaf whose pages are still charged lingers as
 ## a dying memory cgroup, which is part of what the `classify` stage costs.
 ##
+## WINDOWS has a different mechanism and no stages: one job-wide hard limit
+## (`JOB_OBJECT_LIMIT_JOB_MEMORY`, set at process creation alongside atomic
+## job placement, `PROC_THREAD_ATTRIBUTE_JOB_LIST`), not several cgroup
+## placement steps, so `--switch=memory-cap:STAGE` is refused there and the
+## plain switch judges the whole mechanism against none, the same shape as
+## Linux's own plain switch. The OFF arm leaves `RUNQUOTA_MEMORY_CAP` unset;
+## the ON arm sets it to the same per-run cap Linux uses, far above the
+## work's need, so the limit applies and is never reached. Before the first
+## round each arm runs its own probe (`--win-memcap-probe`, this binary's
+## own cargo-style self-reinvocation) that reads its own job's
+## `JOB_OBJECT_LIMIT_JOB_MEMORY` back (`QueryInformationJobObject` with a
+## NULL job handle: "the calling process's own job"), and the gate refuses
+## to run unless each arm shows the limit its configuration names, for the
+## same reason the Linux probe exists: an ON arm whose launches apply no cap
+## would otherwise compare two identical arms and pass, vacuously. The
+## actions themselves are this binary's own `--run64-spin` worker (also
+## cargo-style), launched and joined without a POSIX shell
+## (`process_cost.runMeasuredFanOut`, `WaitForMultipleObjects`) since
+## `run64Script`'s shell `&`/`wait` fan-out has no portable Windows
+## equivalent.
+##
 ## THE CASES.
 ##
 ## * `reprobuild-64`: a 64-action Reprobuild build
@@ -69,8 +90,10 @@
 ## 4 case unavailable, 5 a run could not be measured (a build failed, a
 ## daemon would not start).
 ##
-## Linux is the platform this has run on. The macOS code paths compile but
-## have not been run.
+## Linux is the platform this has run on most; `run-64` (plain and with
+## `--switch=memory-cap`) has also run on Windows, end to end against real
+## `runquota`/`runquotad` binaries. The macOS code paths compile but have
+## not been run.
 
 import std/[algorithm, cpuinfo, json, monotimes, os, strutils, tempfiles, times]
 
@@ -486,7 +509,12 @@ proc daemonEnv(): seq[string] =
   for key, value in envPairs():
     if key notin isolation:
       result.add(key & "=" & value)
-  result.add("RUNQUOTA_ENDPOINT_SCOPE=private")
+  when not defined(windows):
+    # Windows has no `private` endpoint scope; `startDaemon`'s named-pipe
+    # socket name already gives each arm's daemon the same isolation this
+    # gives on POSIX (`runquota_ipc`: "private RunQuota endpoints require
+    # POSIX").
+    result.add("RUNQUOTA_ENDPOINT_SCOPE=private")
   result.add("RUNQUOTA_EXIT_WITH_PARENT=1")
 
 proc inspectObservations(socket: string): JsonNode =
@@ -496,7 +524,11 @@ proc inspectObservations(socket: string): JsonNode =
   let hadScope = existsEnv("RUNQUOTA_ENDPOINT_SCOPE")
   let previousScope = getEnv("RUNQUOTA_ENDPOINT_SCOPE", "")
   putEnv("RUNQUOTA_SOCKET", socket)
-  putEnv("RUNQUOTA_ENDPOINT_SCOPE", "private")
+  when not defined(windows):
+    # No `private` scope on Windows; `socket` is already a named pipe
+    # unique to this arm (`startDaemon`), so the default `host` scope gives
+    # the same isolation.
+    putEnv("RUNQUOTA_ENDPOINT_SCOPE", "private")
   defer:
     putEnv("RUNQUOTA_SOCKET", previousSocket)
     if hadScope: putEnv("RUNQUOTA_ENDPOINT_SCOPE", previousScope)
@@ -551,14 +583,23 @@ proc startDaemon*(cfg: GateConfig; root: string; arm: Arm; switches: string;
   var handedBack = false
   try:
     createDir(dir)
-    # The daemon refuses an endpoint directory anyone else could enter.
-    setFilePermissions(dir, {fpUserRead, fpUserWrite, fpUserExec})
-    result.socket = dir / "rq.sock"
+    when defined(windows):
+      # Windows has no `private` endpoint scope (`runquota_ipc`: "private
+      # RunQuota endpoints require POSIX") -- the transport there is a
+      # named pipe under the default `host` scope instead of a filesystem
+      # socket, isolated the way `tests/support/windows_daemon_fixture.nim`
+      # isolates one: a name no concurrent run collides with.
+      result.socket = r"\\.\pipe\runquota-gate-" & $getCurrentProcessId() &
+        "-" & $arm & "-" & $getMonoTime().ticks
+    else:
+      # The daemon refuses an endpoint directory anyone else could enter.
+      setFilePermissions(dir, {fpUserRead, fpUserWrite, fpUserExec})
+      result.socket = dir / "rq.sock"
+      if result.socket.len > 100:
+        raise newException(ValueError, "socket path too long for a Unix " &
+          "socket (" & $result.socket.len & " bytes): " & result.socket &
+          "; set TMPDIR to a shorter directory")
     result.log = dir / "runquotad.log"
-    if result.socket.len > 100:
-      raise newException(ValueError, "socket path too long for a Unix " &
-        "socket (" & $result.socket.len & " bytes): " & result.socket &
-        "; set TMPDIR to a shorter directory")
     var args = @[cfg.daemonBin,
       "--socket", result.socket,
       "--host-config", dir / "host.toml",
@@ -691,7 +732,8 @@ proc reprobuildEnv(root: string; arm: Arm; socket, switches: string):
       result.add(key & "=" & value)
   let dir = root / $arm
   result.add("RUNQUOTA_SOCKET=" & socket)
-  result.add("RUNQUOTA_ENDPOINT_SCOPE=private")
+  when not defined(windows):
+    result.add("RUNQUOTA_ENDPOINT_SCOPE=private")
   result.add("RUNQUOTA_MEASUREMENT=" & switches)
   # IN-PROCESS. A persistent build daemon keeps the environment it was
   # started with, so the client-side switch would never reach the process
@@ -941,7 +983,8 @@ proc runEnv*(socket, switches, cgroupRoot: string; qos = "";
     if key notin dropped:
       result.add(key & "=" & value)
   result.add("RUNQUOTA_SOCKET=" & socket)
-  result.add("RUNQUOTA_ENDPOINT_SCOPE=private")
+  when not defined(windows):
+    result.add("RUNQUOTA_ENDPOINT_SCOPE=private")
   result.add("RUNQUOTA_MEASUREMENT=" & switches)
   result.add("RUNQUOTA_CGROUP_ROOT=" & cgroupRoot)
   if qos.len > 0:
@@ -963,6 +1006,132 @@ proc probeMemoryCapLevel*(cli: string; env: seq[string]; dir: string):
     if cost.exitStatus != 0: mclUnknown
     else: memoryCapProbeLevel(result.output, GateMemoryCapBytes)
 
+proc winMemoryCapProbeLevel(probeOutput: string; capBytes: uint64):
+    MemoryCapLevel =
+  ## `serveWinMemCapProbe`'s output, read the way `memoryCapProbeLevel`
+  ## reads the Linux probe's: one `key=value` per line.
+  var hasLimit = false
+  var limitBytes = 0'u64
+  var seenHasLimit = false
+  for line in probeOutput.splitLines():
+    let eq = line.find('=')
+    if eq <= 0:
+      continue
+    let value = line[eq + 1 .. ^1].strip()
+    case line[0 ..< eq]
+    of "has_limit":
+      hasLimit = value == "1"
+      seenHasLimit = true
+    of "limit_bytes":
+      limitBytes = try: parseBiggestUInt(value) except ValueError: 0'u64
+    else: discard
+  if not seenHasLimit:
+    return mclUnknown
+  if not hasLimit:
+    return mclNone
+  if limitBytes == capBytes: mclLimits else: mclUnknown
+
+proc probeMemoryCapLevelWindows(cli, self: string; env: seq[string];
+                                dir: string):
+    tuple[level: MemoryCapLevel; output: string] =
+  ## One `runquota run` of `--win-memcap-probe` in an arm's environment:
+  ## the level its own job showed, and the probe's output -- the Windows
+  ## sibling of `probeMemoryCapLevel`.
+  let log = dir / "memory-cap-probe.log"
+  let cost = runMeasured([cli, "run", "--width", "1", "--adapter", "none",
+    "--", self, "--win-memcap-probe"], env, dir, log)
+  result.output = try: readFile(log) except IOError, OSError: ""
+  result.level =
+    if cost.exitStatus != 0: mclUnknown
+    else: winMemoryCapProbeLevel(result.output, GateMemoryCapBytes)
+
+proc run64RunWindows(cfg: GateConfig; arm: Arm; daemon: PrivateDaemon;
+                     env: seq[string]; dir, self: string): RunCost =
+  ## `run64CaseWindowsMemoryCap`'s one round: `run64ActionCount` actions,
+  ## each this binary's own `--run64-spin` worker launched by `runquota
+  ## run`, started together and joined (`process_cost.runMeasuredFanOut`)
+  ## -- `run64Script`'s shell `&`/`wait` fan-out, without a POSIX shell.
+  var argvs: seq[seq[string]]
+  for i in 0 ..< run64ActionCount:
+    argvs.add(@[cfg.cliBin, "run", "--width", "1", "--adapter", "none",
+      "--", self, "--run64-spin", $run64LoopTurns,
+      dir / ("out-" & $i & ".txt")])
+  let before = processCpuSeconds(daemon.pid)
+  result = runMeasuredFanOut(argvs, env, dir, dir)
+  let after = settledDaemonCpuSeconds(daemon.pid)
+  result.daemonCpuSeconds = after - before
+  result.cpuSeconds += result.daemonCpuSeconds
+  var ran = 0
+  for kind, path in walkDir(dir):
+    if kind == pcFile and path.extractFilename.startsWith("out-"):
+      if readFile(path).strip() == $run64LoopTurns: inc ran
+      removeFile(path)
+  if result.exitStatus != 0 or ran != run64ActionCount:
+    raise newException(OSError, "the " & $arm & " run had " &
+      $result.exitStatus & " failing action(s) and " & $ran & " of " &
+      $run64ActionCount & " actions done; logs under " & dir)
+
+proc run64CaseWindowsMemoryCap(cfg: GateConfig; scratch: string): GateCase =
+  ## `--switch=memory-cap` on Windows. No stages: the mechanism has none --
+  ## one job-wide hard limit, set or not, not several cgroup-placement
+  ## steps -- so this judges the whole mechanism in one comparison. The OFF
+  ## arm leaves `RUNQUOTA_MEMORY_CAP` unset; the ON arm sets it to
+  ## `GateMemoryCap`, far above what one run-64 action needs, so the cap
+  ## applies (`JOB_OBJECT_LIMIT_JOB_MEMORY`) and is never reached -- the
+  ## same "applied, never breached" shape the Linux arms use (module
+  ## header, THE MEMORY-CAP SWITCH).
+  let memoryArms = memoryCapArms(MemoryCapSwitch)
+  var daemons: array[Arm, PrivateDaemon]
+  var handedBack = false
+  defer:
+    if not handedBack:
+      for arm in Arm: stopDaemon(daemons[arm])
+  var switches: array[Arm, string]
+  var dirs: array[Arm, string]
+  let self = getAppFilename()
+  for arm in Arm:
+    switches[arm] = armSwitchText(cfg, arm)
+    daemons[arm] = startDaemon(cfg, scratch, arm, switches[arm])
+    dirs[arm] = scratch / $arm / "work"
+    createDir(dirs[arm])
+  proc armEnv(arm: Arm): seq[string] =
+    runEnv(daemons[arm].socket, switches[arm], "", "", memoryArms[arm])
+  # THE MEMORY-CAP CONFIGURATION CHECK, before the first round: as on
+  # Linux, each arm's launch must show the level its configuration names,
+  # or the run is refused -- never a pass (an ON arm applying no cap would
+  # compare two identical arms).
+  var observed: array[Arm, MemoryCapLevel]
+  var outputs: array[Arm, string]
+  for arm in Arm:
+    (observed[arm], outputs[arm]) = probeMemoryCapLevelWindows(cfg.cliBin,
+      self, armEnv(arm), dirs[arm])
+  let problem = memoryCapConfigProblem(memoryArms, observed)
+  if problem.len > 0:
+    raise newException(CaseUnavailable, "memory-cap configuration check: " &
+      problem & "; probe output: off: " &
+      outputs[armOff].strip().replace("\n", " ") & " | on: " &
+      outputs[armOn].strip().replace("\n", " "))
+  result.name = "run-64"
+  result.run = proc (arm: Arm; round: int): RunCost =
+    try:
+      run64RunWindows(cfg, arm, daemons[arm], armEnv(arm), dirs[arm], self)
+    except OSError as err:
+      raise newException(OSError, "round " & $round & ": " & err.msg)
+  result.stop = proc () =
+    for arm in Arm: stopDaemon(daemons[arm])
+  result.details = %*{
+    "cli": cfg.cliBin,
+    "daemon": cfg.daemonBin,
+    "actions": run64ActionCount,
+    "loop_turns_per_action": run64LoopTurns,
+    "mechanism": "windows-job-object",
+    "memory_cap": {
+      "cap": {"off": memoryArms[armOff].cap, "on": memoryArms[armOn].cap},
+      "observed_has_limit": {"off": $(observed[armOff] != mclNone),
+        "on": $(observed[armOn] != mclNone)},
+      "probe_output": {"off": outputs[armOff], "on": outputs[armOn]}}}
+  handedBack = true
+
 proc run64Case(cfg: GateConfig; scratch: string): GateCase =
   for (label, path) in [("runquotad", cfg.daemonBin), ("runquota", cfg.cliBin)]:
     if path.len == 0 or not fileExists(path):
@@ -977,10 +1146,18 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
     if cfg.switch == "qos":
       raise newException(CaseUnavailable, "--switch=qos judges the macOS " &
         "priority policy and this is not macOS")
-  when not defined(linux):
+  when defined(windows):
     if memoryCapOn:
-      raise newException(CaseUnavailable, "--switch=memory-cap judges the " &
-        "Linux cgroup mechanism and this is not Linux")
+      if cfg.switch != MemoryCapSwitch:
+        raise newException(CaseUnavailable, "--switch=" & cfg.switch &
+          " names a cgroup stage, and Windows's memory cap has none (one " &
+          "job-wide limit, not several placement steps); use " &
+          "--switch=memory-cap")
+      return run64CaseWindowsMemoryCap(cfg, scratch)
+  when not defined(linux) and not defined(windows):
+    if memoryCapOn:
+      raise newException(CaseUnavailable, "--switch=memory-cap is " &
+        "implemented for Linux and Windows only, and this is " & hostOS)
   var memoryArms: array[Arm, MemoryCapArm]
   if memoryCapOn:
     memoryArms = memoryCapArms(cfg.switch)   # ValueError: a usage error
@@ -1232,10 +1409,16 @@ runquota_overhead_gate --case=reprobuild-64|run-64|cargo-jobserver|synthetic [op
                               differ only by the client's RUNQUOTA_CGROUP_ROOT
                               (off / a gate-owned root), or, for qos (macOS),
                               by its RUNQUOTA_QOS (off / on); run-64 only
-  --switch=memory-cap[:STAGE] judge the Linux memory cap, placement on in
-                              both arms: the whole mechanism against none,
-                              or STAGE (controller|leaf|limits|classify)
-                              against the stage before it; run-64 only
+  --switch=memory-cap[:STAGE] judge the memory cap (Linux and Windows);
+                              run-64 only. Linux: placement on in both
+                              arms, the whole mechanism against none, or
+                              STAGE (controller|leaf|limits|classify)
+                              against the stage before it. Windows has no
+                              stages (one job-wide limit, not several
+                              placement steps): :STAGE is refused, and the
+                              plain switch judges the whole mechanism
+                              against none, the same as Linux's own plain
+                              switch
   --budget-percent=1          allowed overhead
   --precision-percent=0.5     required 95% interval half-width
   --min-rounds=10 --max-rounds=200 --max-minutes=90
@@ -1330,9 +1513,51 @@ proc serveSyntheticChild*(args: openArray[string]): bool =
       return true
   false
 
+proc serveRun64Child*(args: openArray[string]): bool =
+  ## If invoked as `run64CaseWindowsMemoryCap`'s own action
+  ## (`--run64-spin TURNS OUTPATH`), count to TURNS and write it to OUTPATH
+  ## -- the same contract `run64Script`'s shell loop keeps on POSIX
+  ## (`run64Case`'s own check reads the file back and compares it against
+  ## `run64LoopTurns`). Cargo-style self-reinvocation, like
+  ## `serveSyntheticChild`; not gated to Windows, since nothing about it is
+  ## platform-specific, but POSIX's `run64Case` never invokes it.
+  if args.len == 3 and args[0] == "--run64-spin":
+    let turns = try: parseInt(args[1]) except ValueError: -1
+    if turns < 0:
+      return false
+    var counted = 0
+    for _ in 0 ..< turns:
+      inc counted
+    writeFile(args[2], $counted)
+    return true
+  false
+
+proc serveWinMemCapProbe*(args: openArray[string]): bool =
+  ## If invoked as `run64CaseWindowsMemoryCap`'s configuration-check probe
+  ## (`--win-memcap-probe`), print this process's own job's memory-cap
+  ## limit as `key=value` lines -- the platform analogue of
+  ## `memoryCapProbeScript` reading `/proc/self/cgroup` and `memory.max` on
+  ## Linux. Atomic placement (`PROC_THREAD_ATTRIBUTE_JOB_LIST`) means any
+  ## cap the launcher set is already in force by the time this runs. Only
+  ## reachable on Windows (`readOwnJobMemoryCapLimit` exists only there);
+  ## defined everywhere so the file compiles on every OS.
+  if args.len == 1 and args[0] == "--win-memcap-probe":
+    when defined(windows):
+      let (hasLimit, limitBytes) = readOwnJobMemoryCapLimit()
+      echo "has_limit=" & (if hasLimit: "1" else: "0")
+      echo "limit_bytes=" & $limitBytes
+      return true
+    else:
+      return false
+  false
+
 proc main(): int =
   let args = commandLineParams()
   if serveSyntheticChild(args):
+    return 0
+  if serveRun64Child(args):
+    return 0
+  if serveWinMemCapProbe(args):
     return 0
   var cfg: GateConfig
   try:
@@ -1380,7 +1605,22 @@ proc main(): int =
     if cfg.keepScratch:
       stderr.writeLine("scratch kept at " & scratch)
     else:
-      removeDir(scratch)
+      # A stopped daemon's own log file can still be held by the kernel for
+      # a short while after `gateCase.stop()` returns (observed on
+      # Windows, after `TerminateProcess`: `GetExitCodeProcess` can stop
+      # reporting STILL_ACTIVE slightly before every one of the process's
+      # handles is released) -- `removeDir` right away can then fail with
+      # "being used by another process" on a run that otherwise completed
+      # (or failed) correctly. The same wait-and-retry
+      # `removeGateCgroups` already uses for cgroup v2's own "not empty
+      # yet" lag.
+      for attempt in 0 ..< 20:
+        try:
+          removeDir(scratch)
+          break
+        except OSError:
+          if attempt == 19: raise
+          sleep(50)
 
 when isMainModule:
   quit main()

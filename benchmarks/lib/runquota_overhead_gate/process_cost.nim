@@ -69,6 +69,20 @@ when defined(windows):
       BasicInfo: JobBasicAccountingW
       IoInfo: IoCountersW
 
+    JobExtendedLimitW {.final, pure.} = object
+      ## `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`: the basic limits PLUS the
+      ## fields `SetInformationJobObject`/`QueryInformationJobObject`
+      ## require for info class 9 -- `JobBasicLimitW` alone is undersized
+      ## for that class (it is only `JOBOBJECT_BASIC_LIMIT_INFORMATION`,
+      ## class 2's shape); passing it with class 9's `sizeof` would ask the
+      ## kernel to fill in fields this struct does not have room for.
+      BasicLimitInformation: JobBasicLimitW
+      IoInfo: IoCountersW
+      ProcessMemoryLimit: uint
+      JobMemoryLimit: uint
+      PeakProcessMemoryUsed: uint
+      PeakJobMemoryUsed: uint
+
     StartupInfoExW {.final, pure.} = object
       StartupInfo: STARTUPINFO
       lpAttributeList: pointer
@@ -267,15 +281,26 @@ when defined(posix):
 
 elif defined(windows):
   proc spawnChildInJob*(argv: openArray[string]; env: openArray[string];
-                        cwd, logPath: string):
+                        cwd, logPath: string; killOnClose = true):
       tuple[pid: Pid; processHandle: Handle; job: Handle] =
-    ## `CreateProcessW`, placed in a fresh, limitless Job Object at creation
+    ## `CreateProcessW`, placed in a fresh Job Object at creation
     ## (`PROC_THREAD_ATTRIBUTE_JOB_LIST`, the same mechanism
     ## `runquota_process`'s launcher uses for production leases) so
     ## `runMeasured` can read the WHOLE tree's CPU, not only this one
     ## process's -- Windows has no `wait4`-style aggregation of a reaped
     ## child's own descendants. stdout and stderr go to `logPath`
     ## (truncated), stdin from `NUL`.
+    ##
+    ## `killOnClose` (default true, `runMeasured`'s short-lived children):
+    ## `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so a crash of THIS process
+    ## before the run finishes still reaps whatever it started. `false`
+    ## (`spawnChild`'s long-lived daemon): the job is created for CPU
+    ## accounting alone, with no limit flags at all -- `spawnChild` closes
+    ## the job handle right after spawning, on purpose, because the
+    ## daemon must outlive that call; a job the caller means to outlive
+    ## must not carry kill-on-close, or dropping the only handle to it
+    ## (the very next statement there) kills the daemon it was meant to
+    ## leave running.
     if argv.len == 0:
       raise newException(ValueError, "spawnChildInJob: empty argv")
     let cmdLine = buildWinCommandLine(argv)
@@ -288,9 +313,9 @@ elif defined(windows):
     si.hStdOutput = winOpenLogForWrite(logPath)
     si.hStdError = si.hStdOutput
     let job = createJobObjectW(nil, nil)
-    if job != 0:
-      var info: JobBasicLimitW
-      info.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if job != 0 and killOnClose:
+      var info: JobExtendedLimitW
+      info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
       discard setInformationJobObject(job, JobObjectExtendedLimitInformationClass,
         addr info, int32(sizeof(info)))
     var procInfo: PROCESS_INFORMATION
@@ -370,6 +395,53 @@ elif defined(windows):
         result.cpuSeconds = fileTimeToSeconds(kernel) + fileTimeToSeconds(user)
     discard closeHandle(spawned.processHandle)
 
+  proc runMeasuredFanOut*(argvs: openArray[seq[string]];
+                          env: openArray[string]; cwd, logDir: string):
+      RunCost =
+    ## Like `runMeasured`, but every argv is STARTED CONCURRENTLY, with no
+    ## wait between them, and joined together once all are running --
+    ## `run64Case`'s Windows driver, the closest equivalent of the shell
+    ## `CMD & ...; wait` fan-out `run64Script` uses on POSIX, without
+    ## depending on a POSIX shell being on PATH. Each argv's own log goes to
+    ## `logDir / "fan-<i>.log"`. `result.exitStatus` is the COUNT of argvs
+    ## that exited non-zero (0 means every one succeeded) -- unlike every
+    ## other `RunCost` in this module, it is not one process's own exit
+    ## code, because there isn't a single one; `result.cpuSeconds` sums
+    ## every argv's own job accounting. `WaitForMultipleObjects`'s hard
+    ## limit (`MAXIMUM_WAIT_OBJECTS`, 64) bounds `argvs.len`.
+    if argvs.len == 0:
+      return
+    if argvs.len > MAXIMUM_WAIT_OBJECTS:
+      raise newException(ValueError, "runMeasuredFanOut: " & $argvs.len &
+        " argvs exceeds WaitForMultipleObjects's limit of " &
+        $MAXIMUM_WAIT_OBJECTS)
+    let started = getMonoTime()
+    var spawned: seq[tuple[pid: Pid; processHandle: Handle; job: Handle]]
+    for i, argv in argvs:
+      spawned.add spawnChildInJob(argv, env, cwd,
+        logDir / ("fan-" & $i & ".log"))
+    var handles: WOHandleArray
+    for i, s in spawned: handles[i] = s.processHandle
+    discard waitForMultipleObjects(DWORD(spawned.len), addr handles, 1,
+      INFINITE)
+    let finished = getMonoTime()
+    result.wallSeconds = float((finished - started).inNanoseconds) / 1e9
+    for s in spawned:
+      var exitCode: int32 = 0
+      discard getExitCodeProcess(s.processHandle, exitCode)
+      if exitCode != 0:
+        inc result.exitStatus
+      if s.job != 0:
+        var info: JobBasicAndIoAccountingW
+        var ret: int32 = 0
+        if queryInformationJobObject(s.job,
+            JobObjectBasicAndIoAccountingInformation, addr info,
+            int32(sizeof(info)), addr ret) != 0:
+          result.cpuSeconds += float(info.BasicInfo.TotalUserTime +
+            info.BasicInfo.TotalKernelTime) / 1e7
+        discard closeHandle(s.job)
+      discard closeHandle(s.processHandle)
+
   # -------------------------------------------------------------------
   # The gate's own long-lived daemon, by pid alone (module header: a
   # daemon's CPU is read separately from `runMeasured`'s workloads, by
@@ -389,8 +461,10 @@ elif defined(windows):
     ## job -- a subprocess IT spawns (the observation store's `sqlite3`)
     ## would need a job kept alive to be counted, which this does not do;
     ## the module header's "cutime/cstime" aggregation that covers this on
-    ## POSIX has no Windows equivalent here.
-    let spawned = spawnChildInJob(argv, env, cwd, logPath)
+    ## POSIX has no Windows equivalent here. `killOnClose = false`: this
+    ## proc closes the job handle on the very next line, and the daemon
+    ## must survive that (module doc on `spawnChildInJob`'s `killOnClose`).
+    let spawned = spawnChildInJob(argv, env, cwd, logPath, killOnClose = false)
     if spawned.job != 0:
       discard closeHandle(spawned.job)
     discard closeHandle(spawned.processHandle)
