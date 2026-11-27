@@ -417,7 +417,9 @@ pragma user_version = 7;
     # leaves the store at 8; dropping the trigger re-creation lets an
     # update through.
     let dir = scratchDir("v8")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "observations.sqlite"
     var ladder = ""
     for i in 0 ..< 8:
