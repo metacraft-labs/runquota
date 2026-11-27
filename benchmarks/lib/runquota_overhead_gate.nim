@@ -72,7 +72,18 @@
 ## Linux is the platform this has run on. The macOS code paths compile but
 ## have not been run.
 
-import std/[algorithm, cpuinfo, json, monotimes, os, posix, strutils, tempfiles, times]
+import std/[algorithm, cpuinfo, json, monotimes, os, strutils, tempfiles, times]
+
+when defined(posix):
+  # `std/posix` on a non-POSIX target falls back to `posix_other` (its
+  # generic "every other OS" arm), which still DECLARES `Pid` and a long
+  # list of POSIX procs with `importc`/`header` pragmas naming headers
+  # Windows does not have -- harmless at `nim check` (a pragma alone needs
+  # no header), fatal at C codegen the moment anything using them is
+  # reachable. Importing it only here, instead of unconditionally as
+  # before, is what keeps `Pid` resolving to `process_cost.Pid` alone on
+  # Windows (imported below) instead of two ambiguous types.
+  import std/posix
 
 import runquota_client
 import runquota_core/measurement
@@ -495,21 +506,23 @@ proc inspectObservations(socket: string): JsonNode =
   parseJson(client.inspectionJson("observations"))
 
 proc stopDaemon*(daemon: PrivateDaemon) =
-  ## Ends a daemon THIS GATE started, by its pid: SIGTERM, then SIGKILL if it
-  ## has not exited within 20 s, and reaps it. A pid of 0 (never started, or
-  ## already reaped) is nothing to stop. Raises nothing, so it is safe in a
-  ## `finally` that must not mask the exception being propagated.
+  ## Ends a daemon THIS GATE started, by its pid: a soft terminate (SIGTERM
+  ## on POSIX; Windows has no softer-than-`TerminateProcess` signal, so
+  ## `daemonTerminate`/`daemonKillNow` do the same thing there), then a
+  ## hard one if it has not exited within 20 s, and reaps it. A pid of 0
+  ## (never started, or already reaped) is nothing to stop. Raises nothing,
+  ## so it is safe in a `finally` that must not mask the exception being
+  ## propagated.
   if daemon.pid <= 0:
     return
-  discard kill(daemon.pid, SIGTERM)
+  daemonTerminate(daemon.pid)
   let deadline = getMonoTime() + initDuration(seconds = 20)
-  var status: cint
   while getMonoTime() < deadline:
-    if waitpid(daemon.pid, status, WNOHANG) == daemon.pid:
+    if daemonTryReap(daemon.pid):
       return
     sleep(50)
-  discard kill(daemon.pid, SIGKILL)
-  discard waitpid(daemon.pid, status, 0)
+  daemonKillNow(daemon.pid)
+  daemonReapBlocking(daemon.pid)
 
 const DaemonReadyMillis* = 60_000
   ## How long `startDaemon` waits for a daemon to answer by default.
@@ -567,8 +580,7 @@ proc startDaemon*(cfg: GateConfig; root: string; arm: Arm; switches: string;
       initDuration(milliseconds = readyBudgetMillis)
     var lastError = ""
     while getMonoTime() < deadline:
-      var status: cint
-      if waitpid(result.pid, status, WNOHANG) == result.pid:
+      if daemonTryReap(result.pid):
         # Reaped here: the pid is no longer this daemon's, and the cleanup
         # below must not signal whatever process reuses it.
         result.pid = 0
@@ -827,11 +839,19 @@ proc run64Script(cli: string): string =
 
 proc gateCgroupRoot(): string =
   ## A gate-owned cgroup root below this user's delegated subtree, or "".
-  let own = try: readFile("/proc/self/cgroup") except IOError, OSError: ""
-  let default = resolveCgroupRoot("", own, int(getuid()), hostSwitchOn = true)
-  if not default.usable:
-    return ""
-  default.path.parentDir / ("runquota-gate-" & $getpid() & ".slice")
+  ## cgroup v2 is Linux-only; callers already treat "" (no root) as a
+  ## reason to refuse `--switch=cgroups` (`CaseUnavailable`) or, for
+  ## `--switch=memory-cap`, as "this OS enforces the cap by a different
+  ## mechanism" (Windows: a Job Object; the Linux-only path below is never
+  ## reached there).
+  when defined(linux):
+    let own = try: readFile("/proc/self/cgroup") except IOError, OSError: ""
+    let default = resolveCgroupRoot("", own, int(getuid()), hostSwitchOn = true)
+    if not default.usable:
+      return ""
+    default.path.parentDir / ("runquota-gate-" & $getpid() & ".slice")
+  else:
+    ""
 
 proc removeGateCgroups(root: string) =
   ## Remove the gate's root once its trees are gone, deepest first. Kills
@@ -853,48 +873,56 @@ proc migrationProbe(root: string): JsonNode =
   ## time, each writing itself into a gate-owned leaf's `cgroup.procs` and
   ## timing that one write (the step that takes the kernel's cgroup
   ## threadgroup lock for writing), reported to the parent on a pipe.
-  let target = targetFor(CgroupRoot(state: crsExplicit, path: root),
-    "migration-probe", sessionPriorityNormal, reclaimed = false)
-  var problem = ""
-  if not prepareTarget(target, problem):
-    raise newException(OSError, "migration probe: " & problem)
-  var samples: seq[int64]
-  for i in 0 ..< migrationProbeSamples:
-    let fd = posix.open(cstring(target.leafPath / "cgroup.procs"),
-      O_WRONLY or O_CLOEXEC)
-    if fd < 0:
-      raise newException(OSError, "migration probe: cannot open the leaf")
-    var fds: array[0..1, cint]
-    if pipe(fds) != 0:
-      raise newException(OSError, "migration probe: pipe")
-    let pid = fork()
-    if pid == 0:
-      let t0 = getMonoTime().ticks
-      let ok = posix.write(fd, cstring("0"), 1) == 1
-      var elapsed = getMonoTime().ticks - t0
-      if not ok: elapsed = -1
-      discard posix.write(fds[1], addr elapsed, sizeof(elapsed))
-      exitnow(0)
-    discard posix.close(fds[1])
-    discard posix.close(fd)
-    var elapsed = -1'i64
-    discard posix.read(fds[0], addr elapsed, sizeof(elapsed))
-    discard posix.close(fds[0])
-    var status: cint
-    discard waitpid(pid, status, 0)
-    if elapsed < 0:
-      raise newException(OSError, "migration probe: a child could not join")
-    samples.add(elapsed)
-  discard removeEmptyCgroup(target.leafPath)
-  discard removeEmptyCgroup(target.dirPath)
-  samples.sort()
-  var total = 0'i64
-  for x in samples: total += x
-  proc at(q: float): int64 = samples[min(samples.high, int(q * float(samples.len)))]
-  %*{"samples": samples.len, "unit": "microseconds",
-     "mean": float(total) / float(samples.len) / 1000.0,
-     "median": float(at(0.5)) / 1000.0, "p90": float(at(0.9)) / 1000.0,
-     "p99": float(at(0.99)) / 1000.0, "max": float(samples[^1]) / 1000.0}
+  ## cgroup v2 is Linux-only; `--switch=cgroups` (this proc's only caller)
+  ## already refuses on every other OS for want of a delegated subtree
+  ## (`CaseUnavailable`), so the non-Linux arm below should never run --
+  ## it exists so the file compiles everywhere, not to be reached.
+  when defined(linux):
+    let target = targetFor(CgroupRoot(state: crsExplicit, path: root),
+      "migration-probe", sessionPriorityNormal, reclaimed = false)
+    var problem = ""
+    if not prepareTarget(target, problem):
+      raise newException(OSError, "migration probe: " & problem)
+    var samples: seq[int64]
+    for i in 0 ..< migrationProbeSamples:
+      let fd = posix.open(cstring(target.leafPath / "cgroup.procs"),
+        O_WRONLY or O_CLOEXEC)
+      if fd < 0:
+        raise newException(OSError, "migration probe: cannot open the leaf")
+      var fds: array[0..1, cint]
+      if pipe(fds) != 0:
+        raise newException(OSError, "migration probe: pipe")
+      let pid = fork()
+      if pid == 0:
+        let t0 = getMonoTime().ticks
+        let ok = posix.write(fd, cstring("0"), 1) == 1
+        var elapsed = getMonoTime().ticks - t0
+        if not ok: elapsed = -1
+        discard posix.write(fds[1], addr elapsed, sizeof(elapsed))
+        exitnow(0)
+      discard posix.close(fds[1])
+      discard posix.close(fd)
+      var elapsed = -1'i64
+      discard posix.read(fds[0], addr elapsed, sizeof(elapsed))
+      discard posix.close(fds[0])
+      var status: cint
+      discard waitpid(pid, status, 0)
+      if elapsed < 0:
+        raise newException(OSError, "migration probe: a child could not join")
+      samples.add(elapsed)
+    discard removeEmptyCgroup(target.leafPath)
+    discard removeEmptyCgroup(target.dirPath)
+    samples.sort()
+    var total = 0'i64
+    for x in samples: total += x
+    proc at(q: float): int64 = samples[min(samples.high, int(q * float(samples.len)))]
+    %*{"samples": samples.len, "unit": "microseconds",
+       "mean": float(total) / float(samples.len) / 1000.0,
+       "median": float(at(0.5)) / 1000.0, "p90": float(at(0.9)) / 1000.0,
+       "p99": float(at(0.99)) / 1000.0, "max": float(samples[^1]) / 1000.0}
+  else:
+    raise newException(OSError,
+      "migration probe: cgroup v2 is Linux-only (reached on " & hostOS & ")")
 
 proc runEnv*(socket, switches, cgroupRoot: string; qos = "";
             memoryCap = MemoryCapArm()): seq[string] =

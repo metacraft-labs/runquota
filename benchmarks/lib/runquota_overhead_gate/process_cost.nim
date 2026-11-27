@@ -251,6 +251,20 @@ when defined(posix):
     else:
       result.exitStatus = -1
 
+  proc daemonTerminate*(pid: Pid) =
+    discard kill(pid, SIGTERM)
+
+  proc daemonKillNow*(pid: Pid) =
+    discard kill(pid, SIGKILL)
+
+  proc daemonTryReap*(pid: Pid): bool =
+    var status: cint
+    waitpid(pid, status, WNOHANG) == pid
+
+  proc daemonReapBlocking*(pid: Pid) =
+    var status: cint
+    discard waitpid(pid, status, 0)
+
 elif defined(windows):
   proc spawnChildInJob*(argv: openArray[string]; env: openArray[string];
                         cwd, logPath: string):
@@ -355,6 +369,67 @@ elif defined(windows):
           addr kernel, addr user) != 0:
         result.cpuSeconds = fileTimeToSeconds(kernel) + fileTimeToSeconds(user)
     discard closeHandle(spawned.processHandle)
+
+  # -------------------------------------------------------------------
+  # The gate's own long-lived daemon, by pid alone (module header: a
+  # daemon's CPU is read separately from `runMeasured`'s workloads, by
+  # `processCpuSeconds`). These four give the gate's daemon-lifecycle code
+  # (`stopDaemon`, `startDaemon`) one small cross-platform surface instead
+  # of POSIX's kill/waitpid directly: a plain handle re-opened by pid each
+  # time is simpler than keeping the creation-time handle alive for a
+  # process whose whole point is to outlive this call.
+  # -------------------------------------------------------------------
+
+  proc spawnChild*(argv: openArray[string]; env: openArray[string];
+                   cwd, logPath: string): Pid =
+    ## Like `spawnChildInJob`, but for a long-lived process (the gate's own
+    ## daemon) this module never waits on directly: the job and process
+    ## handle are closed immediately, so only the pid survives. The
+    ## daemon's own CPU is read by `processCpuSeconds`, not through this
+    ## job -- a subprocess IT spawns (the observation store's `sqlite3`)
+    ## would need a job kept alive to be counted, which this does not do;
+    ## the module header's "cutime/cstime" aggregation that covers this on
+    ## POSIX has no Windows equivalent here.
+    let spawned = spawnChildInJob(argv, env, cwd, logPath)
+    if spawned.job != 0:
+      discard closeHandle(spawned.job)
+    discard closeHandle(spawned.processHandle)
+    spawned.pid
+
+  proc daemonTerminate*(pid: Pid) =
+    ## The gate's first attempt to end its own daemon. Windows has no
+    ## SIGTERM-equivalent soft signal; `TerminateProcess` is unconditional
+    ## there, so this and `daemonKillNow` below do the same thing on
+    ## Windows and differ only on POSIX (SIGTERM vs SIGKILL).
+    const ProcessTerminate = 0x0001'i32
+    let h = openProcess(ProcessTerminate, 0'i32, int32(pid))
+    if h != 0:
+      discard terminateProcess(h, 1)
+      discard closeHandle(h)
+
+  proc daemonKillNow*(pid: Pid) =
+    daemonTerminate(pid)
+
+  proc daemonTryReap*(pid: Pid): bool =
+    ## Non-blocking: true once the process has exited. Unlike POSIX's
+    ## `waitpid(WNOHANG)`, this consumes nothing -- Windows has no zombie
+    ## to reap -- so calling it repeatedly is exactly as cheap as POSIX's
+    ## own poll loop already assumes.
+    const ProcessQueryLimitedInformation = 0x1000'i32
+    let h = openProcess(ProcessQueryLimitedInformation, 0'i32, int32(pid))
+    if h == 0:
+      return true # cannot even open it: treat as already gone
+    var code: int32 = 0
+    let ok = getExitCodeProcess(h, code)
+    discard closeHandle(h)
+    ok != 0 and code != STILL_ACTIVE
+
+  proc daemonReapBlocking*(pid: Pid) =
+    const Synchronize = 0x00100000'i32
+    let h = openProcess(Synchronize, 0'i32, int32(pid))
+    if h != 0:
+      discard waitForSingleObject(h, INFINITE)
+      discard closeHandle(h)
 
 when defined(linux):
   proc processCpuSeconds*(pid: Pid): float =
