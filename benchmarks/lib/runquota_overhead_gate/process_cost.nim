@@ -124,8 +124,16 @@ when defined(windows):
     stdcall, dynlib: "kernel32.dll", importc: "GetProcessTimes".}
 
   proc fileTimeToSeconds(t: FILETIME): float =
-    # FILETIME is 100ns ticks, split into two 32-bit words.
-    let ticks = (uint64(t.dwHighDateTime) shl 32) or uint64(t.dwLowDateTime)
+    ## FILETIME is 100ns ticks, split into two 32-bit words -- but
+    ## `std/winlean.DWORD` is `int32`, not `uint32`, so a plain `uint64(x)`
+    ## on either word SIGN-EXTENDS once its top bit is set (observed:
+    ## `dwLowDateTime` alone passes 2^31 ticks, 214.7 s of accumulated CPU,
+    ## well within one gate run against a long-lived daemon), corrupting
+    ## the result to within a few seconds of `uint64.high / 1e7` (~58.5
+    ## years). `cast[uint32]` reinterprets the bits first, the way
+    ## `std/winlean`'s own internal FILETIME-to-`int64` helper does it.
+    let ticks = (uint64(cast[uint32](t.dwHighDateTime)) shl 32) or
+      uint64(cast[uint32](t.dwLowDateTime))
     float(ticks) / 1e7
 
   proc winOpenNulForRead(): Handle =

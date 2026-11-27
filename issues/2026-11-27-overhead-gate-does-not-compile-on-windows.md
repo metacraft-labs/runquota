@@ -212,5 +212,28 @@ limit_bytes=1073741824` (`GateMemoryCapBytes`, 1 GiB), and the gate
 produces real wall/CPU intervals narrowing round over round (a short
 4-round smoke run: wall 5.9% ±16.6, cpu 3.6% ±25.5 -- correctly
 `INCONCLUSIVE`, too few rounds for the required precision, not a failure).
-A full-precision run (default rounds, 25-minute budget) is in progress;
-its verdict will be recorded in RunQuota-Memory-Caps.md § "Verdicts".
+
+**A fifth defect, found by the first full-precision run itself** (default
+rounds, 200 reached, 1342 s): the CPU side went to individual samples near
+1,844,674,406,945 seconds (~58.5 years) partway through round 78, then to
+`nan` by round 180 (one such outlier's squared deviation dominates a naive
+variance calculation; the statistics module is not at fault for not
+surviving an impossible input). Traced to `process_cost.fileTimeToSeconds`:
+`std/winlean.DWORD` is `int32`, not `uint32` (a Nim-specific quirk --
+confirmed by reading `winlean.nim` itself, whose OWN internal
+FILETIME-to-`int64` helper avoids exactly this with a `cast[uint32]`,
+line 349 of that file, which this code did not use), so a plain `uint64(x)`
+on `dwLowDateTime` or `dwHighDateTime` sign-extends the moment that word's
+top bit is set -- `dwLowDateTime` alone passes 2^31 ticks at 214.7 s of
+accumulated CPU, well within reach of a long-lived benchmark daemon
+queried every round for ~22 minutes (round 78 lines up: ~80 rounds x
+~2.5 s of daemon CPU per round ~= 200 s). Reproduced in isolation with a
+crafted `FILETIME` (`dwLowDateTime` with its top bit set, `dwHighDateTime`
+0): the old code reported 1,844,674,407,177.65 s -- the same magnitude as
+the live corruption -- the fixed one 236.20 s, matching the ticks given
+(236.48 s) to rounding. Fixed with `cast[uint32]` on each word before
+widening, mirroring `winlean`'s own pattern; this helper is only used by
+this benchmark tool (`runquota_process.nim`'s own job-based CPU accounting
+never goes through `FILETIME`, so production launches were never affected).
+A second full-precision run with the fix is in progress; its verdict will
+be recorded in RunQuota-Memory-Caps.md § "Verdicts".
