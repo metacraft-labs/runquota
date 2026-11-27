@@ -91,6 +91,11 @@ type
       ## The command's largest successful tree peak, 0 when none is recorded.
     factorMilli*: uint32
       ## The factor the daemon applied, in thousandths.
+    budgetBytes*: uint64
+      ## The target machine's memory budget at the grant. With a `budget`
+      ## basis the cap is this minus what other leases held, so a report can
+      ## say how the free memory came about without a second question to
+      ## the daemon.
 
   FinishMemoryCap* = object
     ## What a launcher that enforced or measured a cap reports with the
