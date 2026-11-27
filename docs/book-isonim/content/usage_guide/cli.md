@@ -436,9 +436,11 @@ own (with [placement](#priority-below-admission) on) whose `memory.max` is the
 cap; the kernel kills the whole tree, and only it, when it passes the cap. On
 **macOS** the launcher reads the tree's memory footprint every 100 ms and, in
 `kill` mode, stops and kills the tree itself; a peak shorter than a reading
-can pass unseen. On **Windows** the mechanism is not built yet. Where a cap
-applies and the launcher could not put it in place (Windows, or Linux without
-a cgroup root), it says so on stderr as the command starts — `memory cap not
+can pass unseen. On **Windows** the tree's Job Object carries a commit limit
+at the cap and the launcher terminates the job when it reaches it; commit is
+not resident memory, so the same cap is stricter there. Where a cap applies
+and the launcher could not put it in place (Linux without a cgroup root, a
+tree outside its Job Object), it says so on stderr as the command starts — `memory cap not
 enforced: <why>` — and the command runs uncapped.
 
 

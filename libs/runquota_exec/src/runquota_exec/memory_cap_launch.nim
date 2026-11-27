@@ -146,7 +146,7 @@ proc platformMemoryCapGap(): string =
   elif defined(macosx):
     "this build's launcher did not apply it"
   elif defined(windows):
-    "not implemented on windows yet"
+    "this build's launcher did not apply it"
   else:
     "not implemented on this platform yet"
 

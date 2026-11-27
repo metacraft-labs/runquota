@@ -1,8 +1,8 @@
 ## A memory cap that applies but that the platform layer did not enforce is
 ## SAID by every CLI launcher, never silent.
 ##
-## Where a platform cannot put the cap in place (Windows has no mechanism
-## yet; Linux needs a cgroup root, which the suite leaves off), a launch asked
+## Where a platform cannot put the cap in place (Linux needs a cgroup root,
+## which the suite leaves off), a launch asked
 ## to apply a cap runs uncapped. macOS arms its own tracker for every capped
 ## launch, so there the cap IS applied and nothing is said. That must be visible: `runquota run`,
 ## `acquire -- CMD` and `jobserver` print `memory cap not enforced: <why>` on

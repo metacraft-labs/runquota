@@ -158,7 +158,7 @@ suite "memoryCapNotEnforced":
     let unsaid = memoryCapNotEnforced(capped, LaunchResult())
     check unsaid.startsWith("memory cap not enforced: ")
     when defined(windows):
-      check unsaid == "memory cap not enforced: not implemented on windows yet"
+      check unsaid == "memory cap not enforced: this build's launcher did not apply it"
     # A lifted run that is not measured says that instead.
     let lifted = resolveMemoryCap(learnedGrant, mcmKill, "off", false)
     check memoryCapNotEnforced(lifted, LaunchResult()).startsWith(

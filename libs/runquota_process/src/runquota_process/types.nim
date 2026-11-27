@@ -319,9 +319,9 @@ type
       ## by `stopMemoryCapWatcher`. 0 when there is no watcher.
     memoryCapBytes*: uint64
       ## Copied from `CommandSpec.memoryCapBytes` at launch, for the
-      ## completion to report even after the spec itself is gone.
+      ## completion to report even after the spec itself is gone (every OS).
     memoryCapAction*: MemoryCapAction
-      ## Copied from `CommandSpec.memoryCapAction` at launch.
+      ## Copied from `CommandSpec.memoryCapAction` at launch (every OS).
     memoryCapMeasuring*: bool
       ## Whether this launch reads the platform mechanism's peak at the end
       ## at all (`memoryCapBytes > 0 or CommandSpec.memoryCapMeasure`).
@@ -345,9 +345,6 @@ type
     memoryCap*: MemoryCapWatch
       ## The launcher's readings and judgement of the tree's memory cap
       ## (macOS; inactive elsewhere and when the launch has no cap).
-    memoryCapBytes*: uint64
-      ## `CommandSpec.memoryCapBytes`, reported with the completion.
-    memoryCapAction*: MemoryCapAction
     memoryCapWanted*: bool
       ## The spec asked for a memory cap or a measurement.
     memoryClassify*: bool

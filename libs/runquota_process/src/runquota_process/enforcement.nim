@@ -242,7 +242,25 @@ proc macosRecord(qosOn: bool; problem = "";
 const WindowsWidthCapHow = "Job Object CPU rate control, a hard cap at the " &
   "granted width (runquota run --cap)"
 
-proc windowsRecord(jobPriorityOn: bool; problem = ""): EnforcementRecord =
+proc windowsMemoryCapEntry(mode: MemoryCapMode): EnforcementEntry =
+  ## The memory cap on Windows is the tree's Job Object: a job-wide commit
+  ## limit, and a notification just below it on which the launcher
+  ## terminates the job. It caps COMMIT, not resident memory, so the same
+  ## figure is stricter than on Linux or macOS.
+  case mode
+  of mcmOff:
+    entry(emMemoryCap, elAdmissionOnly, "admission (memory reservation)",
+      "off by default (the host file does not set [enforcement] memoryCap)")
+  of mcmAdvisory:
+    entry(emMemoryCap, elNone,
+      "the Job Object's peak commit, reported, never killed",
+      "advisory: a tree past its cap is reported and runs on")
+  of mcmKill:
+    entry(emMemoryCap, elEnforced,
+      "Job Object commit limit; the launcher terminates the job at the cap")
+
+proc windowsRecord(jobPriorityOn: bool; problem = "";
+                   memoryCapMode = mcmOff): EnforcementRecord =
   ## Two layers, as on Linux. The RECLAIMED tree always runs at least at
   ## `BELOW_NORMAL_PRIORITY_CLASS` (unconditional, like Linux's nice +10), so
   ## `reclaimed` is enforced whether or not the switch is on. PRIORITY between
@@ -267,8 +285,7 @@ proc windowsRecord(jobPriorityOn: bool; problem = ""): EnforcementRecord =
         "Job Object priority-class limit of idle, below the unconditional " &
         "below-normal class a reclaimed tree already runs at"),
       entry(emWidthCap, elEnforced, WindowsWidthCapHow),
-      entry(emMemoryCap, elAdmissionOnly, "admission (memory reservation)",
-        "Job Object memory limits are not set by RunQuota launchers yet"),
+      windowsMemoryCapEntry(memoryCapMode),
     ]
   else:
     let reason = if problem.len > 0: problem
@@ -282,8 +299,7 @@ proc windowsRecord(jobPriorityOn: bool; problem = ""): EnforcementRecord =
         "below-normal priority class of the whole tree (inherited by every " &
         "process it spawns)"),
       entry(emWidthCap, elEnforced, WindowsWidthCapHow),
-      entry(emMemoryCap, elAdmissionOnly, "admission (memory reservation)",
-        "Job Object memory limits are not set by RunQuota launchers yet"),
+      windowsMemoryCapEntry(memoryCapMode),
     ]
 
 proc enforcementRecordFor*(os: string; root = CgroupRoot();
@@ -307,7 +323,8 @@ proc enforcementRecordFor*(os: string; root = CgroupRoot();
   case os
   of "linux": linuxRecord(root, probeProblem, memory, memoryCapMode)
   of "macos": macosRecord(qosOn, qosProblem, memoryCapMode)
-  of "windows": windowsRecord(jobPriorityOn, jobPriorityProblem)
+  of "windows": windowsRecord(jobPriorityOn, jobPriorityProblem,
+    memoryCapMode)
   else:
     EnforcementRecord(os: os, placement: "n/a", entries: @[
       entry(emPriority, elAdmissionOnly, "admission", "no backend for " & os),

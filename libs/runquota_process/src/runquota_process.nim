@@ -1865,7 +1865,19 @@ when defined(windows):
         processGroupId: processId,
         running: true,
         backend: backendProfile(),
-        fallbackNice: spec.placementFallbackNice
+        fallbackNice: spec.placementFallbackNice,
+        # The cap is in force when the tree is in its Job Object and, in
+        # kill mode, the watcher that terminates the job at the cap runs.
+        memoryCapApplied: memoryCapMeasuring and
+          (spec.memoryCapBytes == 0 or spec.memoryCapAction != mcaKill or
+           memoryCapThread != 0'u64),
+        memoryCapProblem:
+          (if not (spec.memoryCapBytes > 0 or spec.memoryCapMeasure): ""
+           elif job == 0: "the tree is in no Job Object"
+           elif spec.memoryCapBytes > 0 and spec.memoryCapAction == mcaKill and
+               memoryCapThread == 0'u64:
+             "the watcher that terminates the job at the cap did not start"
+           else: "")
       ),
       winStdoutClosed: spec.stdio == inheritStdio,
       winStderrClosed: spec.stdio == inheritStdio,

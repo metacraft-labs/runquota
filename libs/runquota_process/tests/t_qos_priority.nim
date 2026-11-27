@@ -182,6 +182,19 @@ suite "macOS priority tiers":
     check capKill.entries[3].level == elDegraded
     check "kills the tree" in capKill.entries[3].how
     check "can miss a shorter peak" in capKill.entries[3].gap
+    # Windows likewise: the Job Object's commit limit is the cap, so kill
+    # mode is enforced, advisory reports only, off is admission only.
+    # Mutation: the Windows record ignores the mode -> kill reads
+    # admission-only.
+    for (mode, level) in [(mcmOff, elAdmissionOnly), (mcmAdvisory, elNone),
+                          (mcmKill, elEnforced)]:
+      let win = enforcementRecordFor("windows", memoryCapMode = mode)
+      var found = false
+      for item in win.entries:
+        if item.mechanism == emMemoryCap:
+          found = true
+          check item.level == level
+      check found
 
 when defined(macosx):
   suite "macOS priority policy of a launched tree (the OS's own readback)":
