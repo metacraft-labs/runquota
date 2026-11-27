@@ -200,6 +200,9 @@ type
     oomKilledOutsideCap*: bool
       ## A process of the tree was killed for memory by something other than
       ## its cap (a host-wide OOM, an ancestor's limit).
+    memoryCapProblem*: string
+      ## Why a cap or measurement the spec asked for was not measured
+      ## (`memoryCapMeasured` false), or "".
     processCount*: uint32
     telemetrySource*: string
     totals*: FinishTotals

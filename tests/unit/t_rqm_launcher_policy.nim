@@ -10,6 +10,11 @@
 ##   section of the memory-cap design, one assertion per cell. Mutations:
 ##   ignoring the variable (every `off`/size/mode row goes red), treating a
 ##   nested launcher like an outer one, and capping a lifted run.
+## * `memoryCapNotEnforced`: a cap that applies and that the platform layer
+##   did not put in place is said ("memory cap not enforced: <why>", the
+##   launch's reason or the platform's missing mechanism); nothing is said
+##   when it was applied or nothing applied. Mutation: answer "" always (the
+##   state every launcher was in before this note existed).
 ## * `finishOutcome`: a cap kill with kill evidence is `lfCapExceeded`, an
 ##   outside OOM kill is `lfOomKilled`, either without evidence is not
 ##   stated, and a cap kill the launch did not measure is not named a cap
@@ -139,6 +144,33 @@ suite "resolveMemoryCap":
     var lifted = commandSpec(@["true"])
     lifted.applyMemoryCap(resolveMemoryCap(learnedGrant, mcmKill, "off", false))
     check lifted.memoryCapBytes == 0'u64 and lifted.memoryCapMeasure
+
+suite "memoryCapNotEnforced":
+  test "a cap the platform did not apply is said, with the reason":
+    let capped = resolveMemoryCap(learnedGrant, mcmKill, "", false)
+    let given = memoryCapNotEnforced(capped,
+      LaunchResult(memoryCapApplied: false, memoryCapProblem: "no cgroup root"))
+    check given == "memory cap not enforced: no cgroup root"
+    let unsaid = memoryCapNotEnforced(capped, LaunchResult())
+    check unsaid.startsWith("memory cap not enforced: ")
+    when defined(macosx):
+      check unsaid == "memory cap not enforced: not implemented on macos yet"
+    elif defined(windows):
+      check unsaid == "memory cap not enforced: not implemented on windows yet"
+    # A lifted run that is not measured says that instead.
+    let lifted = resolveMemoryCap(learnedGrant, mcmKill, "off", false)
+    check memoryCapNotEnforced(lifted, LaunchResult()).startsWith(
+      "memory cap not measured: ")
+
+  test "nothing to say when it was applied, or when nothing applied":
+    let capped = resolveMemoryCap(learnedGrant, mcmKill, "", false)
+    check memoryCapNotEnforced(capped,
+      LaunchResult(memoryCapApplied: true)) == ""
+    for r in [resolveMemoryCap(learnedGrant, mcmOff, "", false),
+              resolveMemoryCap(noGrant, mcmKill, "", false),
+              resolveMemoryCap(learnedGrant, mcmKill, "", nested = true),
+              resolveMemoryCap(learnedGrant, mcmKill, "bogus", false)]:
+      check memoryCapNotEnforced(r, LaunchResult()) == ""
 
 proc completion(exitCode = 0; signal = 0; measured = true;
                 capKilled = false; outside = false; reached = false;

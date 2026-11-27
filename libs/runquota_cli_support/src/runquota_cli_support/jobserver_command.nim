@@ -932,6 +932,9 @@ proc runJobserver*(args: seq[string];
       if options.verbose:
         stderr.writeLine("runquota jobserver: " &
           placement.placementNote(child.info))
+      let capNote = memoryCap.memoryCapNotEnforced(child.info)
+      if capNote.len > 0:
+        stderr.writeLine("runquota jobserver: " & capNote)
       let group = Pid(child.processGroupId)
       forwardGroup = cint(group)
       installGroupForwarding()
@@ -1081,6 +1084,9 @@ proc runJobserver*(args: seq[string];
         stderr.writeLine("runquota jobserver: cannot start " & command[0] &
           ": " & failure.msg)
         return 127
+      let capNote = memoryCap.memoryCapNotEnforced(child.info)
+      if capNote.len > 0:
+        stderr.writeLine("runquota jobserver: " & capNote)
       lease.markRunning(childProcessId = child.info.processId,
         processGroupId = child.info.processGroupId)
       if resizable:

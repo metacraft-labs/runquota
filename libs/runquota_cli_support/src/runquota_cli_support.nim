@@ -271,9 +271,24 @@ proc printStatus(json: bool): int =
   # THE ENFORCEMENT RECORD IS THIS CLIENT'S, not the daemon's: the cgroups
   # belong to the launching client and its user (`runquota_process/
   # enforcement`).
-  let enforcement = hostEnforcementRecord(launcherCgroupRoot(),
-    jobPriorityOn = launcherJobPriorityOn(),
-    qosOn = launcherQosOn())
+  #
+  # THE MEMORY-CAP MODE the host file sets for this client's launchers goes
+  # into the record too. MERGE HOOK: the record's `memoryCapMode` parameter
+  # arrives with the platform branch that enforces the cap; until then this
+  # build's `hostEnforcementRecord` has none, and `when compiles` keeps the
+  # call that does not pass it. Once both are in one tree, replace the
+  # `when` with the first call.
+  let memoryCapMode = launcherMemoryCapMode()
+  let enforcement =
+    when compiles(hostEnforcementRecord(memoryCapMode = memoryCapMode)):
+      hostEnforcementRecord(launcherCgroupRoot(),
+        jobPriorityOn = launcherJobPriorityOn(),
+        qosOn = launcherQosOn(),
+        memoryCapMode = memoryCapMode)
+    else:
+      hostEnforcementRecord(launcherCgroupRoot(),
+        jobPriorityOn = launcherJobPriorityOn(),
+        qosOn = launcherQosOn())
   if json:
     let daemonJson =
       if statusJson.len > 0: statusJson else: inspectionStatusJson(status)
@@ -1087,6 +1102,8 @@ proc runDebugAcquire(args: seq[string]): int =
           jobPriorityOn = launcherJobPriorityOn(),
           qosOn = launcherQosOn(),
           memoryCapMode = launcherMemoryCapMode())
+      if execution.memoryCapNote.len > 0:
+        stderr.writeLine("runquota acquire: " & execution.memoryCapNote)
       stdout.write(execution.process.stdout)
       stderr.write(execution.process.stderr)
       printMemoryCapReport(execution.memoryCapReport)

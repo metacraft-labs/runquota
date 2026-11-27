@@ -344,13 +344,13 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
     # A reclaimed grant runs at the lower weight, whatever the caller asked.
     spec.niceIncrement = max(spec.niceIncrement, lease.reclaimedNice())
     spec.applyMemoryCap(cap)
-    result.memoryCapNote = cap.reason
     if placeTree:
       spec.applyPlacement(session.treePlacement(lease, root = cgroupRoot,
         jobPriorityOn = jobPriorityOn, qosOn = qosOn))
     if exportParentLease:
       spec.env.add(lease.parentLeaseEnvEntry())
     var child = launchProcess(spec)
+    result.memoryCapNote = cap.memoryCapNotEnforced(child.info)
     result.backend = child.info.backend
     result.cgroupPath = child.info.cgroupPath
     result.cgroupProblem = child.info.cgroupProblem

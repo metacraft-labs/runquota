@@ -25,8 +25,9 @@ type
       ## placement was asked for).
     cgroupProblem*: string
     memoryCapNote*: string
-      ## Why the tree ran without a memory cap (`MemoryCapResolution.reason`),
-      ## or "" when one was applied or measured.
+      ## "memory cap not enforced: <why>" when a cap applied and the
+      ## platform layer did not enforce it (`memoryCapNotEnforced`), "" when
+      ## it did or when no cap applied. The launcher shows it.
     memoryCapReport*: string
       ## The report of a tree that passed its memory cap
       ## (`memoryCapReport`), "" when it did not. The launcher shows it.

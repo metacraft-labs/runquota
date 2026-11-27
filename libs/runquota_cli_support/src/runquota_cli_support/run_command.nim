@@ -538,6 +538,11 @@ proc runRun*(args: seq[string];
           placement.placementNote(child.info))
     if options.verbose:
       stderr.writeLine("runquota run: " & placement.placementNote(child.info))
+    # A cap that applies but that the platform did not enforce is said as
+    # the command starts, never silently (as an unenforceable `--cap` is).
+    let capNote = memoryCap.memoryCapNotEnforced(child.info)
+    if capNote.len > 0:
+      stderr.writeLine("runquota run: " & capNote)
     lease.markRunning(childProcessId = child.info.processId)
     let completion = child.waitForCompletion()
     when defined(posix):

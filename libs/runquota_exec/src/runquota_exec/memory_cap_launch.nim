@@ -138,6 +138,40 @@ proc applyMemoryCap*(spec: var CommandSpec; resolution: MemoryCapResolution) =
   spec.memoryCapAction = resolution.action
   spec.memoryCapMeasure = resolution.measure
 
+proc platformMemoryCapGap(): string =
+  ## Why this platform's launcher applies no memory cap at all yet, for a
+  ## launch that did not say why itself.
+  when defined(linux):
+    "this build's launcher did not apply it"
+  elif defined(macosx):
+    "not implemented on macos yet"
+  elif defined(windows):
+    "not implemented on windows yet"
+  else:
+    "not implemented on this platform yet"
+
+proc memoryCapNotEnforced*(resolution: MemoryCapResolution;
+                           launch: LaunchResult): string =
+  ## "memory cap not enforced: <why>" when the launch was asked to apply a
+  ## cap (or to measure a lifted run, "memory cap not measured: <why>") and
+  ## the platform layer did not; "" when it did, or when nothing was asked.
+  ##
+  ## SAID, NEVER SILENT. A cap the host file turned on and the grant
+  ## carried, but that nothing enforces, is the state a user must be able
+  ## to see: a regression would then run unchecked while every figure in
+  ## the verbose output says it is capped. The launch never fails over it
+  ## (the tree runs regardless), exactly as an unenforceable `--cap` does.
+  ## The reason is the launch's own (`LaunchResult.memoryCapProblem`), or,
+  ## where the platform has no mechanism yet, that it has none.
+  if resolution.error.len > 0 or not resolution.applies or
+      launch.memoryCapApplied:
+    return ""
+  let why =
+    if launch.memoryCapProblem.len > 0: launch.memoryCapProblem
+    else: platformMemoryCapGap()
+  if resolution.capBytes > 0'u64: "memory cap not enforced: " & why
+  else: "memory cap not measured: " & why
+
 proc finishMemoryCap*(completion: ProcessCompletion;
                       resolution: MemoryCapResolution): FinishMemoryCap =
   ## The finish's memory-cap block: present when the launch measured the
