@@ -152,8 +152,18 @@ suite "cgroup placement rules":
         check ch in {'A'..'Z', 'a'..'z', '0'..'9', '_', ':', '@', '-', '%', '~'}
       let target = targetFor(CgroupRoot(state: crsExplicit, path: root), name,
         sessionPriorityNormal, reclaimed = false)
-      check target.leafPath.parentDir.parentDir == root
-      check normalizedPath(target.leafPath).startsWith(root & "/")
+      # A cgroup path is always `/`-separated (see `cgroupChild` in
+      # `cgroup_placement.nim`), on every OS it is built, tested and
+      # printed on -- but `std/os`'s `parentDir` and `normalizedPath`
+      # reassemble a path with the HOST's native separator, which rewrites
+      # it to `\` on Windows even though no `\` was ever in it. So the
+      # grandparent is taken by hand here, by `/`, instead of through
+      # `parentDir`.
+      let leaf = target.leafPath
+      check leaf.startsWith(root & "/")
+      let withoutLeaf = leaf[0 ..< leaf.rfind('/')]
+      let grandparent = withoutLeaf[0 ..< withoutLeaf.rfind('/')]
+      check grandparent == root
       check not seen.contains(dir)
       seen.incl(dir)
     check groupDirName("a:b@c-d_e") == "group-a:b@c-d_e"

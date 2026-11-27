@@ -327,11 +327,21 @@ proc placed*(target: CgroupTarget): bool =
   ## Whether `target` asks for any placement at all.
   target.root.len > 0
 
+proc cgroupChild(parent, child: string): string =
+  ## Joins one component onto a cgroup v2 path with a literal ``/``, on
+  ## every OS. A cgroup path is a path of the Linux kernel (cgroupfs is
+  ## Linux-only), never the host's own filesystem, so it is always
+  ## forward-slash-separated -- including when these pure rules are built,
+  ## tested and printed on a non-Linux host. ``std/os``'s ``/`` operator
+  ## joins with the HOST's native separator, which is ``\`` on Windows, and
+  ## silently rewrites the whole path there.
+  parent & "/" & child
+
 proc dirPath*(target: CgroupTarget): string =
-  target.root / target.dirName
+  cgroupChild(target.root, target.dirName)
 
 proc leafPath*(target: CgroupTarget): string =
-  target.root / target.dirName / target.leafName
+  cgroupChild(cgroupChild(target.root, target.dirName), target.leafName)
 
 proc isCapLeaf*(target: CgroupTarget): bool =
   target.leafName.startsWith(CapLeafPrefix)
