@@ -260,6 +260,12 @@ type
       ## `[machine] write_bytes_per_sec` of the host file, 0 when it sets
       ## none. Reported (`status`, `profile`, `sizing`), never admitted
       ## against.
+    memoryCapFactorMilli*: uint32
+      ## `[enforcement] memoryCapFactor` in thousandths (default
+      ## `DefaultMemoryCapFactorMilli`, never below
+      ## `MinMemoryCapFactorMilli`): a learned memory cap is this factor
+      ## times the command's largest successful tree peak. Recomputed on
+      ## every reload.
     oversubscriptionPermille*: uint32
       ## `admission.oversubscription` in thousandths: CPU grants may reach
       ## each machine's and CPU share group's budget x (1 + this / 1000).
@@ -505,6 +511,14 @@ type
     reclaimed*: bool
       ## Granted into predicted slack rather than free capacity. Charged to
       ## the ledger like any grant; predicted at its charge thereafter.
+    memoryCap*: GrantMemoryCap
+      ## The memory cap computed when the lease was granted
+      ## (`computeMemoryCap`), fixed from then on: leases that end later do
+      ## not raise it and leases granted later do not lower it. Kept on the
+      ## row so every path that reports the grant (`leaseDecision`, a
+      ## `GrantNext`, the `LeaseGranted` answer) carries the same figure.
+      ## Not known for a queued lease, a sub-lease (it runs inside its
+      ## parent's tree and cap) or a lease with no memory dimension.
 
   ConnectionContext* = object
     socketClass*: string
@@ -522,6 +536,12 @@ type
       ## see, and a child it reports is watched through the connection's
       ## peer process instead (LeaseRunning).
     sessionIds*: seq[SessionId]
+    clientMinor*: uint16
+      ## The protocol minor the client announced in its `Hello`
+      ## (`runquota_protocol.ClientMinorToken`), 0 for a client that
+      ## announced none. Decides which optional blocks the daemon may add to
+      ## what it SENDS on this connection: a grant's memory cap only at
+      ## `MemoryCapMinor` or above, since an older client refuses the bytes.
     preparedDeclaration*: PreparedDeclaration
       ## The store half of the `DeclareExtension` frame being handled, done
       ## on this connection's worker BEFORE the request took the daemon-wide

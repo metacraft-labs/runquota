@@ -22,6 +22,7 @@ import runquota_daemon/class_claims
 import runquota_daemon/class_sockets
 import runquota_daemon/prediction
 import runquota_daemon/host_link
+import runquota_daemon/memory_caps
 import runquota_admission
 import runquota_codec
 import runquota_core
@@ -358,6 +359,11 @@ proc applyClassKeys(config: var DaemonConfig; host: HostConfig) =
   ## file dropped is no reservation any more. No flag names them.
   config.oversubscriptionPermille = host.oversubscriptionPermille.get(0'u32)
   config.reservations = host.reservations
+  # `[enforcement] memoryCapFactor`, the file's or the default, recomputed
+  # on every reload like the keys above: unsetting it takes the factor back
+  # to 2. The mode (`memoryCap`) is the launchers' to read, not the daemon's.
+  config.memoryCapFactorMilli =
+    host.memoryCapFactorMilli.get(DefaultMemoryCapFactorMilli)
 
 proc resolveBudget*(config: var DaemonConfig; host: HostConfig) =
   ## The budget from the bottom up: the built-in defaults, then `host`, then
@@ -1932,8 +1938,29 @@ proc leaseDecision(lease: LeaseRow; kind: LeaseDecisionKind;
     kind: kind,
     resources: lease.resources,
     diagnostic: if kind == leaseDecisionQueued: lease.queueDiagnostic else: diagnostic,
-    reclaimed: kind == leaseDecisionGranted and lease.reclaimed
+    reclaimed: kind == leaseDecisionGranted and lease.reclaimed,
+    memoryCap:
+      if kind == leaseDecisionGranted: lease.memoryCap
+      else: GrantMemoryCap(known: false)
   )
+
+proc sendsMemoryCap(context: ConnectionContext): bool =
+  ## Whether this connection's client decodes a grant's memory-cap block: it
+  ## announced `MemoryCapMinor` or later in its `Hello`. An older client
+  ## refuses a grant with bytes after its flags, so it is sent none.
+  context.clientMinor >= MemoryCapMinor
+
+proc encodeDecisionsFor(context: ConnectionContext;
+                        msg: LeaseDecisionBatchMessage): string =
+  ## `encodeLeaseDecisionBatch`, with every decision's memory cap dropped for
+  ## a client that cannot decode it (`sendsMemoryCap`). The caps stay on the
+  ## lease rows either way; only what goes on this connection changes.
+  if context.sendsMemoryCap():
+    return encodeLeaseDecisionBatch(msg)
+  var stripped = msg
+  for decision in stripped.decisions.mitems:
+    decision.memoryCap = GrantMemoryCap(known: false)
+  encodeLeaseDecisionBatch(stripped)
 
 proc sessionsJson(daemon: RunQuotaDaemon): string =
   var ids: seq[uint64] = @[]
@@ -2658,7 +2685,15 @@ proc estimatesJson(daemon: RunQuotaDaemon): string =
       "\"command_stats_id\":" & jsonEscape(row.commandStatsId) & "," &
       "\"conservative_memory_bytes\":" & $row.conservativeMemoryBytes & "," &
       "\"recent_peak_memory_bytes\":" & $row.recentPeakMemoryBytes & "," &
-      "\"sample_count\":" & $row.sampleCount &
+      "\"sample_count\":" & $row.sampleCount & "," &
+      "\"last_outcome\":" & $row.lastOutcome & "," &
+      "\"max_observed_peak_bytes\":" & $row.maxObservedPeakBytes & "," &
+      "\"declared_cap_bytes\":" & $row.declaredCapBytes & "," &
+      "\"declared_by_uid\":" & $row.declaredByUid & "," &
+      "\"declared_unix_millis\":" & $row.declaredUnixMillis & "," &
+      "\"last_breach_cap_bytes\":" & $row.lastBreachCapBytes & "," &
+      "\"last_breach_peak_bytes\":" & $row.lastBreachPeakBytes & "," &
+      "\"last_breach_unix_millis\":" & $row.lastBreachUnixMillis &
     "}")
   result.add("],\"cpu_estimates\":[")
   var cpuKeys: seq[string] = @[]
@@ -3548,6 +3583,10 @@ proc handleHello(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     else: hello.userId
   context.peer = peer
   context.foreignPidNamespace = difference.pid
+  # WHAT THIS CLIENT DECODES, from its own announcement: a client that
+  # announces nothing is older than the announcement and is sent the bytes
+  # such a client expects.
+  context.clientMinor = announcedClientMinor(hello.desiredCapabilities)
   true
 
 proc benchmarkPermitted(daemon: RunQuotaDaemon; sessionId: SessionId): bool =
@@ -3756,36 +3795,97 @@ proc finishPeakMemoryBytes(finish: LeaseFinishedMessage): uint64 =
 
 proc updateEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
                               finish: LeaseFinishedMessage) =
-  let peakMemoryBytes = finishPeakMemoryBytes(finish)
-  if lease.commandStatsId.len == 0 or peakMemoryBytes == 0:
+  ## Fold a finish into its command's learned row (`memory_caps.learnFromFinish`
+  ## holds the rules, including what a cap breach and an OOM kill teach).
+  ##
+  ## THE OBSERVED PEAK includes the tree peak of the finish's memory-cap
+  ## block when it has one: that figure is the cap mechanism's own
+  ## measurement of the whole tree (a cgroup's `memory.peak`, a job's peak
+  ## commit, the footprint walk's largest sum), and it is never smaller than
+  ## what sampling or `ru_maxrss` could see of the same tree.
+  if lease.commandStatsId.len == 0:
     return
   if not daemon.sessions.hasKey(lease.sessionId.value):
     return
+  var observed = finishPeakMemoryBytes(finish)
+  if finish.memoryCap.present:
+    observed = max(observed, finish.memoryCap.treePeakBytes)
   let scope = daemon.sessions[lease.sessionId.value].sessionScope()
   let key = estimateTableKey(scope, lease.commandStatsId)
-  let observed = peakMemoryBytes
-  var conservative =
-    if finish.finish.kind == lfOomKilled:
-      max(observed, lease.resources.memory.value) * 2'u64
-    else:
-      max(observed, (observed * 125'u64) div 100'u64)
-  var sampleCount = 1'u32
-  if daemon.estimates.hasKey(key):
-    let current = daemon.estimates[key]
-    sampleCount = current.sampleCount + 1'u32
-    if conservative < current.conservativeMemoryBytes:
-      conservative = current.conservativeMemoryBytes
-  let row = LearnedEstimateRow(
-    scope: scope,
-    commandStatsId: lease.commandStatsId,
-    conservativeMemoryBytes: conservative,
-    recentPeakMemoryBytes: observed,
-    sampleCount: sampleCount,
-    lastOutcome: uint32(ord(finish.finish.kind)),
-    updatedUnixMillis: nowUnixMillis()
-  )
+  var row = daemon.estimates.getOrDefault(key, LearnedEstimateRow(
+    scope: scope, commandStatsId: lease.commandStatsId))
+  if not row.learnFromFinish(finish, observed, lease.resources.memory.value,
+      nowUnixMillis()):
+    return
   daemon.estimates[key] = row
   discard enqueueEstimateWrite(daemon.estimateStore, row)
+
+proc leaseMemoryCap(daemon: RunQuotaDaemon; lease: LeaseRow;
+                    othersMemoryBytes: uint64): GrantMemoryCap =
+  ## The memory cap of `lease` at its grant (`memory_caps.grantMemoryCap`),
+  ## or none for a lease without a memory dimension of its own: a
+  ## sub-lease runs inside its parent's tree and its parent's cap, and a
+  ## lease with no memory (a pool-only lease) has nothing to cap.
+  ##
+  ## M is the command's largest successful peak in the SESSION's scope, the
+  ## same row admission reads; D is the declaration, which is the command's
+  ## whatever launcher runs it (`DeclarationScope`).
+  if lease.parentLeaseId != 0'u64 or lease.resources.memory.value == 0'u64:
+    return GrantMemoryCap(known: false)
+  var machine: MachineCapacity
+  if not daemon.machineFor(lease.resources.resolvedMachineId(), machine):
+    return GrantMemoryCap(known: false)
+  var maxPeak = 0'u64
+  var declared = 0'u64
+  if lease.commandStatsId.len > 0:
+    if daemon.sessions.hasKey(lease.sessionId.value):
+      let key = estimateTableKey(
+        daemon.sessions[lease.sessionId.value].sessionScope(),
+        lease.commandStatsId)
+      if daemon.estimates.hasKey(key):
+        maxPeak = daemon.estimates[key].maxObservedPeakBytes
+    let declaration = estimateTableKey(DeclarationScope, lease.commandStatsId)
+    if daemon.estimates.hasKey(declaration):
+      declared = daemon.estimates[declaration].declaredCapBytes
+  grantMemoryCap(maxPeak, declared, machine.memoryBytes.value,
+    othersMemoryBytes, daemon.config.memoryCapFactorMilli)
+
+proc machineMemoryHeld(daemon: RunQuotaDaemon; lease: LeaseRow): uint64 =
+  ## What the leases holding memory on `lease`'s machine charge to its
+  ## ledger now: granted, starting or running, any user. The USAGE figure,
+  ## not the class reservations: it is what admission has granted, which is
+  ## what the free budget is free of.
+  var machine: MachineCapacity
+  if not daemon.machineFor(lease.resources.resolvedMachineId(), machine):
+    return 0'u64
+  daemon.machineUsage.getOrDefault(machine.id, MachineUsage()).memory
+
+proc growthExpectation(daemon: RunQuotaDaemon;
+                       commandStatsId: string): GrowthExpectationMessage =
+  ## The cap figures of a command for `runquota expect-growth`: the
+  ## declaration, and over every launcher's learned row of that id the
+  ## largest successful peak, the highest admission figure and the most
+  ## recent breach. A walk of the table, on a request no hot path makes.
+  result.factorMilli = effectiveFactorMilli(daemon.config.memoryCapFactorMilli)
+  for row in daemon.estimates.values:
+    if row.commandStatsId != commandStatsId:
+      continue
+    if row.scope == DeclarationScope:
+      if row.declaredCapBytes > 0'u64:
+        result.found = true
+        result.declaredCapBytes = row.declaredCapBytes
+        result.declaredByUid = row.declaredByUid
+        result.declaredUnixMillis = row.declaredUnixMillis
+      continue
+    result.found = true
+    result.maxObservedPeakBytes = max(result.maxObservedPeakBytes,
+      row.maxObservedPeakBytes)
+    result.conservativeMemoryBytes = max(result.conservativeMemoryBytes,
+      row.conservativeMemoryBytes)
+    if row.lastBreachUnixMillis > result.lastBreachUnixMillis:
+      result.lastBreachCapBytes = row.lastBreachCapBytes
+      result.lastBreachPeakBytes = row.lastBreachPeakBytes
+      result.lastBreachUnixMillis = row.lastBreachUnixMillis
 
 proc foldCpuEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
                                finish: LeaseFinishedMessage) =
@@ -4393,6 +4493,13 @@ proc captureDeferredBatch(daemon: var RunQuotaDaemon;
 proc grantQueuedLease(daemon: var RunQuotaDaemon; id: uint64; delivered: bool) =
   var lease = daemon.leases[id]
   lease.grantedAtMillis = monoMillis()
+  # THE MEMORY CAP, computed here because every grant passes here (a
+  # request, an offer, a `GrantNext` promotion, a sub-lease) and fixed from
+  # here on. Read BEFORE the transition charges this lease to the ledger, so
+  # the memory held is what every OTHER lease holds at this moment.
+  if lease.parentLeaseId == 0'u64:
+    lease.memoryCap = daemon.leaseMemoryCap(lease,
+      daemon.machineMemoryHeld(lease))
   daemon.transitionLeaseState(lease, leaseStateGranted)
   lease.delivered = delivered
   daemon.leases[id] = lease
@@ -6145,7 +6252,10 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       sessionId: msg.sessionId,
       leaseId: queued.id,
       resources: grantedLease.resources,
-      reclaimed: grantedLease.reclaimed
+      reclaimed: grantedLease.reclaimed,
+      memoryCap:
+        if context.sendsMemoryCap(): grantedLease.memoryCap
+        else: GrantMemoryCap(known: false)
     )
     connection.sendResponse(rqLeaseGranted, frame.header.requestId,
         encodeLeaseGranted(granted))
@@ -6233,7 +6343,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     connection.sendResponse(
       rqLeaseDecisionBatch,
       frame.header.requestId,
-      encodeLeaseDecisionBatch(LeaseDecisionBatchMessage(
+      context.encodeDecisionsFor(LeaseDecisionBatchMessage(
           sessionId: msg.sessionId, decisions: @[decision])))
   of rqLeaseResized, rqLeaseGrowRequest:
     # Both report on, or ask about, a RESIZABLE lease and are answered with
@@ -6412,7 +6522,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     connection.sendResponse(
       rqLeaseDecisionBatch,
       frame.header.requestId,
-      encodeLeaseDecisionBatch(LeaseDecisionBatchMessage(
+      context.encodeDecisionsFor(LeaseDecisionBatchMessage(
           sessionId: msg.sessionId, decisions: decisions))
     )
   of rqGrantNext:
@@ -6428,7 +6538,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
     connection.sendResponse(
       rqLeaseDecisionBatch,
       frame.header.requestId,
-      encodeLeaseDecisionBatch(LeaseDecisionBatchMessage(
+      context.encodeDecisionsFor(LeaseDecisionBatchMessage(
           sessionId: msg.sessionId, decisions: decisions))
     )
   of rqLeaseStarting:
@@ -6751,7 +6861,7 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       else:
         decision = row.leaseDecision(leaseDecisionQueued)
     connection.sendResponse(rqLeaseDecisionBatch, frame.header.requestId,
-      encodeLeaseDecisionBatch(LeaseDecisionBatchMessage(
+      context.encodeDecisionsFor(LeaseDecisionBatchMessage(
         sessionId: msg.sessionId, decisions: @[decision])))
   of rqVirtualMachineStarted:
     var msg: VirtualMachineStartedMessage
@@ -6894,6 +7004,61 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
       frame.header.requestId,
       encodeStatsResponse(daemon.statsAnswer(context, msg))
     )
+  of rqExpectGrowth:
+    # ANY CONNECTION, AND NO SESSION. A declaration is about a command, made
+    # by a person or an agent between runs (`runquota expect-growth`), and
+    # it is recorded with the uid the KERNEL names for the peer -- never one
+    # the client declares -- so the row says who made it.
+    var msg: ExpectGrowthMessage
+    if not decodeExpectGrowth(frame.payload, msg):
+      connection.sendError(frame.header.requestId, diagnostic(diagProtocol,
+          "invalid ExpectGrowth payload"))
+      return
+    if msg.commandStatsId.len == 0 or
+        msg.commandStatsId.len > MaxCommandStatsIdBytes:
+      connection.sendError(frame.header.requestId, diagnostic(
+          diagInvalidArgument, "a command id is 1 to " &
+          $MaxCommandStatsIdBytes & " bytes, got " & $msg.commandStatsId.len,
+          "the id a grant is learned under is at most " &
+          $MaxCommandStatsIdBytes & " bytes; a longer one names no command"))
+      return
+    if msg.action == egSet and msg.sizeBytes < MinDeclaredMemoryCapBytes:
+      connection.sendError(frame.header.requestId, diagnostic(
+          diagInvalidArgument, "a declared memory cap must be at least " &
+          humanBytes(MinDeclaredMemoryCapBytes) & ", got " & $msg.sizeBytes &
+          " bytes", "a smaller declaration is a typo, not an expectation"))
+      return
+    if msg.action != egQuery:
+      let owner = ownerIdOf(context.peer)
+      if owner.isNone:
+        # AN UNATTRIBUTABLE DECLARATION IS REFUSED, not recorded as uid 0:
+        # 0 is root, and the declaration exists so the next reader can see
+        # who raised a command's cap.
+        connection.sendError(frame.header.requestId, diagnostic(diagDenied,
+            "the transport reported no credentials for this client, so a " &
+            "declaration could not say who made it",
+            "expect-growth records the declaring uid from peer credentials"))
+        return
+      let key = estimateTableKey(DeclarationScope, msg.commandStatsId)
+      var row = daemon.estimates.getOrDefault(key, LearnedEstimateRow(
+        scope: DeclarationScope, commandStatsId: msg.commandStatsId))
+      let now = nowUnixMillis()
+      if msg.action == egSet:
+        row.declaredCapBytes = msg.sizeBytes
+        row.declaredByUid = cast[uint64](owner.get)
+        row.declaredUnixMillis = now
+      else:
+        # The row stays, with its declaration cleared: the writer queue
+        # upserts and never deletes, and a zero declaration is none.
+        row.declaredCapBytes = 0'u64
+        row.declaredByUid = 0'u64
+        row.declaredUnixMillis = 0'u64
+      row.updatedUnixMillis = now
+      if msg.action == egSet or daemon.estimates.hasKey(key):
+        daemon.estimates[key] = row
+        discard enqueueEstimateWrite(daemon.estimateStore, row)
+    connection.sendResponse(rqGrowthExpectation, frame.header.requestId,
+        encodeGrowthExpectation(daemon.growthExpectation(msg.commandStatsId)))
   of rqInspectionRequest:
     var msg: InspectionRequestMessage
     if not decodeInspectionRequest(frame.payload, msg):
