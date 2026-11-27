@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Open -- confirmed by two independent gate runs; root cause (mechanism vs. this case's methodology) not yet isolated |
+| Status | Open, narrowing. A real bug in the Windows action itself (dead code at `-d:release`) is found and fixed; a suggestive (not yet precise) longer-action run with the fix shows overhead near zero, pointing at methodology over mechanism, but the recorded fail stands until a precise run replaces it |
 | Observed in | `runquota` @ `bb8ef2a8d1513f7b984c66621252c3b9ca445a99` (`agents`); eli-pc (Windows 11 x86_64, 32 CPUs) |
 | Area | `libs/runquota_process/src/runquota_process.nim` (`applyMemoryCapHard` / `applyMemoryCapNotification` / `startMemoryCapWatcher`), or `benchmarks/lib/runquota_overhead_gate.nim`'s `run64CaseWindowsMemoryCap` / `run64RunWindows` methodology -- which one is not yet established |
 | Expectation | `RunQuota-Memory-Caps.md` § "The overhead rule": the 95% CI of the wall and CPU time difference must include zero at the gate's ±0.5% resolution; a mechanism whose interval excludes zero is rejected or made opt-in |
@@ -59,17 +59,48 @@ These are not mutually exclusive, and neither has been isolated: the
 suspected cause needs a controlled comparison (same mechanism, a longer
 action) before either is more than a guess.
 
+## Update, 2026-11-27 (rq-memcap-win): the action itself was dead code
+
+Attempting candidate 2's controlled comparison found a real bug first:
+`serveRun64Child`'s spin worker (the Windows action) was a plain counting
+loop with no observed result, and `-d:release` proved the whole loop had
+no effect and removed it entirely -- measured directly, 2 BILLION claimed
+iterations and 150,000 both completed in ~30 ms. Every Windows `run-64`
+action, in both recorded verdicts above, did ZERO of the work its Linux
+shell-loop counterpart does -- not merely a short amount of work, none.
+
+Fixed (`runquota` `agents` `02c5ac3d`) by reusing `burn` (the `synthetic`
+case's own anti-optimiser xorshift loop) and echoing its result the way
+`serveSyntheticChild` already does; a first attempt that `discard`ed the
+result instead was folded away for the identical reason (`burn`'s own
+fold-resistance needs an observer, not an unfoldable loop body). Verified
+by direct timing: time now scales linearly with the turn count (100M:
+0.18 s, 1B: 1.2 s, 5B: 5.8 s, ~1.16 ns/iteration).
+
+**With the fix**, a quick comparison at `run64LoopTurns` raised to ~1e9
+(~1 s of real CPU per action instead of near zero) -- 8 rounds, stopped
+by the 600 s time budget before reaching its own 20-round minimum, so
+not a formal verdict -- showed **CPU overhead at 0.48%**, interval
+[-2.30%, +3.34%], against 2.39% and 5.94% at the original near-zero
+action length. One host-disturbance outlier in round 1 inflated the
+wall-time reading (24% point estimate; the other seven rounds do not
+support that). Suggestive, consistent with candidate 2 (methodology),
+not yet conclusive. Recorded in `reprobuild-pm`'s
+`spec/RunQuota-Memory-Caps.md` § "Verdicts".
+
 ## Suggested direction
 
-1. A longer-action variant of `run64RunWindows`'s `--run64-spin` worker
-   (a configurable loop count, or a `--run64-min-millis` floor) to test
-   whether the overhead shrinks as the action grows -- the cheapest way to
-   tell the two candidate causes apart without touching
-   `runquota_process.nim` at all.
-2. If the overhead persists even against long actions, the mechanism
-   itself needs profiling: which of the two `SetInformationJobObject`
-   calls, the watcher thread's creation, or its join at teardown
-   (`finalizeMemoryCap`) dominates.
-3. Until resolved, Windows's `kill` mode should not be turned on by
-   default; this is a decision for rq-reform-mgr / the operator, not one
-   this driver can make unilaterally.
+1. A proper `--min-rounds`/`--max-rounds` run at a longer action length
+   (enough rounds, enough time budget, to reach the gate's own required
+   precision) to turn "suggestive" into a verdict. Whether that belongs
+   as a permanent knob on `run-64` (a configurable loop count, or a
+   `--run64-min-millis` floor) or is better served by `reprobuild-64`
+   once it runs on Windows is still open.
+2. If a precise run still shows overhead above budget even against a
+   long action, the mechanism itself needs profiling: which of the two
+   `SetInformationJobObject` calls, the watcher thread's creation, or its
+   join at teardown (`finalizeMemoryCap`) dominates.
+3. Until a precise run says otherwise, the recorded fail (above) stands;
+   Windows's `kill` mode should not be turned on by default. That
+   decision is rq-reform-mgr's / the operator's, not this driver's to
+   make unilaterally.
