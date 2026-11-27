@@ -28,6 +28,7 @@
 import std/[os, osproc, tempfiles, unittest]
 
 import runquota_client
+import daemon_endpoint
 import runquota_core
 import runquota_ipc
 import runquota_protocol
@@ -41,8 +42,11 @@ const
 
 proc runStub(socketPath, mode: string) =
   ## One connection: read the `Hello`, then refuse it (`refuse`) or close
-  ## without a word (`silent`).
-  var listener = bindEndpoint(unixEndpoint(socketPath))
+  ## without a word (`silent`). `endpointForPath` rather than `unixEndpoint`
+  ## directly: on Windows this transport is a named pipe, and
+  ## `endpointForPath` is the one place that already knows how to map a
+  ## `.sock`-shaped path onto one deterministically.
+  var listener = bindEndpoint(endpointForPath(socketPath))
   var connection = acceptConnection(listener)
   var frame: RqspFrame
   if connection.receiveFrame(frame) and mode == "refuse":
@@ -59,16 +63,12 @@ when isMainModule:
     runStub(stubSocket, getEnv(stubModeVar))
     quit(0)
 
-proc socketExists(path: string): bool =
-  try:
-    discard getFileInfo(path, followSymlink = false)
-    true
-  except OSError:
-    false
-
 proc privateSocketPath(): string =
   ## A rendezvous directory this process owns, mode 0700, as
-  ## `requireTrustedEndpointDir` requires.
+  ## `requireTrustedEndpointDir` requires. On Windows the directory is
+  ## never the endpoint itself (`endpointForPath` maps it onto a named
+  ## pipe), but it is still removed in `stopStub` below, so creating it the
+  ## same way on every OS is simplest.
   let dir = createTempDir("rq-refusal-", "")
   setFilePermissions(dir, {fpUserRead, fpUserWrite, fpUserExec})
   dir / "rq.sock"
@@ -80,7 +80,7 @@ proc startStub(socketPath, mode: string): Process =
   delEnv(stubEnvVar)
   delEnv(stubModeVar)
   for _ in 0 ..< 500:
-    if socketExists(socketPath): return
+    if endpointIsBound(socketPath): return
     sleep(10)
   doAssert false, "the stub never bound " & socketPath
 
@@ -98,7 +98,7 @@ suite "a refused Hello":
     defer: stopStub(stub, socketPath)
     var caught: ref RunQuotaRefusedError = nil
     try:
-      var client = connect(unixEndpoint(socketPath))
+      var client = connect(endpointForPath(socketPath))
       client.close()
     except RunQuotaRefusedError as error:
       caught = error
@@ -117,7 +117,7 @@ suite "a refused Hello":
     defer: stopStub(stub, socketPath)
     var caught: ref RunQuotaClientError = nil
     try:
-      var client = connect(unixEndpoint(socketPath))
+      var client = connect(endpointForPath(socketPath))
       client.close()
     except RunQuotaClientError as error:
       caught = error

@@ -16,15 +16,38 @@ import runquota_ipc
 proc peer(uid: uint64; gid = 65000'u64): PeerIdentity =
   PeerIdentity(kind: peerIdentityUser, userId: uid, groupId: gid)
 
+when defined(windows):
+  proc sidPeer(uid: uint64; sid: string): PeerIdentity =
+    PeerIdentity(kind: peerIdentityUser, userId: uid, groupId: 65000'u64,
+      sid: sid)
+
 suite "benchmark authorisation":
   test "a stranger is refused (mutation: allow everyone)":
     check not benchmarkAllowed(peer(54321), 1000, @[], @[])
-  test "the daemon's own user and root are allowed":
+  test "the daemon's own user is allowed":
     check benchmarkAllowed(peer(1000), 1000, @[], @[])
-    check benchmarkAllowed(peer(0), 1000, @[], @[])
-  test "a listed uid is allowed, an unlisted one is not":
-    check benchmarkAllowed(peer(54321), 1000, @["54321"], @[])
-    check not benchmarkAllowed(peer(54322), 1000, @["54321"], @[])
+  when defined(posix):
+    test "root is always allowed":
+      # 0 is root only on POSIX; Windows owner ids are SID hashes, always
+      # >= 2^62 (see docs/database.md), so there is no uid-0 special case
+      # there -- `peerIsDaemonOwnerOrRoot`'s Windows arm compares only
+      # against `daemonOwnerId`.
+      check benchmarkAllowed(peer(0), 1000, @[], @[])
+  when defined(posix):
+    test "a listed uid is allowed, an unlisted one is not":
+      # POSIX matches `allowedUsers` against the decimal uid or its
+      # resolved name; Windows has neither and matches by SID instead (see
+      # "a listed SID is allowed, an unlisted one is not" below).
+      check benchmarkAllowed(peer(54321), 1000, @["54321"], @[])
+      check not benchmarkAllowed(peer(54322), 1000, @["54321"], @[])
+  when defined(windows):
+    test "a listed SID is allowed, an unlisted one is not":
+      check benchmarkAllowed(
+        sidPeer(54321, "S-1-5-21-1-2-3-54321"), 1000,
+        @["S-1-5-21-1-2-3-54321"], @[])
+      check not benchmarkAllowed(
+        sidPeer(54322, "S-1-5-21-1-2-3-54322"), 1000,
+        @["S-1-5-21-1-2-3-54321"], @[])
   test "an unknown group names nobody":
     check not benchmarkAllowed(peer(54321), 1000, @[], @["no-such-group-rq"])
   test "a peer without credentials is refused even as uid 0":

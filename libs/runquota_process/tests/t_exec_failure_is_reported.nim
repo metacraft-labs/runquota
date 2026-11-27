@@ -35,9 +35,18 @@ suite "exec failure reporting":
       check ("argv bytes " & $(script.len + 1 + len("/bin/sh") + 1 + 3)) in
         completion.stderr
 
-  test "a program that does not exist names ENOENT":
-    let completion = launch(@["/nonexistent/rq-test-program"])
-    check completion.exited
-    check completion.exitCode == 127
-    check "ENOENT" in completion.stderr
-    check "/nonexistent/rq-test-program" in completion.stderr
+  when defined(posix):
+    test "a program that does not exist names ENOENT":
+      # `/nonexistent/...` is a POSIX-style absolute path, not a
+      # meaningful Windows input, and `childReportExecFailure` /
+      # `execFailurePrefix` (the mechanism this case pins) is POSIX-only:
+      # `launchProcess`'s Windows arm has never caught a failed launch and
+      # turned it into a reported 127, on either side of the Windows
+      # memory-cap work (runquota issues/2026-11-27-exec-failure-reporting-test-crashes-unhandled-on-windows.md).
+      # Without this guard the call below raises an unhandled `OSError` on
+      # Windows instead of failing a `check`.
+      let completion = launch(@["/nonexistent/rq-test-program"])
+      check completion.exited
+      check completion.exitCode == 127
+      check "ENOENT" in completion.stderr
+      check "/nonexistent/rq-test-program" in completion.stderr

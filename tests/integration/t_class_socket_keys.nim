@@ -48,14 +48,18 @@ suite "class_socket_keys":
     check plain.socketOwnerUid == -1
     check plain.socketGroupGid == -1
     # Every key, on Linux and macOS. `root` and gid 0 exist on every POSIX
-    # host; a decimal id is taken as written.
-    let set = parseHostConfig(Head & "[reservation.ci]\n" &
-      "socket-owner = \"root\"\nsocket-group = \"0\"\n" &
-      "socket-mode = \"0660\"\n", "host.toml", hcpPosix).reservations["ci"]
-    check set.socketOwner == "root"
-    check set.socketOwnerUid == 0
-    check set.socketGroupGid == 0
-    check set.socketMode == 0o660
+    # host; a decimal id is taken as written. `root` is resolved by the
+    # REAL HOST's user database (`resolveAccountId`), not simulated for
+    # `hcpPosix`, so this positive lookup has no Windows form: there is no
+    # `root` account to resolve there, whatever platform is requested.
+    when defined(posix):
+      let set = parseHostConfig(Head & "[reservation.ci]\n" &
+        "socket-owner = \"root\"\nsocket-group = \"0\"\n" &
+        "socket-mode = \"0660\"\n", "host.toml", hcpPosix).reservations["ci"]
+      check set.socketOwner == "root"
+      check set.socketOwnerUid == 0
+      check set.socketGroupGid == 0
+      check set.socketMode == 0o660
     # The largest id chown(2) can apply is accepted.
     check parseHostConfig(Head & "[reservation.ci]\n" &
       "socket-group = \"4294967294\"\n", "host.toml",
@@ -101,47 +105,55 @@ suite "class_socket_keys":
       check ("host.toml:" & $line & ":") in message
       check "Linux and macOS key" in message
 
-  test "class_socket_keys_read_and_refused: runquota config set":
-    let root = getTempDir() / "rq-class-keys-" & $getCurrentProcessId()
-    createDir(root)
-    defer: removeDir(root)
-    let path = root / "runquotad.toml"
-    var changed = false
-    writeFile(path, editHostConfig(path, "reservation.ci.socket-mode",
-      "0660", false, changed))
-    check changed
-    writeFile(path, editHostConfig(path, "reservation.ci.socket-group", "0",
-      false, changed))
-    writeFile(path, editHostConfig(path, "reservation.ci.socket-owner",
-      "root", false, changed))
-    let text = readFile(path)
-    check "socket-mode = \"0660\"" in text
-    check "socket-group = \"0\"" in text
-    check "socket-owner = \"root\"" in text
-    let read = parseHostConfig(text, path).reservations["ci"]
-    check read.socketMode == 0o660
-    check read.socketGroupGid == 0
-    # `unset` removes one line.
-    writeFile(path, editHostConfig(path, "reservation.ci.socket-owner", "",
-      true, changed))
-    check changed
-    check "socket-owner" notin readFile(path)
-    # Refused before anything is written: a bad mode, an unknown group, the
-    # other platform's key (this host is Linux or macOS), a quote.
-    let before = readFile(path)
-    for (key, value) in [("reservation.ci.socket-mode", "0644"),
-                         ("reservation.ci.socket-group", "rq-no-such-group-x"),
-                         ("reservation.ci.allowed-groups", "CI Runners"),
-                         ("reservation.ci.socket-owner", "a\"b"),
-                         ("reservation.c.i.socket-mode", "0660")]:
-      var refused = ""
-      try:
-        discard editHostConfig(path, key, value, false, changed)
-      except HostConfigError as error:
-        refused = error.msg
-      checkpoint key & " " & value & " -> " & refused
-      check refused.len > 0
-    check readFile(path) == before
+  # `editHostConfig` has no platform parameter: it always reads and writes
+  # for `currentHostConfigPlatform()`, the REAL host. Every key this test
+  # sets (`socket-mode`, `socket-group`, `socket-owner`) is a Linux/macOS
+  # key, so on a real Windows host every `editHostConfig` call below would
+  # itself refuse the key it means to set, before the behaviour under test
+  # (refuse-before-write) ever runs. There is no Windows form of this case;
+  # the equivalent for Windows keys is the `hcpWindows` coverage above.
+  when defined(posix):
+    test "class_socket_keys_read_and_refused: runquota config set":
+      let root = getTempDir() / "rq-class-keys-" & $getCurrentProcessId()
+      createDir(root)
+      defer: removeDir(root)
+      let path = root / "runquotad.toml"
+      var changed = false
+      writeFile(path, editHostConfig(path, "reservation.ci.socket-mode",
+        "0660", false, changed))
+      check changed
+      writeFile(path, editHostConfig(path, "reservation.ci.socket-group", "0",
+        false, changed))
+      writeFile(path, editHostConfig(path, "reservation.ci.socket-owner",
+        "root", false, changed))
+      let text = readFile(path)
+      check "socket-mode = \"0660\"" in text
+      check "socket-group = \"0\"" in text
+      check "socket-owner = \"root\"" in text
+      let read = parseHostConfig(text, path).reservations["ci"]
+      check read.socketMode == 0o660
+      check read.socketGroupGid == 0
+      # `unset` removes one line.
+      writeFile(path, editHostConfig(path, "reservation.ci.socket-owner", "",
+        true, changed))
+      check changed
+      check "socket-owner" notin readFile(path)
+      # Refused before anything is written: a bad mode, an unknown group, the
+      # other platform's key (this host is Linux or macOS), a quote.
+      let before = readFile(path)
+      for (key, value) in [("reservation.ci.socket-mode", "0644"),
+                           ("reservation.ci.socket-group", "rq-no-such-group-x"),
+                           ("reservation.ci.allowed-groups", "CI Runners"),
+                           ("reservation.ci.socket-owner", "a\"b"),
+                           ("reservation.c.i.socket-mode", "0660")]:
+        var refused = ""
+        try:
+          discard editHostConfig(path, key, value, false, changed)
+        except HostConfigError as error:
+          refused = error.msg
+        checkpoint key & " " & value & " -> " & refused
+        check refused.len > 0
+      check readFile(path) == before
 
 when defined(posix):
   import std/osproc
