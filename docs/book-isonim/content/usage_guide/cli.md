@@ -388,6 +388,55 @@ as `degraded` and `reclaimed` as `enforced` with the switch on, and says what
 is missing; with it off `priority` is `admission-only` and `reclaimed` is
 `degraded` (its nice +10, which does not schedule an exec'd tree on macOS).
 
+## Memory caps
+
+Admission reserves memory for a command before it starts; a **memory cap**
+stops a tree that grows far past what the command has used before, and kills
+only that tree. `runquotad` computes each host lease's cap at the grant and
+returns it with the grant; the launcher (`run`, `acquire -- CMD`,
+`jobserver`) enforces it with the platform's own mechanism. The cap is:
+
+| The command has | Cap |
+|---|---|
+| a largest successful peak *M* | the factor × *M* (2 by default), or a declared size when that is larger, never above the machine's budget |
+| only a declared size | that size, never above the budget |
+| neither | the memory the budget had left when the lease was granted |
+
+Only a successful run measured by the cap's own mechanism raises *M*. A run
+that exceeds its cap is reported, never learned: the launcher prints what the
+cap was, the peak, and both ways to say the growth is expected. A run that
+exceeds a cap computed from the free budget is told it is not a regression.
+
+The cap is **off by default**. A host turns it on in its host file:
+
+```toml
+[enforcement]
+memoryCap = "kill"       # or "advisory": measure and report, kill nothing
+memoryCapFactor = 2      # at least 1.5
+```
+
+(`runquota config set enforcement.memoryCap kill`,
+`runquota config set enforcement.memoryCapFactor 2.5`). For one run,
+`RUNQUOTA_MEMORY_CAP` overrides it ([environment variables](/reference/environment_variables)):
+`off` lifts the cap (the tree is still measured, so a successful run records
+its new peak), a size such as `8G` is that run's cap, and `advisory` or
+`kill` sets the mode.
+
+## `runquota expect-growth`
+
+```bash
+runquota expect-growth <command-id> --to 8G   # its next grants carry a cap of at least 8 GiB
+runquota expect-growth <command-id>            # print its cap figures; changes nothing
+runquota expect-growth <command-id> --reset    # remove the declaration
+```
+
+The persistent form of `RUNQUOTA_MEMORY_CAP=<size>`: the daemon records the
+declared size with the declaring user's uid and the time, and every launcher
+that runs that command id is granted at least that cap. `--json` prints the
+figures as JSON. Sizes take a `K`, `M`, `G` or `T` binary suffix; a
+declaration below 1 MiB is refused. Exit status 1 when the daemon refuses or
+cannot be reached, 2 on bad arguments.
+
 ## `runquota jobserver`
 
 Run a command that speaks the GNU make jobserver protocol under one lease, and

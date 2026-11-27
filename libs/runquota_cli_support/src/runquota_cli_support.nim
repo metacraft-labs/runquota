@@ -18,6 +18,7 @@ import runquota_cli_support/run_command
 import runquota_cli_support/jobserver_command
 import runquota_cli_support/sizing_command
 import runquota_cli_support/vm_command
+import runquota_cli_support/expect_growth_command
 
 proc wantsVersion*(args: openArray[string]): bool =
   args.len == 1 and args[0] in ["--version", "-V"]
@@ -57,6 +58,7 @@ proc renderUsage*(programName: string): string =
     "    holds a virtual machine's shape on the host daemon while the VM's\n" &
     "    process runs: prints 'granted LEASE', reads '<pid> [<vsock-cid>]' on\n" &
     "    stdin, prints 'started', releases when that process exits\n" &
+    ExpectGrowthUsage.replace("  runquota ", "  " & programName & " ") &
     "  " & programName & " pressure [--group GROUP] [--json]\n" &
     "    build-wait pressure per host, session group, open session and class\n" &
     "    (exit 1 when the daemon cannot be reached or predates it, 2 on bad\n" &
@@ -1442,6 +1444,11 @@ proc runThinApp*(programName: string): int =
         return runJobserver(args[1 .. ^1], clientFailureText, versionString())
       of "pressure":
         return runPressure(programName, args[1 .. ^1])
+      of "expect-growth":
+        # A command's expected memory growth: the persistent form of
+        # `RUNQUOTA_MEMORY_CAP=off|SIZE`
+        # (`runquota_cli_support/expect_growth_command`).
+        return runExpectGrowth(args[1 .. ^1], clientFailureText)
       of "vm":
         # A virtual machine's registration, held for the VM's life
         # (`runquota_cli_support/vm_command`).

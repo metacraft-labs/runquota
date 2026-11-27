@@ -186,8 +186,8 @@ Every table of the host file has options: `memoryBytes`, `cpuMilli`,
 `writeBytesPerSec` and `pools`; `admission` (`order`, `maxWait`,
 `shareBetweenUsers`, `predictive`, `horizon`, `pressureHigh`, `pressureLow`,
 `oversubscription`); `benchmark` (`allowedUsers`, `allowedGroups`,
-`maxQueueWait`, `maxHold`); `enforcement` (`cgroups`, `jobPriority`, `qos`);
-and `reservations.<class>` (`cpuMilli`, `memoryBytes`, `lend`). The names are
+`maxQueueWait`, `maxHold`); `enforcement` (`cgroups`, `jobPriority`, `qos`,
+`memoryCap`, `memoryCapFactor`); and `reservations.<class>` (`cpuMilli`, `memoryBytes`, `lend`). The names are
 the file's keys in camelCase, and the on/off keys are booleans. A value the
 daemon would refuse fails the evaluation. One case is left to the daemon:
 reservations that do not fit a budget the configuration does not declare (the
