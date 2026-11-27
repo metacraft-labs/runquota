@@ -22,6 +22,7 @@
 
 import std/strutils
 
+import runquota_core/memory_cap
 import runquota_process/cgroup_placement
 import runquota_process/job_priority
 import runquota_process/qos_priority
@@ -69,15 +70,61 @@ type
       ## Why placement is off or unavailable, else "".
     entries*: seq[EnforcementEntry]
 
-const
-  MemoryCapGap = "no RunQuota launcher sets a hard memory limit on a tree " &
-    "yet; a tree that outgrows its reservation is not stopped"
-
 proc entry(mechanism: EnforcementMechanism; level: EnforcementLevel;
            how: string; gap = ""): EnforcementEntry =
   EnforcementEntry(mechanism: mechanism, level: level, how: how, gap: gap)
 
-proc linuxRecord(root: CgroupRoot; probeProblem: string): EnforcementRecord =
+const
+  MemoryCapAdmissionHow = "admission (memory reservation)"
+  LinuxMemoryCapHow = "cgroup v2 memory.max of the tree's own leaf, with " &
+    "memory.oom.group 1 (the whole tree is killed, nothing else) and " &
+    "memory.swap.max 0"
+  LinuxMemoryAdvisoryHow = "cgroup v2 memory.peak of the tree's own leaf, " &
+    "measured and reported against the cap; memory.max is left at max"
+
+proc joinGap(trap, gap: string): string =
+  if trap.len == 0: gap
+  elif gap.len == 0: trap
+  else: gap & "; " & trap
+
+proc linuxMemoryCapEntry(placementOn: bool; placementReason: string;
+                         memory: MemoryProbe;
+                         mode: MemoryCapMode): EnforcementEntry =
+  ## The memory cap on Linux. It is a cgroup leaf, so it needs placement
+  ## (a usable cgroup root) AND the memory controller delegated to that
+  ## root; then the host file's `[enforcement] memoryCap` (as the launcher
+  ## resolved it, `mode`) says whether it is enforced, only measured, or
+  ## off. A cgroup with `memory.oom.group` set that is not a task leaf
+  ## (trap 1) is reported in every case: it makes a host-wide OOM kill the
+  ## whole cgroup, the cap or no cap.
+  var trap = ""
+  if memory.oomGroupAncestors.len > 0:
+    trap = "memory.oom.group is set on " &
+      memory.oomGroupAncestors.join(", ") & ", which is not a task leaf: " &
+      "a host-wide OOM kill there takes every tree below it, so the " &
+      "memory cap cannot confine a kill until it is cleared"
+  if not placementOn:
+    return entry(emMemoryCap, elAdmissionOnly, MemoryCapAdmissionHow,
+      joinGap(trap, "memory cap not enforced: no cgroup root (" &
+        placementReason & ")"))
+  if not memory.available:
+    return entry(emMemoryCap, elAdmissionOnly, MemoryCapAdmissionHow,
+      joinGap(trap, "memory cap not enforced: " & memory.problem))
+  case mode
+  of mcmOff:
+    entry(emMemoryCap, elAdmissionOnly, MemoryCapAdmissionHow,
+      joinGap(trap, "memory cap off (the host file does not set [enforcement] " &
+        "memoryCap; the memory controller is available)"))
+  of mcmAdvisory:
+    entry(emMemoryCap, elDegraded, LinuxMemoryAdvisoryHow,
+      joinGap(trap, "advisory mode: a tree past its cap is reported, not " &
+        "stopped"))
+  of mcmKill:
+    entry(emMemoryCap, (if trap.len > 0: elDegraded else: elEnforced),
+      LinuxMemoryCapHow, trap)
+
+proc linuxRecord(root: CgroupRoot; probeProblem: string; memory: MemoryProbe;
+                 memoryCapMode: MemoryCapMode): EnforcementRecord =
   result.os = "linux"
   let available = root.usable and probeProblem.len == 0
   if available:
@@ -92,8 +139,7 @@ proc linuxRecord(root: CgroupRoot; probeProblem: string): EnforcementRecord =
         ", and nice +" & $ReclaimedNiceIncrement),
       entry(emWidthCap, elEnforced,
         "cgroup v2 cpu.max of the tree's own leaf (runquota run --cap)"),
-      entry(emMemoryCap, elAdmissionOnly, "admission (memory reservation)",
-        MemoryCapGap),
+      linuxMemoryCapEntry(true, "", memory, memoryCapMode),
     ]
   elif root.state == crsOff:
     # Off (by default, or by the variable): the launchers change nothing
@@ -106,8 +152,7 @@ proc linuxRecord(root: CgroupRoot; probeProblem: string): EnforcementRecord =
       entry(emReclaimed, elDegraded, "nice +" & $ReclaimedNiceIncrement, gap),
       entry(emWidthCap, elNone, "runquota run --cap runs the command uncapped",
         gap),
-      entry(emMemoryCap, elAdmissionOnly, "admission (memory reservation)",
-        MemoryCapGap),
+      linuxMemoryCapEntry(false, root.reason, memory, memoryCapMode),
     ]
   else:
     let reason = if probeProblem.len > 0: probeProblem else: root.reason
@@ -121,8 +166,7 @@ proc linuxRecord(root: CgroupRoot; probeProblem: string): EnforcementRecord =
         "cgroup placement " & result.placement & ": " & reason),
       entry(emWidthCap, elNone, "runquota run --cap runs the command uncapped",
         "cgroup placement " & result.placement & ": " & reason),
-      entry(emMemoryCap, elAdmissionOnly, "admission (memory reservation)",
-        MemoryCapGap),
+      linuxMemoryCapEntry(false, reason, memory, memoryCapMode),
     ]
 
 const
@@ -206,10 +250,7 @@ proc windowsRecord(jobPriorityOn: bool; problem = ""): EnforcementRecord =
         "below-normal class a reclaimed tree already runs at"),
       entry(emWidthCap, elEnforced, WindowsWidthCapHow),
       entry(emMemoryCap, elAdmissionOnly, "admission (memory reservation)",
-        "launchWindowsProcess reads CommandSpec.memoryCapBytes/memoryCapAction " &
-        "and enforces it, but the host file's [enforcement] memoryCap " &
-        "switch (and the per-run RUNQUOTA_MEMORY_CAP) are not read yet, " &
-        "so no caller sets those fields"),
+        "Job Object memory limits are not set by RunQuota launchers yet"),
     ]
   else:
     let reason = if problem.len > 0: problem
@@ -224,10 +265,7 @@ proc windowsRecord(jobPriorityOn: bool; problem = ""): EnforcementRecord =
         "process it spawns)"),
       entry(emWidthCap, elEnforced, WindowsWidthCapHow),
       entry(emMemoryCap, elAdmissionOnly, "admission (memory reservation)",
-        "launchWindowsProcess reads CommandSpec.memoryCapBytes/memoryCapAction " &
-        "and enforces it, but the host file's [enforcement] memoryCap " &
-        "switch (and the per-run RUNQUOTA_MEMORY_CAP) are not read yet, " &
-        "so no caller sets those fields"),
+        "Job Object memory limits are not set by RunQuota launchers yet"),
     ]
 
 proc enforcementRecordFor*(os: string; root = CgroupRoot();
@@ -235,16 +273,21 @@ proc enforcementRecordFor*(os: string; root = CgroupRoot();
                            jobPriorityOn = false;
                            jobPriorityProblem = "";
                            qosOn = false;
-                           qosProblem = ""): EnforcementRecord =
+                           qosProblem = "";
+                           memory = MemoryProbe();
+                           memoryCapMode = mcmOff): EnforcementRecord =
   ## The record for `os` (`linux`, `macos`, `windows`). On Linux `root` is
   ## the resolved cgroup root and `probeProblem` what probing it found ("" =
   ## trees can be placed there). On Windows `jobPriorityOn` is the
   ## `[enforcement] job-priority` switch in force and `jobPriorityProblem`
   ## why it is off (for the gap text); on macOS `qosOn` and `qosProblem` are
-  ## the `[enforcement] qos` switch the same way. Any other OS is recorded as enforcing
-  ## nothing below admission.
+  ## the `[enforcement] qos` switch the same way. On Linux `memory` is what
+  ## probing the root's memory controller found (`probeMemory`) and
+  ## `memoryCapMode` the `[enforcement] memoryCap` mode the launcher
+  ## resolved (off unless the caller says otherwise). Any other OS is
+  ## recorded as enforcing nothing below admission.
   case os
-  of "linux": linuxRecord(root, probeProblem)
+  of "linux": linuxRecord(root, probeProblem, memory, memoryCapMode)
   of "macos": macosRecord(qosOn, qosProblem)
   of "windows": windowsRecord(jobPriorityOn, jobPriorityProblem)
   else:
@@ -264,16 +307,22 @@ proc hostEnforcementRecord*(root = currentCgroupRoot();
                             jobPriorityOn = currentJobPriorityOn();
                             jobPriorityProblem = jobPriorityOffReason(false);
                             qosOn = currentQosOn();
-                            qosProblem = qosOffReason(false)):
+                            qosProblem = qosOffReason(false);
+                            memoryCapMode = mcmOff):
     EnforcementRecord =
   ## This process's record for the enforcement its launchers would use (a
   ## launcher that reads the host file passes the root and the switch it
   ## resolved with it); on Linux the cgroup root is probed without creating
   ## anything, on Windows `jobPriorityOn` is the job-priority switch, on
-  ## macOS `qosOn` the qos switch. The
+  ## macOS `qosOn` the qos switch, and on Linux `memoryCapMode` the memory
+  ## cap's mode (the memory controller is probed, reading only). The
   ## defaults read only the environment, as `currentCgroupRoot` does.
+  let memory =
+    when defined(linux): probeMemory(root)
+    else: MemoryProbe()
   enforcementRecordFor(hostOsName(), root, probeRoot(root),
-    jobPriorityOn, jobPriorityProblem, qosOn, qosProblem)
+    jobPriorityOn, jobPriorityProblem, qosOn, qosProblem, memory,
+    memoryCapMode)
 
 proc gaps*(record: EnforcementRecord): seq[EnforcementEntry] =
   for item in record.entries:

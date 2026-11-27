@@ -151,6 +151,10 @@ type
     qosTier*: uint8
       ## macOS: the tier (`runquota_process/qos_priority`) the child applied
       ## to itself before it executed; 0 elsewhere or with the layer off.
+    spawnedByClone3*: bool
+      ## Linux: the child was created directly in its leaf by
+      ## `clone3(CLONE_INTO_CGROUP)`, rather than by an ordinary `fork`
+      ## followed by its own write into the leaf's `cgroup.procs`.
     memoryCapApplied*: bool
       ## The launch's memory cap (or its measurement, `memoryCapMeasure`) is
       ## in force: the platform's mechanism is armed for this tree. False when
@@ -344,3 +348,12 @@ type
     memoryCap*: MemoryCapWatch
       ## The launcher's readings and judgement of the tree's memory cap
       ## (macOS; inactive elsewhere and when the launch has no cap).
+    memoryCapBytes*: uint64
+      ## `CommandSpec.memoryCapBytes`, reported with the completion.
+    memoryCapAction*: MemoryCapAction
+    memoryCapWanted*: bool
+      ## The spec asked for a memory cap or a measurement.
+    memoryClassify*: bool
+      ## Linux: read the leaf's `memory.events.local` and `memory.peak`
+      ## once the root is reaped, to classify the end (the tree is in a
+      ## memory-capped leaf of its own, and the stage includes the reads).

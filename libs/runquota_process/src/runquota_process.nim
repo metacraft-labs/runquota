@@ -107,6 +107,7 @@ when defined(posix):
     # glibc only wraps it from 2.34. Issue the syscall directly so the build
     # does not depend on the libc version.
     const SYS_close_range = clong(436)
+      ## Same number on every architecture (the unified table).
 
     proc rawSyscall(number: clong): clong {.
       importc: "syscall", header: "<sys/syscall.h>", varargs, discardable.}
@@ -1883,6 +1884,85 @@ when defined(windows):
     )
 
 when defined(linux):
+  # ---------------------------------------------------------------------------
+  # clone3(CLONE_INTO_CGROUP)
+  # ---------------------------------------------------------------------------
+  #
+  # A MEMORY-CAPPED TREE IS CREATED IN ITS LEAF. `clone3` with
+  # `CLONE_INTO_CGROUP` and the leaf's directory descriptor puts the child in
+  # the leaf from its first instruction, with no migration afterwards: no
+  # write into `cgroup.procs`, no handshake, and none of the kernel's cgroup
+  # threadgroup lock that a migration takes. `stack` 0 makes it behave like
+  # `fork` (the child runs on a copy of the parent's stack); `exit_signal`
+  # SIGCHLD makes it waitable like a forked child. clone(2):
+  # https://man7.org/linux/man-pages/man2/clone.2.html
+  #
+  # IT IS A RAW SYSTEM CALL, so the C library's fork handlers do not run:
+  # neither `pthread_atfork` handlers nor the library's own bookkeeping
+  # (glibc does not, for instance, refresh the thread's cached tid). The
+  # child below therefore runs exactly the code the fork path's child runs,
+  # which makes only plain system calls and allocates nothing, so it needs
+  # none of that. What does rely on the fork handlers is an `LD_PRELOAD`
+  # shim that hooks `fork` to follow the tree (a build monitor), which is why
+  # a launcher with `LD_PRELOAD` set keeps the ordinary `fork`
+  # (`launchProcess`).
+  const
+    SysClone3 = clong(435)
+      ## `__NR_clone3`: the same number on every architecture, from the
+      ## unified system call table (Linux 5.3 and later).
+    CloneIntoCgroup = 0x200000000'u64
+      ## `CLONE_INTO_CGROUP` (Linux 5.7 and later).
+
+  type
+    CloneArgs {.pure, final.} = object
+      ## `struct clone_args` up to `cgroup` (`CLONE_ARGS_SIZE_VER2`, 88
+      ## bytes), every field a `__aligned_u64`.
+      flags: uint64
+      pidfd: uint64
+      childTid: uint64
+      parentTid: uint64
+      exitSignal: uint64
+      stack: uint64
+      stackSize: uint64
+      tls: uint64
+      setTid: uint64
+      setTidSize: uint64
+      cgroup: uint64
+
+  proc clone3IntoCgroup(leafFd: cint): Pid =
+    ## Fork into the cgroup `leafFd` names: the child's pid in the parent,
+    ## 0 in the child, -1 with `errno` on failure (ENOSYS / E2BIG before
+    ## 5.3, EINVAL before 5.7 or for a bad descriptor, EPERM under a
+    ## seccomp filter that refuses it, ENOENT / ENODEV for a removed
+    ## cgroup, EBUSY for one that enables controllers for its children).
+    var args = CloneArgs(flags: CloneIntoCgroup,
+      exitSignal: uint64(SIGCHLD), cgroup: uint64(leafFd))
+    Pid(rawSyscall(SysClone3, addr args, csize_t(sizeof(CloneArgs))))
+
+  proc clone3FallsBack(code: cint): bool =
+    ## The `clone3` failures after which the ordinary fork and the child's
+    ## own write into the leaf still work: everything except a leaf that
+    ## vanished, which is prepared again instead.
+    code != ENOENT and code != ENODEV
+
+  var memoryLeafSequence: int
+    ## The `<n>` of the `cap-<pid>-<n>` leaves this process creates for
+    ## memory-capped trees. Process-wide and atomic: a build engine
+    ## launches from several threads.
+
+  proc nextMemoryLeafSequence(): int =
+    atomicInc(memoryLeafSequence)
+
+  proc openJoinPipes(statusPipe, verdictPipe: var array[0..1, cint]): bool =
+    ## The two pipes of the fork path's placement handshake, or none.
+    if createControlPipe(statusPipe):
+      if createControlPipe(verdictPipe):
+        return true
+      discard posix.close(statusPipe[0])
+      discard posix.close(statusPipe[1])
+      statusPipe = [cint(-1), cint(-1)]
+    false
+
   proc readPlacementByte(fd: cint; value: var uint8): bool =
     ## One byte of the placement handshake; false at end of input (the
     ## other side closed or died) or on an error.
@@ -1980,7 +2060,45 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     # in force, read under the lock), so the launch works on its own copies.
     var target = spec.cgroup
     var fallbackNiceWanted = spec.placementFallbackNice
+    # THE MEMORY CAP (Linux): a tree with a cap, or one only measured by the
+    # cap's mechanism (`memoryCapMeasure`), gets a leaf of its own with the
+    # cap's limits (`memoryCapTarget`), is spawned into it by `clone3`, and
+    # is classified from the leaf's counters after its root is reaped. None
+    # of it can fail the launch: what could not be done is reported in
+    # `memoryCapProblem`, and the tree runs without it.
+    let memoryWanted = spec.memoryCapBytes > 0'u64 or spec.memoryCapMeasure
+    var memoryStage = mcsClassify
+    var memoryPrep: MemoryPreparation
+    var memoryCapApplied = false
+    var memoryCapProblem = ""
+    var memoryClassify = false
+    var useClone3 = false
+    var spawnedByClone3 = false
+    var leafFd: cint = -1
+    var leafProblem = ""
+    var leafVanished = false
+    var cloneErrno: cint = 0
+    var againTarget = CgroupTarget()
+    var againRetryable = false
     when defined(linux):
+      if memoryWanted and not target.placed:
+        memoryCapProblem = "memory cap not enforced: no cgroup root"
+      if memoryWanted and target.placed:
+        # The gate-only stage, read once per launch from the LAUNCHER's own
+        # environment and only for a capped tree, so an uncapped launch
+        # reads nothing it did not read before.
+        let stageText = getEnv(MemoryCapStageEnvVar)
+        if not parseMemoryCapStage(stageText, memoryStage):
+          memoryCapProblem = MemoryCapStageEnvVar & "='" & stageText &
+            "' is not controller, leaf, limits or classify; the whole " &
+            "mechanism applies"
+        target = memoryCapTarget(target, spec.memoryCapBytes,
+          spec.memoryCapAction, memoryStage, getCurrentProcessId(),
+          nextMemoryLeafSequence())
+      # A CAP LEAF HOLDS ONE TREE (`CgroupTarget.freshLeaf`), a CPU-capped
+      # one too: its leaf is created by this launch, never found.
+      if target.isCapLeaf:
+        target.freshLeaf = true
       if target.placed:
         rootLock = lockCgroupRoot(target.root, exclusive = false)
         # THE PRIORITY IS READ UNDER THE SHARED LOCK, and the weight below is
@@ -1993,20 +2111,45 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
           target.cpuWeight = cpuWeightFor(inForce)
           fallbackNiceWanted = fallbackNice(inForce, reclaimed = false)
         var tries = 0
+        var renames = 0
         var retryable = false
         while tries < PlacementAttempts:
           inc tries
-          procsFd = openPreparedProcs(target, placementProblem, retryable)
+          procsFd = openPreparedProcs(target, placementProblem, retryable,
+            memoryPrep)
+          if procsFd < 0 and memoryPrep.leafTaken and
+              renames < CapLeafNameAttempts:
+            # The cap leaf's name is in use (a leftover of an earlier
+            # process with this pid, or another launch's): another name,
+            # which is not one of the vanished-leaf attempts.
+            inc renames
+            dec tries
+            target.leafName = capLeafName(getCurrentProcessId(),
+              nextMemoryLeafSequence())
+            continue
           if procsFd >= 0 or not retryable:
             break
-        if procsFd >= 0:
-          if createControlPipe(statusPipe) and createControlPipe(verdictPipe):
+        if procsFd >= 0 and target.memory:
+          memoryCapApplied = memoryPrep.limits
+          if memoryPrep.problem.len > 0:
+            memoryCapProblem = memoryPrep.problem
+          memoryClassify = memoryStage >= mcsClassify and memoryPrep.limits
+          # CLONE3 FROM THE `limits` STAGE ON, INTO A LEAF OF ITS OWN. Not
+          # when this launcher runs with `LD_PRELOAD` set: a shim that hooks
+          # `fork` (a build monitor following the tree) relies on the C
+          # library's fork handlers, which the raw `clone3` skips. The fork
+          # path below puts the child in the same leaf before it executes
+          # anything, so the cap is the same either way.
+          useClone3 = memoryStage >= mcsLimits and target.freshLeaf and
+            getEnv("LD_PRELOAD").len == 0
+        if procsFd >= 0 and useClone3:
+          leafFd = openLeafDir(target, leafProblem, leafVanished)
+        if procsFd >= 0 and leafFd < 0:
+          if openJoinPipes(statusPipe, verdictPipe):
             joining = true
           else:
             placementProblem = "cannot create the cgroup placement pipes"
-            for fd in [statusPipe[0], statusPipe[1], verdictPipe[0],
-                       verdictPipe[1], procsFd]:
-              if fd >= 0: discard posix.close(fd)
+            discard posix.close(procsFd)
             procsFd = -1
     else:
       if target.placed:
@@ -2024,7 +2167,51 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         var inForce: SessionPriority
         if spec.cgroupPriority.readNow(inForce):
           qosTierWanted = qosTierFor(inForce, reclaimed = false)
-    pid = fork()
+    when defined(linux):
+      if leafFd >= 0:
+        # Into the leaf by `clone3`. The child returns here with 0 and
+        # leaves the loop at once; every variable it touches was declared
+        # above, so it runs no destructor (no `free` between the clone and
+        # the exec).
+        var cloneTries = 0
+        while true:
+          inc cloneTries
+          pid = clone3IntoCgroup(leafFd)
+          if pid >= 0:
+            spawnedByClone3 = true
+            break
+          cloneErrno = errno
+          discard posix.close(leafFd)
+          leafFd = -1
+          if clone3FallsBack(cloneErrno) or cloneTries >= PlacementAttempts:
+            break
+          # The leaf vanished (the root's lock could not be taken, and
+          # another launcher's clean-up removed it): prepare it again, under
+          # its own name, and clone again.
+          discard posix.close(procsFd)
+          againTarget = target
+          againTarget.freshLeaf = false
+          procsFd = openPreparedProcs(againTarget, placementProblem,
+            againRetryable, memoryPrep)
+          if procsFd < 0:
+            break
+          memoryCapApplied = memoryPrep.limits
+          memoryClassify = memoryStage >= mcsClassify and memoryPrep.limits
+          leafFd = openLeafDir(target, leafProblem, leafVanished)
+          if leafFd < 0:
+            break
+        if not spawnedByClone3 and procsFd >= 0:
+          # The ordinary fork and the child's own write into the leaf.
+          if openJoinPipes(statusPipe, verdictPipe):
+            joining = true
+          else:
+            placementProblem = "cannot create the cgroup placement pipes"
+            discard posix.close(procsFd)
+            procsFd = -1
+      if spawnedByClone3:
+        inCgroup = true
+    if not spawnedByClone3:
+      pid = fork()
     when defined(linux):
       if pid == 0 and joining:
         # The child: one write, one report, one wait. Allocation-free.
@@ -2088,6 +2275,12 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       childReportExecFailure(cstring(execFailureText), errno)
       childExit(127)
     when defined(linux):
+      if spawnedByClone3:
+        # The child was created in its leaf; nothing to hand over.
+        discard posix.close(leafFd)
+        leafFd = -1
+        discard posix.close(procsFd)
+        procsFd = -1
       if joining:
         # The parent's half of the handshake (see above).
         discard posix.close(procsFd)
@@ -2147,6 +2340,11 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       # Directories a failed attempt prepared are left empty; take them away
       # unless another tree is in them.
       releaseTarget(target)
+      if memoryWanted:
+        memoryCapApplied = false
+        memoryClassify = false
+        memoryCapProblem = "memory cap not enforced: the tree is not in a " &
+          "cgroup (" & placementProblem & ")"
     # macOS judges the cap itself, from its own readings of the tree
     # (`runquota_process/memory_cap_watch`); Linux's cap is the tree's cgroup leaf
     # and Windows's its Job Object, so neither reads the tree for it. The
@@ -2204,11 +2402,19 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         cgroupProblem: placementProblem,
         fallbackNice: fallbackNiceWanted,
         qosTier: qosTierWanted,
-        memoryCapApplied: memoryCap.applied,
-        memoryCapProblem: memoryCap.problem
+        spawnedByClone3: spawnedByClone3,
+        # macOS arms its own tracker; Linux's cap is the cgroup leaf.
+        memoryCapApplied:
+          (when defined(macosx): memoryCap.applied else: memoryCapApplied),
+        memoryCapProblem:
+          (when defined(macosx): memoryCap.problem else: memoryCapProblem)
       ),
       cgroupTarget: placedTarget,
-      memoryCap: memoryCap
+      memoryCap: memoryCap,
+      memoryCapBytes: spec.memoryCapBytes,
+      memoryCapAction: spec.memoryCapAction,
+      memoryCapWanted: memoryWanted,
+      memoryClassify: memoryClassify
     )
   elif defined(windows):
     # Windows: delegate to the Job-Object-aware launcher above.
@@ -2242,9 +2448,47 @@ proc running*(child: LaunchedProcess): bool =
   else:
     false
 
+when defined(linux):
+  proc classifyMemoryCap(child: LaunchedProcess;
+                         completion: var ProcessCompletion) =
+    ## The memory-cap half of a completion: the leaf's own counters, read
+    ## ONCE, here, after the root was reaped and before `close` removes the
+    ## leaf. Nothing polls them while the tree runs. The kernel counts an
+    ## OOM kill when it kills, before the killed process can be reaped, so
+    ## the counts are complete for every kill that ended the root.
+    completion.memoryCapBytes = child.memoryCapBytes
+    if not child.memoryCapWanted:
+      return
+    if not child.memoryClassify:
+      completion.memoryCapProblem =
+        if child.info.memoryCapProblem.len > 0: child.info.memoryCapProblem
+        else: "the tree was not measured by its leaf (stage " &
+          "below classify, or no leaf of its own)"
+      return
+    var events: MemoryEvents
+    var peak = 0'u64
+    var problem = ""
+    if not readLeafMemory(child.cgroupTarget, events, peak, problem):
+      completion.memoryCapProblem = problem
+      return
+    # KILL EVIDENCE: the root died of a signal, or exited non-zero (a
+    # parent that reported its child's kill). A tree whose root exited 0
+    # has its own conclusion whatever the counters say.
+    let killEvidence = completion.signaled or
+      (completion.exited and completion.exitCode != 0)
+    let verdict = memoryCapVerdict(events, peak, child.memoryCapBytes,
+      child.memoryCapAction, killEvidence)
+    completion.memoryCapMeasured = true
+    completion.memoryPeakBytes = peak
+    completion.memoryPeakSource = mpsCgroup
+    completion.capExceeded = verdict.capExceeded
+    completion.capKilled = verdict.capKilled
+    completion.capReached = verdict.capReached
+    completion.oomKilledOutsideCap = verdict.oomKilledOutsideCap
+
 proc buildCompletion(child: LaunchedProcess; timedOut: bool): ProcessCompletion =
   when defined(posix):
-    buildCompletion(
+    result = buildCompletion(
       child,
       cint(child.waitStatus),
       uint64(max(0, int((epochTime() - child.startedSeconds) * 1000.0))),
@@ -2256,6 +2500,10 @@ proc buildCompletion(child: LaunchedProcess; timedOut: bool): ProcessCompletion 
       child.peakResidentMemoryBytes,
       child.processCount,
       child.telemetrySource)
+    when defined(linux):
+      classifyMemoryCap(child, result)
+    else:
+      result.memoryCapBytes = child.memoryCapBytes
   elif defined(windows):
     # Windows: there are no POSIX-style signals — `child.waitStatus` holds the
     # raw process exit code (or -1 if the child has not been observed to exit).

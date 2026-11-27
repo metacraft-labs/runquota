@@ -43,6 +43,20 @@ when defined(linux):
       return ""
     root
 
+  proc delegatedMemoryTestRoot*(reason: var string): string =
+    ## `delegatedTestRoot`, for tests of the memory cap: also "" with
+    ## `reason` when the memory controller is not delegated to the user's
+    ## subtree (`probeMemory`), so a memory test is reported skipped rather
+    ## than failed on a host that cannot cap.
+    let root = delegatedTestRoot(reason)
+    if root.len == 0:
+      return ""
+    let probe = probeMemory(CgroupRoot(state: crsExplicit, path: root))
+    if not probe.available:
+      reason = probe.problem
+      return ""
+    root
+
   proc populated(dir: string): bool =
     try:
       for line in readFile(dir / "cgroup.events").splitLines():

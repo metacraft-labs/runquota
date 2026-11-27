@@ -14,12 +14,32 @@
 ##
 ## THE LAYOUT, under a root resolved per user (`resolveCgroupRoot`):
 ##
-##   <root>/                      cgroup.subtree_control += cpu
+##   <root>/                      cgroup.subtree_control += cpu (+ memory)
 ##     group-<escaped name>/      cpu.weight from the group's priority
 ##       shared/                  every uncapped tree of the group
-##       cap-<pid>-<n>/           one capped tree, cpu.max = its grant
+##       cap-<pid>-<n>/           one capped tree: cpu.max = its CPU grant,
+##                                and/or memory.max = its memory cap
 ##     reclaimed/                 cpu.weight 1
 ##       shared/, cap-<pid>-<n>/
+##
+## THE MEMORY CAP (`memoryCapTarget`). A tree with a memory cap gets a leaf
+## of its own (one leaf carries both caps when a CPU cap applies too), with
+## `memory.max` = the cap (`max` when the cap only measures),
+## `memory.swap.max` = 0 (a capped tree must not hide its growth in swap) and
+## `memory.oom.group` = 1, so the kernel's OOM killer kills the WHOLE tree or
+## nothing: without it it picks one victim, and a `make` or a shell can
+## survive the compiler it started. `+memory` is enabled in the root's and
+## the group directory's `cgroup.subtree_control`, beside `+cpu`. The memory
+## interface files are documented at
+## https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files
+##
+## TRAP 1: NO ANCESTOR OF A LEAF SETS `memory.oom.group`. On an OOM, the
+## kernel (`mem_cgroup_get_oom_group`) kills the HIGHEST cgroup with
+## `oom.group` set between the victim and the cgroup whose limit was hit; on
+## a host-wide OOM that is anywhere up to the top. A group directory with it
+## set would turn one tree's host-OOM kill into the kill of every tree of
+## the group. So only the leaf this module creates for a capped tree ever
+## gets it, and `probeMemory` reports any ancestor that has it.
 ##
 ## Processes live only in leaves: cgroup v2 forbids processes in a cgroup
 ## that enables a controller for its children ("no internal process"
@@ -85,6 +105,9 @@ const
   PlacementAttempts* = 3
     ## How often a launch prepares its leaf and tries to start the child in
     ## it, when another launcher's clean-up removed the leaf in between.
+  CapLeafNameAttempts* = 4
+    ## How many names a launch tries for a cap leaf of its own when the one
+    ## it was given already exists (`CgroupTarget.freshLeaf`).
 
 type
   CgroupRootState* = enum
@@ -119,6 +142,79 @@ type
       ## `shared` or `cap-<pid>-<n>`.
     cpuMax*: string
       ## "" for an uncapped leaf; otherwise the `cpu.max` text of a cap leaf.
+    memory*: bool
+      ## Enable the memory controller (`+memory`) in the root's and the
+      ## group directory's `cgroup.subtree_control`, so the leaf has the
+      ## memory interface files. Set for a tree with a memory cap (or a
+      ## measured one), at every stage of `MemoryCapStage`.
+    memoryMax*: string
+      ## "" writes no memory limit. Otherwise the leaf's `memory.max` text
+      ## (bytes, or `max` for a tree that is only measured), written
+      ## together with `memory.swap.max` = 0 and `memory.oom.group` = 1.
+      ## Only ever on a leaf of its own (`freshLeaf`): never on a shared
+      ## leaf, and never on a directory above a leaf (trap 1, above).
+    freshLeaf*: bool
+      ## The leaf must be CREATED by this preparation, not found: a cap leaf
+      ## holds exactly one tree. Two trees in one memory-capped leaf would
+      ## die together, and a leaf left over from an earlier tree would hand
+      ## this tree that tree's `memory.events.local` counts and
+      ## `memory.peak`, which the classification reads. An existing leaf of
+      ## that name is reported (`MemoryPreparation.leafTaken`), and the
+      ## launcher picks another name.
+
+  MemoryCapStage* = enum
+    ## How much of the Linux memory-cap mechanism a launch applies. Only the
+    ## overhead gate asks for less than all of it (`MemoryCapStageEnvVar`),
+    ## so that each stage's cost can be measured on its own; each stage
+    ## includes the ones before it.
+    mcsController = "controller"
+      ## `+memory` in the root's and the group's `cgroup.subtree_control`
+      ## only; the tree stays in the leaf it would have had without a cap.
+    mcsLeaf = "leaf"
+      ## And a leaf of its own per capped tree, entered by an ordinary
+      ## `fork` with no limits written.
+    mcsLimits = "limits"
+      ## And the limit writes (`memory.max`, `memory.swap.max`,
+      ## `memory.oom.group`), and spawning with `clone3(CLONE_INTO_CGROUP)`.
+    mcsClassify = "classify"
+      ## And the reads at the end of the tree that classify how it ended
+      ## (`memory.events.local`, `memory.peak`). The full mechanism.
+
+  MemoryPreparation* = object
+    ## What `prepareTarget` did about a target's memory settings. None of
+    ## it can fail a placement: a tree whose memory controller or limits
+    ## could not be set still runs in its leaf, and `problem` says why the
+    ## cap is not on it.
+    controller*: bool
+      ## The memory controller is enabled for the leaf (in the group
+      ## directory's `cgroup.subtree_control`, and so in the root's).
+    limits*: bool
+      ## `memory.max`, `memory.oom.group` (and `memory.swap.max` where the
+      ## kernel accounts swap) were written to the leaf.
+    leafTaken*: bool
+      ## A `freshLeaf` target's leaf already existed: nothing was written to
+      ## it, and the caller must pick another name.
+    problem*: string
+      ## Why the memory settings asked for are not (all) in place, or "".
+
+  MemoryEvents* = object
+    ## The counts of a leaf's `memory.events.local` that classify a tree's
+    ## end. `oom` is raised on the cgroup whose limit was hit (the leaf
+    ## itself only when the CAP was hit); `oom_kill` on the cgroup of each
+    ## process the OOM killer killed, whoever's limit it was. Counted for
+    ## that cgroup alone, unlike the hierarchical `memory.events`, which
+    ## also counts every descendant's events (kernel `memcg_memory_event`).
+    known*: bool
+    oom*: uint64
+    oomKill*: uint64
+
+  MemoryCapVerdict* = object
+    ## How a capped or measured tree ended, as far as memory goes
+    ## (`memoryCapVerdict`).
+    capExceeded*: bool
+    capKilled*: bool
+    capReached*: bool
+    oomKilledOutsideCap*: bool
 
   GroupPriorityRead* = proc (context: pointer;
                              priority: var SessionPriority): bool {.
@@ -167,6 +263,10 @@ proc leafPath*(target: CgroupTarget): string =
 
 proc isCapLeaf*(target: CgroupTarget): bool =
   target.leafName.startsWith(CapLeafPrefix)
+
+proc hasMemoryLimits*(target: CgroupTarget): bool =
+  ## Whether preparing `target` writes memory limits into its leaf.
+  target.memoryMax.len > 0
 
 # ---------------------------------------------------------------------------
 # Pure rules
@@ -238,6 +338,109 @@ proc cpuMaxFor*(grantedMilli: uint64): string =
 
 proc capLeafName*(launcherPid: int; sequence: int): string =
   CapLeafPrefix & $launcherPid & "-" & $sequence
+
+proc parseMemoryCapStage*(text: string; stage: var MemoryCapStage): bool =
+  ## The stage `RUNQUOTA_MEMORY_CAP_STAGE` names: unset or empty is the
+  ## whole mechanism (`mcsClassify`). False for any other text, and `stage`
+  ## is then the whole mechanism too: the variable is the overhead gate's,
+  ## and a value it does not know must not quietly turn the cap off.
+  let value = text.strip()
+  stage = mcsClassify
+  if value.len == 0:
+    return true
+  for candidate in MemoryCapStage:
+    if value == $candidate:
+      stage = candidate
+      return true
+  false
+
+proc memoryMaxFor*(capBytes: uint64; action: MemoryCapAction): string =
+  ## The leaf's `memory.max` text for a cap of `capBytes`: the cap itself
+  ## when it is enforced; `max` (no limit, measured only) for an advisory
+  ## cap and for a lifted run (`capBytes` 0).
+  if capBytes == 0'u64 or action == mcaAdvisory: "max"
+  else: $capBytes
+
+proc memoryCapTarget*(target: CgroupTarget; capBytes: uint64;
+                      action: MemoryCapAction; stage: MemoryCapStage;
+                      launcherPid, sequence: int): CgroupTarget =
+  ## `target` with the memory cap of `capBytes` (0: measured only) applied
+  ## up to `stage`. Pure. A target that is not placed is returned as it is
+  ## (a cap needs a cgroup root). A target that already has a leaf of its
+  ## own (a CPU cap) keeps it, so one leaf carries both caps; otherwise the
+  ## tree gets `cap-<launcherPid>-<sequence>`.
+  result = target
+  if not target.placed:
+    return
+  result.memory = true
+  if stage >= mcsLeaf:
+    if not result.isCapLeaf:
+      result.leafName = capLeafName(launcherPid, sequence)
+    result.freshLeaf = true
+  if stage >= mcsLimits:
+    result.memoryMax = memoryMaxFor(capBytes, action)
+
+proc parseMemoryEvents*(text: string): MemoryEvents =
+  ## The `oom` and `oom_kill` counts of a `memory.events.local` text
+  ## (`<key> <count>` per line). Unknown when either key is missing or is
+  ## not a count: an absent figure must not read as a zero.
+  var haveOom, haveKill = false
+  for line in text.splitLines():
+    let fields = line.splitWhitespace()
+    if fields.len != 2:
+      continue
+    var value: BiggestUInt
+    try:
+      value = parseBiggestUInt(fields[1])
+    except ValueError:
+      continue
+    case fields[0]
+    of "oom":
+      result.oom = uint64(value)
+      haveOom = true
+    of "oom_kill":
+      result.oomKill = uint64(value)
+      haveKill = true
+    else:
+      discard
+  result.known = haveOom and haveKill
+
+proc memoryCapVerdict*(events: MemoryEvents; peakBytes, capBytes: uint64;
+                       action: MemoryCapAction;
+                       killEvidence: bool): MemoryCapVerdict =
+  ## How a tree in a memory-capped (or measured) leaf ended, from the
+  ## leaf's own `memory.events.local` and `memory.peak`, read after its
+  ## root was reaped. Pure.
+  ##
+  ## * `oom` >= 1 and `oom_kill` >= 1, and the root ended with kill evidence
+  ##   (a signal, or a non-zero exit from a parent that reported its
+  ##   child's kill): the CAP was hit and the OOM killer killed in the leaf.
+  ##   Cap exceeded, killed.
+  ## * `oom` >= 1 and `oom_kill` = 0: the cap was hit and an allocation was
+  ##   refused (ENOMEM: the kernel fails some allocations at the limit
+  ##   instead of killing), nothing was killed. Cap reached.
+  ## * `oom_kill` >= 1 and `oom` = 0: a process of the tree was killed for
+  ##   memory, but not because of the cap: a host-wide OOM, or the limit of
+  ##   an ancestor. Killed outside the cap.
+  ## * Otherwise the root's own conclusion; in advisory mode a peak above
+  ##   the cap is a breach that killed nothing.
+  ##
+  ## Only the LOCAL counts can tell these apart: the hierarchical
+  ## `memory.events` of the leaf also counts every cgroup below it, so a
+  ## tree that ran something in a sub-cgroup of its own, with a limit of
+  ## its own, would read as having exceeded its cap.
+  if not events.known:
+    return
+  if events.oom >= 1'u64 and events.oomKill >= 1'u64:
+    if killEvidence:
+      result.capExceeded = true
+      result.capKilled = true
+  elif events.oom >= 1'u64:
+    result.capReached = true
+  elif events.oomKill >= 1'u64:
+    result.oomKilledOutsideCap = true
+  if action == mcaAdvisory and capBytes > 0'u64 and peakBytes > capBytes:
+    result.capExceeded = true
 
 proc parseOwnCgroup*(procSelfCgroup: string): string =
   ## The cgroup v2 path of a process, from its `/proc/<pid>/cgroup` text
@@ -453,70 +656,182 @@ when defined(posix):
     discard posix.close(fd)
     true
 
-  proc enableCpuBelow(dir: string; problem: var string;
-                      vanished: var bool): bool =
-    ## `+cpu` in `dir/cgroup.subtree_control`, unless it is already there.
-    ## Every read and write tells a directory that another launcher's
+  proc enableControllerBelow(dir, controller: string; problem: var string;
+                             vanished: var bool): bool =
+    ## `+<controller>` in `dir/cgroup.subtree_control`, unless it is already
+    ## there. Every read and write tells a directory that another launcher's
     ## clean-up removed meanwhile (`vanished`) from one whose parent does
     ## not delegate the controller, because only the first is worth a retry.
     var enabled = ""
     if not readCgroupFile(dir / "cgroup.subtree_control", enabled, problem,
         vanished):
       return false
-    if hasController(enabled, "cpu"):
+    if hasController(enabled, controller):
       return true
     var available = ""
     if not readCgroupFile(dir / "cgroup.controllers", available, problem,
         vanished):
       return false
-    if not hasController(available, "cpu"):
-      problem = "the cpu controller is not available in " & dir &
-        " (not delegated: its parent does not enable it for its children)"
+    if not hasController(available, controller):
+      problem = "the " & controller & " controller is not available in " &
+        dir & " (not delegated: its parent does not enable it for its " &
+        "children)"
       return false
-    writeCgroupFile(dir / "cgroup.subtree_control", "+cpu", problem, vanished)
+    writeCgroupFile(dir / "cgroup.subtree_control", "+" & controller, problem,
+      vanished)
+
+  proc enableCpuBelow(dir: string; problem: var string;
+                      vanished: var bool): bool =
+    enableControllerBelow(dir, "cpu", problem, vanished)
+
+  proc ensureFreshDir(path: string; problem: var string; vanished,
+                      taken: var bool): bool =
+    ## `mkdir` that must CREATE the directory: an existing one is `taken`.
+    if posix.mkdir(cstring(path), 0o755) == 0:
+      return true
+    if errno == EEXIST:
+      taken = true
+      problem = "cgroup " & path & " already exists; a cap leaf holds one " &
+        "tree only"
+      return false
+    vanished = errno == ENOENT
+    problem = "cannot create cgroup " & path & ": " & errnoText()
+    false
+
+  proc writeMemoryLimits(target: CgroupTarget; memory: var MemoryPreparation;
+                         vanished: var bool): bool =
+    ## The leaf's memory limits, in an order that never leaves a limit
+    ## without the group kill: `memory.swap.max` and `memory.oom.group`
+    ## first, `memory.max` last, so a leaf whose `oom.group` cannot be set
+    ## gets no limit at all rather than a limit under which the kernel kills
+    ## one process and leaves its parent running. False only when the leaf
+    ## vanished (the caller prepares again); every other failure is a
+    ## `memory.problem` and the tree runs in its leaf without the cap.
+    let leaf = target.leafPath
+    var problem = ""
+    var gone = false
+    # No swap for a capped tree: the cap is on memory the tree holds, and a
+    # tree that can push its growth into swap passes the cap unseen. A
+    # kernel that does not account swap has no such file, and nothing to
+    # escape into through it.
+    if fileExists(leaf / "memory.swap.max"):
+      if not writeCgroupFile(leaf / "memory.swap.max", "0", problem, gone):
+        if gone:
+          vanished = true
+          memory.problem = problem
+          return false
+        memory.problem = "memory cap not applied: " & problem
+        return true
+    if not writeCgroupFile(leaf / "memory.oom.group", "1", problem, gone):
+      if gone:
+        vanished = true
+        memory.problem = problem
+        return false
+      memory.problem = "memory cap not applied: " & problem
+      return true
+    if not writeCgroupFile(leaf / "memory.max", target.memoryMax, problem,
+        gone):
+      if gone:
+        vanished = true
+        memory.problem = problem
+        return false
+      memory.problem = "memory cap not applied: " & problem
+      return true
+    memory.limits = true
+    true
 
 proc prepareTarget*(target: CgroupTarget; problem: var string;
-                    vanished: var bool): bool =
+                    vanished: var bool;
+                    memory: var MemoryPreparation): bool =
   ## Create (or confirm) the root, the group or reclaimed directory with its
-  ## weight, and the leaf (with its `cpu.max` for a cap leaf). Idempotent and
-  ## safe against other launchers doing the same at the same time: every
-  ## step accepts what an earlier or concurrent one already did. On failure
-  ## `problem` says which step and why, and nothing is undone (an empty
-  ## directory left behind is reused or cleaned up by the next launch).
+  ## weight, and the leaf (with its `cpu.max` for a cap leaf, and its memory
+  ## limits for a memory-capped one). Idempotent and safe against other
+  ## launchers doing the same at the same time: every step accepts what an
+  ## earlier or concurrent one already did, except the creation of a
+  ## `freshLeaf`. On failure `problem` says which step and why, and nothing
+  ## is undone (an empty directory left behind is reused or cleaned up by
+  ## the next launch).
   ##
   ## `vanished` is set when the failure is another launcher's clean-up
   ## removing the group directory or the leaf between two steps (the last
   ## tree of a group ended): preparing again then succeeds, and the
   ## launcher retries rather than leave its tree unplaced.
+  ##
+  ## THE MEMORY SETTINGS NEVER FAIL THE PLACEMENT. A memory controller that
+  ## cannot be enabled, or a limit that cannot be written, leaves the tree
+  ## placed in its leaf without the cap; `memory` says what is in place and
+  ## why the rest is not.
   vanished = false
+  memory = MemoryPreparation()
   when defined(linux):
     if not target.placed:
       problem = "no cgroup root"
       return false
     if not ensureDir(target.root, problem, vanished): return false
     if not enableCpuBelow(target.root, problem, vanished): return false
+    var memoryOn = false
+    if target.memory:
+      var memoryProblem = ""
+      var gone = false
+      memoryOn = enableControllerBelow(target.root, "memory", memoryProblem,
+        gone)
+      if gone:
+        vanished = true
+        problem = memoryProblem
+        return false
+      if not memoryOn:
+        memory.problem = "memory controller not enabled: " & memoryProblem
     let dir = target.dirPath
     if not ensureDir(dir, problem, vanished): return false
     if not writeCgroupFile(dir / "cpu.weight", $target.cpuWeight, problem,
         vanished):
       return false
     if not enableCpuBelow(dir, problem, vanished): return false
+    if memoryOn:
+      var memoryProblem = ""
+      var gone = false
+      memoryOn = enableControllerBelow(dir, "memory", memoryProblem, gone)
+      if gone:
+        vanished = true
+        problem = memoryProblem
+        return false
+      if not memoryOn:
+        memory.problem = "memory controller not enabled: " & memoryProblem
+    memory.controller = memoryOn
     let leaf = target.leafPath
-    if not ensureDir(leaf, problem, vanished): return false
+    if target.freshLeaf:
+      if not ensureFreshDir(leaf, problem, vanished, memory.leafTaken):
+        return false
+    elif not ensureDir(leaf, problem, vanished):
+      return false
     if target.cpuMax.len > 0:
       if not writeCgroupFile(leaf / "cpu.max", target.cpuMax, problem,
           vanished):
+        return false
+    if target.hasMemoryLimits:
+      if not memoryOn:
+        if memory.problem.len == 0:
+          memory.problem = "memory controller not enabled"
+        memory.problem = "memory cap not applied: " & memory.problem
+      elif not writeMemoryLimits(target, memory, vanished):
+        problem = memory.problem
         return false
     true
   else:
     problem = "cgroups exist only on Linux"
     false
 
+proc prepareTarget*(target: CgroupTarget; problem: var string;
+                    vanished: var bool): bool =
+  var memory: MemoryPreparation
+  prepareTarget(target, problem, vanished, memory)
+
 proc prepareTarget*(target: CgroupTarget; problem: var string): bool =
   var vanished = false
   prepareTarget(target, problem, vanished)
 
 when defined(linux):
+  var O_DIRECTORY {.importc, header: "<fcntl.h>".}: cint
   proc flock(fd: cint; operation: cint): cint {.importc, header: "<sys/file.h>".}
   var
     LOCK_SH {.importc, header: "<sys/file.h>".}: cint
@@ -696,16 +1011,20 @@ proc rewriteGroupWeight*(root: CgroupRoot; group: string;
     ""
 
 proc openPreparedProcs*(target: CgroupTarget; problem: var string;
-                        retryable: var bool): cint =
+                        retryable: var bool;
+                        memory: var MemoryPreparation): cint =
   ## Prepare `target` and open its leaf's `cgroup.procs` for writing
   ## (close-on-exec), for a forked child to write itself into before it
   ## executes. -1 on failure with `problem` set; `retryable` when the leaf
   ## vanished after it was prepared (another launcher's clean-up removed
-  ## it), so preparing it again can succeed.
+  ## it), so preparing it again can succeed. `memory` is what the
+  ## preparation did about the target's memory settings (`prepareTarget`);
+  ## `memory.leafTaken` asks the caller for another leaf name.
   retryable = false
+  memory = MemoryPreparation()
   when defined(linux):
     var vanished = false
-    if not prepareTarget(target, problem, vanished):
+    if not prepareTarget(target, problem, vanished, memory):
       retryable = vanished
       return -1
     let procs = target.leafPath / "cgroup.procs"
@@ -719,15 +1038,144 @@ proc openPreparedProcs*(target: CgroupTarget; problem: var string;
     problem = "cgroups exist only on Linux"
     -1
 
+proc openPreparedProcs*(target: CgroupTarget; problem: var string;
+                        retryable: var bool): cint =
+  var memory: MemoryPreparation
+  openPreparedProcs(target, problem, retryable, memory)
+
+proc openLeafDir*(target: CgroupTarget; problem: var string;
+                  vanished: var bool): cint =
+  ## The leaf's directory, opened `O_RDONLY | O_DIRECTORY | O_CLOEXEC`, for
+  ## `clone3(CLONE_INTO_CGROUP)` (clone(2): "cgroup" is a file descriptor
+  ## referring to a directory in a cgroup v2 hierarchy). -1 with `problem`
+  ## on failure; `vanished` when the leaf was removed meanwhile.
+  vanished = false
+  when defined(linux):
+    let leaf = target.leafPath
+    let fd = posix.open(cstring(leaf), O_RDONLY or O_DIRECTORY or O_CLOEXEC)
+    if fd < 0:
+      let saved = errno
+      vanished = removedErrno(saved)
+      problem = "cannot open " & leaf & ": " & $strerror(saved)
+    fd
+  else:
+    problem = "cgroups exist only on Linux"
+    -1
+
 proc moveIntoTarget*(target: CgroupTarget; pid: int;
                      problem: var string): bool =
   ## Prepare `target` again and move process `pid` into its leaf: the
   ## parent's half of the vanished-leaf retry, for a child that is waiting,
-  ## not yet executed, after its own write found the leaf gone.
+  ## not yet executed, after its own write found the leaf gone. A leaf the
+  ## launch created for itself (`freshLeaf`) is still its own: it was
+  ## created once by this launch and vanished, so creating it again here is
+  ## the same leaf, not another tree's.
   when defined(linux):
-    if not prepareTarget(target, problem):
+    var again = target
+    again.freshLeaf = false
+    if not prepareTarget(again, problem):
       return false
     writeCgroupFile(target.leafPath / "cgroup.procs", $pid, problem)
   else:
     problem = "cgroups exist only on Linux"
     false
+
+proc readLeafMemory*(target: CgroupTarget; events: var MemoryEvents;
+                     peakBytes: var uint64; problem: var string): bool =
+  ## The leaf's `memory.events.local` and `memory.peak`, read ONCE, after
+  ## the tree's root was reaped and before the leaf is removed. Never the
+  ## hierarchical `memory.events` (`memoryCapVerdict` says why). False with
+  ## `problem` when either cannot be read (no memory controller on the
+  ## leaf, a kernel before 5.19 without `memory.peak`).
+  events = MemoryEvents()
+  peakBytes = 0'u64
+  when defined(linux):
+    let leaf = target.leafPath
+    var text = ""
+    var vanished = false
+    if not readCgroupFile(leaf / "memory.events.local", text, problem,
+        vanished):
+      return false
+    events = parseMemoryEvents(text)
+    if not events.known:
+      problem = "no oom / oom_kill counts in " & leaf / "memory.events.local"
+      return false
+    if not readCgroupFile(leaf / "memory.peak", text, problem, vanished):
+      events = MemoryEvents()
+      return false
+    try:
+      peakBytes = uint64(parseBiggestUInt(text.strip()))
+    except ValueError:
+      events = MemoryEvents()
+      problem = "cannot parse " & leaf / "memory.peak" & ": '" & text.strip() &
+        "'"
+      return false
+    true
+  else:
+    problem = "cgroups exist only on Linux"
+    false
+
+type
+  MemoryProbe* = object
+    ## Whether `root` can carry memory-capped leaves, found WITHOUT creating
+    ## or writing anything (`probeMemory`).
+    available*: bool
+      ## The memory controller is available to the root (in its
+      ## `cgroup.controllers`, or, before the root exists, enabled in its
+      ## parent's `cgroup.subtree_control`).
+    problem*: string
+      ## Why not, or "".
+    oomGroupAncestors*: seq[string]
+      ## Every cgroup at or above the root, or between the root and its
+      ## leaves, with `memory.oom.group` = 1 (trap 1). Must be empty: such a
+      ## cgroup turns one tree's host-OOM kill into the kill of everything
+      ## below it.
+
+proc readsOne(path: string): bool =
+  readSmall(path).strip() == "1"
+
+proc probeMemory*(root: CgroupRoot): MemoryProbe =
+  ## The memory half of `probeRoot`, for the capability record: whether the
+  ## memory controller reaches the root, and which cgroups that are not
+  ## task leaves have `memory.oom.group` set. Reads only.
+  if not root.usable:
+    result.problem = root.reason
+    return
+  when defined(linux):
+    # The cgroups above the root, from the mount down: a host-wide OOM's
+    # domain is the whole hierarchy, so `oom.group` on any of them makes
+    # the kernel kill that whole cgroup instead of one tree.
+    let relative = root.path[min(root.path.len, CgroupMountPoint.len) .. ^1]
+    var dir = CgroupMountPoint
+    for component in relative.split('/'):
+      if component.len == 0:
+        continue
+      dir = dir / component
+      if dir != root.path and readsOne(dir / "memory.oom.group"):
+        result.oomGroupAncestors.add(dir)
+    if dirExists(root.path):
+      if readsOne(root.path / "memory.oom.group"):
+        result.oomGroupAncestors.add(root.path)
+      # The group and reclaimed directories: every directory directly below
+      # the root is an ancestor of leaves.
+      try:
+        for kind, path in walkDir(root.path):
+          if kind == pcDir and readsOne(path / "memory.oom.group"):
+            result.oomGroupAncestors.add(path)
+      except OSError:
+        discard
+      if not hasController(readSmall(root.path / "cgroup.controllers"),
+          "memory"):
+        result.problem = "the memory controller is not available in " &
+          root.path
+        return
+    else:
+      let parent = root.path.parentDir
+      if not hasController(readSmall(parent / "cgroup.subtree_control"),
+          "memory"):
+        result.problem = "the memory controller is not delegated to " &
+          parent & " (missing from its cgroup.subtree_control)"
+        return
+    result.available = true
+  else:
+    result.problem = "cgroups exist only on Linux"
