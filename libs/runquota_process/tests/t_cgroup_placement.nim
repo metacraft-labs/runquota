@@ -18,6 +18,30 @@
 ##   `.`/`..`), and the default below the caller's own `user@<uid>.service`
 ##   only. Mutation: accepting an explicit path outside the mount, or a
 ##   default for a process not inside its own user manager.
+## * A root that would take the tree out of its caller's limits: the
+##   launcher's own cgroup and its ancestors below the deepest cgroup the
+##   root also lies in are checked, with a fake reader, and a
+##   `memory.max`/`memory.high`/`memory.swap.max` other than `max`, a
+##   `cpu.max` with a quota, or a `pids.max` below systemd's default task
+##   limit (15% of the smaller of the kernel's `pid_max` and `threads-max`;
+##   any `pids.max` other than `max` when those cannot be read) makes the
+##   root unavailable with the cgroup, the file and the value in the
+##   reason: a limit on the own
+##   scope, on an intermediate ancestor (`app.slice`), the explicit root as
+##   well as the default; a limit on a common ancestor (`user@.service`),
+##   a root below the limited cgroup, `max` values and `cpu.max "max
+##   100000"` leave it usable. Mutations: `resolveCgroupRoot` not calling
+##   `limitLeftBehind` (every "unavailable" case fails), checking only the
+##   own cgroup (the `app.slice` case), checking up to the mount instead of
+##   stopping at the common ancestor (the `user@.service` case), comparing
+##   paths by string prefix (the `app.slice-x` case), reading `cpu.max`'s
+##   period instead of its quota or treating `max` as a limit (the `max`
+##   case), checking only the default root (the explicit case), counting
+##   every `pids.max` other than `max` (the systemd-default case: every
+##   launcher in a systemd unit would decline), comparing with `<=` or
+##   taking the larger kernel limit (the boundary and smaller-limit
+##   cases), and ignoring `pids.max` when the kernel files cannot be read
+##   (the unreadable cases).
 ## * The capability records for Linux (placement on, and unavailable with
 ##   its reason), macOS and Windows, and their JSON.
 ## * Degradation, with real processes: a placement whose directories cannot
@@ -29,7 +53,9 @@
 ##   forked child writes itself into its leaf before it executes, and
 ##   `close` removes the leaf and the group directory once empty. Mutation:
 ##   the child skipping its write into `cgroup.procs`. (Reported SKIPPED
-##   with the reason where there is no delegated subtree.)
+##   with the reason where there is no delegated subtree, or where this
+##   process runs under a limit a tree placed in the test root would leave:
+##   `delegatedTestRoot`.)
 ##
 ## * Concurrent launchers of one group: each tree lands in the shared leaf
 ##   although the others' clean-up keeps removing the leaf and the group
@@ -88,6 +114,31 @@ when defined(linux):
         stderr.writeLine("misplaced: " & parts[0] & " | " & parts[1] &
           " | " & parts[2])
     quit(min(misplaced, 100))
+
+const
+  UserService = "/user.slice/user-1000.slice/user@1000.service"
+  OwnScope = UserService & "/app.slice/run-1.scope"
+
+var fakeLimits: seq[(string, string)]
+  ## (absolute interface file path, contents) the fake reader answers; every
+  ## other file reads as absent. Set by each case before it resolves.
+
+proc fakeRead(path: string): string {.nimcall, gcsafe, raises: [].} =
+  ## The cgroup interface files of a made-up hierarchy: what the limit check
+  ## is to compare must not depend on the cgroups of the host running the
+  ## test. Justified as a fake: the decision is pure over file contents, and
+  ## the real-file path is driven end to end by
+  ## `tests/integration/t_cgroup_placement_caller_limits.nim`.
+  {.cast(gcsafe).}:
+    for (file, text) in fakeLimits:
+      if file == path:
+        return text
+  ""
+
+proc noLimits(path: string): string {.nimcall, gcsafe, raises: [].} = ""
+
+proc limitAt(cgroup, file, value: string) =
+  fakeLimits.add((CgroupMountPoint & cgroup & "/" & file, value & "\n"))
 
 suite "cgroup placement rules":
   test "priority to cpu.weight, and the nice fallback":
@@ -208,34 +259,156 @@ suite "cgroup placement rules":
 
   test "the root":
     const own = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n"
-    check resolveCgroupRoot("off", own, 1000, hostSwitchOn = true, isLinux = true).state == crsOff
-    check resolveCgroupRoot(" off ", own, 1000, hostSwitchOn = true, isLinux = true).state == crsOff
-    let default = resolveCgroupRoot("", own, 1000, hostSwitchOn = true, isLinux = true)
+    check resolveCgroupRoot("off", own, 1000, hostSwitchOn = true, isLinux = true, read = noLimits).state == crsOff
+    check resolveCgroupRoot(" off ", own, 1000, hostSwitchOn = true, isLinux = true, read = noLimits).state == crsOff
+    let default = resolveCgroupRoot("", own, 1000, hostSwitchOn = true, isLinux = true, read = noLimits)
     check default.state == crsDefault
     check default.path ==
       "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/runquota.slice"
     # Another uid's manager, a system service, cgroup v1 only: no default.
-    check resolveCgroupRoot("", own, 1001, hostSwitchOn = true, isLinux = true).state == crsUnavailable
+    check resolveCgroupRoot("", own, 1001, hostSwitchOn = true, isLinux = true, read = noLimits).state == crsUnavailable
     check resolveCgroupRoot("", "0::/system.slice/ci.service\n", 1000,
-      hostSwitchOn = true, isLinux = true).state == crsUnavailable
+      hostSwitchOn = true, isLinux = true, read = noLimits).state == crsUnavailable
     check resolveCgroupRoot("", "1:cpu:/x\n", 1000,
-      hostSwitchOn = true, isLinux = true).state == crsUnavailable
+      hostSwitchOn = true, isLinux = true, read = noLimits).state == crsUnavailable
     # The host switch: off by default; the variable's explicit root turns
     # placement on whatever the switch says, and its `off` wins over an on.
     check resolveCgroupRoot("", own, 1000, hostSwitchOn = false,
-      isLinux = true).state == crsOff
+      isLinux = true, read = noLimits).state == crsOff
     let explicit = resolveCgroupRoot("/sys/fs/cgroup/a/b/", own, 1000,
-      hostSwitchOn = false, isLinux = true)
+      hostSwitchOn = false, isLinux = true, read = noLimits)
     check explicit.state == crsExplicit
     check explicit.path == "/sys/fs/cgroup/a/b"
     for bad in ["/tmp/x", "relative", "/sys/fs/cgroup", "/sys/fs/cgroup/",
                 "/sys/fs/cgroup/../../etc", "/sys/fs/cgroup/a/./b",
                 "/sys/fs/cgroupX/a", "/sys/fs/cgroup/a\nb"]:
-      let resolved = resolveCgroupRoot(bad, own, 1000, hostSwitchOn = true, isLinux = true)
+      let resolved = resolveCgroupRoot(bad, own, 1000, hostSwitchOn = true, isLinux = true, read = noLimits)
       check resolved.state == crsUnavailable
       check resolved.reason.startsWith(CgroupRootEnvVar)
-    check resolveCgroupRoot("", own, 1000, hostSwitchOn = true, isLinux = false).state ==
+    check resolveCgroupRoot("", own, 1000, hostSwitchOn = true, isLinux = false, read = noLimits).state ==
       crsUnavailable
+
+  test "a root that would take the tree out of its caller's limits":
+    let own = "0::" & OwnScope & "\n"
+    let defaultRoot = CgroupMountPoint & UserService & "/" & DefaultRootName
+    proc resolved(env: string): CgroupRoot =
+      resolveCgroupRoot(env, own, 1000, hostSwitchOn = true, isLinux = true,
+        read = fakeRead)
+    # A MemoryMax on the caller's own scope: the default root (a sibling
+    # below user@1000.service) would leave it.
+    fakeLimits = @[]
+    limitAt(OwnScope, "memory.max", "4294967296")
+    var root = resolved("")
+    check root.state == crsUnavailable
+    check "memory.max" in root.reason
+    check "4294967296" in root.reason
+    check CgroupMountPoint & OwnScope in root.reason
+    check limitLeftBehind(OwnScope, defaultRoot, fakeRead) == root.reason
+    # The explicit root is checked the same way.
+    root = resolved(CgroupMountPoint & UserService & "/elsewhere.slice")
+    check root.state == crsUnavailable
+    check "memory.max" in root.reason
+    # A root at or below the limited cgroup keeps the tree inside it.
+    root = resolved(CgroupMountPoint & OwnScope & "/rq")
+    check root.state == crsExplicit
+    check limitLeftBehind(OwnScope, CgroupMountPoint & OwnScope, fakeRead) == ""
+    # A limit on an intermediate ancestor the root is not in (app.slice).
+    fakeLimits = @[]
+    limitAt(UserService & "/app.slice", "memory.high", "8G")
+    root = resolved("")
+    check root.state == crsUnavailable
+    check "memory.high" in root.reason
+    check CgroupMountPoint & UserService & "/app.slice" in root.reason
+    # A limit on a common ancestor (user@.service) stays over the tree.
+    fakeLimits = @[]
+    limitAt(UserService, "memory.max", "1073741824")
+    limitAt(UserService, "pids.max", "100")
+    limitAt(UserService, "cpu.max", "50000 100000")
+    check resolved("").state == crsDefault
+    # Component-wise, not by string prefix: `app.slice-x` is not inside
+    # `app.slice`, so a root there still leaves app.slice's limit.
+    fakeLimits = @[]
+    limitAt(UserService & "/app.slice", "memory.max", "1073741824")
+    check resolved(CgroupMountPoint & UserService & "/app.slice-x").state ==
+      crsUnavailable
+    check resolved(CgroupMountPoint & UserService & "/app.slice/rq").state ==
+      crsExplicit
+    # `max` everywhere, and a cpu.max with no quota, are no limit.
+    fakeLimits = @[]
+    for file in ["memory.max", "memory.high", "memory.swap.max", "pids.max"]:
+      limitAt(OwnScope, file, "max")
+    limitAt(OwnScope, "cpu.max", "max 100000")
+    check resolved("").state == crsDefault
+    # An empty file is no limit either (absent ones are covered above).
+    fakeLimits = @[]
+    limitAt(OwnScope, "memory.max", "")
+    check resolved("").state == crsDefault
+    # cpu.max with a quota, pids.max and memory.swap.max with a number.
+    for (file, value) in [("cpu.max", "50000 100000"), ("pids.max", "100"),
+                          ("memory.swap.max", "0")]:
+      fakeLimits = @[]
+      limitAt(OwnScope, file, value)
+      root = resolved("")
+      check root.state == crsUnavailable
+      check file in root.reason
+      check value in root.reason
+    # pids.max against systemd's default task limit, 15% of the smaller of
+    # the kernel's pid_max and threads-max (this host's figures: 1027717 *
+    # 15 div 100 = 154157, the value systemd writes on every unit).
+    proc withKernel(pidsMax: string) =
+      fakeLimits = @[]
+      fakeLimits.add((KernelPidMaxPath, "4194304\n"))
+      fakeLimits.add((KernelThreadsMaxPath, "1027717\n"))
+      limitAt(OwnScope, "pids.max", pidsMax)
+    check defaultTasksMaxThreshold(fakeRead) == -1   # no kernel files yet
+    withKernel("154157")
+    check defaultTasksMaxThreshold(fakeRead) == 154157
+    check resolved("").state == crsDefault           # the systemd default
+    withKernel("200000")
+    check resolved("").state == crsDefault           # above it
+    withKernel("154156")
+    root = resolved("")
+    check root.state == crsUnavailable               # just below it
+    check "pids.max is 154156" in root.reason
+    withKernel("64")                                 # -p TasksMax=64
+    root = resolved("")
+    check root.state == crsUnavailable
+    check "pids.max is 64" in root.reason
+    check "154157" in root.reason
+    # The smaller of the two kernel limits sets the threshold.
+    fakeLimits = @[]
+    fakeLimits.add((KernelPidMaxPath, "32768\n"))
+    fakeLimits.add((KernelThreadsMaxPath, "1027717\n"))
+    limitAt(OwnScope, "pids.max", "154157")
+    check defaultTasksMaxThreshold(fakeRead) == 4915
+    check resolved("").state == crsDefault
+    # Either kernel file unreadable (or not a count): every pids.max other
+    # than `max` counts.
+    for (pidMax, threadsMax) in [("", "1027717\n"), ("4194304\n", ""),
+                                 ("junk\n", "1027717\n")]:
+      fakeLimits = @[]
+      if pidMax.len > 0: fakeLimits.add((KernelPidMaxPath, pidMax))
+      if threadsMax.len > 0: fakeLimits.add((KernelThreadsMaxPath, threadsMax))
+      limitAt(OwnScope, "pids.max", "154157")
+      root = resolved("")
+      check root.state == crsUnavailable
+      check "pids.max is 154157" in root.reason
+      check "could not be read" in root.reason
+    # pids.max `max` is no limit whatever the kernel files say.
+    withKernel("max")
+    check resolved("").state == crsDefault
+    # Placement off reads nothing and checks nothing.
+    fakeLimits = @[]
+    limitAt(OwnScope, "memory.max", "4294967296")
+    check resolveCgroupRoot("off", own, 1000, hostSwitchOn = true,
+      isLinux = true, read = fakeRead).state == crsOff
+    check resolveCgroupRoot("", own, 1000, hostSwitchOn = false,
+      isLinux = true, read = fakeRead).state == crsOff
+    # The process in the root cgroup itself, or with no cgroup v2 line,
+    # leaves nothing.
+    check limitLeftBehind("/", defaultRoot, fakeRead) == ""
+    check limitLeftBehind("", defaultRoot, fakeRead) == ""
+    fakeLimits = @[]
 
 suite "capability records":
   test "Linux with placement, and without":

@@ -54,9 +54,10 @@
 ##
 ## A ROOT OF ITS OWN (`cgroup_test_root`), never the user's real
 ## `runquota.slice`; on a host without a delegated cgroup v2 subtree with the
-## cpu controller the cases are reported SKIPPED with the reason. The holder
-## process that keeps each group's directory alive ends by itself when the
-## test creates its stop file; nothing is killed.
+## cpu controller, or when this process runs under a limit a tree placed in
+## the test root would leave, the cases are reported SKIPPED with the
+## reason. The holder process that keeps each group's directory alive ends
+## by itself when the test creates its stop file; nothing is killed.
 
 when defined(linux):
   import std/[os, osproc, streams, strtabs, strutils, unittest]
@@ -88,8 +89,8 @@ when defined(linux):
     putEnv("RUNQUOTA_SOCKET", socket)
     delEnv("RUNQUOTA_PARENT_LEASE")
   else:
-    echo "SKIPPED (every case): no delegated cgroup v2 subtree with the cpu " &
-      "controller for this user: " & rootReason
+    echo "SKIPPED (every case): no cgroup test root this process can " &
+      "place trees in: " & rootReason
 
   let root = CgroupRoot(state: crsExplicit, path: testRoot)
 

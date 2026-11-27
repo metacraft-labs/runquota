@@ -26,10 +26,34 @@
 ## constraint, same document, § "No Internal Process Constraint").
 ##
 ## WHO CREATES IT. The launching client, never `runquotad` (which does not
-## spawn or contain process trees). The default root is the caller's own
-## systemd-delegated user subtree, so each user's trees are in that user's
-## cgroups and nothing here needs privilege. systemd's delegation rules:
+## spawn or contain process trees). The default root is `runquota.slice`
+## directly in the caller's own systemd-delegated `user@<uid>.service`, so
+## each user's trees are in that user's cgroups and nothing here needs
+## privilege. systemd's delegation rules:
 ## https://systemd.io/CGROUP_DELEGATION/
+##
+## THE CALLER'S LIMITS COME WITH THE TREE, OR THERE IS NO PLACEMENT. That
+## default root is a SIBLING of the launcher's own cgroup, not a descendant:
+## a launcher started by `systemd-run --user --scope -p MemoryMax=...` runs in
+## `user@<uid>.service/app.slice/run-....scope`, and a tree moved into
+## `runquota.slice/...` would leave the scope and every limit on it. So
+## before it uses a root, default or explicit, a launcher checks the cgroups
+## the tree would leave -- its own and each ancestor up to, not including,
+## the deepest one the root also lies in (`limitLeftBehind`) -- and when any
+## of them carries a limit (a memory or CPU limit, or a `pids.max` below the
+## default systemd writes on every unit) the root is UNAVAILABLE with that
+## limit as the reason: the tree runs where the launcher is, at the fallback
+## nice.
+## Declining rather than creating the root below the launcher's own cgroup
+## is deliberate: cgroup v2 forbids enabling `cpu` for the children of a
+## cgroup that holds processes (the no-internal-process rule below), and the
+## launcher's cgroup holds at least the launcher, so such a root could carry
+## no weights without first moving the launcher and its siblings into a leaf
+## of a cgroup systemd, not RunQuota, manages. An operator who wants
+## placement inside a capped unit delegates it and names a root below the
+## limited cgroup in `RUNQUOTA_CGROUP_ROOT`, from a launcher outside it.
+## (Build-Engine-And-Scheduler.md § Enforcement below admission, "A root that
+## would take a tree out of its caller's limits".)
 ##
 ## NOTHING HERE MAY FAIL A LAUNCH. Every problem becomes a reason string the
 ## launcher reports and the capability record carries, and the tree runs
@@ -119,6 +143,14 @@ type
       ## `shared` or `cap-<pid>-<n>`.
     cpuMax*: string
       ## "" for an uncapped leaf; otherwise the `cpu.max` text of a cap leaf.
+
+  CgroupFileRead* = proc (path: string): string {.nimcall, gcsafe,
+                                                  raises: [].}
+    ## Reads one cgroup interface file by its absolute path: its contents, or
+    ## "" when it is absent, unreadable or empty (all three mean no limit to
+    ## `limitLeftBehind`). Plain procedure, no closure, so a static-helper
+    ## caller can pass one; the default is `readCgroupInterfaceFile`, and a
+    ## test passes one over a made-up hierarchy.
 
   GroupPriorityRead* = proc (context: pointer;
                              priority: var SessionPriority): bool {.
@@ -267,10 +299,13 @@ proc explicitRootProblem*(path: string): string =
   ""
 
 proc defaultRootFor*(ownCgroup: string; uid: int): string =
-  ## `runquota.slice` below the `user@<uid>.service` cgroup that contains
-  ## `ownCgroup`, or "" when the caller is not inside its own user manager's
-  ## subtree (a system service, a container, a job under another manager):
-  ## that is the subtree systemd delegates to the user.
+  ## `runquota.slice` directly in the `user@<uid>.service` cgroup that
+  ## contains `ownCgroup`, or "" when the caller is not inside its own user
+  ## manager's subtree (a system service, a container, a job under another
+  ## manager): that is the subtree systemd delegates to the user. The result
+  ## is a sibling of the caller's own cgroup (`app.slice/....scope` and the
+  ## like), not inside it, which is why `resolveCgroupRoot` checks the limits
+  ## a tree would leave there (`limitLeftBehind`).
   let service = "user@" & $uid & ".service"
   var prefix = ""
   for component in ownCgroup.split('/'):
@@ -281,13 +316,165 @@ proc defaultRootFor*(ownCgroup: string; uid: int): string =
       return CgroupMountPoint & prefix & "/" & DefaultRootName
   ""
 
+proc readCgroupInterfaceFile*(path: string): string {.nimcall, gcsafe,
+                                                        raises: [].} =
+  ## The real `CgroupFileRead`: the file's contents, or "" when it cannot be
+  ## read (an interface file is absent where its controller is not enabled).
+  try: readFile(path) except CatchableError: ""
+
+proc cgroupComponents(path: string): seq[string] =
+  for component in path.split('/'):
+    if component.len > 0:
+      result.add(component)
+
+const
+  MemoryLimitFiles = ["memory.max", "memory.high", "memory.swap.max"]
+    ## The interface files whose value other than `max` is a limit (with
+    ## `cpu.max`, whose quota is its first field, and `pids.max` below the
+    ## systemd default): the list Daemon-Process-Priority.md counts as "the
+    ## caller's resource limits".
+    ## https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files
+    ## https://docs.kernel.org/admin-guide/cgroup-v2.html#pid-interface-files
+  KernelPidMaxPath* = "/proc/sys/kernel/pid_max"
+  KernelThreadsMaxPath* = "/proc/sys/kernel/threads-max"
+  DefaultTasksMaxPercent* = 15
+    ## systemd's documented default of `DefaultTasksMax=`: 15% of the smaller
+    ## of the kernel's `pid_max` and `threads-max`.
+    ## https://www.freedesktop.org/software/systemd/man/latest/systemd-system.conf.html
+
+proc parseCount(text: string; value: var int64): bool =
+  ## A non-negative decimal count, or false.
+  let digits = text.strip()
+  if digits.len == 0 or digits.len > 18:
+    return false
+  var parsed = 0'i64
+  for ch in digits:
+    if ch notin {'0'..'9'}:
+      return false
+    parsed = parsed * 10 + int64(ord(ch) - ord('0'))
+  value = parsed
+  true
+
+proc defaultTasksMaxThreshold*(read: CgroupFileRead): int64 =
+  ## systemd's default per-unit task limit on this host, 15% of the smaller
+  ## of `/proc/sys/kernel/pid_max` and `/proc/sys/kernel/threads-max`
+  ## (integer: `min * 15 div 100`), read through `read`; -1 when either file
+  ## cannot be read or parsed.
+  ##
+  ## WHY IT MATTERS. systemd writes that default to `pids.max` of EVERY unit
+  ## it starts, a `systemd-run --scope` given no limit included, so a
+  ## `pids.max` counted as a limit whatever its value would make every
+  ## launcher in a systemd unit decline placement. A `TasksMax=` a caller
+  ## sets is almost always far below it; one at or above it bounds nothing
+  ## in practice. (Build-Engine-And-Scheduler.md § Enforcement below
+  ## admission, "A root that would take a tree out of its caller's
+  ## limits".)
+  var pidMax, threadsMax: int64
+  if not parseCount(read(KernelPidMaxPath), pidMax) or
+      not parseCount(read(KernelThreadsMaxPath), threadsMax):
+    return -1
+  min(pidMax, threadsMax) * DefaultTasksMaxPercent div 100
+
+proc pidsMaxIsLimit(value: string; threshold: int64): bool =
+  ## Whether a `pids.max` text other than `max` counts as a limit: below
+  ## `threshold`, or always when the threshold is unknown (-1) or the value
+  ## is not a count (the safe direction: placement is declined, with the
+  ## value named).
+  var count: int64
+  if threshold < 0 or not parseCount(value, count):
+    return true
+  count < threshold
+
+proc limitOf(dir: string; read: CgroupFileRead; threshold: var int64;
+             thresholdRead: var bool): string =
+  ## "<file> is <value>" for the first limit `dir` carries, or "". The task
+  ## threshold is read the first time a `pids.max` other than `max` needs
+  ## it, and kept for the other cgroups of the same check.
+  for file in MemoryLimitFiles:
+    let value = read(dir & "/" & file).strip()
+    if value.len > 0 and value != "max":
+      return file & " is " & value
+  let pids = read(dir & "/pids.max").strip()
+  if pids.len > 0 and pids != "max":
+    if not thresholdRead:
+      threshold = defaultTasksMaxThreshold(read)
+      thresholdRead = true
+    if pidsMaxIsLimit(pids, threshold):
+      return "pids.max is " & pids & (if threshold < 0:
+        " (the kernel's pid_max or threads-max could not be read, so " &
+          "every pids.max other than max counts)"
+        else: " (below systemd's default task limit here, " & $threshold & ")")
+  let cpuMax = read(dir & "/cpu.max").strip()
+  let fields = cpuMax.splitWhitespace()
+  if fields.len > 0 and fields[0] != "max":
+    return "cpu.max is " & cpuMax
+  ""
+
+proc limitLeftBehind*(ownCgroup, rootPath: string;
+                      read: CgroupFileRead): string =
+  ## Why placing a tree under `rootPath` (an absolute path in the cgroup v2
+  ## mount) would take it out of a limit the launcher runs under, or "" when
+  ## it would not. `ownCgroup` is the launcher's cgroup relative to the
+  ## mount (the `0::` line of `/proc/self/cgroup`, `parseOwnCgroup`).
+  ##
+  ## THE CGROUPS LEFT are the launcher's own and each of its ancestors up to,
+  ## not including, the deepest one that is also the root or an ancestor of
+  ## it: a limit there stays over the placed tree, and so does one on any
+  ## cgroup above. Compared component by component (`app.slice-x` is not
+  ## inside `app.slice`). A root at or below the launcher's cgroup leaves
+  ## nothing. Each is checked from the launcher's own cgroup upward; the
+  ## first limit found is the reason, naming the cgroup, the file and its
+  ## value. An absent, unreadable or empty file is no limit.
+  ##
+  ## THE LIMITS: `memory.max`, `memory.high` or `memory.swap.max` other than
+  ## `max`; a `cpu.max` whose quota (first field) is not `max`; a
+  ## `pids.max` other than `max` that is below systemd's default per-unit
+  ## task limit (`defaultTasksMaxThreshold`, read through `read` from
+  ## `/proc/sys/kernel/{pid_max,threads-max}`), or any `pids.max` other than
+  ## `max` when those cannot be read.
+  let own = cgroupComponents(ownCgroup)
+  if own.len == 0:
+    return ""
+  var rootRelative = rootPath
+  if rootRelative.startsWith(CgroupMountPoint & "/"):
+    rootRelative = rootRelative[CgroupMountPoint.len .. ^1]
+  let root = cgroupComponents(rootRelative)
+  var common = 0
+  while common < own.len and common < root.len and
+      own[common] == root[common]:
+    inc common
+  var depth = own.len
+  var threshold = -1'i64
+  var thresholdRead = false
+  while depth > common:
+    let dir = CgroupMountPoint & "/" & own[0 ..< depth].join("/")
+    let limit = limitOf(dir, read, threshold, thresholdRead)
+    if limit.len > 0:
+      return "placing the tree under " & rootPath &
+        " would take it out of cgroup " & dir & ", whose " & limit &
+        " (a limit its launcher runs under); the tree runs in the " &
+        "launcher's cgroup instead"
+    dec depth
+  ""
+
 proc resolveCgroupRoot*(envValue, procSelfCgroup: string; uid: int;
-                        hostSwitchOn: bool; isLinux = defined(linux)):
+                        hostSwitchOn: bool; isLinux = defined(linux);
+                        read: CgroupFileRead = readCgroupInterfaceFile):
     CgroupRoot =
   ## The root a launcher of user `uid` places trees under, from the value of
   ## `RUNQUOTA_CGROUP_ROOT`, the host file's `[enforcement] cgroups`
-  ## (`hostSwitchOn`) and its own `/proc/self/cgroup` text. Pure: the inputs
-  ## are what `currentCgroupRoot` reads.
+  ## (`hostSwitchOn`) and its own `/proc/self/cgroup` text. The inputs are
+  ## what `currentCgroupRoot` reads; the cgroup interface files the limit
+  ## check reads go through `read`, the real files unless a test fakes them.
+  ##
+  ## A ROOT THAT WOULD TAKE THE TREE OUT OF ITS CALLER'S LIMITS is
+  ## unavailable, default or explicit: when `limitLeftBehind` finds a limit
+  ## on a cgroup the tree would leave, the result is `crsUnavailable` with
+  ## that reason, and the launcher runs the tree where it is with the
+  ## fallback nice. Only a root that is otherwise usable is checked, so with
+  ## placement off nothing is read. An explicit root with no cgroup v2 line
+  ## in `procSelfCgroup` is not checked: such a process is under no cgroup
+  ## v2 limit to leave.
   ##
   ## PRECEDENCE: the variable's `off` wins over everything; an explicit root
   ## in it turns placement on under that root; with the variable unset the
@@ -310,8 +497,11 @@ proc resolveCgroupRoot*(envValue, procSelfCgroup: string; uid: int;
     if problem.len > 0:
       return CgroupRoot(state: crsUnavailable,
         reason: CgroupRootEnvVar & ": " & problem)
-    return CgroupRoot(state: crsExplicit, path: value.strip(leading = false,
-      chars = {'/'}))
+    let path = value.strip(leading = false, chars = {'/'})
+    let left = limitLeftBehind(parseOwnCgroup(procSelfCgroup), path, read)
+    if left.len > 0:
+      return CgroupRoot(state: crsUnavailable, reason: left)
+    return CgroupRoot(state: crsExplicit, path: path)
   let own = parseOwnCgroup(procSelfCgroup)
   if own.len == 0:
     return CgroupRoot(state: crsUnavailable,
@@ -322,6 +512,9 @@ proc resolveCgroupRoot*(envValue, procSelfCgroup: string; uid: int;
       reason: "this process (cgroup " & own & ") is not inside user@" & $uid &
         ".service, the subtree systemd delegates to the user; set " &
         CgroupRootEnvVar & " to a delegated cgroup")
+  let left = limitLeftBehind(own, root, read)
+  if left.len > 0:
+    return CgroupRoot(state: crsUnavailable, reason: left)
   CgroupRoot(state: crsDefault, path: root)
 
 proc usable*(root: CgroupRoot): bool =
@@ -358,16 +551,20 @@ proc currentCgroupRoot*(hostSwitchOn = false): CgroupRoot =
   ## host file passes nothing, so only an explicit root turns placement on)
   ## and its own cgroup.
   ##
-  ## OFF COSTS NOTHING. `/proc/self/cgroup` and the effective uid are read
-  ## only when the answer can depend on them (the default root with the host
-  ## switch on): with placement off a launch must make no system call it did
-  ## not make before placement existed.
+  ## OFF COSTS NOTHING. `/proc/self/cgroup` is read only when placement is
+  ## on (an explicit root, or the default with the host switch on), where
+  ## both the default root and the check of the caller's limits
+  ## (`limitLeftBehind`) depend on it, and the effective uid only for the
+  ## default root: with placement off a launch must make no system call it
+  ## did not make before placement existed.
   when defined(linux):
     let value = getEnv(CgroupRootEnvVar).strip()
     var own = ""
     var uid = 0
-    if value.len == 0 and hostSwitchOn:
+    let defaultOn = value.len == 0 and hostSwitchOn
+    if defaultOn:
       uid = int(geteuid())
+    if defaultOn or (value.len > 0 and value != CgroupRootOff):
       try:
         own = readFile("/proc/self/cgroup")
       except IOError, OSError:

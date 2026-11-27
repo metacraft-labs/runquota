@@ -607,11 +607,17 @@ proc run64Script(cli: string): string =
     "pids=\"$pids $!\"; i=$((i+1)); done; " &
     "for p in $pids; do wait $p || fail=1; done; exit $fail"
 
-proc gateCgroupRoot(): string =
+proc gateCgroupRoot(reason: var string): string =
   ## A gate-owned cgroup root below this user's delegated subtree, or "".
+  ## "" also when the gate itself runs under a limit that a tree placed
+  ## there would leave (a `systemd-run --scope -p MemoryMax=...` around the
+  ## gate): its launchers would decline that root (`limitLeftBehind`), so
+  ## the cgroups case reports no root instead of measuring a placement
+  ## that does not happen.
   let own = try: readFile("/proc/self/cgroup") except IOError, OSError: ""
   let default = resolveCgroupRoot("", own, int(getuid()), hostSwitchOn = true)
   if not default.usable:
+    reason = default.reason
     return ""
   default.path.parentDir / ("runquota-gate-" & $getpid() & ".slice")
 
@@ -712,7 +718,9 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
         "priority policy and this is not macOS")
   var cgroupRoots: array[Arm, string] = ["off", "off"]
   var probe = newJNull()
-  let gateRoot = if cfg.switch == "cgroups": gateCgroupRoot() else: ""
+  var gateRootReason = ""
+  let gateRoot =
+    if cfg.switch == "cgroups": gateCgroupRoot(gateRootReason) else: ""
   var daemons: array[Arm, PrivateDaemon]
   # THE CASE OWNS WHAT IT SET UP UNTIL IT RETURNS: the daemons of the arms
   # already started, and the gate's cgroup root, which the migration probe
@@ -732,7 +740,8 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
   if cfg.switch == "cgroups":
     if gateRoot.len == 0:
       raise newException(CaseUnavailable, "--switch=cgroups needs a " &
-        "delegated cgroup v2 subtree for this user, and there is none")
+        "delegated cgroup v2 subtree for this user that its trees can be " &
+        "placed in, and there is none: " & gateRootReason)
     cgroupRoots[armOn] = gateRoot
     probe = migrationProbe(gateRoot)
   var switches: array[Arm, string]
