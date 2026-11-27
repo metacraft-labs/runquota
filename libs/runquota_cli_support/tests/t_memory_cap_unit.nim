@@ -25,6 +25,17 @@
 import std/[os, posix, strutils, times, unittest]
 import runquota_cli_support/memory_cap_unit
 
+const SlowSystemctlEnvVar = "RUNQUOTA_TEST_SLOW_SYSTEMCTL"
+  ## Set only in the child `queryUnitPolicy` launches below, on Windows,
+  ## where there is no shebang script to stand in for a hung `systemctl`
+  ## (`startProcess` there has no shell to interpret one, and a bare
+  ## extensionless file is "not a valid Win32 application"). This test
+  ## binary, re-invoked, sleeps past the timeout in its place.
+
+if getEnv(SlowSystemctlEnvVar).len > 0:
+  sleep(30_000)
+  quit(0)
+
 suite "the unit enclosing the cgroup root":
   test "the deepest service or scope above the root":
     let default = enclosingUnit(
@@ -60,11 +71,22 @@ suite "the unit enclosing the cgroup root":
     let dir = getTempDir() / ("rq-unit-" & $getpid())
     createDir(dir)
     defer: removeDir(dir)
-    let slow = dir / "systemctl"
-    # Absolute: systemctl runs with an environment that has no PATH.
-    writeFile(slow, "#!/bin/sh\n" & findExe("sleep", followSymlinks = false) &
-      " 30\n")
-    setFilePermissions(slow, {fpUserRead, fpUserWrite, fpUserExec})
+    var slow: string
+    when defined(windows):
+      # No shebang script here: `startProcess` has no shell to run one
+      # through, and an extensionless file is not a launchable program.
+      # This test binary, re-invoked with the marker set, sleeps instead.
+      slow = getAppFilename()
+      putEnv(SlowSystemctlEnvVar, "1")
+    else:
+      slow = dir / "systemctl"
+      # Absolute: systemctl runs with an environment that has no PATH.
+      writeFile(slow, "#!/bin/sh\n" & findExe("sleep", followSymlinks = false) &
+        " 30\n")
+      setFilePermissions(slow, {fpUserRead, fpUserWrite, fpUserExec})
+    defer:
+      when defined(windows):
+        delEnv(SlowSystemctlEnvVar)
     let started = epochTime()
     let policy = queryUnitPolicy(EnclosingUnit(name: "x.service"),
       timeoutMillis = 300, systemctl = slow)
@@ -98,18 +120,24 @@ suite "the unit enclosing the cgroup root":
     check unsafe[1].startsWith("memory_cap_unsafe: ")
     check "user@1000.service" in unsafe[1]
 
-  test "this host's user manager answers":
-    let unit = EnclosingUnit(name: "user@" & $getuid() & ".service")
-    let policy = queryUnitPolicy(unit)
-    if not policy.known and findExe("systemctl").len == 0:
-      echo "SKIPPED: " & policy.problem
-      skip()
-    elif not policy.known:
-      # A container or CI host without a running user manager: say what
-      # systemctl answered rather than fail on the host.
-      echo "SKIPPED: " & policy.problem
-      skip()
-    else:
-      check policy.delegate.len > 0
-      check policy.oomPolicy.len > 0
-      echo "  ", unitPolicyLines(unit, policy).join(" / ")
+  when defined(posix):
+    test "this host's user manager answers":
+      # `user@<uid>.service` is a systemd unit, which exists only on
+      # Linux; `getuid()` itself has no Windows form (there is no uid
+      # there, see runquota_core/owner_id.nim), unlike the runtime
+      # "systemctl absent" case just below, which would run fine on any
+      # POSIX host without one.
+      let unit = EnclosingUnit(name: "user@" & $getuid() & ".service")
+      let policy = queryUnitPolicy(unit)
+      if not policy.known and findExe("systemctl").len == 0:
+        echo "SKIPPED: " & policy.problem
+        skip()
+      elif not policy.known:
+        # A container or CI host without a running user manager: say what
+        # systemctl answered rather than fail on the host.
+        echo "SKIPPED: " & policy.problem
+        skip()
+      else:
+        check policy.delegate.len > 0
+        check policy.oomPolicy.len > 0
+        echo "  ", unitPolicyLines(unit, policy).join(" / ")
