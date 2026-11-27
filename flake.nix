@@ -773,6 +773,27 @@
             # a committed config and then installs nothing. `pre-commit-check`
             # stays a flake check. Never fails the shell, but says so loudly.
             shellHook = ownRepoOnly ''
+              # The cargo shim (reprobuild `repro-cargo-shim`, installed as
+              # libexec/repro-cargo-shim/cargo beside the `repro` that ships it) records which
+              # units of the target directory a build keeps live, so the daily `repro cargo gc`
+              # can free the rest; without a recorded live set gc never touches a target
+              # directory. reprobuild docs/cargo-gc.md; reprobuild-pm CG2 plan, D5.
+              # Only where the shim exists (a `repro` older than the one that ships it leaves
+              # the shell unchanged) and only on Linux until the shim is verified on macOS;
+              # REPRO_CARGO_SHIM_DIR names the directory explicitly and opts in on any host.
+              # REPRO_CARGO_RECORD=0 switches recording off at run time.
+              _cargo_shim_dir="''${REPRO_CARGO_SHIM_DIR:-}"
+              if [ -z "$_cargo_shim_dir" ] && [ "$(uname -s)" = Linux ]; then
+                if _cargo_shim_repro="$(command -v repro 2>/dev/null)" \
+                   && _cargo_shim_repro="$(readlink -f "$_cargo_shim_repro" 2>/dev/null)"; then
+                  _cargo_shim_dir="$(dirname "$(dirname "$_cargo_shim_repro")")/libexec/repro-cargo-shim"
+                fi
+              fi
+              if [ -x "$_cargo_shim_dir/cargo" ]; then
+                export PATH="$_cargo_shim_dir:$PATH"
+              fi
+              unset _cargo_shim_dir _cargo_shim_repro
+
               PATH=${pkgs.git}/bin:${pkgs.coreutils}/bin:$PATH ${pkgs.bash}/bin/bash \
                 ${./scripts/install-git-hooks.sh} ${pkgs.lib.getExe pkgs.pre-commit} \
                 || echo "warning: the pre-commit hook was not installed; read the diagnostic above, then run 'bash scripts/install-git-hooks.sh \"\$(command -v pre-commit)\"' from this shell." >&2
