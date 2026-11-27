@@ -1063,7 +1063,14 @@ proc run64RunWindows(cfg: GateConfig; arm: Arm; daemon: PrivateDaemon;
       "--", self, "--run64-spin", $run64LoopTurns,
       dir / ("out-" & $i & ".txt")])
   let before = processCpuSeconds(daemon.pid)
-  result = runMeasuredFanOut(argvs, env, dir, dir)
+  # `runMeasuredFanOut` exists on Windows only; this round is reached only
+  # from `run64Case`'s Windows branch, and the guard keeps the gate
+  # compiling everywhere else.
+  when defined(windows):
+    result = runMeasuredFanOut(argvs, env, dir, dir)
+  else:
+    raise newException(OSError, "run64RunWindows is the Windows driver; " &
+      "it is never reached on " & hostOS)
   let after = settledDaemonCpuSeconds(daemon.pid)
   result.daemonCpuSeconds = after - before
   result.cpuSeconds += result.daemonCpuSeconds
