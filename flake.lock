@@ -2556,6 +2556,22 @@
         "type": "github"
       }
     },
+    "metacraft-github-actions": {
+      "locked": {
+        "lastModified": 1795796605,
+        "narHash": "sha256-u63XVlVobdS13H7N8LoYnwg+Wfa6Rl/zAlo9U2SSdy8=",
+        "owner": "metacraft-labs",
+        "repo": "metacraft-github-actions",
+        "rev": "648b34cb917967a71048b7486f5f1ed0a2726dd6",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "ref": "dev",
+        "repo": "metacraft-github-actions",
+        "type": "github"
+      }
+    },
     "microvm": {
       "inputs": {
         "nixpkgs": [
@@ -4792,23 +4808,6 @@
         "type": "github"
       }
     },
-    "release-packaging-src": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1790790501,
-        "narHash": "sha256-pB6zyfBWFK4mzINecy9aqxUb5GWLQTVdc9qvY8e34mg=",
-        "owner": "metacraft-labs",
-        "repo": "reprobuild",
-        "rev": "fb9f2e764b98acdd2d0a0c3ab622f3287bc78b0a",
-        "type": "github"
-      },
-      "original": {
-        "owner": "metacraft-labs",
-        "repo": "reprobuild",
-        "rev": "fb9f2e764b98acdd2d0a0c3ab622f3287bc78b0a",
-        "type": "github"
-      }
-    },
     "reprobuild": {
       "inputs": {
         "bearssl-src": "bearssl-src",
@@ -4947,6 +4946,7 @@
           "nixos-modules",
           "git-hooks-nix"
         ],
+        "metacraft-github-actions": "metacraft-github-actions",
         "nim-shm-lease": "nim-shm-lease",
         "nixos-modules": "nixos-modules",
         "nixpkgs": [
@@ -4955,7 +4955,6 @@
         ],
         "release-bearssl-src": "release-bearssl-src_2",
         "release-nimcrypto-src": "release-nimcrypto-src_2",
-        "release-packaging-src": "release-packaging-src",
         "runquota-package-catalog": "runquota-package-catalog_2"
       }
     },

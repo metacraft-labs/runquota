@@ -14,12 +14,15 @@
       flake = false;
     };
 
-    # Pure package renderers used by release_metadata.nim. Pin their sources
-    # independently of the operator's installed repro executable.
-    release-packaging-src = {
-      url = "github:metacraft-labs/reprobuild/fb9f2e764b98acdd2d0a0c3ab622f3287bc78b0a";
-      flake = false;
-    };
+    # The organisation's tool pins (pins/README.md there). The pure package
+    # renderers release_metadata.nim compiles come from the Reprobuild source
+    # that pins/reprobuild.json names, reached with builtins.getFlake below,
+    # so this repository names no Reprobuild revision of its own and the lock
+    # has no second reprobuild node; `nix flake update metacraft-github-actions`
+    # moves it with the pin. The Windows release (scripts/release/build.ps1)
+    # reads the same pin through this input's locked revision. Its flake has
+    # no inputs, so the lock gains one node.
+    metacraft-github-actions.url = "github:metacraft-labs/metacraft-github-actions/dev";
     release-nimcrypto-src = {
       url = "github:cheatfate/nimcrypto/69eec0375dd146aede41f920c702c531bfe89c6b";
       flake = false;
@@ -362,6 +365,10 @@
               "$gate_self"
           '';
           shmLeaseSrc = "${inputs.nim-shm-lease}/src";
+          # The Reprobuild pins/reprobuild.json names (see the
+          # metacraft-github-actions input), whose package renderers the
+          # release compiles packaging/release_metadata.nim against.
+          pinnedReprobuild = builtins.getFlake inputs.metacraft-github-actions.pins.reprobuild.flakeRef;
           # All native build and lint entrypoints resolve the same pinned sources.
           buildSourceEnv = {
             REPROBUILD_PACKAGES_ROOT = inputs.runquota-package-catalog;
@@ -764,7 +771,14 @@
               pkgs.libarchive
             ];
             inherit (buildSourceEnv) REPROBUILD_PACKAGES_ROOT SHM_LEASE_SRC RUNQUOTA_SQLITE_LIBRARY;
-            RELEASE_PACKAGING_SRC = inputs.release-packaging-src;
+            # The pinned Reprobuild's source tree. The flakeRef carries the
+            # pin's rev and narHash, so it is locked; only the source and the
+            # one input named below are fetched, none of Reprobuild's others.
+            RELEASE_PACKAGING_SRC = pinnedReprobuild.outPath;
+            # nim-cli-spec, which the full project DSL the renderers need
+            # imports (`clispec`). Taken from the pinned Reprobuild's own
+            # lock, so it moves with the pin rather than being a second pin.
+            RELEASE_CLI_SPEC_SRC = "${pinnedReprobuild.inputs.nim-cli-spec-src}/src";
             RELEASE_NIMCRYPTO_SRC = inputs.release-nimcrypto-src;
             RELEASE_BEARSSL_SRC = inputs.release-bearssl-src;
             # The committed .pre-commit-config.yaml is the pre-commit hook, run

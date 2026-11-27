@@ -11,7 +11,7 @@ done < apps/entrypoints.txt
 cp LICENSE "$release_stage/"
 if [ "$release_os" = linux ]; then
   REPROBUILD_SRC="$RELEASE_PACKAGING_SRC" NIMCRYPTO_SRC="$RELEASE_NIMCRYPTO_SRC" \
-    BEARSSL_SRC="$RELEASE_BEARSSL_SRC" nim c -d:reproVendoredHash \
+    BEARSSL_SRC="$RELEASE_BEARSSL_SRC" CLI_SPEC_SRC="$RELEASE_CLI_SPEC_SRC" nim c -d:reproVendoredHash \
       --nimcache:build/nimcache/release-metadata --out:build/release-metadata packaging/release_metadata.nim
   build/release-metadata "$release_target" "$release_stage" build/release-authoring
 fi

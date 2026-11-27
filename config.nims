@@ -65,6 +65,12 @@ if reprobuildSrc.len > 0:
     reprobuildSrc / ".." / "codetracer" / "libs" / "nimcrypto",
     reprobuildSrc / ".." / "nimcrypto",
   ], "nimcrypto" / "hash.nim")
+  # clispec (nim-cli-spec): the full project DSL imports it for every
+  # ``executable … cli:`` description. Reprobuild resolves it the same way
+  # (``$CLI_SPEC_SRC``, then the ``nim-cli-spec`` sibling).
+  addReprobuildPkgPath("CLI_SPEC_SRC", [
+    reprobuildSrc / ".." / "nim-cli-spec" / "src",
+  ], "clispec.nim")
   addReprobuildPkgPath("BEARSSL_SRC", [
     reprobuildSrc / ".." / "nim-bearssl",
     reprobuildSrc / "libs" / "nim-bearssl",
