@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | In progress -- `process_cost.nim` ported to Windows (`runquota` agents `2f00d634`); the main gate file is not |
+| Status | In progress -- the gate builds and runs `synthetic` end to end on Windows (`runquota` agents, see 2026-11-27 progress below); `--switch=memory-cap` on `run-64` is Linux-only by design and still needs a Windows arm |
 | Observed in | `runquota` @ `7c98da54` (`agents` tip); Nim 2.2.8 + WinLibs gcc 16.1.0, eli-pc (Windows 11 x86_64) |
 | Area | `benchmarks/lib/runquota_overhead_gate.nim`; `benchmarks/lib/runquota_overhead_gate/process_cost.nim` |
 | Expectation | RunQuota-Memory-Caps.md's § "The overhead rule" directs each new enforcement mechanism to be judged with this gate, naming a Windows arm (`--switch memory-cap`) explicitly, "each on its own platform, by its driver." |
@@ -86,10 +86,44 @@ isolated-environment test happened to declare at least one variable), and
 is now fixed and covered by a regression test with its own falsifying
 mutation.
 
-**Not done**: `runquota_overhead_gate.nim` itself (the main file) still
-imports `std/posix` unconditionally and declares several `Pid`-typed
-fields from it, which `process_cost.nim` now defines its own Windows
-stand-in for (`process_cost.Pid`) but the main file does not yet consume.
-Wiring the main file to build on Windows -- let alone running the
-`synthetic` case there, let alone a `memory-cap` switch arm -- is still
-open.
+## Progress, 2026-11-27 (rq-memcap-win), part 2 -- the main gate file now builds and runs
+
+`runquota_overhead_gate.nim`'s own unconditional `import std/posix` was
+the next blocker: on Windows it falls back to `posix_other`, which still
+declares `Pid` and a long list of POSIX procs with `importc`/`header`
+pragmas naming headers Windows does not have, and that `Pid` is now
+ambiguous against `process_cost.Pid`. Importing `std/posix` only under
+`when defined(posix)` fixes the ambiguity (Windows gets `process_cost.Pid`
+alone). `stopDaemon`/`startDaemon`'s direct `kill`/`waitpid` calls are
+replaced with a small cross-platform surface
+(`daemonTerminate`/`daemonKillNow`/`daemonTryReap`/`daemonReapBlocking`,
+`process_cost.nim`) instead -- Windows's versions reopen the process by
+pid for `TerminateProcess`/`GetExitCodeProcess`/`WaitForSingleObject`
+rather than keeping a creation-time handle alive, since the daemon is
+meant to outlive the call that started it. `gateCgroupRoot` and
+`migrationProbe` are cgroup v2 / Linux-only by nature (their only callers
+already refuse off Linux), gated behind `when defined(linux)` with a
+defensive raise on the unreached arm instead of failing the whole file's
+C codegen.
+
+**Verified end to end**: built the real `runquota`/`runquotad` binaries
+from source on Windows (`nim c --threads:on`, no changes needed to either
+app), then ran `runquota_overhead_gate.exe --case=synthetic` to
+completion -- real measurement, real statistics, real JSON report,
+correctly `INCONCLUSIVE` at a deliberately short burn/round count (too
+little signal for the required precision, which is the gate's own
+correct answer, not a failure).
+
+**Still open**: `--switch=memory-cap` on `run-64` refuses outright off
+Linux (`when not defined(linux): raise CaseUnavailable`), by design --
+the module's own doc comment says the switch judges the mechanism "one
+stage of its Linux mechanism at a time" with cgroup-rooted arms
+(`gateCgroupRoot`/`armRoots`), and its probe script is `/bin/sh -c`.
+Windows's mechanism has no stages (the spec's own words: "job creation
+for every tree, and the limit," one comparison, not several) and no
+cgroup root to place arms under, so a Windows arm is a parallel branch in
+`run64Case`, not a small patch to the existing one -- its own follow-on,
+not attempted here. `reprobuild-64`'s driver script
+(`run64Script`/`memoryCapProbeScript`) is also `/bin/sh -c`-based and
+would need a Windows-shell equivalent for that case specifically,
+independent of the memory-cap switch.
