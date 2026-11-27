@@ -1758,7 +1758,22 @@ proc ensureEndpointDir*(endpoint: Endpoint; policy = rendezvousPolicy()) =
 
 when defined(windows):
   proc raiseLastWinError(prefix: string) =
-    raise newException(OSError, prefix & ": Windows error " & $osLastError().int32)
+    ## `newException(OSError, ...)` with the message built by hand used to
+    ## leave `OSError.errorCode` at its default (0): every caller through
+    ## this proc then raised an `OSError` that LOOKED like it carried
+    ## `GetLastError()`'s code in its text ("Windows error 2") but did not
+    ## carry it in the field anything downstream actually reads.
+    ## `runquota_client.tryConnectDefault`'s classifier
+    ## (`osErrorKind(error.errorCode)`) read 0, fell through to `cfkOther`
+    ## for every failure on this transport -- including a plain ENOENT-
+    ## shaped "no daemon here" (Windows error 2/3, which `osErrorKind`
+    ## already maps to `cfkAbsent`) -- so a build or test run with no
+    ## daemon printed a spurious "warning: cannot use the RunQuota
+    ## daemon..." on Windows where the POSIX transport (`raiseOSError`,
+    ## which does set the field) stays silent. `raiseOSError` builds the
+    ## same information (the system's own message for the code, the call
+    ## that failed as `additionalInfo`) and sets `errorCode` correctly.
+    raiseOSError(osLastError(), prefix)
 
   proc createServerPipe(name: string; first: bool): WinHandle =
     # Windows: per CreateNamedPipeW, FILE_FLAG_FIRST_PIPE_INSTANCE (0x80000) is
