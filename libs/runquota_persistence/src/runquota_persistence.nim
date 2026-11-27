@@ -122,6 +122,51 @@ proc runSqlite*(path, sqlText: string): SqliteRun =
   let outcome = runSqlScript(path, sqlText)
   SqliteRun(ok: outcome.ok, output: outcome.output, failure: outcome.error)
 
+const MemoryCapColumns* = ["max_observed_peak_bytes", "declared_cap_bytes",
+  "declared_by_uid", "declared_unix_millis", "last_breach_cap_bytes",
+  "last_breach_peak_bytes", "last_breach_unix_millis"]
+  ## The memory-cap figures of a row (see `LearnedEstimateRow`), in the
+  ## order the reads and the upsert list them.
+
+proc addMissingColumns(path: string): bool =
+  ## ADDS THE MEMORY-CAP COLUMNS TO A STORE THAT PREDATES THEM, KEEPING ITS
+  ## ROWS.
+  ##
+  ## `schema_version` is a KEY COLUMN of this table, so bumping
+  ## `EstimateSchemaVersion` would not migrate anything: every row written
+  ## under version 1 would simply stop being read (`loadLearnedEstimates`
+  ## selects one version), and each host would forget every learned figure
+  ## it has the day it upgraded. The new figures have an obvious value for an
+  ## old row -- zero, "nothing recorded yet" -- which is exactly what SQLite's
+  ## `ALTER TABLE ... ADD COLUMN ... DEFAULT 0` gives every existing row, so
+  ## the change is additive and the version stays 1.
+  ## https://www.sqlite.org/lang_altertable.html#altertabaddcol
+  ##
+  ## IDEMPOTENT BY ASKING FIRST. SQLite has no `ADD COLUMN IF NOT EXISTS`, so
+  ## the columns the table has are read from `pragma table_info` and only the
+  ## missing ones are added. A second writer racing this one (two daemons on
+  ## one store, which the lifetime lock prevents in production) makes one
+  ## `ALTER` fail with "duplicate column"; that answers false here, the batch
+  ## is reported dropped, and the next batch's schema check finds the column
+  ## present.
+  let info = queryBound(path, "pragma table_info(learned_estimates)", [])
+  if not info.ok:
+    return false
+  var present: seq[string] = @[]
+  for line in info.output.splitLines():
+    let fields = line.split('|')
+    # cid|name|type|notnull|dflt_value|pk
+    if fields.len >= 2:
+      present.add(fields[1])
+  var script = ""
+  for column in MemoryCapColumns:
+    if column notin present:
+      script.add("alter table learned_estimates add column " & column &
+        " integer not null default 0;\n")
+  if script.len == 0:
+    return true
+  runSqlite(path, script).ok
+
 proc initEstimateSchema(path: string): bool =
   ## Whether the schema is there to be written to. A store whose schema could
   ## not be created cannot take a batch either, so the caller folds this into
@@ -137,11 +182,18 @@ proc initEstimateSchema(path: string): bool =
       sample_count integer not null,
       last_outcome integer not null,
       updated_unix_millis integer not null,
+      max_observed_peak_bytes integer not null default 0,
+      declared_cap_bytes integer not null default 0,
+      declared_by_uid integer not null default 0,
+      declared_unix_millis integer not null default 0,
+      last_breach_cap_bytes integer not null default 0,
+      last_breach_peak_bytes integer not null default 0,
+      last_breach_unix_millis integer not null default 0,
       primary key (scope, command_stats_id, schema_version)
     );
     pragma journal_mode = WAL;
     pragma synchronous = NORMAL;
-  """).ok
+  """).ok and addMissingColumns(path)
 
 proc loadLearnedEstimates*(path: string): seq[LearnedEstimateRow] =
   if path.len == 0 or not fileExists(path):
@@ -150,7 +202,10 @@ proc loadLearnedEstimates*(path: string): seq[LearnedEstimateRow] =
   let run = queryBound(path, """
     select scope, command_stats_id, conservative_memory_bytes,
            recent_peak_memory_bytes, sample_count, last_outcome,
-           updated_unix_millis
+           updated_unix_millis, max_observed_peak_bytes,
+           declared_cap_bytes, declared_by_uid, declared_unix_millis,
+           last_breach_cap_bytes, last_breach_peak_bytes,
+           last_breach_unix_millis
       from learned_estimates
      where schema_version = ?""", [sqlInt(int64(EstimateSchemaVersion))])
   # A STORE THAT WOULD NOT ANSWER YIELDS NO ESTIMATES, not a partial set.
@@ -164,7 +219,7 @@ proc loadLearnedEstimates*(path: string): seq[LearnedEstimateRow] =
   for line in run.output.splitLines():
     if line.len > 0:
       let row = line.split('|')
-      if row.len == 7:
+      if row.len == 14:
         try:
           result.add(LearnedEstimateRow(
             scope: row[0],
@@ -173,7 +228,14 @@ proc loadLearnedEstimates*(path: string): seq[LearnedEstimateRow] =
             recentPeakMemoryBytes: parseUInt(row[3]),
             sampleCount: uint32(parseUInt(row[4])),
             lastOutcome: uint32(parseUInt(row[5])),
-            updatedUnixMillis: parseUInt(row[6])
+            updatedUnixMillis: parseUInt(row[6]),
+            maxObservedPeakBytes: parseUInt(row[7]),
+            declaredCapBytes: parseUInt(row[8]),
+            declaredByUid: parseUInt(row[9]),
+            declaredUnixMillis: parseUInt(row[10]),
+            lastBreachCapBytes: parseUInt(row[11]),
+            lastBreachPeakBytes: parseUInt(row[12]),
+            lastBreachUnixMillis: parseUInt(row[13])
           ))
         except ValueError:
           # A key holding the separator splits into the wrong fields; such
@@ -184,14 +246,24 @@ const estimateUpsert = """
   insert into learned_estimates (
       scope, command_stats_id, schema_version,
       conservative_memory_bytes, recent_peak_memory_bytes,
-      sample_count, last_outcome, updated_unix_millis
-    ) values (?, ?, ?, ?, ?, ?, ?, ?)
+      sample_count, last_outcome, updated_unix_millis,
+      max_observed_peak_bytes, declared_cap_bytes, declared_by_uid,
+      declared_unix_millis, last_breach_cap_bytes, last_breach_peak_bytes,
+      last_breach_unix_millis
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     on conflict(scope, command_stats_id, schema_version) do update set
       conservative_memory_bytes = excluded.conservative_memory_bytes,
       recent_peak_memory_bytes = excluded.recent_peak_memory_bytes,
       sample_count = excluded.sample_count,
       last_outcome = excluded.last_outcome,
-      updated_unix_millis = excluded.updated_unix_millis"""
+      updated_unix_millis = excluded.updated_unix_millis,
+      max_observed_peak_bytes = excluded.max_observed_peak_bytes,
+      declared_cap_bytes = excluded.declared_cap_bytes,
+      declared_by_uid = excluded.declared_by_uid,
+      declared_unix_millis = excluded.declared_unix_millis,
+      last_breach_cap_bytes = excluded.last_breach_cap_bytes,
+      last_breach_peak_bytes = excluded.last_breach_peak_bytes,
+      last_breach_unix_millis = excluded.last_breach_unix_millis"""
 
 proc writeBatch(path: string; rows: seq[LearnedEstimateRow]): bool =
   ## Commits ``rows`` in one transaction on a pooled connection, every value
@@ -206,7 +278,14 @@ proc writeBatch(path: string; rows: seq[LearnedEstimateRow]): bool =
       sqlInt(cast[int64](row.conservativeMemoryBytes)),
       sqlInt(cast[int64](row.recentPeakMemoryBytes)),
       sqlInt(int64(row.sampleCount)), sqlInt(int64(row.lastOutcome)),
-      sqlInt(cast[int64](row.updatedUnixMillis))))
+      sqlInt(cast[int64](row.updatedUnixMillis)),
+      sqlInt(cast[int64](row.maxObservedPeakBytes)),
+      sqlInt(cast[int64](row.declaredCapBytes)),
+      sqlInt(cast[int64](row.declaredByUid)),
+      sqlInt(cast[int64](row.declaredUnixMillis)),
+      sqlInt(cast[int64](row.lastBreachCapBytes)),
+      sqlInt(cast[int64](row.lastBreachPeakBytes)),
+      sqlInt(cast[int64](row.lastBreachUnixMillis))))
   runBound(path, statements).ok
 
 proc noteEstimateWriteFailure(rows: int) =
@@ -269,10 +348,14 @@ proc pendingKey(scope, commandStatsId: string): string =
     commandStatsId & ":"
 
 proc encodePending(row: LearnedEstimateRow): string =
-  ## The key, then the five numbers. Written and read in this module only.
+  ## The key, then the twelve numbers. Written and read in this module only.
   pendingKey(row.scope, row.commandStatsId) &
     $row.conservativeMemoryBytes & "," & $row.recentPeakMemoryBytes & "," &
-    $row.sampleCount & "," & $row.lastOutcome & "," & $row.updatedUnixMillis
+    $row.sampleCount & "," & $row.lastOutcome & "," & $row.updatedUnixMillis &
+    "," & $row.maxObservedPeakBytes & "," & $row.declaredCapBytes & "," &
+    $row.declaredByUid & "," & $row.declaredUnixMillis & "," &
+    $row.lastBreachCapBytes & "," & $row.lastBreachPeakBytes & "," &
+    $row.lastBreachUnixMillis
 
 proc decodePending(encoded: string): LearnedEstimateRow =
   ## Inverse of ``encodePending``. Total on anything ``encodePending``
@@ -292,7 +375,14 @@ proc decodePending(encoded: string): LearnedEstimateRow =
     recentPeakMemoryBytes: parseUInt(numbers[1]),
     sampleCount: uint32(parseUInt(numbers[2])),
     lastOutcome: uint32(parseUInt(numbers[3])),
-    updatedUnixMillis: parseUInt(numbers[4]))
+    updatedUnixMillis: parseUInt(numbers[4]),
+    maxObservedPeakBytes: parseUInt(numbers[5]),
+    declaredCapBytes: parseUInt(numbers[6]),
+    declaredByUid: parseUInt(numbers[7]),
+    declaredUnixMillis: parseUInt(numbers[8]),
+    lastBreachCapBytes: parseUInt(numbers[9]),
+    lastBreachPeakBytes: parseUInt(numbers[10]),
+    lastBreachUnixMillis: parseUInt(numbers[11]))
 
 proc takePendingRows(): seq[LearnedEstimateRow] =
   ## Empties the queue. REQUIRES ``writerLock``. The rows come back as
