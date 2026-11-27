@@ -671,6 +671,15 @@ proc cgroupComponents(path: string): seq[string] =
     if component.len > 0:
       result.add(component)
 
+proc cgroupParent(path: string): string =
+  ## `path`'s parent, split on a literal ``/`` -- the same reason
+  ## `cgroupChild` joins with one: `std/os`'s `parentDir` reassembles a
+  ## path with the HOST's own separator, which is ``\`` on Windows even
+  ## when the input never had one, and a cgroup path is always a path of
+  ## the Linux kernel.
+  let slash = path.rfind('/')
+  if slash < 0: "" else: path[0 ..< slash]
+
 proc isUnitCgroup(name: string): bool =
   ## A cgroup directory systemd made for a unit that can be delegated.
   name.endsWith(".service") or name.endsWith(".scope")
@@ -702,7 +711,7 @@ proc delegationUnit*(dir: string; refusal: var string): string =
     return ""
   if isUnitCgroup(name):
     return dir
-  var parent = dir.parentDir
+  var parent = cgroupParent(dir)
   while parent.len > CgroupMountPoint.len:
     let unit = parent.extractFilename
     if unit.endsWith(".slice"):
@@ -715,7 +724,7 @@ proc delegationUnit*(dir: string; refusal: var string): string =
           "manager " & parent & ", not a delegated unit"
         return ""
       return parent
-    parent = parent.parentDir
+    parent = cgroupParent(parent)
   refusal = dir & " is not inside a systemd service or scope"
   ""
 
