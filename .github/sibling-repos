@@ -17,14 +17,13 @@
 # Keep this non-Nix CI pin aligned with that source constructor.
 reprobuild-packages=92100803eb827ff21d0cc48b7474fb0a65057cbd
 
-# RunQuota's published stats table requires this source-library interface.
-# Explicitly override the carried workspace pin until it includes the interface.
-# These two siblings must be the revisions repro.lock records for them
-# (`deps`): the repro engine refuses a checkout whose HEAD differs from the
-# revision the consumer lock expects ("cross-repo producer ... source revision
-# mismatch"). 22e3100 is the nim-shm-lease `agents` merge that contains the
-# earlier 665e128 interface revision (identical tree); flake.lock agrees.
-nim-shm-lease!=22e3100cdb4fbc374689ddac55b4b32c90654140
-# Transitive source dependency of shm_lease/obsring, at the revision repro.lock
-# and flake.lock record (84fd76b descends from the previously pinned 02f442a).
-nim-shm-queue=84fd76b174d4868e703ba3d599668ee340e0b6ea
+# RunQuota's source-library siblings, cloned at the revisions repro.lock
+# records for them (`deps`). They are bare names on purpose: the repro engine
+# refuses a checkout whose HEAD differs from the revision the consumer lock
+# expects ("cross-repo producer ... source revision mismatch"), so any revision
+# written here can only go stale when the lock moves. The earlier overrides
+# (nim-shm-lease 22e3100c, nim-shm-queue 84fd76b1) existed only to match the
+# lock of 2026-11-04; the lock now pins descendants of both.
+nim-shm-lease
+# Transitive source dependency of shm_lease/obsring.
+nim-shm-queue
