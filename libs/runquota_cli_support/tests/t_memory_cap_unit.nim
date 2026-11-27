@@ -11,12 +11,18 @@
 ## * Unsafe when `Delegate` is not `yes`, when `OOMPolicy` is `stop` or
 ##   `kill`, and when either is unknown. Mutation: ignoring `OOMPolicy`
 ##   (the `Delegate=yes OOMPolicy=stop` case then reads as safe).
+## * Every unit above the root is checked, deepest first, up to and
+##   including `user@<uid>.service`: any one with a bad policy can be
+##   stopped by a cap kill below it. Mutation: the nearest unit only.
+## * A `systemctl` that does not answer is killed at the timeout (a
+##   stand-in program in its place, the one non-real part, because a hung
+##   bus cannot be arranged). Mutation: waiting without a timeout.
 ## * On this host, the real `systemctl show` of the unit enclosing the
 ##   default root answers (when there is a systemd user manager to ask).
 ##
 ## NO MOCKS: the pure rules take `systemctl show` text; the host case runs
 ## the real `systemctl`.
-import std/[os, posix, strutils, unittest]
+import std/[os, posix, strutils, times, unittest]
 import runquota_cli_support/memory_cap_unit
 
 suite "the unit enclosing the cgroup root":
@@ -36,6 +42,33 @@ suite "the unit enclosing the cgroup root":
     check enclosingUnit("/sys/fs/cgroup/system.slice/a.service").name == ""
     check enclosingUnit("/sys/fs/cgroup/a.slice/b.slice").name == ""
     check enclosingUnit("").name == ""
+
+  test "every unit above the root, deepest first, up to the user manager":
+    let units = enclosingUnits("/sys/fs/cgroup/user.slice/user-1000.slice/" &
+      "user@1000.service/app.slice/build.service/inner.scope/rq")
+    check units.len == 3
+    check units[0].name == "inner.scope" and units[0].userManager
+    check units[1].name == "build.service" and units[1].userManager
+    check units[2].name == "user@1000.service" and not units[2].userManager
+    check enclosingUnits("/sys/fs/cgroup/user.slice/user-1000.slice/" &
+      "user@1000.service/runquota.slice").len == 1
+
+  test "a systemctl that does not answer is stopped at the timeout":
+    # A stand-in for a hung bus: a program in systemctl's place that does
+    # not answer. The query must give up at its timeout, kill it, and say
+    # so, rather than wait. Mutation: a wait without a real timeout.
+    let dir = getTempDir() / ("rq-unit-" & $getpid())
+    createDir(dir)
+    defer: removeDir(dir)
+    let slow = dir / "systemctl"
+    writeFile(slow, "#!/bin/sh\nsleep 30\n")
+    setFilePermissions(slow, {fpUserRead, fpUserWrite, fpUserExec})
+    let started = epochTime()
+    let policy = queryUnitPolicy(EnclosingUnit(name: "x.service"),
+      timeoutMillis = 300, systemctl = slow)
+    check not policy.known
+    check "did not answer" in policy.problem
+    check epochTime() - started < 5.0
 
   test "unsafe unless Delegate=yes and OOMPolicy is not stop or kill":
     check memoryCapUnsafeReason(parseUnitPolicy(

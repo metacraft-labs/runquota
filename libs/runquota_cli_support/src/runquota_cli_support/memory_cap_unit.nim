@@ -18,7 +18,7 @@
 ## The rules are pure (`enclosingUnit`, `parseUnitPolicy`,
 ## `memoryCapUnsafeReason`); only `queryUnitPolicy` runs `systemctl show`.
 
-import std/[os, osproc, streams, strutils]
+import std/[monotimes, os, osproc, streams, strutils, times]
 
 type
   EnclosingUnit* = object
@@ -72,6 +72,29 @@ proc enclosingUnit*(rootPath: string): EnclosingUnit =
         components[i].endsWith(".service"):
       result.userManager = true
 
+proc enclosingUnits*(rootPath: string): seq[EnclosingUnit] =
+  ## Every `.service` / `.scope` above `rootPath`, deepest first, up to and
+  ## including `user@<uid>.service` (above it there are only slices). Each
+  ## is a unit systemd watches, and any of them with a bad policy could be
+  ## stopped by a cap kill below it, so every one is checked, not only the
+  ## nearest.
+  var relative = rootPath
+  if relative.startsWith(CgroupMount):
+    relative = relative[CgroupMount.len .. ^1]
+  var components: seq[string]
+  for component in relative.split('/'):
+    if component.len > 0:
+      components.add(component)
+  for i in countdown(components.len - 2, 0):
+    if not isUnitName(components[i]):
+      continue
+    var unit = EnclosingUnit(name: components[i])
+    for j in 0 ..< i:
+      if components[j].startsWith("user@") and
+          components[j].endsWith(".service"):
+        unit.userManager = true
+    result.add(unit)
+
 proc parseUnitPolicy*(output: string): UnitPolicy =
   ## `Delegate=` and `OOMPolicy=` from `systemctl show -p Delegate -p
   ## OOMPolicy` output.
@@ -102,13 +125,16 @@ proc memoryCapUnsafeReason*(policy: UnitPolicy): string =
   reasons.join(", ")
 
 proc queryUnitPolicy*(unit: EnclosingUnit;
-                      timeoutMillis = SystemctlTimeoutMillis): UnitPolicy =
+                      timeoutMillis = SystemctlTimeoutMillis;
+                      systemctl = ""): UnitPolicy =
   ## `systemctl [--user] show <unit> -p Delegate -p OOMPolicy`, bounded by
-  ## `timeoutMillis` (a hung bus must not hang `runquota status`).
+  ## `timeoutMillis` (a hung bus must not hang `runquota status`): polled
+  ## on the monotonic clock, and killed and reaped when it runs out.
+  ## `systemctl` names the program; "" finds it on PATH.
   if unit.name.len == 0:
     return UnitPolicy(problem: "no enclosing service or scope unit")
-  let systemctl = findExe("systemctl")
-  if systemctl.len == 0:
+  let program = if systemctl.len > 0: systemctl else: findExe("systemctl")
+  if program.len == 0:
     return UnitPolicy(problem: "systemctl is not on PATH")
   var args: seq[string]
   if unit.userManager:
@@ -116,27 +142,34 @@ proc queryUnitPolicy*(unit: EnclosingUnit;
   args.add(["show", unit.name, "-p", "Delegate", "-p", "OOMPolicy"])
   var process: Process
   try:
-    process = startProcess(systemctl, args = args,
+    process = startProcess(program, args = args,
       options = {poStdErrToStdOut})
   except OSError as error:
     return UnitPolicy(problem: "cannot run systemctl: " & error.msg)
   defer: process.close()
-  var output = ""
+  let deadline = getMonoTime() + initDuration(milliseconds = timeoutMillis)
+  var code = -1
   try:
-    let code = process.waitForExit(timeoutMillis)
-    if process.running():
-      process.kill()
-      discard process.waitForExit()
-      return UnitPolicy(problem: "systemctl show did not answer within " &
-        $timeoutMillis & " ms")
-    output = process.outputStream.readAll()
+    while true:
+      code = process.peekExitCode()
+      if code != -1:
+        break
+      if getMonoTime() >= deadline:
+        process.kill()
+        discard process.waitForExit()
+        return UnitPolicy(problem: "systemctl show did not answer within " &
+          $timeoutMillis & " ms")
+      sleep(10)
+    # The answer is two short lines, so it fits the pipe and nothing
+    # blocked on reading it while the loop waited.
+    let output = process.outputStream.readAll()
     if code != 0:
       return UnitPolicy(problem: "systemctl show exited " & $code & ": " &
         output.strip())
+    parseUnitPolicy(output)
   except OSError, IOError:
-    return UnitPolicy(problem: "cannot read systemctl's answer: " &
+    UnitPolicy(problem: "cannot read systemctl's answer: " &
       getCurrentExceptionMsg())
-  parseUnitPolicy(output)
 
 proc unitPolicyLines*(unit: EnclosingUnit; policy: UnitPolicy): seq[string] =
   ## `runquota status` text: the unit and its policy, then a

@@ -242,11 +242,14 @@ proc printVirtualMachines(statusJson: string) =
       line.add(" capability=\"" & capability.getStr() & "\"")
     echo line
 
-proc memoryCapUnitJson(unit: EnclosingUnit; policy: UnitPolicy): JsonNode =
-  %*{"unit": unit.name, "user_manager": unit.userManager,
-     "known": policy.known, "delegate": policy.delegate,
-     "oom_policy": policy.oomPolicy, "problem": policy.problem,
-     "unsafe": memoryCapUnsafeReason(policy)}
+proc memoryCapUnitJson(units: seq[EnclosingUnit];
+                       policies: seq[UnitPolicy]): JsonNode =
+  result = newJArray()
+  for i, unit in units:
+    result.add(%*{"unit": unit.name, "user_manager": unit.userManager,
+      "known": policies[i].known, "delegate": policies[i].delegate,
+      "oom_policy": policies[i].oomPolicy, "problem": policies[i].problem,
+      "unsafe": memoryCapUnsafeReason(policies[i])})
 
 proc withEnforcement(daemonJson: string; record: EnforcementRecord;
                      measurement: MeasurementRecord;
@@ -294,17 +297,21 @@ proc printStatus(json: bool): int =
   # unit's `Delegate=` and `OOMPolicy=` decide whether one task's cap kill
   # could stop the whole unit (`runquota_cli_support/memory_cap_unit`).
   # Read here, by `systemctl show`, and never on the launch path.
-  var memoryUnit: EnclosingUnit
-  var memoryUnitPolicy: UnitPolicy
+  # Every unit above the root is checked, up to the user manager.
+  var memoryUnits: seq[EnclosingUnit]
+  var memoryUnitPolicies: seq[UnitPolicy]
   let placementOn = enforcement.placement == "on"
   if placementOn:
-    memoryUnit = enclosingUnit(enforcement.cgroupRoot)
-    memoryUnitPolicy = queryUnitPolicy(memoryUnit)
+    memoryUnits = enclosingUnits(enforcement.cgroupRoot)
+    if memoryUnits.len == 0:
+      memoryUnits.add(EnclosingUnit())
+    for unit in memoryUnits:
+      memoryUnitPolicies.add(queryUnitPolicy(unit))
   if json:
     let daemonJson =
       if statusJson.len > 0: statusJson else: inspectionStatusJson(status)
     echo withEnforcement(daemonJson, enforcement, hostMeasurementRecord(),
-      (if placementOn: memoryCapUnitJson(memoryUnit, memoryUnitPolicy)
+      (if placementOn: memoryCapUnitJson(memoryUnits, memoryUnitPolicies)
        else: nil))
   else:
     echo "sessions: " & $status.activeSessions
@@ -344,8 +351,9 @@ proc printStatus(json: bool): int =
     for line in enforcement.renderLines():
       echo line
     if placementOn:
-      for line in unitPolicyLines(memoryUnit, memoryUnitPolicy):
-        echo line
+      for i, unit in memoryUnits:
+        for line in unitPolicyLines(unit, memoryUnitPolicies[i]):
+          echo line
     for line in hostMeasurementRecord().renderLines():
       echo line
   0
