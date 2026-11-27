@@ -49,6 +49,11 @@
 ##   names the missing controller, places nothing, and leaves no
 ##   `L/runquota` behind. Mutation: creating the root before the holder is
 ##   ready.
+## * (i) A launcher that places for memory only (`memoryOnlyPlacement`)
+##   inside a delegated scope with `MemoryMax=1G`: the tree is placed in
+##   `L/runquota/memory-capped/`, killed by its own 64 MiB cap, and the scope
+##   gets `+memory` and no `+cpu`. Mutation: the memory-only target not
+##   carrying the holder (the tree runs uncapped to its end).
 ## * (e) Eight launchers started together in one delegated scope (three
 ##   rounds) ask systemd exactly once per round (mutation: no lock on the
 ##   unit around the query -- several ask) and all place their trees: L's
@@ -169,6 +174,9 @@ when defined(linux):
     echo "root_reason=" & root.reason.replace("\n", " ")
     var target = targetFor(root, "caller-limits", sessionPriorityLow,
       reclaimed = false)
+    if mode == "memonly-alloc":
+      # A launcher that places for memory only (Reprobuild's actions).
+      target = memoryOnlyPlacement(root)
     proc launch(argv: openArray[string]; capMiB: int; label: string) =
       var spec = commandSpec(argv)
       spec.cgroup = target
@@ -191,9 +199,13 @@ when defined(linux):
       echo label & "_cap_killed=" & $completion.capKilled
     if mode == "alloc":
       launch([getAppFilename(), "--alloc", "160"], 256, "alloc")
+    if mode == "memonly-alloc":
+      launch([getAppFilename(), "--alloc", "160"], 64, "alloc")
+      echo "holder_subtree=" & (if root.holder.len > 0:
+        readFile(root.holder / "cgroup.subtree_control").strip() else: "")
     if mode == "nested-nocpu":
       echo "holder_root_exists=" & $dirExists(root.path)
-    if mode != "resolve":
+    if mode notin ["resolve", "memonly-alloc"]:
       launch([getAppFilename(), "--report"],
         (if mode == "alloc": 0 else: 64), "report")
     if mode == "nested-nocpu":
@@ -501,6 +513,34 @@ when defined(linux):
           "resolve")
         check parseInt(output.field("resolve_ms")) < 6_000
         check output.field("root_path").endsWith("/runquota")
+
+    test "(i) a memory-only tree in a delegated, limited scope is capped inside it":
+      if testRoot.len == 0:
+        echo "SKIPPED: " & reason
+        skip()
+      else:
+        # A launcher that places for memory only (`memoryOnlyPlacement`)
+        # inside a caller's delegated scope with its own limit: the scope is
+        # prepared as the holder for the memory controller alone, the tree
+        # goes to `L/runquota/memory-capped/cap-...`, and its own 64 MiB cap
+        # (below the scope's 1 GiB) kills it. No `+cpu` is enabled in the
+        # scope. Mutation: `memoryOnlyPlacement` not carrying the holder --
+        # the scope is never prepared, `+memory` never reaches the root, and
+        # the tree runs to its end uncapped.
+        let output = inScope(@["Delegate=yes", "MemoryMax=1G"], "", @[],
+          testRoot, "memonly-alloc")
+        let scope = output.field("caller_cgroup").parentDir
+        check output.field("root_path") ==
+          CgroupMountPoint & scope & "/runquota"
+        check output.field("alloc_cgroup_path").startsWith(
+          CgroupMountPoint & scope & "/runquota/memory-capped/cap-")
+        check output.field("alloc_memory_problem") == ""
+        check output.field("alloc_signaled") == "true"
+        check output.field("alloc_cap_killed") == "true"
+        check output.field("alloc_outside") == "false"
+        check "allocated" notin output.field("alloc_stdout")
+        check "memory" in output.field("holder_subtree").splitWhitespace()
+        check "cpu" notin output.field("holder_subtree").splitWhitespace()
 
     test "(h) a delegated cgroup without the cpu controller leaves nothing behind":
       if testRoot.len == 0:

@@ -1345,9 +1345,19 @@ proc memoryOnlyPlacement*(root: CgroupRoot): CgroupTarget =
   ## default weight applies, as for any group at normal priority, and only
   ## the memory controller is enabled for it. Give it no
   ## `GroupPrioritySource`: there is no group whose priority it follows.
+  ##
+  ## WHAT DOES CHANGE: the tree leaves the launcher's cgroup for
+  ## `<root>/memory-capped/`, a sibling of the group directories under the
+  ## root at the kernel's default weight. Inside a caller's limited,
+  ## delegated cgroup the root is that cgroup's `runquota` (`heldRoot`), so
+  ## the holder is carried as `targetFor` carries it, and prepared for the
+  ## memory controller alone (`prepareHolder`).
   if not root.usable:
-    return CgroupTarget()
+    return CgroupTarget(unplacedReason: root.reason)
   result.root = root.path
+  result.holder = root.holder
+  result.holderLimit = root.holderLimit
+  result.holderNote = root.holderNote
   result.dirName = MemoryCappedDirName
   result.cpuWeight = 0
   result.leafName = SharedLeafName
@@ -1566,14 +1576,14 @@ when defined(posix):
 
 
 when defined(linux):
-  proc holderReady(dir: string): bool =
-    ## Whether L needs nothing: no process of its own, and `cpu` (and
-    ## `memory` where L has it) enabled below it. Read without the lock;
-    ## the common case of every launch after the first.
+  proc holderReady(dir: string; needCpu: bool): bool =
+    ## Whether L needs nothing: no process of its own, and `cpu` (when the
+    ## target needs it) and `memory` (where L has it) enabled below it. Read
+    ## without the lock; the common case of every launch after the first.
     if readSmall(dir / "cgroup.procs").strip().len > 0:
       return false
     let enabled = readSmall(dir / "cgroup.subtree_control")
-    if not hasController(enabled, "cpu"):
+    if needCpu and not hasController(enabled, "cpu"):
       return false
     if hasController(readSmall(dir / "cgroup.controllers"), "memory") and
         not hasController(enabled, "memory"):
@@ -1608,7 +1618,9 @@ proc prepareHolder*(target: CgroupTarget; problem: var string): bool =
   ## Make the limited, delegated cgroup L that holds the root
   ## (`target.holder`) able to hold it: L's own processes (the caller's, in
   ## a delegated scope) moved into the leaf `L/caller`, then `+cpu` (and
-  ## `+memory` where L has it) enabled in L's `cgroup.subtree_control`.
+  ## `+memory` where L has it) enabled in L's `cgroup.subtree_control`. A
+  ## target that leaves CPU alone (`memoryOnlyPlacement`) needs only
+  ## `memory`: `cpu` is neither required nor enabled for it.
   ## cgroup v2 allows controllers below a cgroup only once it holds no
   ## process ("no internal process" rule), and systemd's delegation
   ## contract asks the payload of a delegated cgroup to keep its processes
@@ -1623,21 +1635,26 @@ proc prepareHolder*(target: CgroupTarget; problem: var string): bool =
   ## where the launcher is, inside L.
   when defined(linux):
     let dir = target.holder
-    if dir.len == 0 or holderReady(dir):
+    let needCpu = not target.cpuUntouched
+    # The controller this target cannot do without: cpu for a session
+    # group's tree, memory for a memory-only one.
+    let needed = if needCpu: "cpu" else: "memory"
+    if dir.len == 0 or holderReady(dir, needCpu):
       return true
     # A holder this process already found it cannot use (the controller is
     # not delegated to it) is refused at once, without taking its lock.
+    let memoKey = "holder:" & needed & ":" & dir
     var known: DelegationAnswer
-    if memoLookup("holder:" & dir, known, problem):
+    if memoLookup(memoKey, known, problem):
       return false
-    # Delegated, but the cpu controller does not reach it: nothing a launch
-    # can do, and nothing to move.
-    if not hasController(readSmall(dir / "cgroup.controllers"), "cpu"):
+    # Delegated, but the controller does not reach it: nothing a launch can
+    # do, and nothing to move.
+    if not hasController(readSmall(dir / "cgroup.controllers"), needed):
       problem = "cannot place the tree inside cgroup " & dir & " (its " &
         target.holderLimit & " holds the launcher): " & dir & " is " &
-        "delegated but the cpu controller is not delegated to it; the tree " &
-        "runs in the launcher's cgroup, under the limit"
-      memoStore("holder:" & dir, daNo, problem)
+        "delegated but the " & needed & " controller is not delegated to " &
+        "it; the tree runs in the launcher's cgroup, under the limit"
+      memoStore(memoKey, daNo, problem)
       return false
     let fd = posix.open(cstring(dir), O_RDONLY or O_DIRECTORY or O_CLOEXEC)
     # A lock that cannot be taken leaves the work unlocked, as a root's
@@ -1649,10 +1666,10 @@ proc prepareHolder*(target: CgroupTarget; problem: var string): bool =
       if fd >= 0: discard posix.close(fd)
     var why = ""
     var vanished = false
-    if holderReady(dir):
+    if holderReady(dir, needCpu):
       return true
     if not moveHolderProcesses(dir, why) or
-        not enableControllerBelow(dir, "cpu", why, vanished):
+        not enableControllerBelow(dir, needed, why, vanished):
       problem = "cannot place the tree inside cgroup " & dir & " (its " &
         target.holderLimit & " holds the launcher): " & why &
         "; the tree runs in the launcher's cgroup, under the limit"
