@@ -338,7 +338,16 @@ enforcement: priority enforced (cgroup v2 cpu.weight of .../group-<group> ...)
 enforcement: reclaimed enforced (cgroup v2 cpu.weight 1 of .../reclaimed, and nice +10)
 enforcement: width-cap enforced (cgroup v2 cpu.max of the tree's own leaf (runquota run --cap))
 enforcement: memory-cap admission-only (admission (memory reservation)) gap: ...
+memory_cap_unit: user@1000.service delegate=yes oom_policy=continue
 ```
+
+With placement on, `memory_cap_unit` names the systemd unit that encloses
+the cgroup root and its `Delegate=` and `OOMPolicy=`, read with `systemctl
+show`. systemd applies a unit's `OOMPolicy=` to an out-of-memory kill
+anywhere below it, so a unit without `Delegate=yes`, or with `OOMPolicy=stop`
+or `kill`, could be stopped whole because one task passed its memory cap;
+`runquota status` then adds a `memory_cap_unsafe:` line saying why. Keep the
+memory cap and placement off on such a host until the unit is repaired.
 
 The record is the client's: it describes the host and user of the `runquota`
 process that prints it, because the cgroups are the launcher's, not the

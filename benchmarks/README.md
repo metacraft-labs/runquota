@@ -57,6 +57,30 @@ placed, so `reprobuild-64` refuses the switch. Before the rounds the gate
 also times the migration alone (300 children each writing themselves into a
 leaf's `cgroup.procs`) and reports it as `case_details.migration_probe`.
 
+`--switch=memory-cap` judges the Linux per-task memory cap, with placement
+on in BOTH arms (each under a gate-owned root of its own) so only the cap
+differs: the whole mechanism against none of it. `--switch=memory-cap:STAGE`
+judges one stage against the stage before it, so each comparison adds
+exactly one:
+
+| Switch | OFF arm | ON arm |
+|---|---|---|
+| `memory-cap` | `RUNQUOTA_MEMORY_CAP=off` | `RUNQUOTA_MEMORY_CAP=1G`, every stage |
+| `memory-cap:controller` | `RUNQUOTA_MEMORY_CAP=off` | `1G`, `RUNQUOTA_MEMORY_CAP_STAGE=controller` (`+memory` on the root and the group) |
+| `memory-cap:leaf` | `1G`, `controller` | `1G`, `leaf` (a leaf of its own per tree, no limits) |
+| `memory-cap:limits` | `1G`, `leaf` | `1G`, `limits` (`memory.max`, `memory.swap.max`, `memory.oom.group`, and `clone3`) |
+| `memory-cap:classify` | `1G`, `limits` | `1G`, `classify` (the reads at the end of each tree) |
+
+Before the rounds each arm runs one probe through `runquota run` that
+prints what its own cgroup carries, and the gate refuses the run (exit 4)
+unless each arm is at the level its configuration names: an ON arm whose
+launches apply no cap would compare two identical arms. The `classify`
+stage's reads are invisible from inside the tree, so for
+`memory-cap:classify` the check can only confirm that both arms are at
+`limits`. `case_details.memory_cap` carries the arms, what each probe saw,
+and each root's `nr_dying_descendants` before the first round and after the
+latest run. `run-64` only.
+
 Exit status: 0 pass, 1 fail, 2 usage, 3 inconclusive, 4 case unavailable,
 5 a run could not be measured. The JSON report goes to
 `bench-results/runquota-overhead-gate-<case>.json` with every round, the
