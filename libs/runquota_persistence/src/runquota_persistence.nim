@@ -273,6 +273,25 @@ proc storedInt(value: uint64): SqlValue =
   ## vanish at the next start. No real figure reaches the saturation.
   sqlInt(if value > uint64(high(int64)): high(int64) else: int64(value))
 
+proc upsertStatement(row: LearnedEstimateRow): BoundStatement =
+  ## The one upsert of a row, every value bound. Shared by the background
+  ## writer and the synchronous write, so the two cannot store a row
+  ## differently.
+  bound(estimateUpsert,
+    sqlText(row.scope), sqlText(row.commandStatsId),
+    sqlInt(int64(EstimateSchemaVersion)),
+    storedInt(row.conservativeMemoryBytes),
+    storedInt(row.recentPeakMemoryBytes),
+    sqlInt(int64(row.sampleCount)), sqlInt(int64(row.lastOutcome)),
+    storedInt(row.updatedUnixMillis),
+    storedInt(row.maxObservedPeakBytes),
+    storedInt(row.declaredCapBytes),
+    storedInt(row.declaredByUid),
+    storedInt(row.declaredUnixMillis),
+    storedInt(row.lastBreachCapBytes),
+    storedInt(row.lastBreachPeakBytes),
+    storedInt(row.lastBreachUnixMillis))
+
 proc writeBatch(path: string; rows: seq[LearnedEstimateRow]): bool =
   ## Commits ``rows`` in one transaction on a pooled connection, every value
   ## bound. Returns whether they actually landed.
@@ -280,20 +299,7 @@ proc writeBatch(path: string; rows: seq[LearnedEstimateRow]): bool =
     return true
   var statements: seq[BoundStatement] = @[]
   for row in rows:
-    statements.add(bound(estimateUpsert,
-      sqlText(row.scope), sqlText(row.commandStatsId),
-      sqlInt(int64(EstimateSchemaVersion)),
-      storedInt(row.conservativeMemoryBytes),
-      storedInt(row.recentPeakMemoryBytes),
-      sqlInt(int64(row.sampleCount)), sqlInt(int64(row.lastOutcome)),
-      storedInt(row.updatedUnixMillis),
-      storedInt(row.maxObservedPeakBytes),
-      storedInt(row.declaredCapBytes),
-      storedInt(row.declaredByUid),
-      storedInt(row.declaredUnixMillis),
-      storedInt(row.lastBreachCapBytes),
-      storedInt(row.lastBreachPeakBytes),
-      storedInt(row.lastBreachUnixMillis)))
+    statements.add(upsertStatement(row))
   runBound(path, statements).ok
 
 proc noteEstimateWriteFailure(rows: int) =
@@ -475,6 +481,43 @@ proc enqueueEstimateWrite*(store: EstimateStore; row: LearnedEstimateRow): bool 
     result = writerPending.add(encoded)
   finally:
     release(writerLock)
+
+proc durableWrite(store: EstimateStore;
+                  statement: BoundStatement): string =
+  ## Runs one statement against the store NOW, on the caller's thread, in
+  ## its own committed transaction, and answers "" once it is durable or
+  ## the reason it is not. A store in memory only (tests that disable
+  ## persistence) has nothing to write and answers "".
+  if store.isNil or store.mode != pmSqlite:
+    return ""
+  if not initEstimateSchema(store.dbPath):
+    return "the estimate store " & store.dbPath & " has no usable schema"
+  let outcome = runBound(store.dbPath, [statement])
+  if outcome.ok: ""
+  else: "the estimate store " & store.dbPath & " did not commit the write: " &
+    outcome.error
+
+proc writeEstimateNow*(store: EstimateStore; row: LearnedEstimateRow): string =
+  ## Upsert `row` SYNCHRONOUSLY, bypassing the bounded writer queue, and
+  ## answer "" only once it is committed (WAL), else why not.
+  ##
+  ## FOR ROWS THAT MUST NOT BE LOST. The queue drops its oldest row when it
+  ## is full and loses what it holds if the daemon dies before a drain,
+  ## which is right for learned figures -- a lost sample is relearned --
+  ## and wrong for a growth declaration, which an operator made on purpose
+  ## and expects to find recorded. Declarations are rare operator commands,
+  ## not admission, so a write on their request path costs nothing that
+  ## matters. A row written here is never also queued.
+  durableWrite(store, upsertStatement(row))
+
+proc deleteEstimateNow*(store: EstimateStore; scope,
+                        commandStatsId: string): string =
+  ## Delete one row SYNCHRONOUSLY, as `writeEstimateNow` writes one: a
+  ## cleared declaration holds nothing else, so it leaves no row behind.
+  durableWrite(store, bound("delete from learned_estimates where " &
+    "scope = ? and command_stats_id = ? and schema_version = ?",
+    sqlText(scope), sqlText(commandStatsId),
+    sqlInt(int64(EstimateSchemaVersion))))
 
 proc stopEstimateStore*(store: EstimateStore) =
   if store.isNil or store.mode != pmSqlite:

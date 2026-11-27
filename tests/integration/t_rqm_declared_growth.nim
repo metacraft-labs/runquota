@@ -21,6 +21,9 @@
 ##   the declaration stand when it is smaller (the old min(B, D)).
 ## * Only the declaring uid or root may replace or reset a declaration, and
 ##   a daemon holds at most `MaxDeclarations` of them.
+## * A declaration is committed to the store before the daemon answers, so
+##   a burst past the writer queue's size survives a kill; a reset deletes
+##   its row.
 ## * Declarations are listed apart from the learned rows in `estimates`.
 ## * The declaration survives a daemon restart (it is persisted with the
 ##   row).
@@ -36,7 +39,7 @@
 ## No mocks: the built `runquotad` and `runquota`, a real estimate store.
 
 when defined(posix):
-  import std/[json, os, posix, strutils, unittest]
+  import std/[json, os, osproc, posix, strutils, unittest]
 
   import runquota_client
   import runquota_core
@@ -228,6 +231,51 @@ when defined(posix):
       discard client.expectGrowth("d1", egReset)
       check client.expectGrowth("one-more", egSet,
         2'u64 * GiB).declaredCapBytes == 2'u64 * GiB
+
+    test "declarations are durable before the answer, and a reset leaves no row":
+      # A burst of more declarations than the learned-row writer queue holds
+      # (128), then the daemon KILLED at once -- no drain -- and restarted:
+      # every declaration answered is there. Falsifying mutation: hand the
+      # declaration to the queue (`enqueueEstimateWrite`) instead of
+      # committing it -- the rows still queued at the kill are lost.
+      let burst = 300
+      let daemon = startRqmDaemon("rqmdur")
+      var killed = false
+      defer:
+        if not killed: daemon.stop()
+      block:
+        var client = connectDefault()
+        defer: client.close()
+        for i in 0 ..< burst:
+          discard client.expectGrowth("burst" & $i, egSet,
+            uint64(i + 2) * GiB)
+        discard client.expectGrowth("burst0", egReset)
+      daemon.process.kill()
+      discard daemon.process.waitForExit(10_000)
+      daemon.process.close()
+      killed = true
+      # The killed daemon's socket file is left behind; removed here so the
+      # restart below waits for the NEW daemon's socket, not that one.
+      removeFile(daemon.socket)
+      # The reset deleted its row; nothing of it is left on disk.
+      var onDisk = 0
+      for row in loadLearnedEstimates(daemon.root / "est.sqlite"):
+        if row.scope == DeclarationScope:
+          check row.commandStatsId != "burst0"
+          check row.declaredCapBytes > 0'u64
+          inc onDisk
+      check onDisk == burst - 1
+      let restarted = startRqmDaemon("", root = daemon.root)
+      defer: restarted.stop()
+      var client = connectDefault()
+      defer: client.close()
+      var found = 0
+      for i in 1 ..< burst:
+        let answer = client.expectGrowth("burst" & $i, egQuery)
+        if answer.declaredCapBytes == uint64(i + 2) * GiB:
+          inc found
+      check found == burst - 1
+      check client.expectGrowth("burst0", egQuery).declaredCapBytes == 0'u64
 
     test "refusals":
       let daemon = startRqmDaemon("rqmref")

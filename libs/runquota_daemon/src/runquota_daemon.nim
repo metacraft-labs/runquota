@@ -876,9 +876,9 @@ proc initDaemon*(config: DaemonConfig; deferCapture = false): RunQuotaDaemon =
     lostLeasesReaped: 0'u64
   )
   for row in loadLearnedEstimates(effectiveConfig.estimateDbPath):
-    # A cleared declaration is kept on disk (the writer upserts and never
-    # deletes) but is no declaration: it is not loaded, so it neither counts
-    # against `MaxDeclarations` nor costs a lookup.
+    # A cleared declaration is no declaration: a reset deletes its row, and
+    # one written as zeros by an earlier build is not loaded, so it neither
+    # counts against `MaxDeclarations` nor costs a lookup.
     if row.scope == DeclarationScope and row.declaredCapBytes == 0'u64:
       continue
     result.estimates[estimateTableKey(row.scope, row.commandStatsId)] = row
@@ -7127,28 +7127,40 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
             "reset declarations that are no longer needed " &
             "(runquota expect-growth <command-id> --reset)"))
         return
+      # DURABLE BEFORE THE ANSWER. A declaration is the persistent,
+      # auditable form of "this command will grow", so it is committed to
+      # the store on this request, not handed to the bounded writer queue
+      # that learned figures use (which drops its oldest row when full and
+      # loses what it holds if the daemon dies before a drain). Memory
+      # changes only after the store has: a write that fails is refused
+      # with its reason and the declaration in force stays as it was.
       let now = nowUnixMillis()
       if msg.action == egSet:
         row.declaredCapBytes = msg.sizeBytes
         row.declaredByUid = caller
         row.declaredUnixMillis = now
-      else:
-        # Cleared, persisted as cleared (the writer upserts and never
-        # deletes), and dropped from memory: a cleared declaration is none,
-        # and is not reloaded at the next start.
-        row.declaredCapBytes = 0'u64
-        row.declaredByUid = 0'u64
-        row.declaredUnixMillis = 0'u64
-      row.updatedUnixMillis = now
-      if msg.action == egSet:
+        row.updatedUnixMillis = now
+        let failure = writeEstimateNow(daemon.estimateStore, row)
+        if failure.len > 0:
+          connection.sendError(frame.header.requestId, diagnostic(diagDenied,
+              "the declaration was not recorded: " & failure,
+              "nothing changed; the declaration in force is the one before"))
+          return
         if not existing:
           inc daemon.declarationCount
         daemon.estimates[key] = row
-        discard enqueueEstimateWrite(daemon.estimateStore, row)
       elif existing:
+        # A declaration row holds nothing but the declaration, so a reset
+        # deletes it rather than leaving a row of zeros behind.
+        let failure = deleteEstimateNow(daemon.estimateStore,
+          DeclarationScope, msg.commandStatsId)
+        if failure.len > 0:
+          connection.sendError(frame.header.requestId, diagnostic(diagDenied,
+              "the reset was not recorded: " & failure,
+              "nothing changed; the declaration is still in force"))
+          return
         daemon.estimates.del(key)
         dec daemon.declarationCount
-        discard enqueueEstimateWrite(daemon.estimateStore, row)
     connection.sendResponse(rqGrowthExpectation, frame.header.requestId,
         encodeGrowthExpectation(daemon.growthExpectation(msg.commandStatsId)))
   of rqInspectionRequest:
