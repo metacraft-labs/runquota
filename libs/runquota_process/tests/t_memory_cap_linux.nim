@@ -347,6 +347,25 @@ suite "memory cap rules":
     check not memoryCapTarget(CgroupTarget(), 32 * MiB, mcaKill, mcsClassify,
       1, 1).placed
 
+  test "the memory-only placement leaves CPU alone":
+    let root = CgroupRoot(state: crsExplicit, path: "/sys/fs/cgroup/t/r")
+    let memoryOnly = memoryOnlyPlacement(root)
+    check memoryOnly.dirPath == "/sys/fs/cgroup/t/r/" & MemoryCappedDirName
+    check memoryOnly.cpuWeight == 0
+    check memoryOnly.cpuMax == ""
+    check memoryOnly.cpuUntouched
+    let capped = memoryCapTarget(memoryOnly, 32 * MiB, mcaKill, mcsClassify,
+      42, 7)
+    check capped.leafPath == "/sys/fs/cgroup/t/r/memory-capped/cap-42-7"
+    check capped.cpuUntouched
+    check capped.memoryMax == $(32 * MiB)
+    # A session group's target is never CPU-untouched, whatever its group
+    # is called, and a group cannot name the memory-only directory.
+    check not targetFor(root, "memory-capped", sessionPriorityNormal,
+      reclaimed = false).cpuUntouched
+    check groupDirName("memory-capped") != MemoryCappedDirName
+    check not memoryOnlyPlacement(CgroupRoot(state: crsOff)).placed
+
   test "memory.events.local":
     let events = parseMemoryEvents("low 0\nhigh 0\nmax 12\noom 1\n" &
       "oom_kill 2\noom_group_kill 1\n")
@@ -574,6 +593,63 @@ when defined(linux):
           "sweep", 64 * MiB), info)
         check completion.exited and completion.exitCode == 0
         check not dirExists(stale)
+        check cgroupDirsBelow(testRoot) == newSeq[string]()
+
+    test "a memory-only placement writes no CPU file":
+      if testRoot.len == 0:
+        echo "SKIPPED: " & reason
+        skip()
+      else:
+        # The tree of a launcher that places for memory only goes to
+        # `memory-capped/` under the root, and nothing it does there
+        # touches CPU: the directory's weight stays what it was (set here
+        # to a value no launcher writes, after a session group's launch
+        # enabled `+cpu` in the root so that the directory has the file),
+        # `+cpu` is not enabled below it, and its leaf has no `cpu.max` --
+        # even with a priority source on the launch that names `high`.
+        # Mutation: writing the group directory's weight for this target
+        # (the weight changes, or the write of 0 fails the placement).
+        let root = CgroupRoot(state: crsExplicit, path: testRoot)
+        let neighbour = targetFor(root, "cpu-neighbour",
+          sessionPriorityNormal, reclaimed = false)
+        var problem = ""
+        check prepareTarget(neighbour, problem)
+        check removeEmptyCgroup(neighbour.leafPath)
+        check removeEmptyCgroup(neighbour.dirPath)
+        let dir = testRoot / MemoryCappedDirName
+        createDir(dir)
+        check fileExists(dir / "cpu.weight")
+        writeFile(dir / "cpu.weight", "37")
+        var spec = commandSpec([app, "--report-cgroup"])
+        spec.cgroup = memoryOnlyPlacement(root)
+        spec.memoryCapBytes = 64 * MiB
+        spec.memoryCapAction = mcaKill
+        spec.cgroupPriority = GroupPrioritySource(
+          read: proc (context: pointer; priority: var SessionPriority): bool {.
+              nimcall, gcsafe, raises: [].} =
+            priority = sessionPriorityHigh
+            true)
+        var child = launchProcess(spec)
+        let info = child.info
+        let completion = child.waitForCompletion(60_000)
+        let leaf = child.cgroupTarget.leafPath
+        let leafCpuMax =
+          if fileExists(leaf / "cpu.max"): readTrim(leaf / "cpu.max")
+          else: "absent"
+        let weight = readTrim(dir / "cpu.weight")
+        let below = readTrim(dir / "cgroup.subtree_control")
+        child.close()
+        check info.memoryCapApplied
+        check info.cgroupPath.startsWith(dir & "/" & CapLeafPrefix)
+        check completion.exited and completion.exitCode == 0
+        check completion.memoryCapMeasured
+        # The child read its own cgroup first thing: it was in its leaf.
+        check completion.stdout.strip().endsWith(
+          "/" & MemoryCappedDirName & "/" & info.cgroupPath.extractFilename)
+        check weight == "37"
+        check "cpu" notin below.splitWhitespace()
+        check "memory" in below.splitWhitespace()
+        check leafCpuMax in ["absent", "max 100000"]
         check cgroupDirsBelow(testRoot) == newSeq[string]()
 
     test "a cap kill inside a sub-cgroup of the tree's own leaf is the cap's":

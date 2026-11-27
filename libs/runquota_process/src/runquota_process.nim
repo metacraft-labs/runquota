@@ -2184,8 +2184,10 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         # rewrites the weight only under the exclusive lock, after the daemon
         # took its change, so it either lands after this launch's write or
         # this read already sees its priority (`lockCgroupRoot`).
+        # A target that leaves CPU alone (`memoryOnlyPlacement`) follows no
+        # group's priority, so nothing is read for it and no weight is set.
         var inForce: SessionPriority
-        if spec.cgroupPriority.readNow(inForce):
+        if not target.cpuUntouched and spec.cgroupPriority.readNow(inForce):
           target.cpuWeight = cpuWeightFor(inForce)
           fallbackNiceWanted = fallbackNice(inForce, reclaimed = false)
         var tries = 0

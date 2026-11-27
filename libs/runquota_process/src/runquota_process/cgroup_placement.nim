@@ -21,6 +21,9 @@
 ##                                and/or memory.max = its memory cap
 ##     reclaimed/                 cpu.weight 1
 ##       shared/, cap-<pid>-<n>/
+##     memory-capped/             no CPU file written (`memoryOnlyPlacement`)
+##       cap-<pid>-<n>/           one memory-capped tree of a launcher that
+##                                does not place for CPU
 ##
 ## THE MEMORY CAP (`memoryCapTarget`). A tree with a memory cap gets a leaf
 ## of its own (one leaf carries both caps when a CPU cap applies too), with
@@ -119,6 +122,12 @@ const
     ## (`cpu.weight`, `cgroup.procs`, ...), which all contain a `.` that the
     ## escaping below never leaves in a name anyway.
   ReclaimedDirName* = "reclaimed"
+  MemoryCappedDirName* = "memory-capped"
+    ## The directory of the memory-capped trees of a launcher that places
+    ## nothing for CPU (`memoryOnlyPlacement`). It never gets a `cpu.weight`
+    ## or `cpu.max` from a launcher. No `group-` prefix, so no session group
+    ## can name it, and it contains a `-`, which `escapeGroupName` keeps, but
+    ## every group directory starts with `group-`.
   SharedLeafName* = "shared"
   CapLeafPrefix* = "cap-"
   ReclaimedCpuWeight* = 1
@@ -188,6 +197,9 @@ type
       ## `group-<escaped>` or `reclaimed`.
     cpuWeight*: int
       ## Written to `<root>/<dirName>/cpu.weight` each time it is prepared.
+      ## 0 (with no `cpuMax`) writes no CPU file at all: the target of
+      ## `memoryOnlyPlacement`, whose directory keeps the kernel's default
+      ## weight (`cpuUntouched`).
     leafName*: string
       ## `shared` or `cap-<pid>-<n>`.
     cpuMax*: string
@@ -345,6 +357,12 @@ proc leafPath*(target: CgroupTarget): string =
 
 proc isCapLeaf*(target: CgroupTarget): bool =
   target.leafName.startsWith(CapLeafPrefix)
+
+proc cpuUntouched*(target: CgroupTarget): bool =
+  ## Whether preparing `target` leaves every CPU setting alone: no
+  ## `cpu.weight` on its directory, no `cpu.max` on its leaf, and no `+cpu`
+  ## enabled for it (`memoryOnlyPlacement`).
+  target.cpuWeight <= 0 and target.cpuMax.len == 0
 
 proc hasMemoryLimits*(target: CgroupTarget): bool =
   ## Whether preparing `target` writes memory limits into its leaf.
@@ -1311,6 +1329,29 @@ proc targetFor*(root: CgroupRoot; group: string; priority: SessionPriority;
   else:
     result.leafName = SharedLeafName
 
+proc memoryOnlyPlacement*(root: CgroupRoot): CgroupTarget =
+  ## Where a launcher that places its trees for MEMORY ONLY puts a capped
+  ## (or measured) tree: `<root>/memory-capped/`, whose leaf
+  ## `memoryCapTarget` then makes the tree's own `cap-<pid>-<n>`. An
+  ## unusable root gives an empty target (no placement).
+  ##
+  ## FOR A LAUNCHER WHOSE CPU PLACEMENT MUST NOT CHANGE. Reprobuild runs its
+  ## actions under RunQuota's leases but does not place them in a session
+  ## group's cgroup, so they compete for CPU as unplaced work does. Moving a
+  ## memory-capped action into `group-<name>/` would also give it that
+  ## group's `cpu.weight`, a CPU policy the launcher never asked for. This
+  ## directory gets no `cpu.weight` and its leaves no `cpu.max` (a launch
+  ## also skips the priority read that would set one), so the kernel's
+  ## default weight applies, as for any group at normal priority, and only
+  ## the memory controller is enabled for it. Give it no
+  ## `GroupPrioritySource`: there is no group whose priority it follows.
+  if not root.usable:
+    return CgroupTarget()
+  result.root = root.path
+  result.dirName = MemoryCappedDirName
+  result.cpuWeight = 0
+  result.leafName = SharedLeafName
+
 # ---------------------------------------------------------------------------
 # The host
 # ---------------------------------------------------------------------------
@@ -1654,8 +1695,13 @@ proc prepareTarget*(target: CgroupTarget; problem: var string;
       return false
     if target.holder.len > 0 and not prepareHolder(target, problem):
       return false
+    # A target that leaves CPU alone (`memoryOnlyPlacement`) enables no
+    # `+cpu` anywhere and writes no weight: it needs only the memory
+    # controller, and must not depend on the cpu one being delegated.
+    let cpuToo = not target.cpuUntouched
     if not ensureDir(target.root, problem, vanished): return false
-    if not enableCpuBelow(target.root, problem, vanished): return false
+    if cpuToo and not enableCpuBelow(target.root, problem, vanished):
+      return false
     var memoryOn = false
     if target.memory:
       var memoryProblem = ""
@@ -1670,10 +1716,11 @@ proc prepareTarget*(target: CgroupTarget; problem: var string;
         memory.problem = "memory controller not enabled: " & memoryProblem
     let dir = target.dirPath
     if not ensureDir(dir, problem, vanished): return false
-    if not writeCgroupFile(dir / "cpu.weight", $target.cpuWeight, problem,
-        vanished):
-      return false
-    if not enableCpuBelow(dir, problem, vanished): return false
+    if cpuToo:
+      if not writeCgroupFile(dir / "cpu.weight", $target.cpuWeight, problem,
+          vanished):
+        return false
+      if not enableCpuBelow(dir, problem, vanished): return false
     if memoryOn:
       var memoryProblem = ""
       var gone = false

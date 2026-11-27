@@ -302,6 +302,7 @@ competes for CPU at its group's priority:
 | `group-<name>/shared` | low 25, normal 100, high 400, urgent 1600 | every tree of the group |
 | `group-<name>/cap-<pid>-<n>` | the group's | one `run --cap` tree, with `cpu.max` at its grant |
 | `reclaimed/shared` | 1 | trees of a reclaimed grant (also at nice +10) |
+| `memory-capped/cap-<pid>-<n>` | not written (the kernel's default) | one memory-capped tree of a launcher that places its trees for memory only, such as a build tool whose own CPU policy must not change; it gets no `cpu.max` either |
 
 **Placement is off by default.** A host turns it on in its host file, which
 every user's `runquota` reads at each launch:
