@@ -1528,20 +1528,34 @@ proc serveSyntheticChild*(args: openArray[string]): bool =
 
 proc serveRun64Child*(args: openArray[string]): bool =
   ## If invoked as `run64CaseWindowsMemoryCap`'s own action
-  ## (`--run64-spin TURNS OUTPATH`), count to TURNS and write it to OUTPATH
-  ## -- the same contract `run64Script`'s shell loop keeps on POSIX
-  ## (`run64Case`'s own check reads the file back and compares it against
-  ## `run64LoopTurns`). Cargo-style self-reinvocation, like
+  ## (`--run64-spin TURNS OUTPATH`), burn TURNS iterations and write TURNS
+  ## to OUTPATH -- the same contract `run64Script`'s shell loop keeps on
+  ## POSIX (`run64Case`'s own check reads the file back and compares it
+  ## against `run64LoopTurns`). Cargo-style self-reinvocation, like
   ## `serveSyntheticChild`; not gated to Windows, since nothing about it is
   ## platform-specific, but POSIX's `run64Case` never invokes it.
+  ##
+  ## Uses `burn` (the synthetic case's own anti-optimiser loop), not a
+  ## plain counting loop: a plain `for _ in 0 ..< turns: inc counted` has
+  ## no effect the optimiser cannot prove equals `counted = turns`, so
+  ## `-d:release` folded it away entirely -- 2 BILLION claimed iterations
+  ## measured at 31 ms, the same as 150,000 (confirmed by timing both
+  ## directly). The shell loop this mirrors on Linux has no such
+  ## shortcut (every iteration is a real, interpreted arithmetic
+  ## evaluation), so the dead Windows loop understated every action's own
+  ## work relative to its POSIX counterpart -- not what the overhead
+  ## verdicts in RunQuota-Memory-Caps.md's "Verdicts" subsection assumed.
+  ## `burn`'s own fold-resistance needs its result to be OBSERVED
+  ## (`serveSyntheticChild` echoes it); a first attempt here that
+  ## `discard`ed it instead was folded away exactly the same way, for the
+  ## same reason -- the whole loop became a provably-dead computation the
+  ## moment nothing could see its result.
   if args.len == 3 and args[0] == "--run64-spin":
     let turns = try: parseInt(args[1]) except ValueError: -1
     if turns < 0:
       return false
-    var counted = 0
-    for _ in 0 ..< turns:
-      inc counted
-    writeFile(args[2], $counted)
+    echo burn(turns)
+    writeFile(args[2], $turns)
     return true
   false
 
