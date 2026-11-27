@@ -265,6 +265,14 @@ const estimateUpsert = """
       last_breach_peak_bytes = excluded.last_breach_peak_bytes,
       last_breach_unix_millis = excluded.last_breach_unix_millis"""
 
+proc storedInt(value: uint64): SqlValue =
+  ## An unsigned figure as the store's signed 64-bit integer, SATURATING at
+  ## `int64.high`. A plain `cast` turns 2^63 and above into a negative
+  ## number, which `loadLearnedEstimates` cannot parse as unsigned and then
+  ## skips -- so one oversized client-reported peak would make the whole row
+  ## vanish at the next start. No real figure reaches the saturation.
+  sqlInt(if value > uint64(high(int64)): high(int64) else: int64(value))
+
 proc writeBatch(path: string; rows: seq[LearnedEstimateRow]): bool =
   ## Commits ``rows`` in one transaction on a pooled connection, every value
   ## bound. Returns whether they actually landed.
@@ -275,17 +283,17 @@ proc writeBatch(path: string; rows: seq[LearnedEstimateRow]): bool =
     statements.add(bound(estimateUpsert,
       sqlText(row.scope), sqlText(row.commandStatsId),
       sqlInt(int64(EstimateSchemaVersion)),
-      sqlInt(cast[int64](row.conservativeMemoryBytes)),
-      sqlInt(cast[int64](row.recentPeakMemoryBytes)),
+      storedInt(row.conservativeMemoryBytes),
+      storedInt(row.recentPeakMemoryBytes),
       sqlInt(int64(row.sampleCount)), sqlInt(int64(row.lastOutcome)),
-      sqlInt(cast[int64](row.updatedUnixMillis)),
-      sqlInt(cast[int64](row.maxObservedPeakBytes)),
-      sqlInt(cast[int64](row.declaredCapBytes)),
-      sqlInt(cast[int64](row.declaredByUid)),
-      sqlInt(cast[int64](row.declaredUnixMillis)),
-      sqlInt(cast[int64](row.lastBreachCapBytes)),
-      sqlInt(cast[int64](row.lastBreachPeakBytes)),
-      sqlInt(cast[int64](row.lastBreachUnixMillis))))
+      storedInt(row.updatedUnixMillis),
+      storedInt(row.maxObservedPeakBytes),
+      storedInt(row.declaredCapBytes),
+      storedInt(row.declaredByUid),
+      storedInt(row.declaredUnixMillis),
+      storedInt(row.lastBreachCapBytes),
+      storedInt(row.lastBreachPeakBytes),
+      storedInt(row.lastBreachUnixMillis)))
   runBound(path, statements).ok
 
 proc noteEstimateWriteFailure(rows: int) =

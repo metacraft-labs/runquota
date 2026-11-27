@@ -99,3 +99,29 @@ suite "the memory-cap columns of the learned-estimate store":
     let after = loadLearnedEstimates(path)
     check after.len == 1
     check after[0] == updated
+
+  test "a figure past int64 saturates instead of losing the row":
+    # The store keeps signed 64-bit integers. A figure of 2^63 or more cast
+    # straight to one is negative, the reader cannot parse it as unsigned,
+    # and the whole row is skipped at the next start. Saturated, the row
+    # comes back with `int64.high` in that figure. Falsifying mutation: write
+    # the figures with a plain cast -- the row is then not reloaded.
+    let dir = createTempDir("rqmsat", "")
+    defer: removeDir(dir)
+    let path = dir / "est.sqlite"
+    let row = LearnedEstimateRow(scope: "session:x", commandStatsId: "huge",
+      conservativeMemoryBytes: high(uint64), recentPeakMemoryBytes: 5'u64,
+      sampleCount: 1'u32, maxObservedPeakBytes: (1'u64 shl 63) + 5'u64,
+      lastBreachPeakBytes: high(uint64))
+    let store = startEstimateStore(path)
+    check enqueueEstimateWrite(store, row)
+    check waitForRow(path, "huge",
+      proc(r: LearnedEstimateRow): bool = r.sampleCount == 1'u32)
+    stopEstimateStore(store)
+    let back = loadLearnedEstimates(path)
+    check back.len == 1
+    check back[0].maxObservedPeakBytes == uint64(high(int64))
+    check back[0].conservativeMemoryBytes == uint64(high(int64))
+    check back[0].lastBreachPeakBytes == uint64(high(int64))
+    check back[0].recentPeakMemoryBytes == 5'u64
+
