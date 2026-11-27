@@ -1,6 +1,7 @@
 import runquota_core/types
+import runquota_core/memory_cap
 
-export types
+export types, memory_cap
 
 when defined(posix):
   # Descriptor hygiene is shared by the IPC and process layers, both of which

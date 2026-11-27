@@ -1,9 +1,10 @@
 import std/osproc
 
 import runquota_core/cpu_profile
+import runquota_core/memory_cap
 import runquota_process/cgroup_placement
 
-export cpu_profile, cgroup_placement
+export cpu_profile, cgroup_placement, memory_cap
 
 type
   LibraryInfo* = object
@@ -69,6 +70,19 @@ type
       ## the lease granted however many threads it spawns. Not applied on POSIX
       ## yet: cap enforcement there is cgroup work (`cpu.max`), out of scope
       ## for the Windows launcher.
+    memoryCapBytes*: uint64
+      ## The tree's memory cap in bytes; 0 = none. Enforced (or only
+      ## measured, per `memoryCapAction`) by the platform's mechanism: a
+      ## task leaf's `memory.max` (Linux), the Job Object's job-memory limit
+      ## (Windows), the footprint walk (macOS). Only the tree is killed.
+    memoryCapAction*: MemoryCapAction
+      ## `mcaKill` enforces the cap; `mcaAdvisory` measures and reports a
+      ## breach (`ProcessCompletion.capExceeded`) and kills nothing.
+    memoryCapMeasure*: bool
+      ## Measure the tree's peak with the cap's own mechanism even when
+      ## `memoryCapBytes` is 0 (a run whose cap is lifted by
+      ## `RUNQUOTA_MEMORY_CAP=off`), so that a success can record it. Implied
+      ## by a non-zero `memoryCapBytes`.
     cgroup*: CgroupTarget
       ## Linux: the cgroup the child joins right after the fork, before it
       ## does anything else (it writes itself into the leaf's
@@ -157,6 +171,26 @@ type
       ## The largest SUMMED resident set the tree samples saw while it ran
       ## (`tree-sampling`). 0 when nothing sampled it. See `totals` for the
       ## largest single process, which needs no sampling.
+    memoryCapBytes*: uint64
+      ## The memory cap the launch applied (`CommandSpec.memoryCapBytes`),
+      ## 0 when none.
+    memoryCapMeasured*: bool
+      ## The tree was measured by the cap's mechanism (a cap was applied, or
+      ## `memoryCapMeasure` asked for it): `memoryPeakBytes` and the flags
+      ## below are meaningful only when this is true.
+    memoryPeakBytes*: uint64
+      ## The tree's peak as the cap's mechanism measured it (`memory.peak`,
+      ## `PeakJobMemoryUsed`, the footprint walk's largest sum).
+    memoryPeakSource*: MemoryPeakSource
+    capExceeded*: bool
+      ## The tree passed its cap (killed or, in advisory mode, not).
+    capKilled*: bool
+      ## The tree was killed because it passed its cap.
+    capReached*: bool
+      ## An allocation was refused at the cap and nothing was killed.
+    oomKilledOutsideCap*: bool
+      ## A process of the tree was killed for memory by something other than
+      ## its cap (a host-wide OOM, an ancestor's limit).
     processCount*: uint32
     telemetrySource*: string
     totals*: FinishTotals
