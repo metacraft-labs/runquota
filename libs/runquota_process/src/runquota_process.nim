@@ -4,10 +4,12 @@ when defined(posix):
   import std/posix
 
 when defined(windows):
-  # Windows: spawn child processes via std/osproc and assign them to a Job
-  # Object so the whole tree can be tracked and (optionally) killed atomically.
-  # The Job Object also gives us cheap accounting (CPU/IO/process count).
-  import std/[osproc, streams, strtabs, tempfiles]
+  # Windows: spawn child processes with a raw CreateProcessW, placed in a
+  # Job Object at creation (PROC_THREAD_ATTRIBUTE_JOB_LIST) so the whole
+  # tree can be tracked and (optionally) killed atomically. `std/osproc` is
+  # kept only for `countProcessors` -- the launcher no longer uses its
+  # `Process` type or `startProcess`.
+  import std/[osproc, strtabs, tempfiles]
   import std/winlean
 
 import runquota_core
@@ -383,12 +385,67 @@ when defined(windows):
       ControlFlags: uint32
       CpuRate: uint32
 
+    JobNotificationLimitW = object
+      ## JOBOBJECT_NOTIFICATION_LIMIT_INFORMATION. Only the two members this
+      ## launcher gives real meaning (LimitFlags, JobMemoryLimit) are used;
+      ## the I/O and CPU-rate-tolerance notification fields stay zeroed and
+      ## their LimitFlags bits are never set.
+      IoReadBytesLimit: uint64
+      IoWriteBytesLimit: uint64
+      PerJobUserTimeLimit: int64
+      JobMemoryLimit: uint64
+      RateControlTolerance: int32
+      RateControlToleranceInterval: int32
+      LimitFlags: uint32
+
+    JobLimitViolationW = object
+      ## JOBOBJECT_LIMIT_VIOLATION_INFORMATION, read after
+      ## JOB_OBJECT_MSG_NOTIFICATION_LIMIT to learn which notification limit
+      ## fired (`ViolationLimitFlags`) and to re-arm the next notification --
+      ## the system withholds it until this query is made.
+      LimitFlags: uint32
+      ViolationLimitFlags: uint32
+      IoReadBytes: uint64
+      IoReadBytesLimit: uint64
+      IoWriteBytes: uint64
+      IoWriteBytesLimit: uint64
+      PerJobUserTime: int64
+      PerJobUserTimeLimit: int64
+      JobMemory: uint64
+      JobMemoryLimit: uint64
+      RateControlTolerance: int32
+      RateControlToleranceLimit: int32
+
+    JobAssociateCompletionPortW = object
+      ## JOBOBJECT_ASSOCIATE_COMPLETION_PORT.
+      CompletionKey: pointer
+      CompletionPort: Handle
+
+    StartupInfoExW = object
+      ## STARTUPINFOEXW: the base STARTUPINFO plus an attribute list.
+      ## `StartupInfo.cb` MUST be `sizeof(StartupInfoExW)`, not
+      ## `sizeof(STARTUPINFO)` -- otherwise the kernel reads this as the
+      ## plain, non-extended form and ignores `lpAttributeList` even with
+      ## `EXTENDED_STARTUPINFO_PRESENT` set.
+      StartupInfo: STARTUPINFO
+      lpAttributeList: pointer
+
   const
-    # Windows: JobObjectExtendedLimitInformation = 9,
+    # Windows: JobObjectAssociateCompletionPortInformation = 7,
     # JobObjectBasicAndIoAccountingInformation = 8,
+    # JobObjectExtendedLimitInformation = 9,
+    # JobObjectNotificationLimitInformation = 12,
+    # JobObjectLimitViolationInformation = 13 (an unrelated enumeration from
+    # PROC_THREAD_ATTRIBUTE_JOB_LIST's own attribute number 13 below -- the
+    # two just happen to share the integer),
     # JobObjectCpuRateControlInformation = 15.
-    JobObjectExtendedLimitInformation = 9'i32
+    # Source: learn.microsoft.com SetInformationJobObject /
+    # QueryInformationJobObject parameter tables.
+    JobObjectAssociateCompletionPortInformation = 7'i32
     JobObjectBasicAndIoAccountingInformation = 8'i32
+    JobObjectExtendedLimitInformation = 9'i32
+    JobObjectNotificationLimitInformationClass = 12'i32
+    JobObjectLimitViolationInformationClass = 13'i32
     JobObjectCpuRateControlInformation = 15'i32
     # Windows: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000 so when the daemon
     # drops its handle the child tree is reaped automatically. We don't set
@@ -405,14 +462,43 @@ when defined(windows):
     # ceiling the tree cannot exceed (0x4) rather than a weight-based share.
     JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x00000001'u32
     JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP = 0x00000004'u32
+    # Windows: the same bit (0x200), reused with three different meanings
+    # depending which struct/info-class carries it: an ENFORCED job-wide
+    # commit cap in JOBOBJECT_EXTENDED_LIMIT_INFORMATION (JobMemoryLimit), a
+    # NOTIFICATION-ONLY threshold in JOBOBJECT_NOTIFICATION_LIMIT_INFORMATION
+    # (also JobMemoryLimit), and "this is the limit that fired" in
+    # JOBOBJECT_LIMIT_VIOLATION_INFORMATION's ViolationLimitFlags. Sources:
+    # learn.microsoft.com JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    # JOBOBJECT_NOTIFICATION_LIMIT_INFORMATION,
+    # JOBOBJECT_LIMIT_VIOLATION_INFORMATION.
+    JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200'u32
+    # Windows: the ONE completion-port message delivery is guaranteed for
+    # (JOBOBJECT_ASSOCIATE_COMPLETION_PORT Remarks: "except for limits set
+    # with the JobObjectNotificationLimitInformation information class,
+    # messages are intended only as notifications and their delivery...is
+    # not guaranteed. Notifications for limits set with
+    # JobObjectNotificationLimitInformation are guaranteed to arrive at the
+    # completion port"). `JOB_OBJECT_MSG_JOB_MEMORY_LIMIT`, the HARD limit's
+    # own message, is NOT guaranteed, so it is never used as a kill trigger
+    # here.
+    JOB_OBJECT_MSG_NOTIFICATION_LIMIT = 11'u32
+    # Windows: ProcThreadAttributeJobList (13) | PROC_THREAD_ATTRIBUTE_INPUT
+    # (0x20000) -- the lpValue parameter is a pointer to a LIST of job
+    # handles, assigned to the child in the order given, atomically as part
+    # of process creation. Needs Windows 10 / Windows Server 2016 or newer.
+    # Source: learn.microsoft.com UpdateProcThreadAttribute.
+    PROC_THREAD_ATTRIBUTE_JOB_LIST = 0x0002000D'u
+    EXTENDED_STARTUPINFO_PRESENT = 0x00080000'i32
+
+  const windowsCapExceededExitCode* = 2'u32
+    ## The reserved exit code `TerminateJobObject` reports for a `kill`-mode
+    ## memory-cap breach, distinct from `windowsCancelledExitCode` (ordinary
+    ## cancellation) below, so a reader of the exit code alone can tell the
+    ## two apart.
 
   proc createJobObjectW(
     lpJobAttributes: pointer, lpName: WideCString
   ): Handle {.stdcall, dynlib: "kernel32.dll", importc: "CreateJobObjectW".}
-
-  proc assignProcessToJobObject(
-    hJob: Handle, hProcess: Handle
-  ): WINBOOL {.stdcall, dynlib: "kernel32.dll", importc: "AssignProcessToJobObject".}
 
   proc setInformationJobObject(
     hJob: Handle, JobObjectInformationClass: int32,
@@ -433,6 +519,54 @@ when defined(windows):
     hProcess: Handle, dwPriorityClass: uint32
   ): WINBOOL {.stdcall, dynlib: "kernel32.dll", importc: "SetPriorityClass".}
 
+  proc initializeProcThreadAttributeList(
+    lpAttributeList: pointer, dwAttributeCount: int32, dwFlags: int32,
+    lpSize: ptr csize_t
+  ): WINBOOL {.stdcall, dynlib: "kernel32.dll",
+    importc: "InitializeProcThreadAttributeList".}
+
+  proc updateProcThreadAttribute(
+    lpAttributeList: pointer, dwFlags: int32, attribute: uint,
+    lpValue: pointer, cbSize: csize_t, lpPreviousValue: pointer,
+    lpReturnSize: ptr csize_t
+  ): WINBOOL {.stdcall, dynlib: "kernel32.dll",
+    importc: "UpdateProcThreadAttribute".}
+
+  proc deleteProcThreadAttributeList(
+    lpAttributeList: pointer
+  ) {.stdcall, dynlib: "kernel32.dll",
+    importc: "DeleteProcThreadAttributeList".}
+
+  proc createProcessExW(
+    lpApplicationName: WideCString, lpCommandLine: WideCString,
+    lpProcessAttributes, lpThreadAttributes: pointer,
+    bInheritHandles: WINBOOL, dwCreationFlags: int32,
+    lpEnvironment: WideCString, lpCurrentDirectory: WideCString,
+    lpStartupInfo: pointer, lpProcessInformation: var PROCESS_INFORMATION
+  ): WINBOOL {.stdcall, dynlib: "kernel32.dll", importc: "CreateProcessW".}
+    ## The same `CreateProcessW` entry point `winlean.createProcessW` already
+    ## binds, redeclared to take a `pointer` for `lpStartupInfo` so it can be
+    ## a `StartupInfoExW`'s address instead of a plain `STARTUPINFO`'s.
+
+  proc createIoCompletionPort(
+    fileHandle: Handle, existingCompletionPort: Handle,
+    completionKey: uint, numberOfConcurrentThreads: int32
+  ): Handle {.stdcall, dynlib: "kernel32.dll",
+    importc: "CreateIoCompletionPort".}
+
+  proc getQueuedCompletionStatus(
+    completionPort: Handle, lpNumberOfBytesTransferred: ptr uint32,
+    lpCompletionKey: ptr uint, lpOverlapped: ptr pointer,
+    dwMilliseconds: int32
+  ): WINBOOL {.stdcall, dynlib: "kernel32.dll",
+    importc: "GetQueuedCompletionStatus".}
+
+  proc postQueuedCompletionStatus(
+    completionPort: Handle, bytesTransferred: uint32,
+    completionKey: uint, overlapped: pointer
+  ): WINBOOL {.stdcall, dynlib: "kernel32.dll",
+    importc: "PostQueuedCompletionStatus".}
+
   const
     # Windows: the lower scheduling weight a RECLAIMED grant's tree runs at.
     # A process in this class is inherited by the children it spawns, so the
@@ -441,28 +575,6 @@ when defined(windows):
     # ceiling: the tree may use all free CPU when nothing contends, and only
     # loses contests when the work it was admitted beside wants the processor.
     BELOW_NORMAL_PRIORITY_CLASS = 0x00004000'u32
-
-  proc winOpenForJob(p: Process): Handle =
-    ## A handle to the child with the rights `AssignProcessToJobObject`
-    ## needs, opened by pid.
-    ##
-    ## This used to read `p.fProcessHandle` behind `when compiles(...)`. That
-    ## field is PRIVATE to `std/osproc`, so from this module the `compiles`
-    ## was always false and the proc always returned 0: every
-    ## `AssignProcessToJobObject` failed, no child was ever in its Job Object,
-    ## and `terminate` / `killNow` / `cancelAndWait` -- which terminate the
-    ## job -- stopped nothing. A cancelled child ran to its natural end.
-    const
-      ProcessSetQuota = 0x0100'i32
-      ProcessTerminate = 0x0001'i32
-      ProcessQueryLimitedInformation = 0x1000'i32
-      # `SetPriorityClass` needs PROCESS_SET_INFORMATION; the same handle then
-      # serves both the Job Object assignment and lowering a reclaimed tree's
-      # scheduling weight.
-      ProcessSetInformation = 0x0200'i32
-    Handle(openProcess(ProcessSetQuota or ProcessTerminate or
-      ProcessQueryLimitedInformation or ProcessSetInformation, 0'i32,
-      int32(p.processID)))
 
   proc applyKillOnJobClose(job: Handle) =
     var info: JobExtendedLimitW
@@ -548,6 +660,216 @@ when defined(windows):
         kernelMicros = uint64(info.BasicInfo.TotalKernelTime div 10)
       processCount = uint32(max(int32(0), info.BasicInfo.TotalProcesses))
 
+  proc applyMemoryCapHard*(job: Handle; capBytes: uint64) =
+    ## `kill` mode's enforced half: a job-wide commit limit
+    ## (`JOB_OBJECT_LIMIT_JOB_MEMORY` in `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`).
+    ## On breach the commit fails for whichever process attempted it; nothing
+    ## is killed by this alone -- that is `applyMemoryCapNotification` and the
+    ## watcher below. Re-asserts `KILL_ON_JOB_CLOSE` for the same reason
+    ## `applyJobPriorityClass` does: one `LimitFlags` covers both.
+    if capBytes == 0:
+      return
+    var info: JobExtendedLimitW
+    info.BasicLimitInformation.LimitFlags =
+      JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE or int32(JOB_OBJECT_LIMIT_JOB_MEMORY)
+    info.JobMemoryLimit = uint(capBytes)
+    discard setInformationJobObject(
+      job,
+      JobObjectExtendedLimitInformation,
+      addr info,
+      int32(sizeof(JobExtendedLimitW))
+    )
+
+  proc applyMemoryCapNotification*(job: Handle; capBytes: uint64) =
+    ## The watcher's actual trigger: a notification-only threshold at
+    ## `capBytes` (`JobObjectNotificationLimitInformation`), independent of
+    ## whether `applyMemoryCapHard` set an enforced limit too. Crossing it
+    ## never fails an allocation; it posts the one completion-port message
+    ## Windows guarantees to deliver (`JOB_OBJECT_MSG_NOTIFICATION_LIMIT`).
+    if capBytes == 0:
+      return
+    var info: JobNotificationLimitW
+    info.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY
+    info.JobMemoryLimit = capBytes
+    discard setInformationJobObject(
+      job,
+      JobObjectNotificationLimitInformationClass,
+      addr info,
+      int32(sizeof(JobNotificationLimitW))
+    )
+
+  proc memoryLimitViolated(job: Handle): bool =
+    ## Called after `JOB_OBJECT_MSG_NOTIFICATION_LIMIT`: queries which
+    ## notification limit fired, which ALSO re-arms the next notification --
+    ## the system withholds it until this query is made, so this must be
+    ## called exactly once per message, even when the answer turns out to be
+    ## "not memory" (this launcher never sets any other notification limit,
+    ## so that should not happen, but a watcher that skipped the query on
+    ## that path would silently stop being notified of real breaches).
+    var info: JobLimitViolationW
+    var ret: int32 = 0
+    if queryInformationJobObject(
+      job,
+      JobObjectLimitViolationInformationClass,
+      addr info,
+      int32(sizeof(JobLimitViolationW)),
+      addr ret) == 0:
+      return false
+    (info.ViolationLimitFlags and JOB_OBJECT_LIMIT_JOB_MEMORY) != 0
+
+  proc readPeakJobMemoryUsed*(job: Handle): uint64 =
+    ## `PeakJobMemoryUsed`: the kernel tracks this constantly, with or
+    ## without any limit set, so it is readable in `advisory` mode and for a
+    ## lifted (`RUNQUOTA_MEMORY_CAP=off`) run exactly as in `kill` mode --
+    ## commit, not resident memory (source `job`).
+    var info: JobExtendedLimitW
+    var ret: int32 = 0
+    if queryInformationJobObject(
+      job,
+      JobObjectExtendedLimitInformation,
+      addr info,
+      int32(sizeof(JobExtendedLimitW)),
+      addr ret) != 0:
+      result = uint64(info.PeakJobMemoryUsed)
+
+  const
+    MemoryCapWatcherStopSentinel = 0xFFFF_FFFF'u32
+      ## Not a real `JOB_OBJECT_MSG_*` value (the highest documented one is
+      ## in the low teens): posted by `stopMemoryCapWatcher` to wake a
+      ## watcher thread that saw no breach, so it joins instead of blocking
+      ## in `GetQueuedCompletionStatus` forever.
+
+  type
+    MemoryCapWatchState = object
+      job: Handle
+      port: Handle
+      killed: bool
+        ## Set by the watcher thread alone, read by `stopMemoryCapWatcher`
+        ## only after it has joined the thread -- never concurrently.
+
+  proc createThreadWin(lpThreadAttributes: pointer; dwStackSize: csize_t;
+                       lpStartAddress: proc (p: pointer): int32 {.stdcall.};
+                       lpParameter: pointer; dwCreationFlags: int32;
+                       lpThreadId: ptr int32): Handle {.
+    stdcall, dynlib: "kernel32.dll", importc: "CreateThread".}
+
+  proc memoryCapWatcherThreadProc(param: pointer): int32 {.stdcall.} =
+    ## The watcher thread: a raw `CreateThread`, not `std/typedthreads`, so
+    ## the two handles it hands back (`startMemoryCapWatcher`'s result) are
+    ## plain `uint64`s `LaunchedProcess` can carry on every platform, the
+    ## same way it already carries `winJobHandle`.
+    let state = cast[ptr MemoryCapWatchState](param)
+    while true:
+      var bytes: uint32 = 0
+      var key: uint = 0
+      var overlapped: pointer = nil
+      let ok = getQueuedCompletionStatus(state.port, addr bytes, addr key,
+        addr overlapped, INFINITE)
+      if ok == 0 or bytes == MemoryCapWatcherStopSentinel:
+        return 0
+      if bytes == JOB_OBJECT_MSG_NOTIFICATION_LIMIT:
+        if memoryLimitViolated(state.job):
+          state.killed = true
+          discard terminateJobObject(state.job, windowsCapExceededExitCode)
+          return 0
+        # Re-armed by `memoryLimitViolated`'s query; keep watching in case a
+        # future version of this launcher adds another notification limit.
+
+  const
+    MemoryCapNotifyMarginMilli = 950'u64
+      ## The notification threshold is armed at this fraction (in
+      ## thousandths) of the hard cap, never AT it. Measured 2026-11-27: a
+      ## notification armed at exactly `capBytes`, with the hard cap also
+      ## at `capBytes`, never fires at all -- the hard limit refuses the
+      ## very commit that would bring the job's total to the threshold, so
+      ## the total never actually reaches it and the "guaranteed" message
+      ## is never posted. Confirmed with a worker that ignores its own
+      ## allocation failures (so nothing but the watcher can stop it): with
+      ## the margin, the watcher kills it every time; with none, it runs to
+      ## completion every time. The margin must leave room for at least one
+      ## more realistic allocation to still succeed after the notification
+      ## fires, so the watcher has a window to act before the hard limit
+      ## would have refused anyway.
+
+  proc startMemoryCapWatcher*(job: Handle; capBytes: uint64):
+      tuple[threadHandle: uint64; state: uint64] =
+    ## Associates a fresh I/O completion port with `job`
+    ## (`JobObjectAssociateCompletionPortInformation`), arms the
+    ## notification threshold BELOW `capBytes` (`MemoryCapNotifyMarginMilli`;
+    ## see its comment for why it cannot be AT `capBytes`), and starts a
+    ## thread that calls `TerminateJobObject` with `windowsCapExceededExitCode`
+    ## the instant the threshold is crossed. The port is associated before
+    ## the threshold is armed, which is itself before any process joins the
+    ## job (every caller places the job via `PROC_THREAD_ATTRIBUTE_JOB_LIST`
+    ## only after this returns), so no breach can be missed.
+    ##
+    ## Call `stopMemoryCapWatcher` exactly once with both results, whether
+    ## or not the breach happened -- the watcher thread never exits on its
+    ## own otherwise. `(0, 0)` means the watcher could not be started (the
+    ## cap is then unenforced for this launch; callers fall back exactly as
+    ## they do when the job itself could not be created).
+    let port = createIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 1)
+    var assoc = JobAssociateCompletionPortW(CompletionKey: nil,
+      CompletionPort: port)
+    discard setInformationJobObject(
+      job,
+      JobObjectAssociateCompletionPortInformation,
+      addr assoc,
+      int32(sizeof(JobAssociateCompletionPortW)))
+    let notifyBytes = (capBytes * MemoryCapNotifyMarginMilli) div 1000'u64
+    applyMemoryCapNotification(job, notifyBytes)
+    let state = cast[ptr MemoryCapWatchState](
+      alloc0(sizeof(MemoryCapWatchState)))
+    state.job = job
+    state.port = port
+    var tid: int32 = 0
+    let th = createThreadWin(nil, 0, memoryCapWatcherThreadProc, state, 0,
+      addr tid)
+    if th == 0:
+      discard closeHandle(port)
+      dealloc(state)
+      return (0'u64, 0'u64)
+    (uint64(th), cast[uint64](state))
+
+  proc stopMemoryCapWatcher*(threadHandle, state: uint64): bool =
+    ## Joins the watcher thread and releases its completion port. Returns
+    ## whether it terminated the job for a breach. A no-op (returns false)
+    ## when `state` is 0, matching `startMemoryCapWatcher`'s "could not
+    ## start" result.
+    if state == 0:
+      return false
+    let statePtr = cast[ptr MemoryCapWatchState](state)
+    discard postQueuedCompletionStatus(
+      statePtr.port, MemoryCapWatcherStopSentinel, 0, nil)
+    if threadHandle != 0:
+      discard waitForSingleObject(Handle(threadHandle), INFINITE)
+      discard closeHandle(Handle(threadHandle))
+    result = statePtr.killed
+    discard closeHandle(statePtr.port)
+    dealloc(statePtr)
+
+  proc finalizeMemoryCap(child: var LaunchedProcess) =
+    ## Stops this launch's watcher (if any) and reads the tree's peak,
+    ## exactly once -- called at the done transition in `pollCompletion`
+    ## and in `waitForCompletion`'s timeout path, right beside the
+    ## existing `readJobAccounting` call. `buildCompletion` only reads
+    ## what this leaves on `child`; it never calls it itself, since it
+    ## takes `child` by value and stopping a watcher twice would double-
+    ## close its handles.
+    if child.memoryCapFinalized:
+      return
+    child.memoryCapFinalized = true
+    if child.winJobHandle == 0:
+      return
+    if child.memoryCapMeasuring:
+      child.memoryPeakBytesMeasured =
+        readPeakJobMemoryUsed(Handle(child.winJobHandle))
+    if child.winMemoryCapState != 0:
+      child.memoryCapKilled = stopMemoryCapWatcher(
+        child.winMemoryCapThread, child.winMemoryCapState)
+      child.winMemoryCapThread = 0
+      child.winMemoryCapState = 0
+
 proc shellScriptDir*(): string =
   ## Where Windows launches stage a long ``sh -c`` program as a wrapper
   ## script. A directory of its own, so a consumer that observes the
@@ -574,11 +896,12 @@ proc backendProfile*(): ProcessBackendProfile =
       implicitShell: false
     )
   elif defined(windows):
-    # Windows: each lease's child tree runs in a Job Object so cancellation
-    # and accounting are scoped to the tree, not the leader process alone.
+    # Windows: each lease's child tree is placed in a Job Object at
+    # creation, so cancellation and accounting are scoped to the tree, not
+    # the leader process alone.
     ProcessBackendProfile(
-      name: "windows-osproc-jobobject",
-      launchPrimitive: "CreateProcess+AssignProcessToJobObject",
+      name: "windows-jobobject",
+      launchPrimitive: "CreateProcessW+PROC_THREAD_ATTRIBUTE_JOB_LIST",
       outputCapture: "nonblocking-pipes-peek-bounded",
       completionWait: "exit-code-poll",
       cancellation: "TerminateJobObject",
@@ -1122,7 +1445,7 @@ when defined(windows):
     ## exited, when something it started keeps a pipe write-end open. The
     ## POSIX arm's `lingeringPipeDrainSeconds`, for the same reason.
 
-  proc winDrainPipe(handle: FileHandle; stream: Stream; closed: var bool;
+  proc winDrainPipe(handle: Handle; closed: var bool;
                     target: var string; total: var uint64; limit: int) =
     ## Read what one pipe holds RIGHT NOW, never waiting for more.
     ##
@@ -1134,23 +1457,27 @@ when defined(windows):
     ## again or goes away. That wait is what used to make completion of a
     ## FORKING action -- a leader that exits while a descendant holds the
     ## inherited write end -- take as long as the descendant lived.
-    if closed or stream == nil:
+    if closed or handle == 0:
       return
     var buffer: array[8192, char]
     while true:
       var available = 0'i32
-      if not peekNamedPipe(Handle(handle), lpTotalBytesAvail = addr available):
+      if not peekNamedPipe(handle, lpTotalBytesAvail = addr available):
         closed = true
         return
       if available <= 0:
         return
-      let n = stream.readData(addr buffer[0], min(int(available), buffer.len))
-      if n <= 0:
+      var got: int32 = 0
+      let toRead = min(available, int32(buffer.len))
+      if readFile(handle, addr buffer[0], toRead, addr got, nil) == 0:
         closed = true
         return
-      winAppendBounded(target, total, addr buffer[0], n, limit)
+      if got <= 0:
+        closed = true
+        return
+      winAppendBounded(target, total, addr buffer[0], int(got), limit)
 
-  proc winDrainOutput(child: var LaunchedProcess; process: Process) =
+  proc winDrainOutput(child: var LaunchedProcess) =
     # Windows: drain whatever the stdout and stderr pipes currently hold into
     # `child.stdoutText` / `child.stderrText`. The two are separate pipes, as
     # on POSIX: every consumer writes `completion.stdout` and
@@ -1158,12 +1485,19 @@ when defined(windows):
     # second one.
     if child.winStdoutClosed and child.winStderrClosed:
       return
-    winDrainPipe(process.outputHandle, process.outputStream,
-      child.winStdoutClosed, child.stdoutText, child.stdoutBytes,
-      child.stdoutLimit)
-    winDrainPipe(process.errorHandle, process.errorStream,
-      child.winStderrClosed, child.stderrText, child.stderrBytes,
-      child.stderrLimit)
+    winDrainPipe(Handle(child.winStdoutHandle), child.winStdoutClosed,
+      child.stdoutText, child.stdoutBytes, child.stdoutLimit)
+    winDrainPipe(Handle(child.winStderrHandle), child.winStderrClosed,
+      child.stderrText, child.stderrBytes, child.stderrLimit)
+
+  proc winProcessRunning(handle: Handle): bool =
+    if handle == 0:
+      return false
+    var code: int32 = 0
+    getExitCodeProcess(handle, code) != 0 and code == STILL_ACTIVE
+
+  proc winProcessExitCode(handle: Handle): int32 =
+    discard getExitCodeProcess(handle, result)
 
   proc winOutputSettled(child: LaunchedProcess): bool =
     ## After the leased process has exited: true once both pipes have reached
@@ -1253,97 +1587,255 @@ when defined(windows):
       result.argv.add(argv[shellStart + 4 .. ^1])
     result.temporaryFiles = @[scriptPath]
 
+  proc buildWindowsCommandLine(argv: openArray[string]): string =
+    ## `quoteShell` on Windows is `quoteShellWindows` (`std/strutils`,
+    ## public): the same quoting `std/osproc`'s private `buildCommandLine`
+    ## uses, which this module cannot call.
+    result = quoteShell(argv[0])
+    for i in 1 ..< argv.len:
+      result.add(' ')
+      result.add(quoteShell(argv[i]))
+
+  proc buildWindowsEnvBlock(env: StringTableRef): tuple[data: cstring; len: int] =
+    ## The double-NUL-terminated block `CreateProcessW` expects.
+    ## `newWideCString(data, len)` (called on the result by the caller) adds
+    ## its own terminating wide NUL after `len` content bytes, which is
+    ## already the env block's required trailing double-NUL once the last
+    ## entry's own embedded `\0` (included in `len`) is counted -- the same
+    ## trick `std/osproc`'s private `buildEnv` relies on, which this module
+    ## cannot call either.
+    var total = 0
+    for key, val in pairs(env):
+      total += key.len + val.len + 2 # "=" and the entry's own "\0"
+    var buf = cast[cstring](alloc0(max(total, 1)))
+    var pos = 0
+    for key, val in pairs(env):
+      let entry = key & "=" & val
+      copyMem(addr buf[pos], cstring(entry), entry.len + 1)
+      pos += entry.len + 1
+    (buf, total)
+
+  proc winMakeInheritablePipe(readEnd, writeEnd: var Handle) =
+    var sa: SECURITY_ATTRIBUTES
+    sa.nLength = int32(sizeof(SECURITY_ATTRIBUTES))
+    sa.lpSecurityDescriptor = nil
+    sa.bInheritHandle = 1
+    if createPipe(readEnd, writeEnd, sa, 0) == 0:
+      raiseOSError(osLastError())
+
+  proc winOpenNulForRead(): Handle =
+    ## The child's stdin, redirected from the NUL device -- the Windows
+    ## analog of POSIX dup2'ing `/dev/null` onto `STDIN_FILENO`. Unlike the
+    ## anonymous pipe `std/osproc` creates for stdin, nothing here needs to
+    ## be drained or ever written to.
+    var sa: SECURITY_ATTRIBUTES
+    sa.nLength = int32(sizeof(SECURITY_ATTRIBUTES))
+    sa.lpSecurityDescriptor = nil
+    sa.bInheritHandle = 1
+    const
+      GenericRead = cast[int32](0x80000000'u32)
+      FileShareReadWrite = 0x00000003'i32
+      OpenExisting = 3'i32
+      FileAttributeNormal = 0x00000080'i32
+    result = createFileW(newWideCString("NUL"), GenericRead,
+      FileShareReadWrite, addr sa, OpenExisting, FileAttributeNormal, 0)
+    if result == INVALID_HANDLE_VALUE:
+      raiseOSError(osLastError())
+
+  proc winCreateProcessInJob(cmdLine: string;
+                             envBlock: tuple[data: cstring; len: int];
+                             cwd: string; si: STARTUPINFO; job: Handle):
+      tuple[ok: bool; procInfo: PROCESS_INFORMATION] =
+    ## `CreateProcessW` with `job` named in a `PROC_THREAD_ATTRIBUTE_JOB_LIST`,
+    ## so the child is a member of `job` from its very first instruction --
+    ## no window in which it, or a grandchild it forks immediately, is not.
+    var attrListSize: csize_t = 0
+    discard initializeProcThreadAttributeList(nil, 1, 0, addr attrListSize)
+    if attrListSize == 0:
+      return (false, PROCESS_INFORMATION())
+    let attrListBuf = alloc(int(attrListSize))
+    defer: dealloc(attrListBuf)
+    if initializeProcThreadAttributeList(attrListBuf, 1, 0,
+        addr attrListSize) == 0:
+      return (false, PROCESS_INFORMATION())
+    defer: deleteProcThreadAttributeList(attrListBuf)
+    var jobList = [job]
+    if updateProcThreadAttribute(attrListBuf, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+        addr jobList[0], csize_t(sizeof(Handle)), nil, nil) == 0:
+      return (false, PROCESS_INFORMATION())
+    var siEx: StartupInfoExW
+    siEx.StartupInfo = si
+    siEx.StartupInfo.cb = int32(sizeof(StartupInfoExW))
+    siEx.lpAttributeList = attrListBuf
+    let cmdWide = newWideCString(cmdLine)
+    let envWide = if envBlock.data.isNil: newWideCString(cstring(nil))
+                  else: newWideCString(envBlock.data, envBlock.len)
+    let cwdWide = newWideCString(cwd)
+    var procInfo: PROCESS_INFORMATION
+    const flags = NORMAL_PRIORITY_CLASS or CREATE_UNICODE_ENVIRONMENT or
+      EXTENDED_STARTUPINFO_PRESENT
+    let ok = createProcessExW(nil, cmdWide, nil, nil, 1, flags, envWide,
+      cwdWide, addr siEx, procInfo) != 0
+    (ok, procInfo)
+
+  proc winCreateProcessPlain(cmdLine: string;
+                             envBlock: tuple[data: cstring; len: int];
+                             cwd: string; si: STARTUPINFO):
+      tuple[ok: bool; procInfo: PROCESS_INFORMATION] =
+    ## The fallback when no job could be created, or the job-list attribute
+    ## was refused: an ordinary, unplaced launch. Placement must never fail
+    ## a launch outright -- the same principle the Linux cgroup module
+    ## states for itself.
+    var siVar = si
+    let cmdWide = newWideCString(cmdLine)
+    let envWide = if envBlock.data.isNil: newWideCString(cstring(nil))
+                  else: newWideCString(envBlock.data, envBlock.len)
+    let cwdWide = newWideCString(cwd)
+    var procInfo: PROCESS_INFORMATION
+    const flags = NORMAL_PRIORITY_CLASS or CREATE_UNICODE_ENVIRONMENT
+    let ok = createProcessExW(nil, cmdWide, nil, nil, 1, flags, envWide,
+      cwdWide, addr siVar, procInfo) != 0
+    (ok, procInfo)
+
   proc launchWindowsProcess(spec: CommandSpec): LaunchedProcess =
     if spec.argv.len == 0:
       raise newException(ValueError, "empty argv")
     let treeSampling = measureTreeSampling in clientMeasurements()
     let cwd = if spec.cwd.len > 0: spec.cwd else: getCurrentDir()
     let prepared = prepareWindowsArgv(spec.argv)
-    let args =
-      if prepared.argv.len > 1: prepared.argv[1 .. ^1]
-      else: @[]
-    # Windows: poEvalCommand + poUsePath were tried in earlier prototypes but
-    # cause quoting headaches; pass argv directly and let osproc CreateProcess
-    # for us.
-    var process: Process
-    try:
-      process = startProcess(
-        prepared.argv[0],
-        workingDir = cwd,
-        args = args,
-        env = windowsChildEnv(spec),
-        # stdout and stderr on SEPARATE pipes, as on POSIX. They used to be
-        # merged here, which left `completion.stderr` empty on Windows and
-        # made `stderrLimit` bound nothing.
-        options = (if spec.stdio == inheritStdio:
-          {poUsePath, poParentStreams} else: {poUsePath})
-      )
-    except CatchableError:
+    let cmdLine = buildWindowsCommandLine(prepared.argv)
+    let envBlock = buildWindowsEnvBlock(windowsChildEnv(spec))
+
+    var si: STARTUPINFO
+    si.cb = int32(sizeof(STARTUPINFO))
+    si.dwFlags = STARTF_USESTDHANDLES
+    var stdinHandle, stdoutRead, stdoutWrite, stderrRead, stderrWrite: Handle
+    if spec.stdio == inheritStdio:
+      si.hStdInput = getStdHandle(STD_INPUT_HANDLE)
+      si.hStdOutput = getStdHandle(STD_OUTPUT_HANDLE)
+      si.hStdError = getStdHandle(STD_ERROR_HANDLE)
+    else:
+      # stdout and stderr on SEPARATE pipes, as on POSIX: `completion.stdout`
+      # and `completion.stderr` go to different places, and `stderrLimit`
+      # bounds the second one.
+      stdinHandle = winOpenNulForRead()
+      winMakeInheritablePipe(stdoutRead, stdoutWrite)
+      winMakeInheritablePipe(stderrRead, stderrWrite)
+      # The ends THIS process keeps must not be inherited by a FUTURE child
+      # it launches; only the child-side ends (and the NUL handle) stay
+      # inheritable.
+      discard setHandleInformation(stdoutRead, DWORD(HANDLE_FLAG_INHERIT), 0)
+      discard setHandleInformation(stderrRead, DWORD(HANDLE_FLAG_INHERIT), 0)
+      si.hStdInput = stdinHandle
+      si.hStdOutput = stdoutWrite
+      si.hStdError = stderrWrite
+
+    # Windows: every leased tree is placed in a Job Object AT CREATION
+    # (PROC_THREAD_ATTRIBUTE_JOB_LIST, below), closing the race the previous
+    # CreateJobObjectW-then-AssignProcessToJobObject sequence accepted. Every
+    # limit below-admission wants on this tree -- KILL_ON_JOB_CLOSE, the CPU
+    # cap, priority, a memory cap once wired in -- is set on the job BEFORE
+    # the child exists, so there is no "assigned yet?" uncertainty at all:
+    # if `CreateProcessW` below succeeds with this job in its attribute
+    # list, every limit already in force on the job covers the child from
+    # its first instruction.
+    var job = createJobObjectW(nil, nil)
+    if job != 0:
+      applyKillOnJobClose(job)
+      # A granted CPU cap (`runquota run --cap`) becomes a hard Job Object
+      # CPU-rate ceiling on the whole tree.
+      if spec.cpuRateCapMilli > 0'u32:
+        applyCpuRateCap(job, spec.cpuRateCapMilli)
+      # Enforcement below admission, the switchable layer: when job-priority
+      # enforcement is on, the whole tree is forced to its group's priority
+      # class (idle for a reclaimed grant), a Job Object limit no child can
+      # escape.
+      #
+      # THE CLASS IS READ AT THE LAST INSTANT, right here before the limit is
+      # set, through the same `GroupPrioritySource` the Linux weight uses
+      # (`cgroupPriority`): a `session set --priority` that lands between the
+      # placement decision and this call is seen, not overwritten by the
+      # stale class. On a read failure (the daemon could not answer under the
+      # client's bound) the class keeps `spec.jobPriorityClass`, the fallback
+      # resolved at placement from the priority last known, and the launch
+      # still proceeds -- as the Linux weight write does. No lock is needed:
+      # a single `SetInformationJobObject` call has no critical section a
+      # concurrent set can land inside (unlike Linux's prepare-then-write).
+      if spec.jobPriorityClass != 0'u32:
+        var priorityClass = spec.jobPriorityClass
+        var inForce: SessionPriority
+        if spec.cgroupPriority.readNow(inForce):
+          priorityClass = jobPriorityClassFor(inForce, reclaimed = false)
+        applyJobPriorityClass(job, priorityClass)
+      elif spec.niceIncrement > 0:
+        # A RECLAIMED grant's whole tree runs at a lower scheduling weight,
+        # the Windows realization of POSIX `nice`. Previously a per-process
+        # `SetPriorityClass` a child could override; now a Job Object
+        # PRIORITY-CLASS LIMIT like `jobPriorityClass` above, because the job
+        # exists before any process does.
+        applyJobPriorityClass(job, BELOW_NORMAL_PRIORITY_CLASS)
+
+    # Windows design of RunQuota-Memory-Caps.md: `kill` mode sets both the
+    # hard limit (so an over-cap commit fails immediately) and a
+    # notification at the same threshold -- the watcher's actual,
+    # guaranteed trigger. `advisory` mode and a lifted run
+    # (`memoryCapBytes == 0` with `memoryCapMeasure` asking for it anyway)
+    # set neither: `PeakJobMemoryUsed` is readable with no limit at all, so
+    # they read it back retrospectively instead (`close`, below).
+    var memoryCapThread = 0'u64
+    var memoryCapState = 0'u64
+    let memoryCapMeasuring = job != 0 and
+      (spec.memoryCapBytes > 0 or spec.memoryCapMeasure)
+    if job != 0 and spec.memoryCapBytes > 0 and spec.memoryCapAction == mcaKill:
+      applyMemoryCapHard(job, spec.memoryCapBytes)
+      let watcher = startMemoryCapWatcher(job, spec.memoryCapBytes)
+      memoryCapThread = watcher.threadHandle
+      memoryCapState = watcher.state
+
+    var created = if job != 0: winCreateProcessInJob(cmdLine, envBlock, cwd, si, job)
+                  else: (ok: false, procInfo: PROCESS_INFORMATION())
+    if job != 0 and not created.ok:
+      # The job itself is fine, but something about placing the child in it
+      # at creation was refused (an unexpected environment, not a case this
+      # launcher has seen) -- fall back to an ordinary, unplaced launch
+      # rather than failing the command outright. Any watcher already
+      # started would otherwise be left pointing at a job about to close.
+      if memoryCapState != 0:
+        discard stopMemoryCapWatcher(memoryCapThread, memoryCapState)
+        memoryCapThread = 0
+        memoryCapState = 0
+      discard closeHandle(job)
+      job = 0
+    if not created.ok:
+      created = winCreateProcessPlain(cmdLine, envBlock, cwd, si)
+
+    # The handles CreateProcess duplicated into the child are this process's
+    # own copies of the CHILD-side ends; they must be closed so the pipe's
+    # write end (and the NUL read handle) truly closes once the child and
+    # everything it spawned have exited, not merely once this process does.
+    if spec.stdio != inheritStdio:
+      discard closeHandle(stdinHandle)
+      discard closeHandle(stdoutWrite)
+      discard closeHandle(stderrWrite)
+    if envBlock.data != nil:
+      dealloc(envBlock.data)
+
+    if not created.ok:
+      let err = osLastError()
+      if job != 0:
+        discard closeHandle(job)
+      if spec.stdio != inheritStdio:
+        discard closeHandle(stdoutRead)
+        discard closeHandle(stderrRead)
       for path in prepared.temporaryFiles:
         try:
           removeFile(path)
         except CatchableError:
           discard
-      raise
-    var job = createJobObjectW(nil, nil)
-    if job != 0:
-      # Windows: best-effort assignment. The child has already started; if it
-      # was launched without CREATE_SUSPENDED it may have spawned a grandchild
-      # before we get here. We accept this race for now.
-      #
-      # A job the child is NOT in is closed rather than kept: `terminate` and
-      # `killNow` fall back to terminating the process itself when there is
-      # no job, and a kept empty job would make them terminate nothing.
-      let processHandle = winOpenForJob(process)
-      # A RECLAIMED grant runs its whole tree at a lower scheduling weight
-      # (`spec.niceIncrement > 0`, set by the launcher for a reclaimed lease,
-      # the Windows realization of POSIX `nice`). Below-normal priority is
-      # inherited by the children the child spawns, so the tree yields the CPU
-      # to the work it was admitted beside, but keeps all of it when nothing
-      # contends. Best effort, like the job assignment: a child that already
-      # spawned a grandchild loses that race, which is the same race the job
-      # assignment accepts.
-      if processHandle != 0 and spec.niceIncrement > 0:
-        discard setPriorityClass(processHandle, BELOW_NORMAL_PRIORITY_CLASS)
-      let assigned = processHandle != 0 and
-        assignProcessToJobObject(job, processHandle) != 0
-      if processHandle != 0:
-        discard closeHandle(processHandle)
-      if assigned:
-        applyKillOnJobClose(job)
-        # A granted CPU cap (`runquota run --cap`) becomes a hard Job Object
-        # CPU-rate ceiling on the whole tree. Only when the child really is in
-        # the job: a cap on a job the child escaped would bound nothing.
-        if spec.cpuRateCapMilli > 0'u32:
-          applyCpuRateCap(job, spec.cpuRateCapMilli)
-        # Enforcement below admission, the switchable layer: when job-priority
-        # enforcement is on, the whole tree is forced to its group's priority
-        # class (idle for a reclaimed grant), a Job Object limit no child can
-        # escape. Off (`jobPriorityClass == 0`) nothing here runs and the tree
-        # keeps the unconditional class set above. Independent of the CPU-rate
-        # cap (a different info class), so a reclaimed `run --cap` gets both.
-        #
-        # THE CLASS IS READ AT THE LAST INSTANT, right here before the limit is
-        # set, through the same `GroupPrioritySource` the Linux weight uses
-        # (`cgroupPriority`): a `session set --priority` that lands between the
-        # placement decision and this call is seen, not overwritten by the
-        # stale class. On a read failure (the daemon could not answer under the
-        # client's bound) the class keeps `spec.jobPriorityClass`, the fallback
-        # resolved at placement from the priority last known, and the launch
-        # still proceeds -- as the Linux weight write does. A reclaimed tree
-        # carries idle and no source, so it stays idle. No lock is needed: a
-        # single `SetInformationJobObject` call has no critical section a
-        # concurrent set can land inside (unlike Linux's prepare-then-write).
-        if spec.jobPriorityClass != 0'u32:
-          var priorityClass = spec.jobPriorityClass
-          var inForce: SessionPriority
-          if spec.cgroupPriority.readNow(inForce):
-            priorityClass = jobPriorityClassFor(inForce, reclaimed = false)
-          applyJobPriorityClass(job, priorityClass)
-      else:
-        discard closeHandle(job)
-        job = 0
-    let processId = uint64(process.processID)
+      raiseOSError(err, prepared.argv[0])
+
+    discard closeHandle(created.procInfo.hThread)
+    let processId = uint64(created.procInfo.dwProcessId)
     result = LaunchedProcess(
       pid: int(processId),
       processGroupId: int(processId),
@@ -1372,8 +1864,17 @@ when defined(windows):
       ),
       winStdoutClosed: spec.stdio == inheritStdio,
       winStderrClosed: spec.stdio == inheritStdio,
-      winProcess: process,
+      winProcessHandle: uint64(created.procInfo.hProcess),
+      winStdoutHandle: (if spec.stdio == inheritStdio: 0'u64
+                        else: uint64(stdoutRead)),
+      winStderrHandle: (if spec.stdio == inheritStdio: 0'u64
+                        else: uint64(stderrRead)),
       winJobHandle: uint64(job),
+      winMemoryCapThread: memoryCapThread,
+      winMemoryCapState: memoryCapState,
+      memoryCapBytes: spec.memoryCapBytes,
+      memoryCapAction: spec.memoryCapAction,
+      memoryCapMeasuring: memoryCapMeasuring,
       temporaryLaunchFiles: prepared.temporaryFiles
     )
 
@@ -1731,9 +2232,9 @@ proc running*(child: LaunchedProcess): bool =
       return false
     kill(Pid(child.pid), 0) == 0 or errno == EPERM
   elif defined(windows):
-    if not child.runningFlag or child.winProcess.isNil:
+    if not child.runningFlag or child.winProcessHandle == 0:
       return false
-    child.winProcess.running()
+    winProcessRunning(Handle(child.winProcessHandle))
   else:
     false
 
@@ -1788,6 +2289,32 @@ proc buildCompletion(child: LaunchedProcess; timedOut: bool): ProcessCompletion 
     if not timedOut and child.waitStatus >= 0:
       result.exited = true
       result.exitCode = child.waitStatus
+    # The memory-cap mechanism (`finalizeMemoryCap`, called at the done
+    # transition before this): a capped or measured launch reports its cap,
+    # the mechanism's own peak and whether it was killed or merely passed
+    # the cap. An unmeasured launch leaves every field at its zero value,
+    # which `breached`-style readers already treat as "nothing to report".
+    if child.memoryCapMeasuring:
+      result.memoryCapMeasured = true
+      result.memoryPeakBytes = child.memoryPeakBytesMeasured
+      result.memoryPeakSource = mpsJob
+      result.memoryCapBytes = child.memoryCapBytes
+      if child.memoryCapBytes > 0:
+        # A kill IS passing the cap, even though the watcher's own
+        # notification margin (`MemoryCapNotifyMarginMilli`) means the
+        # measured peak at the moment of the kill can read a little under
+        # `memoryCapBytes` -- the numeric comparison alone would then miss
+        # it, which `capKilled` on its own never does.
+        let exceeded = child.memoryCapKilled or
+          child.memoryPeakBytesMeasured >= child.memoryCapBytes
+        result.capExceeded = exceeded
+        result.capKilled = child.memoryCapKilled
+        if exceeded and child.memoryCapAction == mcaKill and
+            not child.memoryCapKilled:
+          # The hard limit refused a commit before the watcher's
+          # notification was handled: nothing was killed, but the cap was
+          # reached.
+          result.capReached = true
   else:
     raise newException(OSError, "runquota_process is only implemented on POSIX")
 
@@ -1922,39 +2449,31 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
   elif defined(windows):
     # Windows: nonblocking completion check. We sample live tree telemetry,
     # drain any output the pipe already holds (PeekNamedPipe-gated so an idle
-    # child doesn't stall us), and ask osproc whether the process has exited.
-    # When it has, keep draining until both pipes reach end of input or the
-    # lingering-drain grace expires, then populate `child.completion`.
+    # child doesn't stall us), and ask the kernel whether the process has
+    # exited. When it has, keep draining until both pipes reach end of input
+    # or the lingering-drain grace expires, then populate `child.completion`.
     if child.completion.exited or child.completion.signaled or
         child.completion.timedOut:
       return true
-    if child.winProcess.isNil:
+    if child.winProcessHandle == 0:
       return false
-    let process = child.winProcess
+    let processHandle = Handle(child.winProcessHandle)
 
     # Windows: sample RSS / process count before draining so even a very
     # short-lived child gets at least one snapshot while still alive.
     if not child.doneFlag:
       winSampleTelemetry(child)
-    winDrainOutput(child, process)
+    winDrainOutput(child)
 
     if not child.doneFlag:
-      var alive = true
-      try:
-        alive = process.running()
-      except CatchableError:
-        alive = false
-      if not alive:
+      if not winProcessRunning(processHandle):
         child.doneFlag = true
         child.runningFlag = false
         child.doneSeconds = epochTime()
-        try:
-          child.waitStatus = process.peekExitCode()
-        except CatchableError:
-          child.waitStatus = -1
+        child.waitStatus = winProcessExitCode(processHandle)
         # Windows: one final telemetry snapshot, taken once.
         winSampleTelemetry(child, force = true)
-        winDrainOutput(child, process)
+        winDrainOutput(child)
 
     if child.doneFlag:
       # Gated on the leased process having exited, NOT on its pipes reaching
@@ -1975,6 +2494,7 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
         # the tree ever spawned) over the live toolhelp32 count.
         if jobProcessCount > child.processCount:
           child.processCount = jobProcessCount
+      finalizeMemoryCap(child)
       child.completion = child.buildCompletion(timedOut = false)
       if child.completion.processCount == 0:
         child.completion.processCount = 1
@@ -2044,8 +2564,8 @@ proc terminate*(child: var LaunchedProcess) =
       discard kill(Pid(child.pid), SIGTERM)
   elif defined(windows):
     # Windows: terminate the whole tree by terminating its Job Object. If the
-    # job handle is missing (assignment failed), fall back to terminating the
-    # primary process via osproc.
+    # job handle is missing (job creation or placement failed), fall back to
+    # terminating the primary process directly.
     child.cancelSent = true
     if child.winJobHandle != 0:
       discard terminateJobObject(Handle(child.winJobHandle),
@@ -2140,9 +2660,9 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
     # (which drains the bounded stdout and stderr buffers, samples Job Object /
     # toolhelp32 telemetry, and detects exit) until the child finishes or the
     # deadline elapses.
-    if child.winProcess.isNil:
+    if child.winProcessHandle == 0:
       raise newException(OSError, "runquota_process: missing Windows process handle")
-    let process = child.winProcess
+    let processHandle = Handle(child.winProcessHandle)
     var timedOut = false
 
     while true:
@@ -2158,29 +2678,17 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
         let killDeadline = epochTime() + 1.0
         while epochTime() < killDeadline:
           winSampleTelemetry(child)
-          winDrainOutput(child, process)
-          var alive = true
-          try:
-            alive = process.running()
-          except CatchableError:
-            alive = false
-          if not alive:
+          winDrainOutput(child)
+          if not winProcessRunning(processHandle):
             child.doneFlag = true
             child.runningFlag = false
-            try:
-              child.waitStatus = process.peekExitCode()
-            except CatchableError:
-              child.waitStatus = -1
+            child.waitStatus = winProcessExitCode(processHandle)
             break
           sleep(10)
         if not child.doneFlag:
           child.killNow()
-          try: discard process.waitForExit(timeout = 1000)
-          except CatchableError: discard
-          try:
-            child.waitStatus = process.peekExitCode()
-          except CatchableError:
-            child.waitStatus = -1
+          discard waitForSingleObject(processHandle, 1000'i32)
+          child.waitStatus = winProcessExitCode(processHandle)
           child.doneFlag = true
           child.runningFlag = false
         # Windows: final telemetry + output drain, plus Job Object accounting.
@@ -2190,7 +2698,7 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
         winSampleTelemetry(child, force = true)
         child.doneSeconds = epochTime()
         while true:
-          winDrainOutput(child, process)
+          winDrainOutput(child)
           if child.winOutputSettled():
             break
           sleep(5)
@@ -2205,6 +2713,7 @@ proc waitForCompletion*(child: var LaunchedProcess; timeout = -1): ProcessComple
           child.rusageSysMicros = kernelMicros
           if jobProcessCount > child.processCount:
             child.processCount = jobProcessCount
+        finalizeMemoryCap(child)
         break
 
       # Windows: short sleep so we don't burn a core polling the pipe / tree.
@@ -2243,12 +2752,27 @@ proc close*(child: var LaunchedProcess) =
     child.cgroupTarget = CgroupTarget()
     close(child.memoryCap.tracker)
   elif defined(windows):
-    # Windows: release osproc resources and let the Job Object close. With
-    # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set, closing the last handle reaps
-    # any straggler processes in the tree.
-    if not child.winProcess.isNil:
-      try: child.winProcess.close() except CatchableError: discard
-      child.winProcess = nil
+    # Windows: release the process and pipe handles, then let the Job Object
+    # close. With JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set, closing the last
+    # handle reaps any straggler processes in the tree.
+    #
+    # A watcher not already stopped by `finalizeMemoryCap` (the caller
+    # closed without ever calling `waitForCompletion`/`pollCompletion`
+    # through to done) is stopped here instead, so it is never leaked.
+    if child.winMemoryCapState != 0:
+      discard stopMemoryCapWatcher(child.winMemoryCapThread,
+        child.winMemoryCapState)
+      child.winMemoryCapThread = 0
+      child.winMemoryCapState = 0
+    if child.winProcessHandle != 0:
+      discard closeHandle(Handle(child.winProcessHandle))
+      child.winProcessHandle = 0
+    if child.winStdoutHandle != 0:
+      discard closeHandle(Handle(child.winStdoutHandle))
+      child.winStdoutHandle = 0
+    if child.winStderrHandle != 0:
+      discard closeHandle(Handle(child.winStderrHandle))
+      child.winStderrHandle = 0
     if child.winJobHandle != 0:
       discard closeHandle(Handle(child.winJobHandle))
       child.winJobHandle = 0

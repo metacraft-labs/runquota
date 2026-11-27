@@ -1,5 +1,3 @@
-import std/osproc
-
 import runquota_core/cpu_profile
 import runquota_core/memory_cap
 import runquota_process/cgroup_placement
@@ -289,21 +287,50 @@ type
     reapMonoMillis*: int64
     info*: LaunchResult
     completion*: ProcessCompletion
-    # Windows: extra slots store the osproc Process ref and the Job Object
-    # handle so the rest of the lifecycle (wait/terminate/close) can find
-    # them. The fields are present on all platforms (kept simple to avoid
-    # case-object constructor noise) but only populated on Windows.
+    # Windows: extra slots store the raw process/pipe/Job Object handles so
+    # the rest of the lifecycle (wait/terminate/close) can find them. The
+    # fields are present on all platforms (kept simple to avoid case-object
+    # constructor noise) but only populated on Windows.
     #
-    # `winProcess` MUST be a typed `Process` ref (not a raw `pointer`):
-    # Nim's Process is a ref ProcessObj, and storing only an untyped
-    # pointer cast hides the reference from the GC. At higher concurrency
-    # the GC can collect the underlying ProcessObj before the LaunchedProcess
-    # is finished with it; the next pollCompletion then dereferences freed
-    # memory, occasionally tripping the
-    # `poParentStreams notin p.options` assert inside osproc.outputStream
-    # when the freed memory happens to alias a Process with those options.
-    winProcess*: Process
+    # These are RAW `HANDLE` values (as `uint64`), not an `osproc.Process`:
+    # the launcher calls `CreateProcessW` itself (with a
+    # `PROC_THREAD_ATTRIBUTE_JOB_LIST` so the child joins its Job Object at
+    # creation, closing the create-then-assign race `AssignProcessToJobObject`
+    # had), so there is no `Process` ref for `std/osproc` to hand back and
+    # nothing here needs the GC: a `HANDLE` is just a kernel-owned integer,
+    # closed exactly once by `close`.
+    winProcessHandle*: uint64
+    winStdoutHandle*: uint64
+      ## The parent-kept read end of the child's stdout pipe (`captureStdio`
+      ## only; 0 for `inheritStdio`, which redirects to this process's own
+      ## console handles instead and is never drained).
+    winStderrHandle*: uint64
     winJobHandle*: uint64
+    winMemoryCapThread*: uint64
+      ## `kill` mode only: the watcher thread `startMemoryCapWatcher`
+      ## started, joined and closed exactly once by `close` (through
+      ## `stopMemoryCapWatcher`). 0 when this launch has no watcher.
+    winMemoryCapState*: uint64
+      ## The watcher's heap state, paired with `winMemoryCapThread`; freed
+      ## by `stopMemoryCapWatcher`. 0 when there is no watcher.
+    memoryCapBytes*: uint64
+      ## Copied from `CommandSpec.memoryCapBytes` at launch, for the
+      ## completion to report even after the spec itself is gone.
+    memoryCapAction*: MemoryCapAction
+      ## Copied from `CommandSpec.memoryCapAction` at launch.
+    memoryCapMeasuring*: bool
+      ## Whether this launch reads the platform mechanism's peak at the end
+      ## at all (`memoryCapBytes > 0 or CommandSpec.memoryCapMeasure`).
+    memoryCapFinalized*: bool
+      ## Set once the watcher (if any) has been stopped and the peak read,
+      ## at the done transition in `pollCompletion` / `waitForCompletion` --
+      ## never twice, since stopping an already-stopped watcher would
+      ## double-close its handles.
+    memoryPeakBytesMeasured*: uint64
+      ## `PeakJobMemoryUsed`, read once at `memoryCapFinalized`.
+    memoryCapKilled*: bool
+      ## `stopMemoryCapWatcher`'s answer: this launch's tree was terminated
+      ## for crossing its memory cap.
     # Windows: end of input seen on the child's stdout / stderr pipe.
     winStdoutClosed*: bool
     winStderrClosed*: bool

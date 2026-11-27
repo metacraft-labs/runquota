@@ -206,7 +206,10 @@ proc windowsRecord(jobPriorityOn: bool; problem = ""): EnforcementRecord =
         "below-normal class a reclaimed tree already runs at"),
       entry(emWidthCap, elEnforced, WindowsWidthCapHow),
       entry(emMemoryCap, elAdmissionOnly, "admission (memory reservation)",
-        "Job Object memory limits are not set by RunQuota launchers yet"),
+        "launchWindowsProcess reads CommandSpec.memoryCapBytes/memoryCapAction " &
+        "and enforces it, but the host file's [enforcement] memoryCap " &
+        "switch (and the per-run RUNQUOTA_MEMORY_CAP) are not read yet, " &
+        "so no caller sets those fields"),
     ]
   else:
     let reason = if problem.len > 0: problem
@@ -221,7 +224,10 @@ proc windowsRecord(jobPriorityOn: bool; problem = ""): EnforcementRecord =
         "process it spawns)"),
       entry(emWidthCap, elEnforced, WindowsWidthCapHow),
       entry(emMemoryCap, elAdmissionOnly, "admission (memory reservation)",
-        "Job Object memory limits are not set by RunQuota launchers yet"),
+        "launchWindowsProcess reads CommandSpec.memoryCapBytes/memoryCapAction " &
+        "and enforces it, but the host file's [enforcement] memoryCap " &
+        "switch (and the per-run RUNQUOTA_MEMORY_CAP) are not read yet, " &
+        "so no caller sets those fields"),
     ]
 
 proc enforcementRecordFor*(os: string; root = CgroupRoot();
