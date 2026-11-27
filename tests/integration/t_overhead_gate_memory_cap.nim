@@ -8,32 +8,39 @@
 ##   against none of it; `memory-cap:<stage>` is that stage against the
 ##   stage before it, so each comparison adds exactly one stage, and an
 ##   unknown stage is a usage error. Mutation: pairing a stage against
-##   "off" (two stages at once) fails the one-step property.
+##   the bottom arm (two stages at once) fails the one-step property.
 ## * The argument parsing: `--switch=memory-cap[:STAGE]` reaches the
 ##   configuration as given.
 ## * The probe (`memoryCapProbeLevel`): the level a tree's own cgroup shows
 ##   (none, controller, leaf, limits), from the probe script's output.
-## * THE CONFIGURATION CHECK REFUSES A VACUOUS ON ARM, with real processes:
-##   the probe runs through the real `runquota` CLI against a real private
-##   `runquotad`, in a test-owned cgroup root, with the ON arm's cap turned
-##   off (`RUNQUOTA_MEMORY_CAP=off`: the switch leaving the cap off, the
-##   spec's mutation for this test). Its launch shows no cap, and
-##   `memoryCapConfigProblem` must refuse the run rather than let the gate
-##   compare two identical arms. Mutation: a check that accepts any level
-##   (or only looks at the OFF arm) passes the vacuous arm here.
+## * THE CONFIGURATION CHECK PASSES ONLY ARMS THAT REALLY APPLY THEIR
+##   STAGE, AND REFUSES A VACUOUS ON ARM, with real launches: for every
+##   switch, each arm's environment, exactly as the gate builds it
+##   (`memoryCapArms`), is resolved into a launch, the gate's probe script
+##   runs in that launch's real cgroup, and `memoryCapConfigProblem` must
+##   accept what it saw. An arm whose cap is left out must be refused.
+##   Mutations: the switch leaving the ON arm's cap out (every switch's
+##   real launch then shows a lower level, and the check that must accept
+##   fails); a check that accepts any level (the vacuous arm is accepted).
+## * The bottom arm through the REAL `runquota` CLI and a real private
+##   `runquotad`: with `RUNQUOTA_MEMORY_CAP` unset its tree has no memory
+##   cap at all. Mutation: an environment that leaks a cap into the bottom
+##   arm (the probe then shows one).
+##
+## THE ONE STAND-IN: `resolveArm`. Turning `RUNQUOTA_MEMORY_CAP` and the
+## host file's mode into a launch's cap is the launching client's resolver,
+## which is not in this tree yet. The test resolves each arm with the
+## client's documented rule (unset: the host mode, off on a gate host;
+## `off`: cap 0, measured only when the host mode is not off; a size: that
+## cap, in kill mode when the host leaves the cap off; `advisory` / `kill`:
+## the mode) and launches through the real `runquota_process` launcher.
+## Once the resolver lands, the real-CLI case below covers every arm.
 ##
 ## * The report's spawn path (`memoryCapSpawnPath`): `clone3` for a capped
 ##   arm at the `limits` stage or later, `fork` below it or when
 ##   `LD_PRELOAD` is set in the launchers' environment, and the warning
 ##   (`ldPreloadWarning`) the gate prints when its own environment sets it.
 ##   Mutation: ignoring the environment.
-##
-## WHAT IS NOT YET RUN: the gate end to end with the cap ON. Turning
-## `RUNQUOTA_MEMORY_CAP=1G` into a launch's cap is the launching client's
-## resolver, which this tree does not have yet; until it does, the real ON
-## arm shows no cap and the gate refuses, which is the behaviour asserted
-## above. The case below that probes the real ON arm reports what it saw
-## and asserts the check's answer for it either way.
 ##
 ## NO MOCKS: the real CLI and daemon (`daemon_binary`), the real cgroups of
 ## a test-owned root (`cgroup_test_root`). Linux only: the cap is a cgroup.
@@ -53,7 +60,7 @@ when defined(linux):
       let order = [mclNone, mclController, mclLeaf, mclLimits]
       proc rank(level: MemoryCapLevel): int = order.find(level)
       let whole = memoryCapArms("memory-cap")
-      check whole[armOff].cap == "off" and whole[armOff].level == mclNone
+      check whole[armOff].cap == "" and whole[armOff].level == mclNone
       check whole[armOn].cap == GateMemoryCap
       check whole[armOn].stage == ""
       check whole[armOn].level == mclLimits
@@ -62,9 +69,9 @@ when defined(linux):
         let arms = memoryCapArms("memory-cap:" & stage)
         check arms[armOn].stage == stage
         check arms[armOn].cap == GateMemoryCap
-        # The OFF arm is the stage before: "off" for the first stage.
+        # The OFF arm is the stage before: unset for the first stage.
         if previous == "off":
-          check arms[armOff].cap == "off"
+          check arms[armOff].cap == ""
           check arms[armOff].stage == ""
         else:
           check arms[armOff].cap == GateMemoryCap
@@ -138,7 +145,70 @@ when defined(linux):
     var reason = ""
     let root = delegatedMemoryTestRoot(reason)
 
-    test "test_rqm_overhead_gate_memory_cap: a vacuous ON arm is refused (real CLI and daemon)":
+    proc parseSize(text: string): uint64 =
+      ## A size with an optional binary suffix (K, M, G, T).
+      let unit = text[^1]
+      let digits = if unit in {'K', 'M', 'G', 'T'}: text[0 ..< ^1] else: text
+      let shift = case unit
+        of 'K': 10
+        of 'M': 20
+        of 'G': 30
+        of 'T': 40
+        else: 0
+      uint64(parseBiggestUInt(digits)) shl shift
+
+    proc resolveArm(arm: MemoryCapArm; spec: var CommandSpec) =
+      ## The launching client's rule for `RUNQUOTA_MEMORY_CAP`, with the
+      ## host file's mode off (the stand-in; see the header).
+      case arm.cap
+      of "", "off", "advisory", "kill":
+        discard               # host mode off: no cap, nothing measured
+      else:
+        spec.memoryCapBytes = parseSize(arm.cap)
+        spec.memoryCapAction = mcaKill
+
+    proc launchedLevel(arm: MemoryCapArm; root, group: string):
+        MemoryCapLevel =
+      ## The level the gate's probe sees in a real launch of `arm`.
+      var spec = commandSpec(["/bin/sh", "-c", memoryCapProbeScript])
+      spec.cgroup = targetFor(CgroupRoot(state: crsExplicit, path: root),
+        group, sessionPriorityNormal, reclaimed = false)
+      resolveArm(arm, spec)
+      if arm.stage.len > 0:
+        putEnv(MemoryCapStageEnvVar, arm.stage)
+      else:
+        delEnv(MemoryCapStageEnvVar)
+      defer: delEnv(MemoryCapStageEnvVar)
+      var child = launchProcess(spec)
+      let completion = child.waitForCompletion(30_000)
+      child.close()
+      memoryCapProbeLevel(completion.stdout, GateMemoryCapBytes)
+
+    test "test_rqm_overhead_gate_memory_cap: real launches pass the check, a vacuous ON arm is refused":
+      if root.len == 0:
+        echo "SKIPPED: " & reason
+        skip()
+      else:
+        for switch in ["memory-cap", "memory-cap:controller",
+                       "memory-cap:leaf", "memory-cap:limits",
+                       "memory-cap:classify"]:
+          let arms = memoryCapArms(switch)
+          var observed: array[Arm, MemoryCapLevel]
+          for arm in Arm:
+            observed[arm] = launchedLevel(arms[arm], root,
+              switch.replace(":", "-") & "-" & $arm)
+          checkpoint switch & ": off " & $observed[armOff] & ", on " &
+            $observed[armOn]
+          check memoryCapConfigProblem(arms, observed) == ""
+        # The vacuous ON arm: the cap left out, the stage still asked for.
+        let arms = memoryCapArms("memory-cap")
+        var leftOut = arms[armOn]
+        leftOut.cap = ""
+        let vacuous = launchedLevel(leftOut, root, "vacuous")
+        check vacuous == mclNone
+        check "vacuous" in memoryCapConfigProblem(arms, [mclNone, vacuous])
+
+    test "the bottom arm through the real CLI and daemon has no memory cap":
       if root.len == 0:
         echo "SKIPPED: " & reason
         skip()
@@ -148,29 +218,20 @@ when defined(linux):
         var cfg = parseGateArgs(["--case=run-64", "--switch=memory-cap"])
         cfg.daemonBin = daemonPath()
         cfg.cliBin = cliPath()
-        let switches = armSwitchText(cfg, armOn)
-        let daemon = gate.startDaemon(cfg, scratch, armOn, switches)
+        let switches = armSwitchText(cfg, armOff)
+        let daemon = gate.startDaemon(cfg, scratch, armOff, switches)
         defer: stopDaemon(daemon)
         let arms = memoryCapArms("memory-cap")
-        # THE MUTATION: the ON arm's cap left off.
-        var leftOff = arms[armOn]
-        leftOff.cap = "off"
         let probed = probeMemoryCapLevel(cfg.cliBin, runEnv(daemon.socketPath,
-          switches, root, memoryCap = leftOff), scratch)
+          switches, root, memoryCap = arms[armOff]), scratch)
         checkpoint "probe output: " & probed.output
         check probed.level == mclNone
-        let problem = memoryCapConfigProblem(arms, [mclNone, probed.level])
-        check "vacuous" in problem
-        # The real ON arm, as configured. Until the launching client
-        # resolves the variable into a cap it shows no cap and is refused
-        # in the same way; once it does, it must show the full cap and
-        # pass the check.
+        # The real ON arm, reported for the record: it shows the full cap
+        # only once the launching client resolves the variable.
         let real = probeMemoryCapLevel(cfg.cliBin, runEnv(daemon.socketPath,
           switches, root, memoryCap = arms[armOn]), scratch)
-        echo "the ON arm as configured shows '" & $real.level & "'"
-        let realProblem = memoryCapConfigProblem(arms, [mclNone, real.level])
-        if real.level == mclLimits:
-          check realProblem == ""
-        else:
-          check realProblem.len > 0
+        echo "  the ON arm through the real CLI shows '" & $real.level & "'"
+
+    test "the test root is left empty":
+      if root.len > 0:
         check removeTestRoot(root) == ""

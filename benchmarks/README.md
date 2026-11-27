@@ -65,11 +65,17 @@ exactly one:
 
 | Switch | OFF arm | ON arm |
 |---|---|---|
-| `memory-cap` | `RUNQUOTA_MEMORY_CAP=off` | `RUNQUOTA_MEMORY_CAP=1G`, every stage |
-| `memory-cap:controller` | `RUNQUOTA_MEMORY_CAP=off` | `1G`, `RUNQUOTA_MEMORY_CAP_STAGE=controller` (`+memory` on the root and the group) |
+| `memory-cap` | `RUNQUOTA_MEMORY_CAP` unset (cap mode off) | `RUNQUOTA_MEMORY_CAP=1G`, every stage |
+| `memory-cap:controller` | `RUNQUOTA_MEMORY_CAP` unset | `1G`, `RUNQUOTA_MEMORY_CAP_STAGE=controller` (`+memory` on the root and the group) |
 | `memory-cap:leaf` | `1G`, `controller` | `1G`, `leaf` (a leaf of its own per tree, no limits) |
 | `memory-cap:limits` | `1G`, `leaf` | `1G`, `limits` (`memory.max`, `memory.swap.max`, `memory.oom.group`, and `clone3`) |
 | `memory-cap:classify` | `1G`, `limits` | `1G`, `classify` (the reads at the end of each tree) |
+
+The bottom arm leaves `RUNQUOTA_MEMORY_CAP` unset, so the host file the
+launching client reads decides, and a gate host leaves `[enforcement]
+memoryCap` off. `RUNQUOTA_MEMORY_CAP=off` would not do: it lifts the cap
+but, where the host file turns the cap on, still measures the tree in a
+leaf of its own.
 
 Before the rounds each arm runs one probe through `runquota run` that
 prints what its own cgroup carries, and the gate refuses the run (exit 4)

@@ -29,9 +29,13 @@
 ## before it), with cgroup placement ON IN BOTH ARMS so only the cap
 ## differs. Each arm has a gate-owned cgroup root of its own, because
 ## enabling the memory controller on a root is itself what the first stage
-## costs. The arms differ by `RUNQUOTA_MEMORY_CAP` (a per-run cap far above
-## the work's need, or `off`) and `RUNQUOTA_MEMORY_CAP_STAGE`, paired so that
-## each comparison adds exactly one stage (`memoryCapArms`). Before the
+## costs. The bottom arm is the cap mode off: `RUNQUOTA_MEMORY_CAP` unset,
+## and the host file the launching client reads leaving `[enforcement]
+## memoryCap` off. The other arms set `RUNQUOTA_MEMORY_CAP` to a per-run cap
+## far above the work's need, and `RUNQUOTA_MEMORY_CAP_STAGE`, paired so
+## that each comparison adds exactly one stage (`memoryCapArms`). Not
+## `RUNQUOTA_MEMORY_CAP=off`: that LIFTS the cap but, where the host file
+## turns the cap on, still measures the tree in a leaf of its own. Before the
 ## first round each arm runs one probe through `runquota run` that reports
 ## what its own cgroup carries, and the gate refuses to run unless each arm
 ## is at the level its configuration names (`memoryCapConfigProblem`): an
@@ -166,7 +170,8 @@ type
   MemoryCapArm* = object
     ## One arm of a memory-cap comparison.
     cap*: string
-      ## `RUNQUOTA_MEMORY_CAP` for the arm's clients.
+      ## `RUNQUOTA_MEMORY_CAP` for the arm's clients; "" leaves it unset
+      ## (the host file's mode decides: the bottom arm).
     stage*: string
       ## `RUNQUOTA_MEMORY_CAP_STAGE`; "" leaves it unset (the whole
       ## mechanism).
@@ -189,18 +194,19 @@ proc memoryCapArms*(switch: string): array[Arm, MemoryCapArm] =
   ## mechanism against none of it:
   ##
   ##   switch                  OFF arm                  ON arm
-  ##   memory-cap              cap off                  cap 1G, all stages
-  ##   memory-cap:controller   cap off                  cap 1G, controller
+  ##   memory-cap              unset                    cap 1G, all stages
+  ##   memory-cap:controller   unset                    cap 1G, controller
   ##   memory-cap:leaf         cap 1G, controller       cap 1G, leaf
   ##   memory-cap:limits       cap 1G, leaf             cap 1G, limits
   ##   memory-cap:classify     cap 1G, limits           cap 1G, classify
   ##
-  ## `off` turns the cap off for the run, which (with the host file's cap
-  ## off, as on a gate host) is no memory cap at all: the tree is placed
-  ## exactly as without the feature. The configuration check
-  ## (`memoryCapConfigProblem`) refuses a host where it is not.
-  ## ValueError for an unknown stage.
-  let none = MemoryCapArm(cap: "off", stage: "", level: mclNone)
+  ## "unset" is the cap mode off: no `RUNQUOTA_MEMORY_CAP`, so the host
+  ## file's mode decides, and with its `memoryCap` off (absent) the tree is
+  ## placed exactly as without the feature. A per-run size is a cap in
+  ## kill mode when the host file leaves the cap off. The configuration
+  ## check (`memoryCapConfigProblem`) refuses a host where either arm does
+  ## not show its level. ValueError for an unknown stage.
+  let none = MemoryCapArm(cap: "", stage: "", level: mclNone)
   proc capped(stage: MemoryCapStage): MemoryCapArm =
     MemoryCapArm(cap: GateMemoryCap, stage: $stage, level:
       case stage
@@ -273,8 +279,8 @@ proc memoryCapConfigProblem*(arms: array[Arm, MemoryCapArm];
   ## and the gate would pass a cost it never measured.
   for arm in Arm:
     if observed[arm] != arms[arm].level:
-      return "the " & $arm & " arm (" & MemoryCapEnvVar & "=" &
-        arms[arm].cap & (if arms[arm].stage.len > 0: " " &
+      return "the " & $arm & " arm (" & MemoryCapEnvVar &
+        (if arms[arm].cap.len > 0: "=" & arms[arm].cap else: " unset") & (if arms[arm].stage.len > 0: " " &
           MemoryCapStageEnvVar & "=" & arms[arm].stage else: "") &
         ") was configured for the memory cap at '" & $arms[arm].level &
         "' but its launch showed '" & $observed[arm] & "'" &
