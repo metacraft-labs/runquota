@@ -292,16 +292,19 @@ proc runUnleased(command: seq[string]; env: seq[string]): int =
       error.msg)
     127
 
-proc launcherCgroupRoot*(): CgroupRoot =
+proc launcherCgroupRoot*(mayAsk = true): CgroupRoot =
   ## The cgroup root RunQuota's CLI launchers place trees under: the
   ## variable, then the host file's `[enforcement] cgroups` (off when
   ## absent). A host file that cannot be read or parsed leaves placement off
   ## and says why: a launcher never fails over a setting it only consults.
+  ## `mayAsk` false for a command that only reports or adjusts (`status`,
+  ## `session set`): it never asks systemd or records anything, and a
+  ## caller's cgroup whose delegation is not yet known reads as such.
   var switchOn = false
   var problem = ""
   if getEnv(CgroupRootEnvVar).strip().len == 0:
     switchOn = enforcementCgroupsOn(problem)
-  result = currentCgroupRoot(switchOn)
+  result = currentCgroupRoot(switchOn, mayAsk)
   if problem.len > 0 and result.state == crsOff:
     result.reason = "off: the host file could not be read (" & problem & ")"
 

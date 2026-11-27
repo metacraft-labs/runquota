@@ -215,6 +215,8 @@ proc placementNote*(placement: TreePlacement; launch: LaunchResult): string =
   ## is not enforced reports) and which priority policy the tree took.
   if launch.cgroupPath.len > 0:
     result = "cgroup " & launch.cgroupPath
+    if launch.cgroupNote.len > 0:
+      result.add(" (" & launch.cgroupNote & ")")
   else:
     let why =
       if launch.cgroupProblem.len > 0: launch.cgroupProblem

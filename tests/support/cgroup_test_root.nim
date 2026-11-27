@@ -23,17 +23,45 @@ when defined(linux):
 
   var rootSequence = 0
 
-  proc delegatedTestRoot*(reason: var string): string =
+  proc noCgroupLimits(path: string): string {.nimcall, gcsafe, raises: [].} =
+    ## A reader that finds no limit: resolves the default root's PATH, which
+    ## `delegatedTestRoot` then checks against this process's limits itself.
+    ""
+
+  proc delegatedTestRoot*(reason: var string; checkLimits = true): string =
     ## A fresh, test-owned root below this user's delegated subtree, or ""
     ## with `reason` when this host gives the user no delegated cgroup v2
     ## subtree with the cpu controller (a CI container, a system service).
     ## The root is not created here: the first launch creates it, as in
     ## production, and `removeTestRoot` takes it away.
-    let default = resolveCgroupRoot("", readFile("/proc/self/cgroup"),
-      int(getuid()), hostSwitchOn = true)
+    ##
+    ## THE TEST PROCESS'S OWN LIMITS. The root is a sibling of the user's
+    ## `runquota.slice`, so a tree placed in it leaves every cgroup between
+    ## this process and `user@<uid>.service`. A launcher keeps a tree under a
+    ## limited one of those (`limitingCgroup`), unless it is the agent
+    ## session's scope that `RUNQUOTA_AGENT_SESSION_SCOPE` names. So with
+    ## `checkLimits` (the default) this returns "" with that limit as the
+    ## reason, and the test reports SKIPPED, when the suite runs under a
+    ## limited cgroup the marker does not name: an agent session whose
+    ## harness does not set the marker, or a `systemd-run -p MemoryMax=...`
+    ## around the suite. Set the marker to the session's scope unit name to
+    ## run these tests there. `checkLimits = false` is for the test that
+    ## starts its launchers in scopes of their own.
+    let own = readFile("/proc/self/cgroup")
+    let default = resolveCgroupRoot("", own, int(getuid()),
+      hostSwitchOn = true, read = noCgroupLimits)
     if not default.usable:
       reason = default.reason
       return ""
+    if checkLimits:
+      let limited = limitingCgroup(parseOwnCgroup(own), default.path,
+        getEnv(AgentSessionScopeEnvVar).strip(), readCgroupInterfaceFile)
+      if limited.dir.len > 0:
+        reason = "this test runs under cgroup " & limited.dir & " (" &
+          limited.limit & "), which a tree placed beside runquota.slice " &
+          "would leave; if it is the agent session's scope, name its unit " &
+          "in " & AgentSessionScopeEnvVar
+        return ""
     inc rootSequence
     let root = default.path.parentDir / ("runquota-test-" & $getCurrentProcessId() &
       "-" & $rootSequence & "-" & $int64(epochTime() * 1000) & ".slice")

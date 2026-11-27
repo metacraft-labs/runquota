@@ -88,8 +88,8 @@ when defined(linux):
     putEnv("RUNQUOTA_SOCKET", socket)
     delEnv("RUNQUOTA_PARENT_LEASE")
   else:
-    echo "SKIPPED (every case): no delegated cgroup v2 subtree with the cpu " &
-      "controller for this user: " & rootReason
+    echo "SKIPPED (every case): no cgroup test root this process can " &
+      "place trees in: " & rootReason
 
   let root = CgroupRoot(state: crsExplicit, path: testRoot)
 

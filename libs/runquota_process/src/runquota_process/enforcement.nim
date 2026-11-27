@@ -338,7 +338,7 @@ proc hostOsName*(): string =
   elif defined(windows): "windows"
   else: hostOS
 
-proc hostEnforcementRecord*(root = currentCgroupRoot();
+proc hostEnforcementRecord*(root = currentCgroupRoot(mayAsk = false);
                             jobPriorityOn = currentJobPriorityOn();
                             jobPriorityProblem = jobPriorityOffReason(false);
                             qosOn = currentQosOn();

@@ -51,8 +51,11 @@
 ## fresh root below the user's delegated subtree (`cgroup_test_root`); the
 ## user's real `runquota.slice` is never written. On a host that gives the
 ## user no delegated cgroup v2 subtree with the cpu controller (a CI
-## container), the cases are reported SKIPPED with the reason: they need the
-## kernel's controller, which nothing can stand in for.
+## container), or where this process runs under a limited cgroup that
+## `RUNQUOTA_AGENT_SESSION_SCOPE` does not name (a launcher keeps its trees
+## under such a limit, so none would be placed in the test root), the cases
+## are reported SKIPPED with the reason: they need the kernel's controller,
+## which nothing can stand in for.
 ##
 ## ROBUSTNESS ON A SHARED, LOADED HOST, without weakening a bound.
 ## * ONE PHYSICAL CORE. After its daemon starts, the test pins itself, and
@@ -338,8 +341,8 @@ when defined(linux):
     # launches share the two CPUs.
     pinSelf(cpus)
   else:
-    echo "SKIPPED (every case): no delegated cgroup v2 subtree with the cpu " &
-      "controller for this user: " & rootReason
+    echo "SKIPPED (every case): no cgroup test root this process can " &
+      "place trees in: " & rootReason
 
   template needRoot(): bool =
     ## Inside a test: whether the cases can run here; reported SKIPPED with

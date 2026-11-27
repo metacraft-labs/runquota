@@ -52,6 +52,43 @@
 ## cgroups and nothing here needs privilege. systemd's delegation rules:
 ## https://systemd.io/CGROUP_DELEGATION/
 ##
+## A CALLER'S LIMIT KEEPS ITS TREES. The default root is a SIBLING of the
+## launcher's own cgroup: a launcher started by `systemd-run --user --scope
+## -p MemoryMax=8G repro build` runs in `user@<uid>.service/app.slice/
+## run-....scope`, and a tree moved into `runquota.slice` would leave that
+## scope and its limit. So the launcher reads the limits on its own cgroup and
+## each ancestor up to, not including, the deepest cgroup the candidate root
+## also lies in (`limitingCgroup`). The deepest limited one, L, holds the
+## tree: the root becomes `L/runquota` (`HolderRootName`), so every limit on
+## L and above it, and the tree's own caps, all hold. That needs L delegated
+## by systemd (`Delegate=yes`): L must be a `.service` or `.scope`, or a
+## plain cgroup below one (never a slice, nor a plain cgroup of the user
+## manager itself; `delegationUnit`), and that unit delegated. The unit's
+## delegation is read from systemd's `user.delegate` / `trusted.delegate`
+## attribute, which the system manager writes; where it is missing (a
+## user's own manager may not write it) from RunQuota's record of an earlier
+## answer (`user.runquota.delegated`); and only then from the manager
+## itself, once, through a bounded `systemctl show -p Delegate`
+## (`cgroupDelegated`), whose answer, yes or no, is recorded. Where L holds
+## processes (the caller's own, in a delegated scope) they are first moved
+## into the leaf `L/caller`, as systemd's delegation contract asks of a
+## delegated cgroup's payload, and then the controllers are enabled below L
+## (`prepareHolder`). Where L is not delegated, placement is refused with the
+## reason, and the tree runs where the launcher is: inside L, under its
+## limit. A limited cgroup inside RunQuota's own placement (a tree's cap
+## leaf) is not a caller's: the launcher is inside another RunQuota-placed
+## tree and places nothing. All of this happens only for a launcher under a
+## limited cgroup that is not the agent session's scope; `runquota status`
+## reads it without asking or writing anything.
+##
+## THE ONE CGROUP A TREE LEAVES ON PURPOSE is the agent session's scope: the
+## limited cgroup whose directory name equals `RUNQUOTA_AGENT_SESSION_SCOPE`
+## (`AgentSessionScopeEnvVar`), which the agent harness sets to its scope's
+## unit name. That scope bounds the harness, not the builds it starts, which
+## RunQuota's own admission and caps govern. Only an exact name counts: a
+## unit name that merely looks like an agent session's is a limit like any
+## other.
+##
 ## NOTHING HERE MAY FAIL A LAUNCH. Every problem becomes a reason string the
 ## launcher reports and the capability record carries, and the tree runs
 ## with the nice fallback (`fallbackNice`).
@@ -131,6 +168,15 @@ type
       ## The root directory, for `crsDefault` and `crsExplicit`.
     reason*: string
       ## Why there is no root, for `crsOff` and `crsUnavailable`.
+    holder*: string
+      ## The limited, delegated cgroup L the launcher runs under, when the
+      ## root is `L/runquota` (`HolderRootName`) instead of the candidate
+      ## root; "" otherwise.
+    holderLimit*: string
+      ## L's limit, `<file>=<value>`, for the reasons that name it.
+    holderNote*: string
+      ## Something about the holder a user should see although the tree is
+      ## placed (systemd's answer could not be recorded), or "".
 
   CgroupTarget* = object
     ## Where one launch puts its tree: plain data, so that a launcher that
@@ -146,6 +192,15 @@ type
       ## `shared` or `cap-<pid>-<n>`.
     cpuMax*: string
       ## "" for an uncapped leaf; otherwise the `cpu.max` text of a cap leaf.
+    holder*: string
+      ## `CgroupRoot.holder`: the limited cgroup the root lies in, prepared
+      ## (`prepareHolder`) before the root, or "".
+    holderLimit*: string
+    holderNote*: string
+      ## `CgroupRoot.holderNote`, reported with the launch.
+    unplacedReason*: string
+      ## For a target that is not placed: why (the root's reason), so a cap
+      ## that cannot be enforced can say so.
     memory*: bool
       ## Enable the memory controller (`+memory`) in the root's and the
       ## group directory's `cgroup.subtree_control`, so the leaf has the
@@ -510,8 +565,653 @@ proc defaultRootFor*(ownCgroup: string; uid: int): string =
       return CgroupMountPoint & prefix & "/" & DefaultRootName
   ""
 
+const
+  AgentSessionScopeEnvVar* = "RUNQUOTA_AGENT_SESSION_SCOPE"
+    ## The unit name (for example `agent-session-1234.scope`) of the agent
+    ## session's scope,
+    ## set by the agent harness that made it: the one limited cgroup a
+    ## leased tree is placed outside of. Exact directory-name match only.
+  HolderRootName* = "runquota"
+    ## The root a limited, delegated cgroup L holds trees in: `L/runquota`.
+  HolderCallerLeaf* = "caller"
+    ## The leaf L's own processes are moved into before controllers are
+    ## enabled below L.
+  HolderMoveRounds* = 32
+    ## How many times the move re-reads L's `cgroup.procs` for processes
+    ## that appeared meanwhile (a forking caller) before it gives up.
+  KernelPidMaxPath* = "/proc/sys/kernel/pid_max"
+  KernelThreadsMaxPath* = "/proc/sys/kernel/threads-max"
+  DefaultTasksMaxPercent* = 15
+    ## systemd's documented default of `DefaultTasksMax=`: 15% of the smaller
+    ## of the kernel's `pid_max` and `threads-max`.
+    ## https://www.freedesktop.org/software/systemd/man/latest/systemd-system.conf.html
+  MemoryLimitFiles = ["memory.max", "memory.high", "memory.swap.max"]
+    ## A value other than `max` in any of these is a memory limit.
+    ## https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files
+
+type
+  CgroupFileRead* = proc (path: string): string {.nimcall, gcsafe,
+                                                  raises: [].}
+    ## Reads one cgroup interface file by its absolute path: its contents, or
+    ## "" when it is absent, unreadable or empty (all three mean no limit).
+    ## Plain procedure, no closure, so a static-helper caller can pass one.
+  DelegationAnswer* = enum
+    daYes = "yes"
+    daNo = "no"
+    daUnknown = "unknown"
+      ## Not determined: systemd could not be asked, did not answer, or
+      ## (read-only) was not asked.
+
+  CgroupDelegationRead* = proc (unitDir: string; mayAsk: bool;
+                                answer: var string): DelegationAnswer {.
+    nimcall, gcsafe, raises: [].}
+    ## Whether the systemd unit whose cgroup is `unitDir` (a `.service` or
+    ## `.scope`) is delegated. `mayAsk` false: read what is recorded only,
+    ## never run `systemctl` or write anything (`runquota status`).
+    ## `answer` says what decided it, for a reason.
+
+  CallerLimit* = object
+    ## The deepest limited cgroup a tree placed at a candidate root would
+    ## leave, other than the marked agent-session scope (`limitingCgroup`).
+    dir*: string
+      ## Its absolute path, or "" when there is none.
+    limit*: string
+      ## Its first limit, `<file>=<value>`.
+
+proc readCgroupInterfaceFile*(path: string): string {.nimcall, gcsafe,
+                                                        raises: [].} =
+  ## The real `CgroupFileRead`.
+  try: readFile(path) except CatchableError: ""
+
+when defined(linux):
+  import std/locks
+  var O_DIRECTORY {.importc, header: "<fcntl.h>".}: cint
+  proc flock(fd: cint; operation: cint): cint {.importc, header: "<sys/file.h>".}
+  var
+    LOCK_SH {.importc, header: "<sys/file.h>".}: cint
+    LOCK_EX {.importc, header: "<sys/file.h>".}: cint
+
+  proc getxattr(path, name: cstring; value: pointer; size: csize_t): int {.
+    importc, header: "<sys/xattr.h>".}
+  proc setxattr(path, name: cstring; value: pointer; size: csize_t;
+                flags: cint): cint {.importc, header: "<sys/xattr.h>".}
+  proc pipe2(fds: var array[0..1, cint]; flags: cint): cint {.
+    importc, header: "<unistd.h>".}
+
+const
+  DelegationQueryTimeoutMillis* = 2_000
+    ## How long a launcher waits for `systemctl show` before it kills it:
+    ## a hung bus costs a scope at most this, once (the answer, a timeout
+    ## included, is kept for the process).
+  SystemctlReapMillis = 200
+    ## How long a killed `systemctl` is given to be reaped before the
+    ## launcher stops waiting for it.
+  SystemctlEnvKept = ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]
+    ## All of the launcher's environment that `systemctl` gets: what it
+    ## needs to reach the user manager's bus, and nothing a launcher's
+    ## caller could use to change what it runs or answers.
+  DelegationRecordAttr* = "user.runquota.delegated"
+    ## Where RunQuota records systemd's answer ("yes" / "no") on the unit's
+    ## cgroup, so the next launch reads it instead of asking: a started
+    ## unit's `Delegate=` cannot change. RunQuota's own attribute; it never
+    ## writes systemd's `user.delegate`.
+
+proc cgroupComponents(path: string): seq[string] =
+  for component in path.split('/'):
+    if component.len > 0:
+      result.add(component)
+
+proc isUnitCgroup(name: string): bool =
+  ## A cgroup directory systemd made for a unit that can be delegated.
+  name.endsWith(".service") or name.endsWith(".scope")
+
+proc isUserManager(name: string): bool =
+  name.startsWith("user@") and name.endsWith(".service")
+
+proc delegationUnit*(dir: string; refusal: var string): string =
+  ## The unit whose delegation decides whether the limited cgroup `dir` may
+  ## hold trees, or "" with `refusal`. Pure. Following systemd's delegation
+  ## contract (https://systemd.io/CGROUP_DELEGATION/):
+  ##
+  ## * `dir` is itself a `.service` or `.scope`: that unit.
+  ## * `dir` is a slice: never delegated (systemd does not delegate slices).
+  ## * `dir` is the user manager (`user@<uid>.service`): never a holder.
+  ## * `dir` is a plain directory: the nearest unit above it, which made it
+  ##   as the payload of its delegated subtree -- but not when that nearest
+  ##   unit is a slice or the user manager (`user@<uid>.service`): its
+  ##   subtree is the manager's own, not a delegated unit's payload.
+  let name = dir.extractFilename
+  if name.endsWith(".slice"):
+    refusal = dir & " is a slice, which systemd cannot delegate"
+    return ""
+  if isUserManager(name):
+    # The user manager's own cgroup holds every unit of the user; it is
+    # never a holder, whatever its delegation.
+    refusal = dir & " is the user manager itself, which never holds a " &
+      "tree's root"
+    return ""
+  if isUnitCgroup(name):
+    return dir
+  var parent = dir.parentDir
+  while parent.len > CgroupMountPoint.len:
+    let unit = parent.extractFilename
+    if unit.endsWith(".slice"):
+      refusal = dir & " is a plain cgroup whose nearest unit is the slice " &
+        parent & ", which systemd cannot delegate"
+      return ""
+    if isUnitCgroup(unit):
+      if isUserManager(unit):
+        refusal = dir & " is a plain cgroup whose nearest unit is the user " &
+          "manager " & parent & ", not a delegated unit"
+        return ""
+      return parent
+    parent = parent.parentDir
+  refusal = dir & " is not inside a systemd service or scope"
+  ""
+
+proc insideRunQuotaPlacement*(dir, defaultRoot: string): bool =
+  ## Whether `dir` lies inside RunQuota's own placement: at or below the
+  ## default root, or at or below a `<cgroup>/runquota` holder root. A limit
+  ## there is a tree's own cap (or its group's), not a caller's, and the
+  ## launcher in it is inside another RunQuota-placed tree. Pure.
+  if defaultRoot.len > 0 and (dir == defaultRoot or
+      dir.startsWith(defaultRoot & "/")):
+    return true
+  let relative = dir[min(dir.len, CgroupMountPoint.len) .. ^1]
+  HolderRootName in cgroupComponents(relative)
+
+when defined(linux):
+  proc readAttr(dir, name: string): string =
+    var value: array[16, char]
+    let got = getxattr(cstring(dir), cstring(name), addr value[0],
+      csize_t(value.len))
+    if got <= 0:
+      return ""
+    result = newString(got)
+    for i in 0 ..< got: result[i] = value[i]
+
+proc cgroupDelegationMarked*(dir: string): bool =
+  ## Whether `dir` carries systemd's delegation mark: its `user.delegate` or
+  ## `trusted.delegate` extended attribute is "1". The system manager writes
+  ## it on a unit it delegates; a user's own manager may not (systemd 260
+  ## does not), which is why `cgroupDelegated` asks when it is missing.
+  when defined(linux):
+    readAttr(dir, "user.delegate") == "1" or
+      readAttr(dir, "trusted.delegate") == "1"
+  else:
+    false
+
+when defined(linux):
+  const
+    MemoSlots = 64
+      ## How many cgroups' answers a process remembers (oldest replaced).
+    MemoTextBytes = 480
+      ## The answer's text is kept up to this many bytes.
+
+  type
+    MemoSlot = object
+      ## One remembered answer. Plain values only, no `string`: the memo is
+      ## a process-wide global that every launch reads, and a global that
+      ## holds no GC'd memory is GC-safe to read and write under its lock.
+      used: bool
+      key: array[64, char]
+        ## The SHA-256 hex digest of what the answer is about (a unit's
+        ## cgroup path, or "holder:" and a holder's path).
+      answer: DelegationAnswer
+      textLen: int
+      text: array[MemoTextBytes, char]
+
+  var
+    memoLock: Lock
+    memoSlots: array[MemoSlots, MemoSlot]
+      ## Per process: each unit's answer once found (a timeout included,
+      ## so a hung bus costs one wait per process, not one per launch).
+    memoNext: int
+  initLock(memoLock)
+
+  proc memoKey(subject: string): array[64, char] =
+    let digest = sha256Hex(subject)
+    for i in 0 ..< min(digest.len, result.len):
+      result[i] = digest[i]
+
+  proc memoLookup(subject: string; answer: var DelegationAnswer;
+                  text: var string): bool =
+    let key = memoKey(subject)
+    withLock memoLock:
+      for slot in memoSlots:
+        if slot.used and slot.key == key:
+          answer = slot.answer
+          text = newString(slot.textLen)
+          for i in 0 ..< slot.textLen: text[i] = slot.text[i]
+          return true
+    false
+
+  proc memoStore(subject: string; answer: DelegationAnswer; text: string) =
+    var slot = MemoSlot(used: true, key: memoKey(subject), answer: answer,
+      textLen: min(text.len, MemoTextBytes))
+    for i in 0 ..< slot.textLen: slot.text[i] = text[i]
+    withLock memoLock:
+      memoSlots[memoNext mod MemoSlots] = slot
+      inc memoNext
+
+  var POSIX_SPAWN_SETSIGMASK_FLAG {.importc: "POSIX_SPAWN_SETSIGMASK",
+    header: "<spawn.h>".}: cint
+  type AddCloseFrom = proc (actions: var Tposix_spawn_file_actions;
+                            fromFd: cint): cint {.cdecl, gcsafe, raises: [].}
+    ## `posix_spawn_file_actions_addclosefrom_np` (glibc 2.34 and later):
+    ## close every descriptor from `fromFd` up in the child.
+
+  proc dlsym(handle: pointer; name: cstring): pointer {.importc,
+    header: "<dlfcn.h>".}
+
+  proc addCloseFrom(): AddCloseFrom =
+    ## The C library's `posix_spawn_file_actions_addclosefrom_np`, looked up
+    ## at run time (`RTLD_DEFAULT`, the null handle on glibc and musl), or
+    ## nil where it does not exist (glibc before 2.34, musl): naming it at
+    ## link time would tie RunQuota to one C library version, which it
+    ## avoids elsewhere too (`close_range` is a raw system call).
+    cast[AddCloseFrom](dlsym(nil, "posix_spawn_file_actions_addclosefrom_np"))
+
+  proc runBoundedCommand*(program: string; args: openArray[string];
+                          env: openArray[string]; timeoutMillis: int;
+                          output, problem, note: var string): int =
+    ## Run `program` with exactly `env`, its stdout and stderr captured, for
+    ## at most `timeoutMillis`. -1 with `problem` when it could not run or
+    ## did not finish; otherwise its exit status.
+    ##
+    ## SAFE IN A MULTI-THREADED LAUNCHER. `posix_spawn`, not `fork`: no
+    ## copy of the launcher runs any code of its own. The output pipe is
+    ## close-on-exec from birth (`pipe2`), so a tree another thread forks
+    ## meanwhile does not inherit it; the child gets it as stdout and stderr
+    ## by the spawn's own `dup2`, `/dev/null` as stdin, no other descriptor
+    ## of the launcher's, and a default signal mask. The reads are
+    ## non-blocking and bounded by the deadline: a grandchild that keeps the
+    ## pipe open after `systemctl` exits cannot hold the launcher. On expiry
+    ## the child is killed and reaped for at most `SystemctlReapMillis`
+    ## more; one still not reaped is left, and reported as the timeout.
+    ## posix_spawn(3): https://man7.org/linux/man-pages/man3/posix_spawn.3.html
+    ## `note` says what could not be done short of failing (the descriptors).
+    output = ""
+    note = ""
+    var fds: array[0..1, cint]
+    if pipe2(fds, O_CLOEXEC) != 0:
+      problem = "cannot create a pipe: " & $strerror(errno)
+      return -1
+    var argv = @[program]
+    for arg in args: argv.add(arg)
+    let cargv = allocCStringArray(argv)
+    let cenv = allocCStringArray(env)
+    defer:
+      deallocCStringArray(cargv)
+      deallocCStringArray(cenv)
+    var actions: Tposix_spawn_file_actions
+    var attr: Tposix_spawnattr
+    discard posix_spawn_file_actions_init(actions)
+    discard posix_spawnattr_init(attr)
+    defer:
+      discard posix_spawn_file_actions_destroy(actions)
+      discard posix_spawnattr_destroy(attr)
+    discard posix_spawn_file_actions_addopen(actions, 0, "/dev/null",
+      O_RDONLY, 0)
+    discard posix_spawn_file_actions_adddup2(actions, fds[1], 1)
+    discard posix_spawn_file_actions_adddup2(actions, fds[1], 2)
+    # And nothing else of the launcher's: a descriptor its own caller left
+    # open without close-on-exec (the write end of that caller's output
+    # pipe, say) would otherwise pass to systemctl and to anything that
+    # outlives it, and hold the caller's pipe open as long as that lives.
+    # Where the C library cannot do it (no `addclosefrom`, or it fails),
+    # the spawn goes on without it: the launcher's own pipe is close-on-exec
+    # and its reads are bounded, so what remains is only such descriptors
+    # reaching systemctl, said in `note`.
+    let closeFrom = addCloseFrom()
+    if closeFrom.isNil:
+      note = "descriptors not closed in systemctl (the C library has no " &
+        "posix_spawn_file_actions_addclosefrom_np)"
+    else:
+      let failed = closeFrom(actions, 3)
+      if failed != 0:
+        note = "descriptors not closed in systemctl " &
+          "(posix_spawn_file_actions_addclosefrom_np: " & $strerror(failed) &
+          ")"
+    var mask: Sigset
+    discard sigemptyset(mask)
+    discard posix_spawnattr_setsigmask(attr, mask)
+    discard posix_spawnattr_setflags(attr, POSIX_SPAWN_SETSIGMASK_FLAG)
+    var pid: Pid
+    let spawned = posix_spawn(pid, cstring(program), actions, attr, cargv,
+      cenv)
+    discard posix.close(fds[1])
+    if spawned != 0:
+      discard posix.close(fds[0])
+      problem = "cannot start " & program & ": " & $strerror(spawned)
+      return -1
+    let flags = fcntl(fds[0], F_GETFL)
+    discard fcntl(fds[0], F_SETFL, flags or O_NONBLOCK)
+    let deadline = getMonoTime() + initDuration(milliseconds = timeoutMillis)
+    var open = true
+    var status: cint = 0
+    var reaped = false
+    proc drain(fd: cint; output: var string; open: var bool) =
+      ## What the pipe holds now, without waiting.
+      while open:
+        var buffer: array[256, char]
+        let got = posix.read(fd, addr buffer[0], buffer.len)
+        if got > 0:
+          for i in 0 ..< got: output.add(buffer[i])
+        elif got == 0:
+          open = false
+        elif errno != EINTR:
+          return      # EAGAIN: nothing more now
+    while true:
+      let left = int((deadline - getMonoTime()).inMilliseconds)
+      if left <= 0:
+        break
+      if open:
+        var pfd = TPollfd(fd: fds[0], events: POLLIN, revents: 0)
+        if posix.poll(addr pfd, 1, cint(min(left, 50))) > 0:
+          drain(fds[0], output, open)
+      else:
+        sleep(min(left, 10))
+      if posix.waitpid(pid, status, WNOHANG) == pid:
+        reaped = true
+        drain(fds[0], output, open)
+        break
+    discard posix.close(fds[0])
+    if not reaped:
+      discard posix.kill(pid, SIGKILL)
+      let reapBy = getMonoTime() + initDuration(
+        milliseconds = SystemctlReapMillis)
+      while getMonoTime() < reapBy:
+        if posix.waitpid(pid, status, WNOHANG) == pid:
+          break
+        sleep(5)
+      problem = program & " did not answer within " & $timeoutMillis & " ms"
+      return -1
+    if WIFEXITED(status): WEXITSTATUS(status) else: -1
+
+  proc systemctlEnvironment*(): seq[string] =
+    ## The environment `systemctl` gets: `SystemctlEnvKept` from this
+    ## process, `XDG_RUNTIME_DIR` defaulted to `/run/user/<euid>` where that
+    ## exists, and nothing else.
+    for key in SystemctlEnvKept:
+      var value = getEnv(key)
+      if key == "XDG_RUNTIME_DIR" and value.len == 0:
+        let fallback = "/run/user/" & $geteuid()
+        if dirExists(fallback): value = fallback
+      if value.len > 0:
+        result.add(key & "=" & value)
+
+  proc askManagerDelegate(unitDir: string; answer: var string):
+      DelegationAnswer =
+    ## systemd's answer for the unit whose cgroup is `unitDir`:
+    ## `systemctl show -p Delegate --value <unit>`, of the user's manager
+    ## (`--user`) when the unit lies below a `user@<uid>.service`, else of
+    ## the system manager. Bounded (`runBounded`), with the environment
+    ## scrubbed to `SystemctlEnvKept` (and `XDG_RUNTIME_DIR` defaulted to
+    ## `/run/user/<euid>` where that exists).
+    let systemctl = findExe("systemctl")
+    if systemctl.len == 0:
+      answer = "systemctl is not on PATH, so systemd could not be asked"
+      return daUnknown
+    var userManager = false
+    let components = cgroupComponents(unitDir[min(unitDir.len,
+      CgroupMountPoint.len) .. ^1])
+    for i in 0 ..< max(0, components.len - 1):
+      if isUserManager(components[i]):
+        userManager = true
+    var args: seq[string]
+    if userManager:
+      args.add("--user")
+    args.add(["show", "-p", "Delegate", "--value", unitDir.extractFilename])
+    let env = systemctlEnvironment()
+    var output, problem, note = ""
+    let code = runBoundedCommand(systemctl, args, env,
+      DelegationQueryTimeoutMillis, output, problem, note)
+    if note.len > 0:
+      problem = if problem.len > 0: problem & "; " & note else: problem
+    let command = "systemctl " & args.join(" ")
+    if code < 0:
+      answer = command & ": " & problem
+      return daUnknown
+    if code != 0:
+      answer = command & " exited " & $code & ": " & output.strip()
+      return daUnknown
+    let value = output.strip()
+    answer = command & " answered Delegate=" & value
+    if value == "yes": daYes else: daNo
+
+proc cgroupDelegated*(unitDir: string; mayAsk: bool;
+                      answer: var string): DelegationAnswer {.nimcall,
+    gcsafe, raises: [].} =
+  ## The real `CgroupDelegationRead`, cheapest first:
+  ##
+  ## 1. this process's own memo of the unit's answer;
+  ## 2. systemd's mark (`cgroupDelegationMarked`);
+  ## 3. RunQuota's record of an earlier answer (`DelegationRecordAttr`);
+  ## 4. with `mayAsk`, systemd itself (`askManagerDelegate`), once: a "yes"
+  ##    or "no" is recorded in `DelegationRecordAttr` (a failure to record
+  ##    goes into `answer`), and every answer, a timeout included, in the
+  ##    memo. Without `mayAsk` the answer is `daUnknown`, "not yet
+  ##    determined".
+  ##
+  ## For a "yes", `answer` is empty unless something is worth telling (the
+  ## answer could not be recorded). Called only for a launcher under a
+  ## limited cgroup that is not the agent session's scope, so a launch
+  ## outside one never gets here.
+  ##
+  ## The cast covers `getEnv` and `findExe` (environment reads) and the
+  ## `posix` calls, which touch no GC'd global; the memo holds no GC'd
+  ## memory (`MemoSlot`).
+  {.cast(gcsafe).}:
+    try:
+      when defined(linux):
+        var memo: DelegationAnswer
+        if memoLookup(unitDir, memo, answer):
+          return memo
+        proc recorded(unitDir: string; answer: var string;
+                      verdict: var DelegationAnswer): bool =
+          ## systemd's mark, or RunQuota's record of an earlier answer.
+          if cgroupDelegationMarked(unitDir):
+            verdict = daYes
+            return true
+          let value = readAttr(unitDir, DelegationRecordAttr)
+          if value == "yes":
+            verdict = daYes
+            return true
+          if value == "no":
+            answer = "systemd answered Delegate=no (recorded in " &
+              DelegationRecordAttr & ")"
+            verdict = daNo
+            return true
+          false
+        if recorded(unitDir, answer, result):
+          return
+        if not mayAsk:
+          answer = "delegation of " & unitDir & " not yet determined (the " &
+            "first launch asks systemd)"
+          return daUnknown
+        # ONE QUERY PER UNIT, across threads and processes: an exclusive
+        # `flock` on the unit's own directory (a separate open file
+        # description per call, so threads of one process exclude each
+        # other too) around reading the record, asking and recording.
+        # Whoever waited reads the record the first one wrote. A lock that
+        # cannot be taken leaves the query unlocked: it is idempotent.
+        let fd = posix.open(cstring(unitDir), O_RDONLY or O_DIRECTORY or
+          O_CLOEXEC)
+        if fd >= 0:
+          while flock(fd, LOCK_EX) != 0 and errno == EINTR:
+            discard
+        defer:
+          if fd >= 0: discard posix.close(fd)
+        if recorded(unitDir, answer, result):
+          memoStore(unitDir, result, answer)
+          return
+        result = askManagerDelegate(unitDir, answer)
+        if result == daYes:
+          # Nothing to tell on a "yes", unless it could not be recorded.
+          answer = ""
+        if result in {daYes, daNo}:
+          let value = $result
+          if setxattr(cstring(unitDir), cstring(DelegationRecordAttr),
+              cstring(value), csize_t(value.len), 0) != 0:
+            let failure = "could not record systemd's answer in " &
+              DelegationRecordAttr & " on " & unitDir & " (" &
+              $strerror(errno) & "), so every new launcher asks again"
+            answer = if answer.len > 0: answer & "; " & failure else: failure
+        memoStore(unitDir, result, answer)
+      else:
+        answer = "cgroups exist only on Linux"
+        result = daUnknown
+    except CatchableError:
+      answer = "systemd could not be asked: " & getCurrentExceptionMsg()
+      result = daUnknown
+
+proc parseCount(text: string; value: var int64): bool =
+  ## A non-negative decimal count, or false.
+  let digits = text.strip()
+  if digits.len == 0 or digits.len > 18:
+    return false
+  var parsed = 0'i64
+  for ch in digits:
+    if ch notin {'0'..'9'}:
+      return false
+    parsed = parsed * 10 + int64(ord(ch) - ord('0'))
+  value = parsed
+  true
+
+proc defaultTasksMaxThreshold*(read: CgroupFileRead): int64 =
+  ## systemd's default per-unit task limit on this host, 15% of the smaller
+  ## of `/proc/sys/kernel/pid_max` and `/proc/sys/kernel/threads-max`
+  ## (`min * 15 div 100`), read through `read`; -1 when either cannot be
+  ## read. systemd writes that default to the `pids.max` of EVERY unit it
+  ## starts, so a `pids.max` counted as a limit whatever its value would
+  ## hold every tree of every unit; a `TasksMax=` a caller sets is far
+  ## below it.
+  ##
+  ## THE ASSUMPTION: systemd's built-in `DefaultTasksMax=15%`. A host whose
+  ## manager configuration sets a lower `DefaultTasksMax=` makes every unit
+  ## read as limited, so every launcher in a unit asks once whether that
+  ## unit is delegated; the recorded answer (yes or no) bounds that to one
+  ## query per scope.
+  var pidMax, threadsMax: int64
+  if not parseCount(read(KernelPidMaxPath), pidMax) or
+      not parseCount(read(KernelThreadsMaxPath), threadsMax):
+    return -1
+  min(pidMax, threadsMax) * DefaultTasksMaxPercent div 100
+
+proc limitOf(dir: string; read: CgroupFileRead; threshold: var int64;
+             thresholdRead: var bool): string =
+  ## "<file>=<value>" for the first limit `dir` carries, or "": a memory
+  ## file other than `max`, a `pids.max` below systemd's default (or any
+  ## `pids.max` other than `max` when that default cannot be read: the safe
+  ## direction), or a `cpu.max` whose quota is not `max`.
+  for file in MemoryLimitFiles:
+    let value = read(dir & "/" & file).strip()
+    if value.len > 0 and value != "max":
+      return file & "=" & value
+  let pids = read(dir & "/pids.max").strip()
+  if pids.len > 0 and pids != "max":
+    if not thresholdRead:
+      threshold = defaultTasksMaxThreshold(read)
+      thresholdRead = true
+    var count: int64
+    if threshold < 0 or not parseCount(pids, count) or count < threshold:
+      return "pids.max=" & pids
+  let cpuMax = read(dir & "/cpu.max").strip()
+  let fields = cpuMax.splitWhitespace()
+  if fields.len > 0 and fields[0] != "max":
+    return "cpu.max=" & cpuMax
+  ""
+
+proc limitingCgroup*(ownCgroup, rootPath, agentScope: string;
+                     read: CgroupFileRead): CallerLimit =
+  ## The deepest limited cgroup a tree placed under `rootPath` would leave:
+  ## among the launcher's own cgroup (`ownCgroup`, relative to the mount)
+  ## and its ancestors up to, not including, the deepest one that is also
+  ## `rootPath` or an ancestor of it -- a limit on that common ancestor or
+  ## above covers the root too. A cgroup whose directory name is exactly
+  ## `agentScope` (non-empty) is skipped: the agent session's scope. Checked
+  ## from the launcher's own cgroup upward, so the first limited one found
+  ## is the deepest.
+  let own = cgroupComponents(ownCgroup)
+  if own.len == 0:
+    return
+  var rootRelative = rootPath
+  if rootRelative.startsWith(CgroupMountPoint & "/"):
+    rootRelative = rootRelative[CgroupMountPoint.len .. ^1]
+  let root = cgroupComponents(rootRelative)
+  var common = 0
+  while common < own.len and common < root.len and
+      own[common] == root[common]:
+    inc common
+  var threshold = -1'i64
+  var thresholdRead = false
+  var depth = own.len
+  while depth > common:
+    let name = own[depth - 1]
+    if agentScope.len == 0 or name != agentScope:
+      let dir = CgroupMountPoint & "/" & own[0 ..< depth].join("/")
+      let limit = limitOf(dir, read, threshold, thresholdRead)
+      if limit.len > 0:
+        return CallerLimit(dir: dir, limit: limit)
+    dec depth
+
+proc heldRoot(candidate: CgroupRoot; ownCgroup, agentScope,
+              defaultRoot: string; read: CgroupFileRead;
+              delegated: CgroupDelegationRead; mayAsk: bool): CgroupRoot =
+  ## `candidate`, or the root inside the caller's limited cgroup that holds
+  ## the tree instead, or a refusal naming that cgroup (the module header).
+  let limited = limitingCgroup(ownCgroup, candidate.path, agentScope, read)
+  if limited.dir.len == 0:
+    return candidate
+  # RunQuota's own placement: below the root this launch would use (the
+  # default or an explicit one), the default root, or a holder's root.
+  if insideRunQuotaPlacement(limited.dir, candidate.path) or
+      insideRunQuotaPlacement(limited.dir, defaultRoot):
+    # The launcher runs inside a tree RunQuota already placed (a cap leaf,
+    # or a holder root): that limit is RunQuota's own. Nothing is placed,
+    # and nothing there is moved, enabled or marked.
+    return CgroupRoot(state: crsUnavailable,
+      reason: "the launcher runs inside another RunQuota-placed tree (" &
+        limited.dir & ", " & limited.limit & "), which keeps its tree " &
+        "where it is")
+  var answer = ""
+  let unit = delegationUnit(limited.dir, answer)
+  if unit.len == 0:
+    # Not a cgroup systemd can delegate at all (a slice, the user manager,
+    # a plain cgroup of either): no `Delegate=yes` would help.
+    return CgroupRoot(state: crsUnavailable,
+      reason: "cgroup " & limited.dir & " has a limit (" & limited.limit &
+        ") that a tree placed under " & candidate.path & " would leave, " &
+        "and " & answer & ": it cannot be delegated, so RunQuota cannot " &
+        "place the tree inside it; the tree runs in the launcher's cgroup, " &
+        "under the limit")
+  let verdict = delegated(unit, mayAsk, answer)
+  if verdict != daYes:
+    return CgroupRoot(state: crsUnavailable,
+      reason: "cgroup " & limited.dir & " has a limit (" & limited.limit &
+        ") that a tree placed under " & candidate.path & " would leave, " &
+        "and it is " & (if verdict == daUnknown: "not known to be " else: "not ") &
+        "delegated (" & answer & "), so RunQuota cannot " &
+        "place the tree inside it; start the caller with -p Delegate=yes (systemd-run) to keep " &
+        "the tree under the limit with RunQuota's placement, or name its " &
+        "unit in " & AgentSessionScopeEnvVar & " if it is the agent " &
+        "session's scope; the tree runs in the launcher's cgroup, under " &
+        "the limit")
+  result = candidate
+  result.path = limited.dir & "/" & HolderRootName
+  result.holder = limited.dir
+  result.holderLimit = limited.limit
+  # A "yes" that could not be recorded: every new launcher will ask again,
+  # and its placement note says why.
+  result.holderNote = answer
+
 proc resolveCgroupRoot*(envValue, procSelfCgroup: string; uid: int;
-                        hostSwitchOn: bool; isLinux = defined(linux)):
+                        hostSwitchOn: bool; isLinux = defined(linux);
+                        read: CgroupFileRead = readCgroupInterfaceFile;
+                        agentScope = "";
+                        delegated: CgroupDelegationRead = cgroupDelegated;
+                        mayAsk = true):
     CgroupRoot =
   ## The root a launcher of user `uid` places trees under, from the value of
   ## `RUNQUOTA_CGROUP_ROOT`, the host file's `[enforcement] cgroups`
@@ -523,6 +1223,13 @@ proc resolveCgroupRoot*(envValue, procSelfCgroup: string; uid: int;
   ## host switch decides, and it is off unless the host file turns it on
   ## (placement has not passed the overhead gate; the specification's
   ## enforcement switches).
+  ##
+  ## THE CALLER'S LIMITS, for a default or explicit root alike: the deepest
+  ## limited cgroup between the launcher and the root, other than the
+  ## cgroup named `agentScope`, holds the tree (`heldRoot`). The interface
+  ## files go through `read` and the delegation mark through `delegated`,
+  ## the real ones unless a test answers them. With placement off nothing
+  ## is read.
   let value = envValue.strip()
   if value == CgroupRootOff:
     return CgroupRoot(state: crsOff,
@@ -539,8 +1246,12 @@ proc resolveCgroupRoot*(envValue, procSelfCgroup: string; uid: int;
     if problem.len > 0:
       return CgroupRoot(state: crsUnavailable,
         reason: CgroupRootEnvVar & ": " & problem)
-    return CgroupRoot(state: crsExplicit, path: value.strip(leading = false,
-      chars = {'/'}))
+    let explicit = CgroupRoot(state: crsExplicit, path: value.strip(
+      leading = false, chars = {'/'}))
+    # A process with no cgroup v2 line is under no cgroup v2 limit to leave.
+    let own = parseOwnCgroup(procSelfCgroup)
+    return heldRoot(explicit, own, agentScope, defaultRootFor(own, uid),
+      read, delegated, mayAsk)
   let own = parseOwnCgroup(procSelfCgroup)
   if own.len == 0:
     return CgroupRoot(state: crsUnavailable,
@@ -551,7 +1262,8 @@ proc resolveCgroupRoot*(envValue, procSelfCgroup: string; uid: int;
       reason: "this process (cgroup " & own & ") is not inside user@" & $uid &
         ".service, the subtree systemd delegates to the user; set " &
         CgroupRootEnvVar & " to a delegated cgroup")
-  CgroupRoot(state: crsDefault, path: root)
+  heldRoot(CgroupRoot(state: crsDefault, path: root), own, agentScope, root,
+    read, delegated, mayAsk)
 
 proc usable*(root: CgroupRoot): bool =
   root.state in {crsDefault, crsExplicit}
@@ -563,8 +1275,11 @@ proc targetFor*(root: CgroupRoot; group: string; priority: SessionPriority;
   ## reclaimed subtree whatever their group. `capMilli > 0` asks for a cap
   ## leaf of its own. An unusable root gives an empty target (no placement).
   if not root.usable:
-    return CgroupTarget()
+    return CgroupTarget(unplacedReason: root.reason)
   result.root = root.path
+  result.holder = root.holder
+  result.holderLimit = root.holderLimit
+  result.holderNote = root.holderNote
   if reclaimed:
     result.dirName = ReclaimedDirName
     result.cpuWeight = ReclaimedCpuWeight
@@ -581,27 +1296,32 @@ proc targetFor*(root: CgroupRoot; group: string; priority: SessionPriority;
 # The host
 # ---------------------------------------------------------------------------
 
-proc currentCgroupRoot*(hostSwitchOn = false): CgroupRoot =
+proc currentCgroupRoot*(hostSwitchOn = false; mayAsk = true): CgroupRoot =
   ## The root for this process, from its environment, the host switch the
   ## caller read (`[enforcement] cgroups`; a library caller that reads no
   ## host file passes nothing, so only an explicit root turns placement on)
   ## and its own cgroup.
   ##
-  ## OFF COSTS NOTHING. `/proc/self/cgroup` and the effective uid are read
-  ## only when the answer can depend on them (the default root with the host
-  ## switch on): with placement off a launch must make no system call it did
-  ## not make before placement existed.
+  ## OFF COSTS NOTHING. `/proc/self/cgroup`, the cgroup files of the limit
+  ## check and the effective uid are read only when the answer can depend
+  ## on them (placement on): with placement off a launch must make no system
+  ## call it did not make before placement existed.
   when defined(linux):
     let value = getEnv(CgroupRootEnvVar).strip()
     var own = ""
     var uid = 0
-    if value.len == 0 and hostSwitchOn:
+    let defaultOn = value.len == 0 and hostSwitchOn
+    # The launcher's own cgroup (and uid, which locates the default root,
+    # RunQuota's own placement) are read whenever placement is on: both the
+    # root and the caller's limits depend on them.
+    if defaultOn or (value.len > 0 and value != CgroupRootOff):
       uid = int(geteuid())
       try:
         own = readFile("/proc/self/cgroup")
       except IOError, OSError:
         own = ""
-    resolveCgroupRoot(value, own, uid, hostSwitchOn)
+    resolveCgroupRoot(value, own, uid, hostSwitchOn,
+      agentScope = getEnv(AgentSessionScopeEnvVar).strip(), mayAsk = mayAsk)
   else:
     resolveCgroupRoot(getEnv(CgroupRootEnvVar), "", 0, hostSwitchOn)
 
@@ -784,6 +1504,108 @@ when defined(posix):
     memory.limits = true
     true
 
+
+when defined(linux):
+  proc holderReady(dir: string): bool =
+    ## Whether L needs nothing: no process of its own, and `cpu` (and
+    ## `memory` where L has it) enabled below it. Read without the lock;
+    ## the common case of every launch after the first.
+    if readSmall(dir / "cgroup.procs").strip().len > 0:
+      return false
+    let enabled = readSmall(dir / "cgroup.subtree_control")
+    if not hasController(enabled, "cpu"):
+      return false
+    if hasController(readSmall(dir / "cgroup.controllers"), "memory") and
+        not hasController(enabled, "memory"):
+      return false
+    true
+
+  proc moveHolderProcesses(dir: string; problem: var string): bool =
+    ## Every process in L itself into the leaf `L/caller`, re-reading L's
+    ## `cgroup.procs` until it is empty (a forking caller adds processes
+    ## while they move), at most `HolderMoveRounds` times. A process that
+    ## exits in between (ESRCH) is not a failure.
+    let leaf = dir / HolderCallerLeaf
+    var vanished = false
+    if not ensureDir(leaf, problem, vanished):
+      return false
+    for _ in 0 ..< HolderMoveRounds:
+      let pids = readSmall(dir / "cgroup.procs").splitWhitespace()
+      if pids.len == 0:
+        return true
+      for pid in pids:
+        var moveProblem = ""
+        if not writeCgroupFile(leaf / "cgroup.procs", pid, moveProblem) and
+            errno != ESRCH:
+          problem = "cannot move process " & pid & " of " & dir &
+            " into " & leaf & ": " & moveProblem
+          return false
+    problem = "processes kept appearing in " & dir & " after " &
+      $HolderMoveRounds & " rounds of moving them into " & leaf
+    false
+
+proc prepareHolder*(target: CgroupTarget; problem: var string): bool =
+  ## Make the limited, delegated cgroup L that holds the root
+  ## (`target.holder`) able to hold it: L's own processes (the caller's, in
+  ## a delegated scope) moved into the leaf `L/caller`, then `+cpu` (and
+  ## `+memory` where L has it) enabled in L's `cgroup.subtree_control`.
+  ## cgroup v2 allows controllers below a cgroup only once it holds no
+  ## process ("no internal process" rule), and systemd's delegation
+  ## contract asks the payload of a delegated cgroup to keep its processes
+  ## in leaves (https://systemd.io/CGROUP_DELEGATION/).
+  ##
+  ## UNDER L's EXCLUSIVE LOCK (a `flock` on L's directory, as
+  ## `lockCgroupRoot` takes on a root): several launchers in one L would
+  ## otherwise race to move each other and to enable controllers. Each
+  ## re-checks under the lock, so the second finds the work done. Nothing
+  ## here writes `memory.oom.group`. False with `problem` (naming L, its
+  ## limit and `-p Delegate=yes`) when it cannot be done; the tree then runs
+  ## where the launcher is, inside L.
+  when defined(linux):
+    let dir = target.holder
+    if dir.len == 0 or holderReady(dir):
+      return true
+    # A holder this process already found it cannot use (the controller is
+    # not delegated to it) is refused at once, without taking its lock.
+    var known: DelegationAnswer
+    if memoLookup("holder:" & dir, known, problem):
+      return false
+    # Delegated, but the cpu controller does not reach it: nothing a launch
+    # can do, and nothing to move.
+    if not hasController(readSmall(dir / "cgroup.controllers"), "cpu"):
+      problem = "cannot place the tree inside cgroup " & dir & " (its " &
+        target.holderLimit & " holds the launcher): " & dir & " is " &
+        "delegated but the cpu controller is not delegated to it; the tree " &
+        "runs in the launcher's cgroup, under the limit"
+      memoStore("holder:" & dir, daNo, problem)
+      return false
+    let fd = posix.open(cstring(dir), O_RDONLY or O_DIRECTORY or O_CLOEXEC)
+    # A lock that cannot be taken leaves the work unlocked, as a root's
+    # does: each step accepts what a concurrent launcher already did.
+    if fd >= 0:
+      while flock(fd, LOCK_EX) != 0 and errno == EINTR:
+        discard
+    defer:
+      if fd >= 0: discard posix.close(fd)
+    var why = ""
+    var vanished = false
+    if holderReady(dir):
+      return true
+    if not moveHolderProcesses(dir, why) or
+        not enableControllerBelow(dir, "cpu", why, vanished):
+      problem = "cannot place the tree inside cgroup " & dir & " (its " &
+        target.holderLimit & " holds the launcher): " & why &
+        "; the tree runs in the launcher's cgroup, under the limit"
+      return false
+    if hasController(readSmall(dir / "cgroup.controllers"), "memory"):
+      # Optional: a root without memory is reported by the memory cap.
+      var memoryWhy = ""
+      discard enableControllerBelow(dir, "memory", memoryWhy, vanished)
+    true
+  else:
+    problem = "cgroups exist only on Linux"
+    false
+
 proc prepareTarget*(target: CgroupTarget; problem: var string;
                     vanished: var bool;
                     memory: var MemoryPreparation): bool =
@@ -810,6 +1632,8 @@ proc prepareTarget*(target: CgroupTarget; problem: var string;
   when defined(linux):
     if not target.placed:
       problem = "no cgroup root"
+      return false
+    if target.holder.len > 0 and not prepareHolder(target, problem):
       return false
     if not ensureDir(target.root, problem, vanished): return false
     if not enableCpuBelow(target.root, problem, vanished): return false
@@ -875,12 +1699,6 @@ proc prepareTarget*(target: CgroupTarget; problem: var string): bool =
   var vanished = false
   prepareTarget(target, problem, vanished)
 
-when defined(linux):
-  var O_DIRECTORY {.importc, header: "<fcntl.h>".}: cint
-  proc flock(fd: cint; operation: cint): cint {.importc, header: "<sys/file.h>".}
-  var
-    LOCK_SH {.importc, header: "<sys/file.h>".}: cint
-    LOCK_EX {.importc, header: "<sys/file.h>".}: cint
 
 proc lockCgroupRoot*(root: string; exclusive: bool; create = true): cint =
   ## Hold the root's lock: SHARED by a launcher from reading its group's
@@ -1060,7 +1878,12 @@ proc probeRoot*(root: CgroupRoot): string =
     let parent = root.path.parentDir
     if not dirExists(parent):
       return "the parent of the cgroup root does not exist: " & parent
-    if not hasController(readSmall(parent / "cgroup.subtree_control"), "cpu"):
+    if root.holder.len > 0:
+      # The first launch enables the controllers below the holder
+      # (`prepareHolder`); what matters now is that it has them.
+      if not hasController(readSmall(parent / "cgroup.controllers"), "cpu"):
+        return "the cpu controller is not available in " & parent
+    elif not hasController(readSmall(parent / "cgroup.subtree_control"), "cpu"):
       return "the cpu controller is not delegated to " & parent &
         " (missing from its cgroup.subtree_control)"
     if posix.access(cstring(parent), W_OK) != 0:

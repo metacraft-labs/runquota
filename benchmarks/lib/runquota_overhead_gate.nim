@@ -880,16 +880,22 @@ proc run64Script(cli: string): string =
     "for p in $pids; do wait $p || fail=1; done; exit $fail"
 
 proc gateCgroupRoot(): string =
-  ## A gate-owned cgroup root below this user's delegated subtree, or "".
-  ## cgroup v2 is Linux-only; callers already treat "" (no root) as a
-  ## reason to refuse `--switch=cgroups` (`CaseUnavailable`) or, for
-  ## `--switch=memory-cap`, as "this OS enforces the cap by a different
-  ## mechanism" (Windows: a Job Object; the Linux-only path below is never
-  ## reached there).
+  ## A gate-owned cgroup root below this user's delegated subtree, beside
+  ## `runquota.slice`, or "". cgroup v2 is Linux-only; callers already treat
+  ## "" (no root) as a reason to refuse `--switch=cgroups`
+  ## (`CaseUnavailable`) or, for `--switch=memory-cap`, as "this OS enforces
+  ## the cap by a different mechanism" (Windows: a Job Object). Resolved as
+  ## a launcher would (with the agent session's marker, so a gate run from
+  ## an agent session keeps its root), read-only: the gate asks no manager
+  ## and writes nothing. A gate under another limited cgroup would have its
+  ## clients' trees held inside that cgroup, not beside `runquota.slice`, so
+  ## it gets no root.
   when defined(linux):
     let own = try: readFile("/proc/self/cgroup") except IOError, OSError: ""
-    let default = resolveCgroupRoot("", own, int(getuid()), hostSwitchOn = true)
-    if not default.usable:
+    let default = resolveCgroupRoot("", own, int(getuid()),
+      hostSwitchOn = true, agentScope = getEnv(AgentSessionScopeEnvVar).strip(),
+      mayAsk = false)
+    if not default.usable or default.holder.len > 0:
       return ""
     default.path.parentDir / ("runquota-gate-" & $getpid() & ".slice")
   else:

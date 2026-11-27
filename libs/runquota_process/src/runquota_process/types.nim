@@ -144,6 +144,10 @@ type
       ## placed.
     cgroupProblem*: string
       ## Why a requested placement did not happen, or "".
+    cgroupNote*: string
+      ## Something about a placement that did happen that its user should
+      ## know (systemd's answer on the caller's cgroup could not be
+      ## recorded, so every launcher asks again), or "".
     fallbackNice*: int
       ## The nice the child took in place of its cgroup when it was not
       ## placed (`CommandSpec.placementFallbackNice`, or the one the launch

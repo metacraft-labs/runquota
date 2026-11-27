@@ -2138,9 +2138,23 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     var cloneErrno: cint = 0
     var againTarget = CgroupTarget()
     var againRetryable = false
+    let placementNoteText = spec.cgroup.holderNote
     when defined(linux):
+      # A CALLER'S LIMITED CGROUP THAT HOLDS THE ROOT is made ready first
+      # (`prepareHolder`: its processes moved, its controllers enabled), and
+      # only then is anything created in it: the root's lock below creates
+      # `L/runquota`, which must not be left behind for a holder that turns
+      # out unusable. A refused holder leaves the tree where the launcher
+      # is, with the reason, like any unavailable placement.
+      if target.placed and target.holder.len > 0:
+        if not prepareHolder(target, placementProblem):
+          target = CgroupTarget(unplacedReason: placementProblem)
       if memoryWanted and not target.placed:
-        memoryCapProblem = "no cgroup root"
+        # The root's own reason when there was one (a caller's limited
+        # cgroup that is not delegated, say), so the report names it.
+        memoryCapProblem =
+          if target.unplacedReason.len > 0: target.unplacedReason
+          else: "no cgroup root"
       if memoryWanted and target.placed:
         # The gate-only stage, read once per launch from the LAUNCHER's own
         # environment and only for a capped tree, so an uncapped launch
@@ -2488,6 +2502,7 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         backend: backendProfile(),
         cgroupPath: placedLeaf,
         cgroupProblem: placementProblem,
+        cgroupNote: placementNoteText,
         fallbackNice: fallbackNiceWanted,
         qosTier: qosTierWanted,
         spawnedByClone3: spawnedByClone3,

@@ -289,7 +289,8 @@ proc printStatus(json: bool): int =
   # THE MEMORY-CAP MODE the host file sets for this client's launchers goes
   # into the record too, so the record says whether a cap is off, advisory
   # or enforced here.
-  let enforcement = hostEnforcementRecord(launcherCgroupRoot(),
+  # Read-only: a status query asks no manager and writes nothing.
+  let enforcement = hostEnforcementRecord(launcherCgroupRoot(mayAsk = false),
     jobPriorityOn = launcherJobPriorityOn(),
     qosOn = launcherQosOn(),
     memoryCapMode = launcherMemoryCapMode())
@@ -460,7 +461,8 @@ proc runSessionSet(args: seq[string]): int =
       # launcher that read the older priority nor a concurrent set can
       # leave the older weight behind.
       var query = GroupPriorityQuery(client: addr client, group: answer.group)
-      let problem = rewriteGroupWeight(launcherCgroupRoot(), answer.group,
+      let problem = rewriteGroupWeight(launcherCgroupRoot(mayAsk = false),
+        answer.group,
         answer.priority, query.groupPrioritySource())
       if problem.len > 0:
         stderr.writeLine("runquota session set: the priority is set, but " &

@@ -19,6 +19,8 @@
 ## `memoryCapUnsafeReason`); only `queryUnitPolicy` runs `systemctl show`.
 
 import std/[monotimes, os, osproc, streams, strutils, times]
+when defined(linux):
+  import runquota_process/cgroup_placement
 
 type
   EnclosingUnit* = object
@@ -38,7 +40,7 @@ type
 
 const
   CgroupMount = "/sys/fs/cgroup"
-  SystemctlTimeoutMillis* = 5_000
+  UnitPolicyQueryTimeoutMillis* = 5_000
 
 proc isUnitName(component: string): bool =
   component.endsWith(".service") or component.endsWith(".scope")
@@ -125,7 +127,7 @@ proc memoryCapUnsafeReason*(policy: UnitPolicy): string =
   reasons.join(", ")
 
 proc queryUnitPolicy*(unit: EnclosingUnit;
-                      timeoutMillis = SystemctlTimeoutMillis;
+                      timeoutMillis = UnitPolicyQueryTimeoutMillis;
                       systemctl = ""): UnitPolicy =
   ## `systemctl [--user] show <unit> -p Delegate -p OOMPolicy`, bounded by
   ## `timeoutMillis` (a hung bus must not hang `runquota status`): polled
@@ -140,36 +142,48 @@ proc queryUnitPolicy*(unit: EnclosingUnit;
   if unit.userManager:
     args.add("--user")
   args.add(["show", unit.name, "-p", "Delegate", "-p", "OOMPolicy"])
-  var process: Process
-  try:
-    process = startProcess(program, args = args,
-      options = {poStdErrToStdOut})
-  except OSError as error:
-    return UnitPolicy(problem: "cannot run systemctl: " & error.msg)
-  defer: process.close()
-  let deadline = getMonoTime() + initDuration(milliseconds = timeoutMillis)
-  var code = -1
-  try:
-    while true:
-      code = process.peekExitCode()
-      if code != -1:
-        break
-      if getMonoTime() >= deadline:
-        process.kill()
-        discard process.waitForExit()
-        return UnitPolicy(problem: "systemctl show did not answer within " &
-          $timeoutMillis & " ms")
-      sleep(10)
-    # The answer is two short lines, so it fits the pipe and nothing
-    # blocked on reading it while the loop waited.
-    let output = process.outputStream.readAll()
+  when defined(linux):
+    # The launcher's own bounded runner (`runBoundedCommand`): posix_spawn,
+    # a close-on-exec pipe read without blocking, killed and reaped at the
+    # deadline, with the environment scrubbed to what systemctl needs.
+    var output, problem, note = ""
+    let code = runBoundedCommand(program, args, systemctlEnvironment(),
+      timeoutMillis, output, problem, note)
+    if code < 0:
+      return UnitPolicy(problem: "systemctl show: " & problem)
     if code != 0:
       return UnitPolicy(problem: "systemctl show exited " & $code & ": " &
         output.strip())
     parseUnitPolicy(output)
-  except OSError, IOError:
-    UnitPolicy(problem: "cannot read systemctl's answer: " &
-      getCurrentExceptionMsg())
+  else:
+    var process: Process
+    try:
+      process = startProcess(program, args = args,
+        options = {poStdErrToStdOut})
+    except OSError as error:
+      return UnitPolicy(problem: "cannot run systemctl: " & error.msg)
+    defer: process.close()
+    let deadline = getMonoTime() + initDuration(milliseconds = timeoutMillis)
+    var code = -1
+    try:
+      while true:
+        code = process.peekExitCode()
+        if code != -1:
+          break
+        if getMonoTime() >= deadline:
+          process.kill()
+          discard process.waitForExit()
+          return UnitPolicy(problem: "systemctl show did not answer within " &
+            $timeoutMillis & " ms")
+        sleep(10)
+      let output = process.outputStream.readAll()
+      if code != 0:
+        return UnitPolicy(problem: "systemctl show exited " & $code & ": " &
+          output.strip())
+      parseUnitPolicy(output)
+    except OSError, IOError:
+      UnitPolicy(problem: "cannot read systemctl's answer: " &
+        getCurrentExceptionMsg())
 
 proc unitPolicyLines*(unit: EnclosingUnit; policy: UnitPolicy): seq[string] =
   ## `runquota status` text: the unit and its policy, then a

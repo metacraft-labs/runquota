@@ -61,7 +61,9 @@ suite "the unit enclosing the cgroup root":
     createDir(dir)
     defer: removeDir(dir)
     let slow = dir / "systemctl"
-    writeFile(slow, "#!/bin/sh\nsleep 30\n")
+    # Absolute: systemctl runs with an environment that has no PATH.
+    writeFile(slow, "#!/bin/sh\n" & findExe("sleep", followSymlinks = false) &
+      " 30\n")
     setFilePermissions(slow, {fpUserRead, fpUserWrite, fpUserExec})
     let started = epochTime()
     let policy = queryUnitPolicy(EnclosingUnit(name: "x.service"),
