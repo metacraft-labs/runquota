@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | The Windows `--switch=memory-cap` arm on `run-64` now runs end to end against real `runquota`/`runquotad` binaries (see "part 3" below); a full-precision verdict run is in progress, to be recorded in RunQuota-Memory-Caps.md § "Verdicts" |
+| Status | Resolved. The gate builds and runs real, full-precision verdicts on Windows, `synthetic` and `run-64` (plain and `--switch=memory-cap`) both. Two Windows defects found along the way are fixed (part 3, part 4 below). What the Windows memory-cap verdict itself found -- a confirmed overhead-budget fail, not a gate defect -- is tracked separately: `issues/2026-11-27-windows-memory-cap-exceeds-the-cpu-overhead-budget-on-run-64.md` |
 | Observed in | `runquota` @ `7c98da54` (`agents` tip); Nim 2.2.8 + WinLibs gcc 16.1.0, eli-pc (Windows 11 x86_64) |
 | Area | `benchmarks/lib/runquota_overhead_gate.nim`; `benchmarks/lib/runquota_overhead_gate/process_cost.nim` |
 | Expectation | RunQuota-Memory-Caps.md's § "The overhead rule" directs each new enforcement mechanism to be judged with this gate, naming a Windows arm (`--switch memory-cap`) explicitly, "each on its own platform, by its driver." |
