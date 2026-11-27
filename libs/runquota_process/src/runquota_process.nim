@@ -965,23 +965,55 @@ when defined(posix):
       # zombie's IO counters, then reap it below as always (Linux takes
       # the counters from the `wait4` below instead). `waitid` with
       # `WNOWAIT` leaves the child waitable, so the `wait4` that follows
-      # returns at once with the same status and the rusage. A `waitid` that
-      # fails, or reports no exit yet under `WNOHANG`, changes nothing:
-      # `wait4` below gives the same answer it always did.
-      if child.sizingData and not child.ioTotals.known:
+      # returns at once with the same status and the rusage.
+      # The cap's watch reads the root's high-water mark from the same
+      # zombie: its own peak, however short, and however soon it exited.
+      let wantIo = child.sizingData and not child.ioTotals.known
+      let wantPeak = child.memoryCap.active and not child.memoryCap.rootPeakRead
+      if wantIo or wantPeak:
         var info: SigInfo
         zeroMem(addr info, sizeof(info))
         let flags = WEXITED or WNOWAIT or (options and WNOHANG)
-        if waitid(pPid, Id(child.pid), info, flags) == 0 and
-            info.si_pid == Pid(child.pid):
-          child.ioTotals = readExitedRootIo(child.pid)
-        elif (options and WNOHANG) != 0:
-          # Not exited yet (or the probe failed): `wait4` with WNOHANG
-          # answers the same, so nothing is lost by asking it.
-          discard
+        let probed = waitid(pPid, Id(child.pid), info, flags)
+        if probed == 0 and info.si_pid == Pid(child.pid):
+          if wantIo:
+            child.ioTotals = readExitedRootIo(child.pid)
+          if wantPeak:
+            var footprint, lifetimeMax: uint64
+            if readMacosProcessFootprint(uint64(child.pid), footprint,
+                                         lifetimeMax):
+              let wasExceeded = child.memoryCap.exceeded
+              child.memoryCap.observeExitedRoot(lifetimeMax)
+              # A BREACH FIRST SEEN AT THE ROOT'S EXIT, under `mcaKill`: the
+              # root peaked and exited before any reading. The root itself
+              # has finished (its status stands, so the tree is reported as
+              # over its cap but not killed), but what is left of its tree is
+              # killed, as it would have been at a reading.
+              if not wasExceeded and child.memoryCap.exceeded and
+                  child.memoryCap.action == mcaKill and
+                  child.memoryCap.applied:
+                child.memoryCap.killedAfterRootExit = killMacosTree(
+                  child.memoryCap.root,
+                  (if child.memoryCap.ownGroup: child.processGroupId else: 0),
+                  trackedMembers(child.memoryCap.tracker))
+        elif probed == 0 and (options and WNOHANG) != 0:
+          # NOT EXITED YET, so answer that and do NOT go on to `wait4`. The
+          # root can exit between the two calls, and a `wait4` that then
+          # reaped it would consume the zombie this probe exists to read:
+          # its figures would be lost for good, and the finish would carry no
+          # root peak and no IO (measured on macOS 26.5: one launch in 30 lost the
+          # root's peak this way). The next poll finds the zombie, reads it
+          # and reaps it.
+          return Pid(0)
+        # A probe that FAILED changes nothing: `wait4` below gives the answer
+        # it always did, without the zombie's figures.
     var usage: Rusage
     result = wait4(Pid(child.pid), addr status, options, addr usage)
     if result == Pid(child.pid):
+      # The root is reaped: no reading of its tree follows, so the cap's
+      # kqueue goes now, on every path to the completion, rather than at
+      # `close` (which a caller may never call).
+      close(child.memoryCap.tracker)
       child.rusageKnown = true
       child.rusageUserMicros = timevalMicros(usage.ru_utime)
       child.rusageSysMicros = timevalMicros(usage.ru_stime)
@@ -1038,6 +1070,15 @@ when defined(posix):
           result.memoryProfile = sampler.memoryProfile()
     if child.sizingData:
       result.io = child.ioTotals
+    if child.memoryCap.active:
+      result.memoryCapBytes = child.memoryCap.capBytes
+      result.memoryCapProblem = child.memoryCap.problem
+      if child.memoryCap.applied:
+        result.memoryCapMeasured = true
+        result.capExceeded = child.memoryCap.exceeded
+        result.capKilled = child.memoryCap.killed
+        result.memoryPeakBytes = child.memoryCap.peakBytes
+        result.memoryPeakSource = mpsPoll
     if not timedOut:
       if WIFEXITED(status):
         result.exited = true
@@ -1601,6 +1642,27 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       # Directories a failed attempt prepared are left empty; take them away
       # unless another tree is in them.
       releaseTarget(target)
+    # macOS judges the cap itself, from its own readings of the tree
+    # (`runquota_process/memory_cap_watch`); Linux's cap is the tree's cgroup leaf
+    # and Windows's its Job Object, so neither reads the tree for it. The
+    # tracker is opened at once, so it watches the root before the child's
+    # command can fork (whatever the child forked before it, the tracker's
+    # first list finds).
+    var memoryCap = MemoryCapWatch()
+    when defined(macosx):
+      memoryCap = initMemoryCapWatch(spec.memoryCapBytes,
+        spec.memoryCapAction, spec.memoryCapMeasure)
+      if memoryCap.active:
+        memoryCap.ownGroup = spec.createProcessGroup
+        memoryCap.tracker = openMacosTreeTracker(uint64(pid))
+        if memoryCap.tracker.isOpen and
+            readMacosTreeMember(int32(pid), memoryCap.root):
+          memoryCap.applied = true
+        else:
+          memoryCap.problem = "the macOS tree tracker could not be armed: " &
+            (if memoryCap.tracker.problem.len > 0: memoryCap.tracker.problem
+             else: "the root could not be read")
+          close(memoryCap.tracker)
     var sampler = initCpuProfileSampler()
     if profiles or sizingData:
       # The profile's clock starts at 0, the launch.
@@ -1636,9 +1698,12 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         cgroupPath: placedLeaf,
         cgroupProblem: placementProblem,
         fallbackNice: fallbackNiceWanted,
-        qosTier: qosTierWanted
+        qosTier: qosTierWanted,
+        memoryCapApplied: memoryCap.applied,
+        memoryCapProblem: memoryCap.problem
       ),
-      cgroupTarget: placedTarget
+      cgroupTarget: placedTarget,
+      memoryCap: memoryCap
     )
   elif defined(windows):
     # Windows: delegate to the Job-Object-aware launcher above.
@@ -1761,6 +1826,29 @@ proc pollCompletion*(child: var LaunchedProcess): bool =
         child.launchMonoMillis
       let profileDue = (child.profiles or child.sizingData) and
         child.profileSampler.due(sinceLaunch)
+      # A CAPPED TREE IS READ AT THE SAME CADENCE, on the same rule (not at
+      # the first poll, then once per interval), from its tracker: kernel
+      # events keep its members, so a reading is one footprint read per
+      # member and no search for them.
+      let capDue = child.memoryCap.active and
+        now - max(child.memoryCap.lastReadingSeconds, child.startedSeconds) >=
+          MemoryCapIntervalSeconds
+      when defined(macosx):
+        if capDue:
+          child.memoryCap.lastReadingSeconds = now
+          var footprint, highWater: uint64
+          var members: uint32
+          if readMacosTrackedFootprint(child.memoryCap.tracker, footprint,
+                                       highWater, members) and
+              child.memoryCap.observe(footprint, highWater) and
+              child.memoryCap.action == mcaKill:
+            # The first reading over the cap, under `mcaKill`: freeze and
+            # kill exactly this tree now. The root is reaped below as
+            # always, and its signal is the kill's evidence.
+            discard killMacosTree(child.memoryCap.root,
+              (if child.memoryCap.ownGroup: child.processGroupId else: 0),
+              trackedMembers(child.memoryCap.tracker))
+            child.memoryCap.killed = true
       if treeDue or profileDue:
         inc child.treeWalks
         let sample =
@@ -2153,6 +2241,7 @@ proc close*(child: var LaunchedProcess) =
     # launch of the group, or of a cap, removes them then).
     releaseTarget(child.cgroupTarget)
     child.cgroupTarget = CgroupTarget()
+    close(child.memoryCap.tracker)
   elif defined(windows):
     # Windows: release osproc resources and let the Job Object close. With
     # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set, closing the last handle reaps

@@ -5,6 +5,7 @@ import runquota_core/child_process
 import runquota_host
 import runquota_host_macos/types as macosTypes
 import runquota_host_macos/process_telemetry
+import runquota_host_macos/process_tracker
 
 export macosTypes
 
@@ -67,7 +68,12 @@ proc sampleMacosMemoryPressure*(required = false): HostMemoryPressureSample =
 proc sampleMacosProcessTreeTelemetry*(rootProcessId: uint64): HostProcessTreeTelemetrySample =
   sampleMacosProcessTreeTelemetryNative(rootProcessId)
 
-export process_telemetry.readMacosProcessDiskIo
+export process_telemetry.readMacosProcessDiskIo,
+  process_telemetry.MacosTreeMember, process_telemetry.macosTreeMembers,
+  process_telemetry.stillMacosTreeMember,
+  process_telemetry.readMacosProcessFootprint,
+  process_telemetry.readMacosTreeMember,
+  process_tracker
 
 when defined(macosx):
   proc sysctlbyname(name: cstring; oldp: pointer; oldlenp: ptr csize_t;

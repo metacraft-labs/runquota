@@ -10,9 +10,11 @@ when defined(macosx):
   const
     ProcPidTBsdInfo = 3.cint
     ProcPidTaskInfo = 4.cint
-    RusageFlavorV2 = 2.cint
-      ## `RUSAGE_INFO_V2` of `<sys/resource.h>`. Its leading fields are
-      ## V1's, which added the reaped-children times (`ri_child_*`).
+    RusageFlavorV4 = 4.cint
+      ## `RUSAGE_INFO_V4` of `<sys/resource.h>`. A superset of V2 (the
+      ## reaped-children times `ri_child_*` and the disk IO bytes) that adds
+      ## `ri_lifetime_max_phys_footprint`; the same one `proc_pid_rusage`
+      ## call reads it, so the footprint costs no extra system call.
     MaxChildListAttempts = 8
     MaxTreeProcesses = 65536
       ## A bound on one walk, so a fork bomb cannot make the walk itself
@@ -34,14 +36,16 @@ when defined(macosx):
       pti_total_user {.importc.}: uint64
       pti_total_system {.importc.}: uint64
 
-    RusageInfoV2 {.importc: "struct rusage_info_v2",
+    RusageInfoV4 {.importc: "struct rusage_info_v4",
                     header: "<sys/resource.h>", bycopy.} = object
       ri_user_time {.importc.}: uint64
       ri_system_time {.importc.}: uint64
+      ri_phys_footprint {.importc.}: uint64
       ri_child_user_time {.importc.}: uint64
       ri_child_system_time {.importc.}: uint64
       ri_diskio_bytesread {.importc.}: uint64
       ri_diskio_byteswritten {.importc.}: uint64
+      ri_lifetime_max_phys_footprint {.importc.}: uint64
 
     MachTimebaseInfoData {.importc: "mach_timebase_info_data_t",
                             header: "<mach/mach_time.h>", bycopy.} = object
@@ -160,7 +164,8 @@ when defined(macosx):
     nanoseconds div 1_000'u64
 
   proc readMetrics(identity: MacosProcessIdentity; residentBytes,
-                   cpuTimeMicros, cumulativeMicros: var uint64;
+                   cpuTimeMicros, cumulativeMicros, footprintBytes,
+                   lifetimeMaxFootprintBytes: var uint64;
                    timebase: MachTimebaseInfoData): bool =
     if identity.pid > uint64(high(DarwinPid)):
       return false
@@ -196,14 +201,19 @@ when defined(macosx):
     # reaped inside it. Also in Mach absolute-time ticks. A process whose
     # rusage cannot be read (it exited meanwhile) is skipped like one whose
     # task info cannot.
-    var usage: RusageInfoV2
-    if procPidRusage(pid, RusageFlavorV2, addr usage) != 0.cint:
+    var usage: RusageInfoV4
+    if procPidRusage(pid, RusageFlavorV4, addr usage) != 0.cint:
       return false
     var cumulativeTicks = usage.ri_user_time
     cumulativeTicks.checkedAdd(usage.ri_system_time)
     cumulativeTicks.checkedAdd(usage.ri_child_user_time)
     cumulativeTicks.checkedAdd(usage.ri_child_system_time)
     cumulativeMicros = absoluteTimeMicros(cumulativeTicks, timebase)
+    # The footprint is what the kernel charges the process (compressed pages
+    # included, unlike `pti_resident_size`), and the lifetime maximum is the
+    # kernel's own high-water mark of it: both from the same rusage read.
+    footprintBytes = usage.ri_phys_footprint
+    lifetimeMaxFootprintBytes = usage.ri_lifetime_max_phys_footprint
     true
 
 proc readMacosProcessDiskIo*(processId: uint64; bytesRead,
@@ -219,8 +229,8 @@ proc readMacosProcessDiskIo*(processId: uint64; bytesRead,
   when defined(macosx):
     if processId == 0'u64 or processId > uint64(high(DarwinPid)):
       return false
-    var usage: RusageInfoV2
-    if procPidRusage(cint(processId), RusageFlavorV2, addr usage) != 0.cint:
+    var usage: RusageInfoV4
+    if procPidRusage(cint(processId), RusageFlavorV4, addr usage) != 0.cint:
       return false
     bytesRead = usage.ri_diskio_bytesread
     bytesWritten = usage.ri_diskio_byteswritten
@@ -265,13 +275,20 @@ proc sampleMacosProcessTreeTelemetryNative*(
         rootProcessId,
         "the Mach absolute-time conversion is unavailable"
       )
+    var footprintBytes = 0'u64
+    var maxProcessFootprintBytes = 0'u64
     for row in tree:
-      var rowResidentBytes, rowCpuTimeMicros, rowCumulativeMicros: uint64
+      var rowResidentBytes, rowCpuTimeMicros, rowCumulativeMicros,
+        rowFootprintBytes, rowLifetimeMaxBytes: uint64
       if readMetrics(row, rowResidentBytes, rowCpuTimeMicros,
-                     rowCumulativeMicros, timebase):
+                     rowCumulativeMicros, rowFootprintBytes,
+                     rowLifetimeMaxBytes, timebase):
         residentMemoryBytes.checkedAdd(rowResidentBytes)
         cpuTimeMicros.checkedAdd(rowCpuTimeMicros)
         cumulativeMicros.checkedAdd(rowCumulativeMicros)
+        footprintBytes.checkedAdd(rowFootprintBytes)
+        maxProcessFootprintBytes = max(maxProcessFootprintBytes,
+          rowLifetimeMaxBytes)
 
     HostProcessTreeTelemetrySample(
       rootProcessId: rootProcessId,
@@ -281,6 +298,9 @@ proc sampleMacosProcessTreeTelemetryNative*(
       cpuTimeMicros: cpuTimeMicros,
       cumulativeCpuTimeMicros: cumulativeMicros,
       cumulativeCpuKnown: true,
+      footprintBytes: footprintBytes,
+      maxProcessFootprintBytes: maxProcessFootprintBytes,
+      footprintKnown: true,
       source: TelemetrySource,
       diagnostic: okDiagnostic()
     )
@@ -290,3 +310,77 @@ proc sampleMacosProcessTreeTelemetryNative*(
       rootProcessId,
       "backend is only active on macOS"
     )
+
+type
+  MacosTreeMember* = object
+    ## One process of a tree, named by its pid AND its start time, so a pid
+    ## the kernel has since reused for another process is never mistaken for
+    ## it (`stillMacosTreeMember`).
+    pid*: int32
+    startSeconds*: uint64
+    startMicroseconds*: uint64
+
+proc macosTreeMembers*(rootProcessId: uint64): seq[MacosTreeMember] =
+  ## The processes of the tree under `rootProcessId`, the root included,
+  ## found the same way the telemetry walk finds them: by ancestry, through
+  ## `proc_listchildpids`. A process that left the tree by `setsid` and
+  ## re-parenting to launchd before this walk is not found; nothing public
+  ## on macOS names it. Empty when the root is not there or off macOS.
+  when defined(macosx):
+    if rootProcessId == 0'u64 or rootProcessId > uint64(high(DarwinPid)):
+      return
+    for identity in treeIdentities(DarwinPid(rootProcessId)):
+      result.add(MacosTreeMember(pid: int32(identity.pid),
+        startSeconds: identity.startSeconds,
+        startMicroseconds: identity.startMicroseconds))
+  else:
+    discard rootProcessId
+
+proc stillMacosTreeMember*(member: MacosTreeMember): bool =
+  ## Whether `member.pid` is still the process the walk found (same start
+  ## time). A zombie still answers: its pid cannot be reused until it is
+  ## reaped.
+  when defined(macosx):
+    var now: MacosProcessIdentity
+    readIdentity(DarwinPid(member.pid), now) and
+      now.startSeconds == member.startSeconds and
+      now.startMicroseconds == member.startMicroseconds
+  else:
+    discard member
+    false
+
+proc readMacosProcessFootprint*(processId: uint64; footprintBytes,
+                                lifetimeMaxBytes: var uint64): bool =
+  ## `ri_phys_footprint` and `ri_lifetime_max_phys_footprint` of ONE
+  ## process. Works on a zombie: measured on macOS 26.5.1, a child that
+  ## touched 302 MiB and exited reads footprint 0 and lifetime maximum
+  ## 302 MiB between `waitid(WNOWAIT)` and the reap, and fails once reaped.
+  ## That is how the launcher reads its root's peak after the exit. False
+  ## when the process cannot be read.
+  when defined(macosx):
+    if processId == 0'u64 or processId > uint64(high(DarwinPid)):
+      return false
+    var usage: RusageInfoV4
+    if procPidRusage(cint(processId), RusageFlavorV4, addr usage) != 0.cint:
+      return false
+    footprintBytes = usage.ri_phys_footprint
+    lifetimeMaxBytes = usage.ri_lifetime_max_phys_footprint
+    true
+  else:
+    discard processId
+    false
+
+proc readMacosTreeMember*(pid: int32; member: var MacosTreeMember): bool =
+  ## `pid` as a tree member: its pid and start time, for a check by
+  ## `stillMacosTreeMember` before it is signalled. False when it is gone.
+  when defined(macosx):
+    var identity: MacosProcessIdentity
+    if pid <= 0 or not readIdentity(DarwinPid(pid), identity):
+      return false
+    member = MacosTreeMember(pid: pid, startSeconds: identity.startSeconds,
+      startMicroseconds: identity.startMicroseconds)
+    true
+  else:
+    discard pid
+    discard member
+    false

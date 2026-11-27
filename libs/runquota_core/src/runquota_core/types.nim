@@ -121,6 +121,20 @@ type
       ## use between two readings. Meaningful only when
       ## ``cumulativeCpuKnown``.
     cumulativeCpuKnown*: bool
+    footprintBytes*: uint64
+      ## The physical footprint of the processes alive in the tree now,
+      ## summed: what the operating system charges each process for its
+      ## memory, compressed pages included (macOS `ri_phys_footprint`). It is
+      ## the figure a memory cap compares. Meaningful only when
+      ## ``footprintKnown``.
+    maxProcessFootprintBytes*: uint64
+      ## The largest lifetime high-water mark of any ONE process alive in the
+      ## tree now (macOS `ri_lifetime_max_phys_footprint`), kept by the
+      ## kernel, so a peak of a single process between two readings is not
+      ## missed. It is not a peak of the tree: two processes' marks may come
+      ## from different moments, so they are never summed. Meaningful only
+      ## when ``footprintKnown``.
+    footprintKnown*: bool
     source*: string
     diagnostic*: Diagnostic
 

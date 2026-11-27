@@ -3,8 +3,9 @@ import std/osproc
 import runquota_core/cpu_profile
 import runquota_core/memory_cap
 import runquota_process/cgroup_placement
+import runquota_process/memory_cap_watch
 
-export cpu_profile, cgroup_placement, memory_cap
+export cpu_profile, cgroup_placement, memory_cap, memory_cap_watch
 
 type
   LibraryInfo* = object
@@ -152,6 +153,13 @@ type
     qosTier*: uint8
       ## macOS: the tier (`runquota_process/qos_priority`) the child applied
       ## to itself before it executed; 0 elsewhere or with the layer off.
+    memoryCapApplied*: bool
+      ## The launch's memory cap (or its measurement, `memoryCapMeasure`) is
+      ## in force: the platform's mechanism is armed for this tree. False when
+      ## the launch asked for no cap, and false with `memoryCapProblem` set
+      ## when it asked and the mechanism could not be armed.
+    memoryCapProblem*: string
+      ## Why a cap the launch asked for is not in force, else "".
 
   ProcessCompletion* = object
     processId*: uint64
@@ -188,6 +196,9 @@ type
       ## The tree was killed because it passed its cap.
     capReached*: bool
       ## An allocation was refused at the cap and nothing was killed.
+    memoryCapProblem*: string
+      ## Why a cap the launch asked for was not in force, else "" (the
+      ## launch's `LaunchResult.memoryCapProblem`).
     oomKilledOutsideCap*: bool
       ## A process of the tree was killed for memory by something other than
       ## its cap (a host-wide OOM, an ancestor's limit).
@@ -300,3 +311,6 @@ type
     cgroupTarget*: CgroupTarget
       ## The placement this launch made, released (its leaf and group
       ## directory removed when empty) by `close`.
+    memoryCap*: MemoryCapWatch
+      ## The launcher's readings and judgement of the tree's memory cap
+      ## (macOS; inactive elsewhere and when the launch has no cap).
