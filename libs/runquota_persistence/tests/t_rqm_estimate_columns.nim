@@ -56,7 +56,9 @@ proc waitForRow(path, key: string; field: proc(row: LearnedEstimateRow): bool):
 suite "the memory-cap columns of the learned-estimate store":
   test "an old store keeps its rows and takes the new figures":
     let dir = createTempDir("rqmest", "")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "est.sqlite"
     check runSqlScript(path, shippedSchema).ok
 
@@ -107,7 +109,9 @@ suite "the memory-cap columns of the learned-estimate store":
     # comes back with `int64.high` in that figure. Falsifying mutation: write
     # the figures with a plain cast -- the row is then not reloaded.
     let dir = createTempDir("rqmsat", "")
-    defer: removeDir(dir)
+    defer:
+      closePooledConnections()
+      removeDir(dir)
     let path = dir / "est.sqlite"
     let row = LearnedEstimateRow(scope: "session:x", commandStatsId: "huge",
       conservativeMemoryBytes: high(uint64), recentPeakMemoryBytes: 5'u64,
