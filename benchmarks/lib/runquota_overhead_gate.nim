@@ -22,6 +22,25 @@
 ## to run if the answer is not the arm's configuration: a gate that compared
 ## two identical daemons would pass every measurement, vacuously.
 ##
+## THE MEMORY-CAP SWITCH (`--switch=memory-cap[:STAGE]`, `run-64` only).
+## The per-task memory cap must add no measurable overhead, so it is judged
+## one stage of its Linux mechanism at a time (`MemoryCapStage`:
+## `controller`, `leaf`, `limits`, `classify`, each including the ones
+## before it), with cgroup placement ON IN BOTH ARMS so only the cap
+## differs. Each arm has a gate-owned cgroup root of its own, because
+## enabling the memory controller on a root is itself what the first stage
+## costs. The arms differ by `RUNQUOTA_MEMORY_CAP` (a per-run cap far above
+## the work's need, or `off`) and `RUNQUOTA_MEMORY_CAP_STAGE`, paired so that
+## each comparison adds exactly one stage (`memoryCapArms`). Before the
+## first round each arm runs one probe through `runquota run` that reports
+## what its own cgroup carries, and the gate refuses to run unless each arm
+## is at the level its configuration names (`memoryCapConfigProblem`): an
+## ON arm whose launches apply no cap would otherwise compare two identical
+## arms and pass, vacuously. The report carries each root's
+## `cgroup.stat` `nr_dying_descendants` before the first round and after
+## the latest run: a removed leaf whose pages are still charged lingers as
+## a dying memory cgroup, which is part of what the `classify` stage costs.
+##
 ## THE CASES.
 ##
 ## * `reprobuild-64`: a 64-action Reprobuild build
@@ -122,6 +141,158 @@ const
   exitInconclusive* = 3
   exitUnavailable* = 4
   exitError* = 5
+
+# ---------------------------------------------------------------------------
+# The memory-cap switch: the arms' configuration and its check
+# ---------------------------------------------------------------------------
+
+type
+  MemoryCapLevel* = enum
+    ## How much of the memory cap a launched tree's own cgroup shows, as
+    ## the probe run inside it sees it. `classify` adds only reads at the
+    ## end of the tree, invisible from inside, so it shows as `limits`.
+    mclNone = "none"
+      ## No memory controller on the tree's cgroup.
+    mclController = "controller"
+      ## The memory controller, in the group's shared leaf.
+    mclLeaf = "leaf"
+      ## A `cap-` leaf of its own, `memory.max` = max.
+    mclLimits = "limits"
+      ## A `cap-` leaf with `memory.max` = the gate's cap and
+      ## `memory.oom.group` = 1.
+    mclUnknown = "unknown"
+      ## Anything else (the probe failed, or another cap was applied).
+
+  MemoryCapArm* = object
+    ## One arm of a memory-cap comparison.
+    cap*: string
+      ## `RUNQUOTA_MEMORY_CAP` for the arm's clients.
+    stage*: string
+      ## `RUNQUOTA_MEMORY_CAP_STAGE`; "" leaves it unset (the whole
+      ## mechanism).
+    level*: MemoryCapLevel
+      ## What the configuration check must observe in the arm.
+
+const
+  GateMemoryCap* = "1G"
+    ## The ON arm's per-run cap: far above what one `run-64` action (a shell
+    ## loop) needs, so the cap is applied and never reached.
+  GateMemoryCapBytes* = 1'u64 shl 30
+  MemoryCapSwitch* = "memory-cap"
+
+proc isMemoryCapSwitch*(switch: string): bool =
+  switch == MemoryCapSwitch or switch.startsWith(MemoryCapSwitch & ":")
+
+proc memoryCapArms*(switch: string): array[Arm, MemoryCapArm] =
+  ## The two arms of `--switch=memory-cap[:STAGE]`. Each comparison adds
+  ## EXACTLY ONE stage, except the plain switch, which is the whole
+  ## mechanism against none of it:
+  ##
+  ##   switch                  OFF arm                  ON arm
+  ##   memory-cap              cap off                  cap 1G, all stages
+  ##   memory-cap:controller   cap off                  cap 1G, controller
+  ##   memory-cap:leaf         cap 1G, controller       cap 1G, leaf
+  ##   memory-cap:limits       cap 1G, leaf             cap 1G, limits
+  ##   memory-cap:classify     cap 1G, limits           cap 1G, classify
+  ##
+  ## `off` turns the cap off for the run, which (with the host file's cap
+  ## off, as on a gate host) is no memory cap at all: the tree is placed
+  ## exactly as without the feature. The configuration check
+  ## (`memoryCapConfigProblem`) refuses a host where it is not.
+  ## ValueError for an unknown stage.
+  let none = MemoryCapArm(cap: "off", stage: "", level: mclNone)
+  proc capped(stage: MemoryCapStage): MemoryCapArm =
+    MemoryCapArm(cap: GateMemoryCap, stage: $stage, level:
+      case stage
+      of mcsController: mclController
+      of mcsLeaf: mclLeaf
+      of mcsLimits, mcsClassify: mclLimits)
+  if switch == MemoryCapSwitch:
+    return [none, MemoryCapArm(cap: GateMemoryCap, stage: "",
+      level: mclLimits)]
+  if not isMemoryCapSwitch(switch):
+    raise newException(ValueError, "not a memory-cap switch: " & switch)
+  let name = switch[MemoryCapSwitch.len + 1 .. ^1]
+  var stage: MemoryCapStage
+  if name.len == 0 or not parseMemoryCapStage(name, stage):
+    raise newException(ValueError, "unknown memory-cap stage '" & name &
+      "'; expected controller, leaf, limits or classify")
+  case stage
+  of mcsController: [none, capped(mcsController)]
+  of mcsLeaf: [capped(mcsController), capped(mcsLeaf)]
+  of mcsLimits: [capped(mcsLeaf), capped(mcsLimits)]
+  of mcsClassify: [capped(mcsLimits), capped(mcsClassify)]
+
+const memoryCapProbeScript* =
+  "p=$(sed -n 's/^0:://p' /proc/self/cgroup); d=/sys/fs/cgroup$p; " &
+  "echo \"cgroup=$p\"; if [ -e \"$d/memory.max\" ]; then echo memory=1; " &
+  "echo \"max=$(cat \"$d/memory.max\")\"; " &
+  "echo \"oomgroup=$(cat \"$d/memory.oom.group\")\"; else echo memory=0; fi"
+  ## Run as the action of one `runquota run`: what the tree's own cgroup
+  ## carries, one `key=value` per line.
+
+proc memoryCapProbeLevel*(probeOutput: string; capBytes: uint64):
+    MemoryCapLevel =
+  ## The level `memoryCapProbeScript`'s output shows (`MemoryCapLevel`).
+  var cgroup, memory, max, oomGroup = ""
+  var seen = false
+  for line in probeOutput.splitLines():
+    let eq = line.find('=')
+    if eq <= 0:
+      continue
+    let value = line[eq + 1 .. ^1].strip()
+    case line[0 ..< eq]
+    of "cgroup":
+      cgroup = value
+      seen = true
+    of "memory": memory = value
+    of "max": max = value
+    of "oomgroup": oomGroup = value
+    else: discard
+  if not seen or cgroup.len == 0:
+    return mclUnknown
+  if memory == "0":
+    return mclNone
+  if memory != "1":
+    return mclUnknown
+  let ownLeaf = cgroup.extractFilename.startsWith(CapLeafPrefix)
+  if not ownLeaf:
+    return (if max == "max": mclController else: mclUnknown)
+  if max == "max":
+    return mclLeaf
+  if max == $capBytes and oomGroup == "1":
+    return mclLimits
+  mclUnknown
+
+proc memoryCapConfigProblem*(arms: array[Arm, MemoryCapArm];
+                             observed: array[Arm, MemoryCapLevel]): string =
+  ## "" when each arm's probe showed the level its configuration names;
+  ## otherwise why the gate refuses to run. An ON arm that applies no cap
+  ## (the CLI ignores the variable, the cap is off, there is no cgroup
+  ## root) is the case this exists for: it would make the arms identical,
+  ## and the gate would pass a cost it never measured.
+  for arm in Arm:
+    if observed[arm] != arms[arm].level:
+      return "the " & $arm & " arm (" & MemoryCapEnvVar & "=" &
+        arms[arm].cap & (if arms[arm].stage.len > 0: " " &
+          MemoryCapStageEnvVar & "=" & arms[arm].stage else: "") &
+        ") was configured for the memory cap at '" & $arms[arm].level &
+        "' but its launch showed '" & $observed[arm] & "'" &
+        (if arm == armOn and observed[arm] == mclNone:
+          ": its launches apply no cap, so the comparison would be vacuous"
+         else: "")
+  ""
+
+proc nrDyingDescendants*(root: string): int =
+  ## `nr_dying_descendants` of `root`'s `cgroup.stat`, -1 when unreadable.
+  try:
+    for line in readFile(root / "cgroup.stat").splitLines():
+      let fields = line.splitWhitespace()
+      if fields.len == 2 and fields[0] == "nr_dying_descendants":
+        return parseInt(fields[1])
+  except IOError, OSError, ValueError:
+    discard
+  -1
 
 # ---------------------------------------------------------------------------
 # The arms' measurement switches
@@ -245,6 +416,10 @@ type
     pid: Pid
     socket: string
     log: string
+
+proc socketPath*(daemon: PrivateDaemon): string =
+  ## The daemon's private endpoint, for a client environment (`runEnv`).
+  daemon.socket
 
 proc daemonEnv(): seq[string] =
   ## The daemon's environment: this one, minus anything that would point it
@@ -678,16 +853,19 @@ proc migrationProbe(root: string): JsonNode =
      "median": float(at(0.5)) / 1000.0, "p90": float(at(0.9)) / 1000.0,
      "p99": float(at(0.99)) / 1000.0, "max": float(samples[^1]) / 1000.0}
 
-proc runEnv(socket, switches, cgroupRoot: string; qos = ""): seq[string] =
+proc runEnv*(socket, switches, cgroupRoot: string; qos = "";
+            memoryCap = MemoryCapArm()): seq[string] =
   ## A `runquota run` client's environment for one arm: the arm's daemon,
-  ## its measurement switches and its cgroup root, and, for `--switch=qos`,
-  ## the macOS priority-policy switch (`RUNQUOTA_QOS`: `off` / `on`); no
-  ## session group or parent lease inherited from whoever started the gate.
+  ## its measurement switches and its cgroup root, for `--switch=qos` the
+  ## macOS priority-policy switch (`RUNQUOTA_QOS`: `off` / `on`), and for
+  ## `--switch=memory-cap` the arm's per-run cap and stage; no session
+  ## group, parent lease, or memory-cap setting inherited from whoever
+  ## started the gate.
   const dropped = ["RUNQUOTA_SOCKET", "RUNQUOTA_MEASUREMENT",
     "RUNQUOTA_ENDPOINT_SCOPE", "RUNQUOTA_CGROUP_ROOT", "RUNQUOTA_QOS",
     "RUNQUOTA_SESSION",
     "RUNQUOTA_SESSION_PRIORITY", "RUNQUOTA_SESSION_CACHE_TTL",
-    "RUNQUOTA_PARENT_LEASE"]
+    "RUNQUOTA_PARENT_LEASE", MemoryCapEnvVar, MemoryCapStageEnvVar]
   for key, value in envPairs():
     if key notin dropped:
       result.add(key & "=" & value)
@@ -697,22 +875,55 @@ proc runEnv(socket, switches, cgroupRoot: string; qos = ""): seq[string] =
   result.add("RUNQUOTA_CGROUP_ROOT=" & cgroupRoot)
   if qos.len > 0:
     result.add("RUNQUOTA_QOS=" & qos)
+  if memoryCap.cap.len > 0:
+    result.add(MemoryCapEnvVar & "=" & memoryCap.cap)
+  if memoryCap.stage.len > 0:
+    result.add(MemoryCapStageEnvVar & "=" & memoryCap.stage)
+
+proc probeMemoryCapLevel*(cli: string; env: seq[string]; dir: string):
+    tuple[level: MemoryCapLevel, output: string] =
+  ## One `runquota run` of `memoryCapProbeScript` in an arm's environment:
+  ## the level its tree's cgroup showed, and the probe's output.
+  let log = dir / "memory-cap-probe.log"
+  let cost = runMeasured([cli, "run", "--width", "1", "--adapter", "none",
+    "--", "/bin/sh", "-c", memoryCapProbeScript], env, dir, log)
+  result.output = try: readFile(log) except IOError, OSError: ""
+  result.level =
+    if cost.exitStatus != 0: mclUnknown
+    else: memoryCapProbeLevel(result.output, GateMemoryCapBytes)
 
 proc run64Case(cfg: GateConfig; scratch: string): GateCase =
   for (label, path) in [("runquotad", cfg.daemonBin), ("runquota", cfg.cliBin)]:
     if path.len == 0 or not fileExists(path):
       raise newException(CaseUnavailable, "the " & label &
         " binary is missing: '" & path & "'")
-  if cfg.switch.len > 0 and cfg.switch notin ["cgroups", "qos"]:
+  let memoryCapOn = isMemoryCapSwitch(cfg.switch)
+  if cfg.switch.len > 0 and cfg.switch notin ["cgroups", "qos"] and
+      not memoryCapOn:
     raise newException(ValueError, "unknown --switch: " & cfg.switch &
-      "; expected cgroups or qos")
+      "; expected cgroups, qos, memory-cap or memory-cap:STAGE")
   when not defined(macosx):
     if cfg.switch == "qos":
       raise newException(CaseUnavailable, "--switch=qos judges the macOS " &
         "priority policy and this is not macOS")
+  when not defined(linux):
+    if memoryCapOn:
+      raise newException(CaseUnavailable, "--switch=memory-cap judges the " &
+        "Linux cgroup mechanism and this is not Linux")
+  var memoryArms: array[Arm, MemoryCapArm]
+  if memoryCapOn:
+    memoryArms = memoryCapArms(cfg.switch)   # ValueError: a usage error
   var cgroupRoots: array[Arm, string] = ["off", "off"]
   var probe = newJNull()
-  let gateRoot = if cfg.switch == "cgroups": gateCgroupRoot() else: ""
+  let gateRoot =
+    if cfg.switch == "cgroups" or memoryCapOn: gateCgroupRoot() else: ""
+  # The memory-cap switch places BOTH arms, each under a root of its own:
+  # the first stage is the memory controller on the root, and a root
+  # shared by the arms would give the OFF arm the ON arm's controller.
+  var armRoots: array[Arm, string]
+  if memoryCapOn and gateRoot.len > 0:
+    for arm in Arm:
+      armRoots[arm] = gateRoot.changeFileExt("") & "-" & $arm & ".slice"
   var daemons: array[Arm, PrivateDaemon]
   # THE CASE OWNS WHAT IT SET UP UNTIL IT RETURNS: the daemons of the arms
   # already started, and the gate's cgroup root, which the migration probe
@@ -727,7 +938,9 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
     if not handedBack:
       for arm in Arm:
         stopDaemon(daemons[arm])
-      try: removeGateCgroups(gateRoot)
+      try:
+        removeGateCgroups(gateRoot)
+        for arm in Arm: removeGateCgroups(armRoots[arm])
       except CatchableError: discard
   if cfg.switch == "cgroups":
     if gateRoot.len == 0:
@@ -735,6 +948,12 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
         "delegated cgroup v2 subtree for this user, and there is none")
     cgroupRoots[armOn] = gateRoot
     probe = migrationProbe(gateRoot)
+  if memoryCapOn:
+    if gateRoot.len == 0:
+      raise newException(CaseUnavailable, "--switch=" & cfg.switch &
+        " needs a delegated cgroup v2 subtree for this user, and there " &
+        "is none")
+    cgroupRoots = armRoots
   var switches: array[Arm, string]
   var dirs: array[Arm, string]
   for arm in Arm:
@@ -743,15 +962,48 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
     dirs[arm] = scratch / $arm / "work"
     createDir(dirs[arm])
   let script = run64Script(cfg.cliBin)
+  proc armEnv(arm: Arm): seq[string] =
+    runEnv(daemons[arm].socket, switches[arm], cgroupRoots[arm],
+      (if cfg.switch == "qos": (if arm == armOn: "on" else: "off") else: ""),
+      (if memoryCapOn: memoryArms[arm] else: MemoryCapArm()))
+  # THE MEMORY-CAP CONFIGURATION CHECK, before the first round: each arm's
+  # launch must show the level its configuration names, or the run is
+  # refused (never a pass).
+  var memoryCapJson = newJNull()
+  if memoryCapOn:
+    var observed: array[Arm, MemoryCapLevel]
+    var outputs: array[Arm, string]
+    for arm in Arm:
+      (observed[arm], outputs[arm]) = probeMemoryCapLevel(cfg.cliBin,
+        armEnv(arm), dirs[arm])
+    let problem = memoryCapConfigProblem(memoryArms, observed)
+    if problem.len > 0:
+      raise newException(CaseUnavailable, "memory-cap configuration " &
+        "check: " & problem & "; probe output: off: " &
+        outputs[armOff].strip().replace("\n", " ") & " | on: " &
+        outputs[armOn].strip().replace("\n", " "))
+    memoryCapJson = %*{
+      "cap": {"off": memoryArms[armOff].cap, "on": memoryArms[armOn].cap},
+      "stage": {"off": memoryArms[armOff].stage,
+        "on": memoryArms[armOn].stage},
+      "observed_level": {"off": $observed[armOff], "on": $observed[armOn]},
+      "nr_dying_descendants": {
+        "before": {"off": nrDyingDescendants(cgroupRoots[armOff]),
+          "on": nrDyingDescendants(cgroupRoots[armOn])},
+        "after": {"off": -1, "on": -1}}}
+  let dying = memoryCapJson
   result.name = "run-64"
   result.run = proc (arm: Arm; round: int): RunCost =
     let daemon = daemons[arm]
     let before = processCpuSeconds(daemon.pid)
     let log = scratch / $arm / "run.log"
-    result = runMeasured(["/bin/sh", "-c", script],
-      runEnv(daemon.socket, switches[arm], cgroupRoots[arm],
-        (if cfg.switch == "qos": (if arm == armOn: "on" else: "off") else: "")),
+    result = runMeasured(["/bin/sh", "-c", script], armEnv(arm),
       dirs[arm], log)
+    if dying.kind == JObject:
+      # After the latest run of this arm: the report is built from these
+      # details once the rounds end, so it carries the last reading.
+      dying["nr_dying_descendants"]["after"][$arm] =
+        %nrDyingDescendants(cgroupRoots[arm])
     let after = settledDaemonCpuSeconds(daemon.pid)
     result.daemonCpuSeconds = after - before
     result.cpuSeconds += result.daemonCpuSeconds
@@ -774,6 +1026,8 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
     for arm in Arm:
       stopDaemon(daemons[arm])
     removeGateCgroups(gateRoot)
+    for arm in Arm:
+      removeGateCgroups(armRoots[arm])
   result.details = %*{
     "cli": cfg.cliBin,
     "daemon": cfg.daemonBin,
@@ -782,6 +1036,7 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
     "cpu_milli": cfg.cpuMilli,
     "cgroup_root": {"off": cgroupRoots[armOff], "on": cgroupRoots[armOn]},
     "migration_probe": probe,
+    "memory_cap": memoryCapJson,
   }
   handedBack = true
 
@@ -893,6 +1148,10 @@ runquota_overhead_gate --case=reprobuild-64|run-64|cargo-jobserver|synthetic [op
                               differ only by the client's RUNQUOTA_CGROUP_ROOT
                               (off / a gate-owned root), or, for qos (macOS),
                               by its RUNQUOTA_QOS (off / on); run-64 only
+  --switch=memory-cap[:STAGE] judge the Linux memory cap, placement on in
+                              both arms: the whole mechanism against none,
+                              or STAGE (controller|leaf|limits|classify)
+                              against the stage before it; run-64 only
   --budget-percent=1          allowed overhead
   --precision-percent=0.5     required 95% interval half-width
   --min-rounds=10 --max-rounds=200 --max-minutes=90
