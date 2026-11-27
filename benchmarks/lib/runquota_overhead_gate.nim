@@ -66,6 +66,15 @@
 ## `run64Script`'s shell `&`/`wait` fan-out has no portable Windows
 ## equivalent.
 ##
+## ON MACOS the cap is one mechanism, the launcher's own readings of the
+## tree (a kqueue that keeps its members, read every 100 ms), so only plain
+## `--switch=memory-cap` exists there: no cap against a 1 GiB cap in kill
+## mode, both arms unplaced. Nothing inside a tree shows the readings, so
+## the configuration check is behavioural: each arm's probe touches 1.25
+## GiB, and the ON arm's must be killed and reported for it while the OFF
+## arm's must survive (`memoryCapProbeLevelMacos`). The gate warns when its
+## own environment sets `DYLD_INSERT_LIBRARIES` (`dyldInsertWarning`).
+##
 ## THE CASES.
 ##
 ## * `reprobuild-64`: a 64-action Reprobuild build
@@ -198,6 +207,10 @@ type
     mclLimits = "limits"
       ## A `cap-` leaf with `memory.max` = the gate's cap and
       ## `memory.oom.group` = 1.
+    mclTracked = "tracked"
+      ## macOS: the launcher reads the tree against the gate's cap in kill
+      ## mode. The probe that allocates past the cap is killed for it and
+      ## reported (`memoryCapProbeLevelMacos`); macOS has no cgroup to show.
     mclUnknown = "unknown"
       ## Anything else (the probe failed, or another cap was applied).
 
@@ -222,7 +235,8 @@ const
 proc isMemoryCapSwitch*(switch: string): bool =
   switch == MemoryCapSwitch or switch.startsWith(MemoryCapSwitch & ":")
 
-proc memoryCapArms*(switch: string): array[Arm, MemoryCapArm] =
+proc memoryCapArms*(switch: string; macos = defined(macosx)):
+    array[Arm, MemoryCapArm] =
   ## The two arms of `--switch=memory-cap[:STAGE]`. Each comparison adds
   ## EXACTLY ONE stage, except the plain switch, which is the whole
   ## mechanism against none of it:
@@ -240,7 +254,20 @@ proc memoryCapArms*(switch: string): array[Arm, MemoryCapArm] =
   ## kill mode when the host file leaves the cap off. The configuration
   ## check (`memoryCapConfigProblem`) refuses a host where either arm does
   ## not show its level. ValueError for an unknown stage.
+  ##
+  ## ON MACOS (`macos`) the cap has one mechanism, the launcher's own
+  ## readings of the tree, so there is one comparison: plain `memory-cap`,
+  ## no cap against a 1 GiB cap in kill mode, whose ON arm must show
+  ## `mclTracked`. The stages are the Linux cgroup mechanism's and are a
+  ## usage error there.
   let none = MemoryCapArm(cap: "", stage: "", level: mclNone)
+  if macos:
+    if switch == MemoryCapSwitch:
+      return [none, MemoryCapArm(cap: GateMemoryCap, stage: "",
+        level: mclTracked)]
+    raise newException(ValueError, "--switch=" & switch & ": the memory-cap " &
+      "stages are the Linux cgroup mechanism's; on macOS the cap is judged " &
+      "as a whole, with --switch=memory-cap")
   proc capped(stage: MemoryCapStage): MemoryCapArm =
     MemoryCapArm(cap: GateMemoryCap, stage: $stage, level:
       case stage
@@ -270,6 +297,66 @@ const memoryCapProbeScript* =
   "echo \"oomgroup=$(cat \"$d/memory.oom.group\")\"; else echo memory=0; fi"
   ## Run as the action of one `runquota run`: what the tree's own cgroup
   ## carries, one `key=value` per line.
+
+const memoryCapProbeScriptMacos* =
+  "perl -e '$x = \"a\"; $x x= 1280 * 1024 * 1024; sleep 1; " &
+  "print \"survived\\n\"'"
+  ## macOS: run as the action of one `runquota run`. It touches 1.25 GiB,
+  ## past the gate's 1 GiB cap, and holds it for a second, ten readings: a
+  ## launch that applies the cap in kill mode kills it and reports the
+  ## breach; one that applies none lets it print `survived`. The string is
+  ## grown in place (`x=`): `"a" x N` builds it and then copies it, which
+  ## peaks at twice the size (measured: 2.5 GiB against 1.25 GiB).
+
+const MemoryCapProbeStatsKey* = "gate.memory-cap-probe"
+  ## The probe's own command stats key. Without it the probe shares the
+  ## rounds' key (`run/sh@<work dir>`: both run `sh` in the arm's work
+  ## directory), and the OFF arm's surviving probe teaches its daemon a
+  ## learned memory figure that admission then charges to every action of
+  ## every round, which runs that arm less parallel than the other.
+
+proc memoryCapProbeArgv*(cli, script: string): seq[string] =
+  ## The probe's `runquota run`: under its own stats key, and on macOS
+  ## `--verbose`, whose line about the memory cap is what the macOS check
+  ## reads (`memoryCapProbeLevelMacos`).
+  result = @[cli, "run", "--width", "1", "--adapter", "none",
+    "--stats-key", MemoryCapProbeStatsKey]
+  when defined(macosx):
+    result.add("--verbose")
+  result.add(["--", "/bin/sh", "-c", script])
+
+proc memoryCapProbeLevelMacos*(probeOutput: string; exitStatus: int;
+                               capBytes = GateMemoryCapBytes):
+    MemoryCapLevel =
+  ## The level `memoryCapProbeScriptMacos` shows, from the `runquota run
+  ## --verbose` output and its exit status. The CLI's own statement of the
+  ## cap it applied is required either way, so an OFF arm that is in fact
+  ## capped (a host file that turns the cap on gives it the grant's cap,
+  ## which the probe survives) is not mistaken for one with no cap:
+  ##
+  ## * `mclNone`: the CLI says "memory cap none: memory cap off", and the
+  ##   probe survived and exited 0;
+  ## * `mclTracked`: the CLI says it applied `capBytes` in kill mode, and the
+  ##   probe was killed with the CLI's breach report;
+  ## * `mclUnknown`: anything else.
+  ## The probe's own `survived` is a line by itself: the CLI's breach
+  ## report echoes the command, whose text contains the word.
+  var survived = false
+  for line in probeOutput.splitLines():
+    if line.strip() == "survived":
+      survived = true
+  let reported = "runquota: memory cap exceeded:" in probeOutput
+  let statedOff = "runquota run: memory cap none: memory cap off" in
+    probeOutput
+  let statedCap = "runquota run: memory cap " & $capBytes & " bytes (" in
+    probeOutput and "mcaKill)" in probeOutput
+  if exitStatus == 0 and survived and statedOff and not statedCap and
+      not reported:
+    return mclNone
+  if exitStatus != 0 and statedCap and not statedOff and reported and
+      "killed" in probeOutput and not survived:
+    return mclTracked
+  mclUnknown
 
 proc memoryCapProbeLevel*(probeOutput: string; capBytes: uint64):
     MemoryCapLevel =
@@ -345,6 +432,19 @@ proc memoryCapSpawnPath*(arm: MemoryCapArm; launcherEnv: openArray[string]):
   if arm.level != mclLimits:
     return "fork"
   if envValue(launcherEnv, "LD_PRELOAD").len > 0: "fork" else: "clone3"
+
+proc dyldInsertWarning*(gateEnv: openArray[string]): string =
+  ## macOS's counterpart of `ldPreloadWarning`: the warning the gate prints
+  ## when its own environment sets `DYLD_INSERT_LIBRARIES` (an agent
+  ## harness's command-trace shim, for one). Every non-platform process of
+  ## both arms then runs with it, which adds a cost the cap did not cause
+  ## and can hide one it did. "" when it is not set.
+  let inserted = envValue(gateEnv, "DYLD_INSERT_LIBRARIES")
+  if inserted.len == 0:
+    return ""
+  "WARNING: DYLD_INSERT_LIBRARIES is set in the gate's environment (" &
+    inserted & "); every process of both arms runs with it, so measure " &
+    "outside the session that sets it"
 
 proc ldPreloadWarning*(gateEnv: openArray[string]): string =
   ## The warning the gate prints when its own environment sets
@@ -1005,12 +1105,17 @@ proc probeMemoryCapLevel*(cli: string; env: seq[string]; dir: string):
   ## One `runquota run` of `memoryCapProbeScript` in an arm's environment:
   ## the level its tree's cgroup showed, and the probe's output.
   let log = dir / "memory-cap-probe.log"
-  let cost = runMeasured([cli, "run", "--width", "1", "--adapter", "none",
-    "--", "/bin/sh", "-c", memoryCapProbeScript], env, dir, log)
+  let script =
+    when defined(macosx): memoryCapProbeScriptMacos else: memoryCapProbeScript
+  let cost = runMeasured(memoryCapProbeArgv(cli, script), env, dir, log)
   result.output = try: readFile(log) except IOError, OSError: ""
   result.level =
-    if cost.exitStatus != 0: mclUnknown
-    else: memoryCapProbeLevel(result.output, GateMemoryCapBytes)
+    when defined(macosx):
+      memoryCapProbeLevelMacos(result.output, cost.exitStatus,
+        GateMemoryCapBytes)
+    else:
+      if cost.exitStatus != 0: mclUnknown
+      else: memoryCapProbeLevel(result.output, GateMemoryCapBytes)
 
 proc winMemoryCapProbeLevel(probeOutput: string; capBytes: uint64):
     MemoryCapLevel =
@@ -1145,7 +1250,7 @@ proc run64CaseWindowsMemoryCap(cfg: GateConfig; scratch: string): GateCase =
       "probe_output": {"off": outputs[armOff], "on": outputs[armOn]}}}
   handedBack = true
 
-proc run64Case(cfg: GateConfig; scratch: string): GateCase =
+proc run64Case*(cfg: GateConfig; scratch: string): GateCase =
   for (label, path) in [("runquotad", cfg.daemonBin), ("runquota", cfg.cliBin)]:
     if path.len == 0 or not fileExists(path):
       raise newException(CaseUnavailable, "the " & label &
@@ -1171,10 +1276,11 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
           "job-wide limit, not several placement steps); use " &
           "--switch=memory-cap")
       return run64CaseWindowsMemoryCap(cfg, scratch)
-  when not defined(linux) and not defined(windows):
+  when not defined(linux) and not defined(windows) and
+      not defined(macosx):
     if memoryCapOn:
       raise newException(CaseUnavailable, "--switch=memory-cap is " &
-        "implemented for Linux and Windows only, and this is " & hostOS)
+        "implemented for Linux, macOS and Windows only, and this is " & hostOS)
   var memoryArms: array[Arm, MemoryCapArm]
   if memoryCapOn:
     memoryArms = memoryCapArms(cfg.switch)   # ValueError: a usage error
@@ -1213,12 +1319,14 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
         "delegated cgroup v2 subtree for this user, and there is none")
     cgroupRoots[armOn] = gateRoot
     probe = migrationProbe(gateRoot)
-  if memoryCapOn:
-    if gateRoot.len == 0:
-      raise newException(CaseUnavailable, "--switch=" & cfg.switch &
-        " needs a delegated cgroup v2 subtree for this user, and there " &
-        "is none")
-    cgroupRoots = armRoots
+  # macOS has no cgroups: both arms run unplaced, and only the cap differs.
+  when defined(linux):
+    if memoryCapOn:
+      if gateRoot.len == 0:
+        raise newException(CaseUnavailable, "--switch=" & cfg.switch &
+          " needs a delegated cgroup v2 subtree for this user, and there " &
+          "is none")
+      cgroupRoots = armRoots
   var switches: array[Arm, string]
   var dirs: array[Arm, string]
   for arm in Arm:
@@ -1242,7 +1350,9 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
     var gateEnv: seq[string]
     for key, value in envPairs():
       gateEnv.add(key & "=" & value)
-    let warning = ldPreloadWarning(gateEnv)
+    let warning =
+      when defined(macosx): dyldInsertWarning(gateEnv)
+      else: ldPreloadWarning(gateEnv)
     if warning.len > 0:
       stderr.writeLine(warning)
     var observed: array[Arm, MemoryCapLevel]
@@ -1261,17 +1371,23 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
       "stage": {"off": memoryArms[armOff].stage,
         "on": memoryArms[armOn].stage},
       "observed_level": {"off": $observed[armOff], "on": $observed[armOn]},
-      "spawn_path": {
-        "off": memoryCapSpawnPath(memoryArms[armOff], armEnv(armOff)),
-        "on": memoryCapSpawnPath(memoryArms[armOn], armEnv(armOn))},
-      "spawn_path_basis": "derived from each arm's stage and its " &
-        "launchers' LD_PRELOAD; a kernel that refuses clone3 also falls " &
-        "back to fork, which this does not see",
+      "spawn_path":
+        when defined(macosx): %*{"off": "fork", "on": "fork"}
+        else: %*{
+          "off": memoryCapSpawnPath(memoryArms[armOff], armEnv(armOff)),
+          "on": memoryCapSpawnPath(memoryArms[armOn], armEnv(armOn))},
+      "spawn_path_basis":
+        when defined(macosx): "macOS launchers create every tree with fork"
+        else: "derived from each arm's stage and its " &
+          "launchers' LD_PRELOAD; a kernel that refuses clone3 also falls " &
+          "back to fork, which this does not see",
       "warning": warning,
-      "nr_dying_descendants": {
-        "before": {"off": nrDyingDescendants(cgroupRoots[armOff]),
-          "on": nrDyingDescendants(cgroupRoots[armOn])},
-        "after": {"off": -1, "on": -1}}}
+      "nr_dying_descendants":
+        when defined(macosx): newJNull()   # no cgroups on macOS
+        else: %*{
+          "before": {"off": nrDyingDescendants(cgroupRoots[armOff]),
+            "on": nrDyingDescendants(cgroupRoots[armOn])},
+          "after": {"off": -1, "on": -1}}}
   let dying = memoryCapJson
   result.name = "run-64"
   result.run = proc (arm: Arm; round: int): RunCost =
@@ -1287,7 +1403,8 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
           dirs[arm], self)
       except OSError as err:
         raise newException(OSError, "round " & $round & ": " & err.msg)
-      if dying.kind == JObject:
+      if dying.kind == JObject and
+          dying["nr_dying_descendants"].kind == JObject:
         dying["nr_dying_descendants"]["after"][$arm] =
           %nrDyingDescendants(cgroupRoots[arm])
     else:
@@ -1296,7 +1413,8 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
       let log = scratch / $arm / "run.log"
       result = runMeasured(["/bin/sh", "-c", script], armEnv(arm),
         dirs[arm], log)
-      if dying.kind == JObject:
+      if dying.kind == JObject and
+          dying["nr_dying_descendants"].kind == JObject:
         # After the latest run of this arm: the report is built from these
         # details once the rounds end, so it carries the last reading.
         dying["nr_dying_descendants"]["after"][$arm] =
