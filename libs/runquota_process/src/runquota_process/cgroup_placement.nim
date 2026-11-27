@@ -1032,9 +1032,10 @@ proc sweepStaleCapLeaves*(target: CgroupTarget) =
         continue
       if not pidAlive(pid):
         let stale = target.dirPath / path
-        if not removeEmptyCgroup(stale) and errno == EBUSY:
-          removeEmptyDescendants(stale)
-          discard removeEmptyCgroup(stale)
+        when defined(posix):
+          if not removeEmptyCgroup(stale) and errno == EBUSY:
+            removeEmptyDescendants(stale)
+            discard removeEmptyCgroup(stale)
   except OSError:
     discard
 

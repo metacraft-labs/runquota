@@ -151,11 +151,13 @@ suite "memoryCapNotEnforced":
     let given = memoryCapNotEnforced(capped,
       LaunchResult(memoryCapApplied: false, memoryCapProblem: "no cgroup root"))
     check given == "memory cap not enforced: no cgroup root"
+    # A reason that already names what failed is said once.
+    check memoryCapNotEnforced(capped, LaunchResult(memoryCapApplied: false,
+      memoryCapProblem: "memory cap not applied: memory.max: EACCES")) ==
+      "memory cap not enforced: memory.max: EACCES"
     let unsaid = memoryCapNotEnforced(capped, LaunchResult())
     check unsaid.startsWith("memory cap not enforced: ")
-    when defined(macosx):
-      check unsaid == "memory cap not enforced: not implemented on macos yet"
-    elif defined(windows):
+    when defined(windows):
       check unsaid == "memory cap not enforced: not implemented on windows yet"
     # A lifted run that is not measured says that instead.
     let lifted = resolveMemoryCap(learnedGrant, mcmKill, "off", false)
@@ -219,6 +221,18 @@ suite "finishOutcome and finishMemoryCap":
     let killed = completion(signal = 9, capKilled = true,
       peak = 2'u64 * GiB).finishMemoryCap(resolution)
     check killed.present and not killed.breached # the kill is the conclusion
+    # A tree reported killed for its cap whose ROOT ended cleanly first
+    # (macOS: the breach read from the root's zombie, the rest of the tree
+    # killed) has no kill evidence, so its finish is the root's own
+    # success. The breach must then ride in the block, or the daemon takes
+    # a peak above the cap for a clean measured success and learns it.
+    # Mutation: flags from `capKilled` alone -> no flag, learned.
+    let cleanRoot = completion(exitCode = 0, capKilled = true,
+      peak = 3'u64 * GiB)
+    check finishOutcome(cleanRoot).kind == lfSucceeded
+    let cleanBlock = cleanRoot.finishMemoryCap(resolution)
+    check cleanBlock.present and cleanBlock.exceededAdvisory
+    check cleanBlock.breached
     let reached = completion(reached = true,
       peak = 2'u64 * GiB).finishMemoryCap(resolution)
     check reached.capReached and reached.breached

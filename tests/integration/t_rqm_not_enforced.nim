@@ -1,9 +1,10 @@
 ## A memory cap that applies but that the platform layer did not enforce is
 ## SAID by every CLI launcher, never silent.
 ##
-## Until each platform's mechanism is built (macOS and Windows have none yet;
-## Linux needs a cgroup root, which the suite leaves off), a launch asked to
-## apply a cap runs uncapped. That must be visible: `runquota run`,
+## Where a platform cannot put the cap in place (Windows has no mechanism
+## yet; Linux needs a cgroup root, which the suite leaves off), a launch asked
+## to apply a cap runs uncapped. macOS arms its own tracker for every capped
+## launch, so there the cap IS applied and nothing is said. That must be visible: `runquota run`,
 ## `acquire -- CMD` and `jobserver` print `memory cap not enforced: <why>` on
 ## stderr as the command starts, as an unenforceable `--cap` does, and the
 ## command still runs. `RUNQUOTA_MEMORY_CAP=1G` makes a cap apply with no
@@ -44,8 +45,11 @@ when defined(posix):
         checkpoint(capped.output)
         check capped.code == 0
         check "ran" in capped.output
-        check "runquota " & verb & ": memory cap not enforced: " in
-          capped.output
+        when defined(macosx):
+          check "memory cap not" notin capped.output
+        else:
+          check "runquota " & verb & ": memory cap not enforced: " in
+            capped.output
         let uncapped = cli(daemon.withCap(""), args)
         checkpoint(uncapped.output)
         check uncapped.code == 0

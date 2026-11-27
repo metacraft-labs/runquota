@@ -171,7 +171,8 @@ proc linuxRecord(root: CgroupRoot; probeProblem: string; memory: MemoryProbe;
 
 const
   MacosWidthCapGap = "macOS has no hard CPU cap for a process tree"
-  MacosMemoryCapGap = "macOS has no hard memory cap for a process tree"
+  MacosMemoryCapGap = "macOS has no kernel memory limit for a process " &
+    "tree: the launcher's readings, 100 ms apart, can miss a shorter peak"
   MacosNiceGap = "nice +" & $ReclaimedNiceIncrement & " is applied but " &
     "measured not to change the CPU share of an exec'd tree on macOS, " &
     "which schedules by QoS class"
@@ -181,7 +182,26 @@ const
     "set without posix_spawn, nice does not schedule an exec'd tree, and a " &
     "negative nice needs root)"
 
-proc macosRecord(qosOn: bool; problem = ""): EnforcementRecord =
+proc macosMemoryCapEntry(mode: MemoryCapMode): EnforcementEntry =
+  ## The memory cap on macOS is the LAUNCHER's: it reads the tree's memory
+  ## footprint every 100 ms and, in kill mode, stops and kills the tree
+  ## itself. No kernel limit backs it, so it is `degraded` at best: a peak
+  ## shorter than one reading can pass the cap unseen.
+  case mode
+  of mcmOff:
+    entry(emMemoryCap, elNone, "admission (memory reservation)",
+      "off by default (the host file does not set [enforcement] memoryCap)")
+  of mcmAdvisory:
+    entry(emMemoryCap, elNone,
+      "footprint read every 100 ms by the launcher, reported, never killed",
+      "advisory: a tree past its cap is reported and runs on")
+  of mcmKill:
+    entry(emMemoryCap, elDegraded,
+      "footprint read every 100 ms by the launcher, which stops and kills " &
+      "the tree past its cap", MacosMemoryCapGap)
+
+proc macosRecord(qosOn: bool; problem = "";
+                 memoryCapMode = mcmOff): EnforcementRecord =
   ## Two layers, as on Linux and Windows. A RECLAIMED tree always runs at
   ## nice +10 (unconditional), which on macOS does not change the CPU share
   ## of an exec'd tree (measured, `qos_priority`), so `reclaimed` is only
@@ -202,8 +222,7 @@ proc macosRecord(qosOn: bool; problem = ""): EnforcementRecord =
         "priority, throttled IO), inherited by every process of the tree"),
       entry(emWidthCap, elNone, "runquota run --cap runs the command uncapped",
         MacosWidthCapGap),
-      entry(emMemoryCap, elNone, "admission (memory reservation)",
-        MacosMemoryCapGap),
+      macosMemoryCapEntry(memoryCapMode),
     ]
   else:
     let reason = if problem.len > 0: problem
@@ -217,8 +236,7 @@ proc macosRecord(qosOn: bool; problem = ""): EnforcementRecord =
         gap & "; " & MacosNiceGap),
       entry(emWidthCap, elNone, "runquota run --cap runs the command uncapped",
         MacosWidthCapGap),
-      entry(emMemoryCap, elNone, "admission (memory reservation)",
-        MacosMemoryCapGap),
+      macosMemoryCapEntry(memoryCapMode),
     ]
 
 const WindowsWidthCapHow = "Job Object CPU rate control, a hard cap at the " &
@@ -288,7 +306,7 @@ proc enforcementRecordFor*(os: string; root = CgroupRoot();
   ## recorded as enforcing nothing below admission.
   case os
   of "linux": linuxRecord(root, probeProblem, memory, memoryCapMode)
-  of "macos": macosRecord(qosOn, qosProblem)
+  of "macos": macosRecord(qosOn, qosProblem, memoryCapMode)
   of "windows": windowsRecord(jobPriorityOn, jobPriorityProblem)
   else:
     EnforcementRecord(os: os, placement: "n/a", entries: @[

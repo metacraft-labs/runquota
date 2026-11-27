@@ -424,17 +424,23 @@ memoryCap = "kill"       # or "advisory": measure and report, kill nothing
 memoryCapFactor = 2      # at least 1.5
 ```
 
-**Not every platform enforces it yet.** Where a cap applies and the launcher
-could not put it in place (no cgroup root on Linux; macOS and Windows, whose
-mechanisms are not built yet), the launcher says so on stderr as the command
-starts — `memory cap not enforced: <why>` — and the command runs uncapped.
-
 (`runquota config set enforcement.memoryCap kill`,
 `runquota config set enforcement.memoryCapFactor 2.5`). For one run,
 `RUNQUOTA_MEMORY_CAP` overrides it ([environment variables](/reference/environment_variables)):
 `off` lifts the cap (the tree is still measured, so a successful run records
 its new peak), a size such as `8G` is that run's cap, and `advisory` or
 `kill` sets the mode.
+
+**How each platform enforces it.** On **Linux** the tree gets a cgroup of its
+own (with [placement](#priority-below-admission) on) whose `memory.max` is the
+cap; the kernel kills the whole tree, and only it, when it passes the cap. On
+**macOS** the launcher reads the tree's memory footprint every 100 ms and, in
+`kill` mode, stops and kills the tree itself; a peak shorter than a reading
+can pass unseen. On **Windows** the mechanism is not built yet. Where a cap
+applies and the launcher could not put it in place (Windows, or Linux without
+a cgroup root), it says so on stderr as the command starts — `memory cap not
+enforced: <why>` — and the command runs uncapped.
+
 
 ## `runquota expect-growth`
 

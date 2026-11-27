@@ -144,7 +144,7 @@ proc platformMemoryCapGap(): string =
   when defined(linux):
     "this build's launcher did not apply it"
   elif defined(macosx):
-    "not implemented on macos yet"
+    "this build's launcher did not apply it"
   elif defined(windows):
     "not implemented on windows yet"
   else:
@@ -166,9 +166,15 @@ proc memoryCapNotEnforced*(resolution: MemoryCapResolution;
   if resolution.error.len > 0 or not resolution.applies or
       launch.memoryCapApplied:
     return ""
-  let why =
+  var why =
     if launch.memoryCapProblem.len > 0: launch.memoryCapProblem
     else: platformMemoryCapGap()
+  # The platform layer reports a bare reason, but a layer below it may
+  # already have said what failed; say it once.
+  for prefix in ["memory cap not enforced: ", "memory cap not applied: ",
+                 "memory cap not measured: "]:
+    if why.startsWith(prefix):
+      why = why[prefix.len .. ^1]
   if resolution.capBytes > 0'u64: "memory cap not enforced: " & why
   else: "memory cap not measured: " & why
 
@@ -182,14 +188,25 @@ proc finishMemoryCap*(completion: ProcessCompletion;
   ## block, and the daemon then learns no maximum from it.
   if not completion.memoryCapMeasured or resolution.basis == mcbNone:
     return FinishMemoryCap(present: false)
+  # KILLED FOR THE CAP ONLY WITH KILL EVIDENCE, the same test the finish's
+  # conclusion takes (`lfCapExceeded` needs a signal or a non-zero exit
+  # status). A launcher may report its tree killed for the cap while the
+  # root itself ended cleanly before the kill (macOS: a breach first read
+  # from the root's zombie). Then the finish is the root's own conclusion,
+  # and the breach must ride in the block as a flag; otherwise the daemon
+  # would take a peak above the cap for a clean measured success and learn
+  # it as the command's new size.
+  let killedForCap = completion.capKilled and
+    ((completion.signaled and completion.signal > 0) or
+     (completion.exited and completion.exitCode > 0))
   FinishMemoryCap(
     present: true,
     capBytes: completion.memoryCapBytes,
     basis: resolution.basis,
     treePeakBytes: completion.memoryPeakBytes,
     peakSource: completion.memoryPeakSource,
-    capReached: completion.capReached and not completion.capKilled,
-    exceededAdvisory: completion.capExceeded and not completion.capKilled)
+    capReached: completion.capReached and not killedForCap,
+    exceededAdvisory: completion.capExceeded and not killedForCap)
 
 proc factorText(factorMilli: uint32): string =
   ## `2`, `1.5`, `2.25`: the factor as the host file writes it.

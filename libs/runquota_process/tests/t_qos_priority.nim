@@ -167,6 +167,21 @@ suite "macOS priority tiers":
     check "priority=degraded" in on.summaryLine
     check "reclaimed=enforced" in on.summaryLine
     check "macOS has no hard CPU cap" in on.summaryLine
+    # The memory cap is the launcher's footprint readings, so the record
+    # follows the mode the launcher resolved: off (none), advisory (none, it
+    # never kills) and kill (degraded: a peak shorter than a reading can
+    # pass). Mutation: the record ignores the mode -> kill reads as none.
+    let capOff = enforcementRecordFor("macos", memoryCapMode = mcmOff)
+    let capAdvisory = enforcementRecordFor("macos",
+      memoryCapMode = mcmAdvisory)
+    let capKill = enforcementRecordFor("macos", memoryCapMode = mcmKill)
+    check capOff.entries[3].level == elNone
+    check "off by default" in capOff.entries[3].gap
+    check capAdvisory.entries[3].level == elNone
+    check "never killed" in capAdvisory.entries[3].how
+    check capKill.entries[3].level == elDegraded
+    check "kills the tree" in capKill.entries[3].how
+    check "can miss a shorter peak" in capKill.entries[3].gap
 
 when defined(macosx):
   suite "macOS priority policy of a launched tree (the OS's own readback)":

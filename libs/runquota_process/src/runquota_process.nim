@@ -2090,6 +2090,9 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     var memoryPrep: MemoryPreparation
     var memoryCapApplied = false
     var memoryCapProblem = ""
+    var memoryStageProblem = ""
+      ## The gate-only stage variable's complaint, kept apart so that a
+      ## later preparation's own report does not erase it.
     var memoryClassify = false
     var useClone3 = false
     var spawnedByClone3 = false
@@ -2101,14 +2104,14 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
     var againRetryable = false
     when defined(linux):
       if memoryWanted and not target.placed:
-        memoryCapProblem = "memory cap not enforced: no cgroup root"
+        memoryCapProblem = "no cgroup root"
       if memoryWanted and target.placed:
         # The gate-only stage, read once per launch from the LAUNCHER's own
         # environment and only for a capped tree, so an uncapped launch
         # reads nothing it did not read before.
         let stageText = getEnv(MemoryCapStageEnvVar)
         if not parseMemoryCapStage(stageText, memoryStage):
-          memoryCapProblem = MemoryCapStageEnvVar & "='" & stageText &
+          memoryStageProblem = MemoryCapStageEnvVar & "='" & stageText &
             "' is not controller, leaf, limits or classify; the whole " &
             "mechanism applies"
         target = memoryCapTarget(target, spec.memoryCapBytes,
@@ -2392,8 +2395,8 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       if memoryWanted:
         memoryCapApplied = false
         memoryClassify = false
-        memoryCapProblem = "memory cap not enforced: the tree is not in a " &
-          "cgroup (" & placementProblem & ")"
+        memoryCapProblem = "the tree is not in a cgroup (" &
+          placementProblem & ")"
     # macOS judges the cap itself, from its own readings of the tree
     # (`runquota_process/memory_cap_watch`); Linux's cap is the tree's cgroup leaf
     # and Windows's its Job Object, so neither reads the tree for it. The
@@ -2456,7 +2459,12 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         memoryCapApplied:
           (when defined(macosx): memoryCap.applied else: memoryCapApplied),
         memoryCapProblem:
-          (when defined(macosx): memoryCap.problem else: memoryCapProblem)
+          (when defined(macosx): memoryCap.problem
+           elif defined(linux):
+             (if memoryStageProblem.len == 0: memoryCapProblem
+              elif memoryCapProblem.len == 0: memoryStageProblem
+              else: memoryStageProblem & "; " & memoryCapProblem)
+           else: memoryCapProblem)
       ),
       cgroupTarget: placedTarget,
       memoryCap: memoryCap,
