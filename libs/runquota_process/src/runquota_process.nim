@@ -1939,6 +1939,25 @@ when defined(linux):
       exitSignal: uint64(SIGCHLD), cgroup: uint64(leafFd))
     Pid(rawSyscall(SysClone3, addr args, csize_t(sizeof(CloneArgs))))
 
+  proc preloadFileSet*(path: string): bool =
+    ## Whether `path` (the dynamic linker's `/etc/ld.so.preload`) names
+    ## anything: a non-empty file preloads its libraries into every
+    ## program, exactly as `LD_PRELOAD` does, so it keeps the fork path for
+    ## the same reason. ld.so(8).
+    var info: Stat
+    stat(cstring(path), info) == 0 and info.st_size > 0
+
+  var systemPreloadState: int
+    ## 0 not read yet, 1 no system preload, 2 set: `/etc/ld.so.preload` is
+    ## looked at once per process, not once per launch.
+
+  proc systemPreloadSet(): bool =
+    var state = atomicLoadN(addr systemPreloadState, ATOMIC_ACQUIRE)
+    if state == 0:
+      state = if preloadFileSet("/etc/ld.so.preload"): 2 else: 1
+      atomicStoreN(addr systemPreloadState, state, ATOMIC_RELEASE)
+    state == 2
+
   proc clone3FallsBack(code: cint): bool =
     ## The `clone3` failures after which the ordinary fork and the child's
     ## own write into the leaf still work: everything except a leaf that
@@ -2099,6 +2118,11 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       # one too: its leaf is created by this launch, never found.
       if target.isCapLeaf:
         target.freshLeaf = true
+        # A launch that creates a cap leaf first removes the empty cap
+        # leaves of launchers that died before their clean-up, in the
+        # directory it caps into: a memory-only cap leaf has no other
+        # sweep, and it would stay for good.
+        sweepStaleCapLeaves(target)
       if target.placed:
         rootLock = lockCgroupRoot(target.root, exclusive = false)
         # THE PRIORITY IS READ UNDER THE SHARED LOCK, and the weight below is
@@ -2129,19 +2153,25 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
             continue
           if procsFd >= 0 or not retryable:
             break
+          # Preparing again: a leaf this attempt created is still this
+          # launch's own, and is reused under its name, not renamed.
+          if memoryPrep.leafCreated:
+            target.freshLeaf = false
         if procsFd >= 0 and target.memory:
           memoryCapApplied = memoryPrep.limits
           if memoryPrep.problem.len > 0:
             memoryCapProblem = memoryPrep.problem
           memoryClassify = memoryStage >= mcsClassify and memoryPrep.limits
           # CLONE3 FROM THE `limits` STAGE ON, INTO A LEAF OF ITS OWN. Not
-          # when this launcher runs with `LD_PRELOAD` set: a shim that hooks
+          # when this launcher runs with `LD_PRELOAD` set, or with a
+          # non-empty `/etc/ld.so.preload` (the same preload, host-wide):
+          # a shim that hooks
           # `fork` (a build monitor following the tree) relies on the C
           # library's fork handlers, which the raw `clone3` skips. The fork
           # path below puts the child in the same leaf before it executes
           # anything, so the cap is the same either way.
           useClone3 = memoryStage >= mcsLimits and target.freshLeaf and
-            getEnv("LD_PRELOAD").len == 0
+            getEnv("LD_PRELOAD").len == 0 and not systemPreloadSet()
         if procsFd >= 0 and useClone3:
           leafFd = openLeafDir(target, leafProblem, leafVanished)
         if procsFd >= 0 and leafFd < 0:
@@ -2179,6 +2209,8 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
           pid = clone3IntoCgroup(leafFd)
           if pid >= 0:
             spawnedByClone3 = true
+            # In the child too: a plain assignment, no allocation (the
+            # retry's failure text, if any, is the parent's to drop).
             break
           cloneErrno = errno
           discard posix.close(leafFd)
@@ -2196,6 +2228,7 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
           if procsFd < 0:
             break
           memoryCapApplied = memoryPrep.limits
+          memoryCapProblem = memoryPrep.problem
           memoryClassify = memoryStage >= mcsClassify and memoryPrep.limits
           leafFd = openLeafDir(target, leafProblem, leafVanished)
           if leafFd < 0:
@@ -2275,6 +2308,10 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
       childReportExecFailure(cstring(execFailureText), errno)
       childExit(127)
     when defined(linux):
+      if spawnedByClone3 and pid > 0:
+        # A retry that succeeded leaves no problem behind.
+        placementProblem = ""
+        memoryCapProblem = memoryPrep.problem
       if spawnedByClone3:
         # The child was created in its leaf; nothing to hand over.
         discard posix.close(leafFd)
@@ -2300,8 +2337,15 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
               "child joined it"
             while tries < PlacementAttempts:
               inc tries
-              if moveIntoTarget(target, int(pid), placementProblem):
+              if moveIntoTarget(target, int(pid), placementProblem,
+                  memoryPrep):
                 verdict = 0'u8
+                # The leaf was prepared again: what is on it now.
+                if target.memory:
+                  memoryCapApplied = memoryPrep.limits
+                  memoryCapProblem = memoryPrep.problem
+                  memoryClassify = memoryStage >= mcsClassify and
+                    memoryPrep.limits
                 break
           else:
             placementProblem = "the child could not join " & leaf & ": " &
@@ -2321,6 +2365,10 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         discard close(stdoutPipe[1])
         discard close(stderrPipe[0])
         discard close(stderrPipe[1])
+      # Nothing was started: take away the leaf (and an empty group
+      # directory) this launch prepared, which would otherwise stay.
+      if target.placed:
+        releaseTarget(target)
       raise newException(OSError, "fork failed")
 
     if spec.stdio == captureStdio:
@@ -2467,10 +2515,15 @@ when defined(linux):
       return
     var events: MemoryEvents
     var peak = 0'u64
+    var peakKnown = false
     var problem = ""
-    if not readLeafMemory(child.cgroupTarget, events, peak, problem):
+    if not readLeafMemory(child.cgroupTarget, events, peak, peakKnown,
+        problem):
       completion.memoryCapProblem = problem
       return
+    # Without `memory.peak` (before 5.19) the events still classify the
+    # end; the peak stays unknown (`mpsNone`), and `problem` says why.
+    completion.memoryCapProblem = problem
     # KILL EVIDENCE: the root died of a signal, or exited non-zero (a
     # parent that reported its child's kill). A tree whose root exited 0
     # has its own conclusion whatever the counters say.
@@ -2480,7 +2533,7 @@ when defined(linux):
       child.memoryCapAction, killEvidence)
     completion.memoryCapMeasured = true
     completion.memoryPeakBytes = peak
-    completion.memoryPeakSource = mpsCgroup
+    completion.memoryPeakSource = if peakKnown: mpsCgroup else: mpsNone
     completion.capExceeded = verdict.capExceeded
     completion.capKilled = verdict.capKilled
     completion.capReached = verdict.capReached

@@ -59,7 +59,7 @@
 ## Static-helper library rules apply (no `ref` types): this module is part of
 ## `runquota_process`.
 
-import std/[os, strutils, times]
+import std/[monotimes, os, strutils, times]
 when defined(posix):
   import std/posix
 
@@ -199,6 +199,10 @@ type
     leafTaken*: bool
       ## A `freshLeaf` target's leaf already existed: nothing was written to
       ## it, and the caller must pick another name.
+    leafCreated*: bool
+      ## This preparation created the leaf. A launch that must prepare
+      ## again (a later step found something vanished) reuses that leaf
+      ## under the same name instead of taking a new one.
     problem*: string
       ## Why the memory settings asked for are not (all) in place, or "".
 
@@ -596,6 +600,20 @@ proc currentCgroupRoot*(hostSwitchOn = false): CgroupRoot =
 proc readSmall(path: string): string =
   try: readFile(path) except IOError, OSError: ""
 
+const runquotaHideMemoryFile {.strdefine.} = ""
+  ## TESTS ONLY: the name of one memory interface file the launcher should
+  ## look for under a name that does not exist, so a test can stand for a
+  ## kernel that lacks it (`memory.oom.group` before 4.19, `memory.peak`
+  ## before 5.19). Empty in every real build, where `memoryFile` is the
+  ## identity and costs nothing.
+
+proc memoryFile(name: string): string =
+  ## `name`, unless a test build hides it (`runquotaHideMemoryFile`).
+  when runquotaHideMemoryFile.len > 0:
+    if name == runquotaHideMemoryFile:
+      return name & ".hidden-by-test"
+  name
+
 when defined(posix):
   proc errnoText(): string =
     $strerror(errno)
@@ -718,9 +736,12 @@ when defined(posix):
     ## without the group kill: `memory.swap.max` (enforced caps only) and
     ## `memory.oom.group` first, `memory.max` last, so a leaf whose `oom.group` cannot be set
     ## gets no limit at all rather than a limit under which the kernel kills
-    ## one process and leaves its parent running. False only when the leaf
-    ## vanished (the caller prepares again); every other failure is a
-    ## `memory.problem` and the tree runs in its leaf without the cap.
+    ## one process and leaves its parent running. False only when the LEAF
+    ## vanished (the caller prepares again). An interface file that does
+    ## not exist in a leaf that does (ENOENT from a kernel without it:
+    ## `memory.oom.group` before 4.19) is not a vanished leaf: like every
+    ## other failure it is a `memory.problem`, and the tree runs in its
+    ## leaf, with any CPU cap, without the memory cap.
     let leaf = target.leafPath
     var problem = ""
     var gone = false
@@ -729,24 +750,24 @@ when defined(posix):
     # for a leaf that only measures (`max`: advisory mode, a lifted run),
     # which must not change how the tree uses memory. A kernel that does
     # not account swap has no such file, and nothing to escape into.
-    if target.memoryMax != "max" and fileExists(leaf / "memory.swap.max"):
-      if not writeCgroupFile(leaf / "memory.swap.max", "0", problem, gone):
-        if gone:
+    if target.memoryMax != "max" and fileExists(leaf / memoryFile("memory.swap.max")):
+      if not writeCgroupFile(leaf / memoryFile("memory.swap.max"), "0", problem, gone):
+        if gone and not dirExists(leaf):
           vanished = true
           memory.problem = problem
           return false
         memory.problem = "memory cap not applied: " & problem
         return true
-    if not writeCgroupFile(leaf / "memory.oom.group", "1", problem, gone):
-      if gone:
+    if not writeCgroupFile(leaf / memoryFile("memory.oom.group"), "1", problem, gone):
+      if gone and not dirExists(leaf):
         vanished = true
         memory.problem = problem
         return false
       memory.problem = "memory cap not applied: " & problem
       return true
-    if not writeCgroupFile(leaf / "memory.max", target.memoryMax, problem,
+    if not writeCgroupFile(leaf / memoryFile("memory.max"), target.memoryMax, problem,
         gone):
-      if gone:
+      if gone and not dirExists(leaf):
         vanished = true
         memory.problem = problem
         return false
@@ -817,6 +838,7 @@ proc prepareTarget*(target: CgroupTarget; problem: var string;
     if target.freshLeaf:
       if not ensureFreshDir(leaf, problem, vanished, memory.leafTaken):
         return false
+      memory.leafCreated = true
     elif not ensureDir(leaf, problem, vanished):
       return false
     if target.cpuMax.len > 0:
@@ -918,12 +940,14 @@ proc waitUntilEmpty*(dir: string; timeoutMillis: int): bool =
   ## leaf now would fail and leave it behind. True at once when the file
   ## cannot be read (nothing to wait for).
   when defined(linux):
-    let deadline = epochTime() + float(timeoutMillis) / 1000.0
+    # The monotonic clock: a wall-clock step must not stretch or cut the
+    # wait.
+    let deadline = getMonoTime() + initDuration(milliseconds = timeoutMillis)
     while true:
       let events = readSmall(dir / "cgroup.events")
       if events.len == 0 or "populated 0" in events:
         return true
-      if epochTime() >= deadline:
+      if getMonoTime() >= deadline:
         return false
       sleep(10)
   else:
@@ -960,9 +984,15 @@ proc releaseTarget*(target: CgroupTarget) =
   if not target.placed:
     return
   let lock = lockCgroupRoot(target.root, exclusive = true)
-  if target.isCapLeaf:
-    removeEmptyDescendants(target.leafPath)
-  if removeEmptyCgroup(target.leafPath):
+  var removed = removeEmptyCgroup(target.leafPath)
+  when defined(posix):
+    # A cap leaf the kernel refused (EBUSY) may hold only empty
+    # sub-cgroups its tree made; remove those and try once more. The walk
+    # happens only then, so an ordinary release costs one `rmdir`.
+    if not removed and errno == EBUSY and target.isCapLeaf:
+      removeEmptyDescendants(target.leafPath)
+      removed = removeEmptyCgroup(target.leafPath)
+  if removed:
     discard removeEmptyCgroup(target.dirPath)
   unlockCgroupRoot(lock)
 
@@ -993,8 +1023,10 @@ proc sweepStaleCapLeaves*(target: CgroupTarget) =
       except ValueError:
         continue
       if not pidAlive(pid):
-        removeEmptyDescendants(target.dirPath / path)
-        discard removeEmptyCgroup(target.dirPath / path)
+        let stale = target.dirPath / path
+        if not removeEmptyCgroup(stale) and errno == EBUSY:
+          removeEmptyDescendants(stale)
+          discard removeEmptyCgroup(stale)
   except OSError:
     discard
 
@@ -1122,7 +1154,8 @@ proc openLeafDir*(target: CgroupTarget; problem: var string;
     -1
 
 proc moveIntoTarget*(target: CgroupTarget; pid: int;
-                     problem: var string): bool =
+                     problem: var string;
+                     memory: var MemoryPreparation): bool =
   ## Prepare `target` again and move process `pid` into its leaf: the
   ## parent's half of the vanished-leaf retry, for a child that is waiting,
   ## not yet executed, after its own write found the leaf gone. A leaf the
@@ -1132,50 +1165,120 @@ proc moveIntoTarget*(target: CgroupTarget; pid: int;
   when defined(linux):
     var again = target
     again.freshLeaf = false
-    if not prepareTarget(again, problem):
+    var vanished = false
+    if not prepareTarget(again, problem, vanished, memory):
       return false
     writeCgroupFile(target.leafPath / "cgroup.procs", $pid, problem)
   else:
     problem = "cgroups exist only on Linux"
     false
 
+proc moveIntoTarget*(target: CgroupTarget; pid: int;
+                     problem: var string): bool =
+  var memory: MemoryPreparation
+  moveIntoTarget(target, pid, problem, memory)
+
+proc mountHasLocalEvents*(mountinfo: string;
+                          mountPoint = CgroupMountPoint): bool =
+  ## Whether the cgroup2 file system at `mountPoint` is mounted with
+  ## `memory_localevents`, from `/proc/self/mountinfo` text. That option
+  ## makes every `memory.events` count the cgroup alone, like
+  ## `memory.events.local` (cgroup-v2.rst, "memory_localevents"). Each
+  ## line is `id parent major:minor root mount-point options ... - fstype
+  ## source super-options` (proc(5)).
+  for line in mountinfo.splitLines():
+    let fields = line.splitWhitespace()
+    let dash = fields.find("-")
+    if fields.len < 5 or dash < 0 or dash + 3 >= fields.len:
+      continue
+    if fields[4] != mountPoint or fields[dash + 1] != "cgroup2":
+      continue
+    return "memory_localevents" in fields[dash + 3].split(',')
+  false
+
+var localEventsState: int
+  ## 0 not read yet, 1 hierarchical `memory.events`, 2 local
+  ## (`memory_localevents`): the mount is read once per process.
+
+proc memoryEventsAreLocal*(): bool =
+  ## `mountHasLocalEvents` for this process's cgroup2 mount, read once and
+  ## cached (two threads that both read it store the same answer).
+  when defined(linux):
+    var state = atomicLoadN(addr localEventsState, ATOMIC_ACQUIRE)
+    if state == 0:
+      state = if mountHasLocalEvents(readSmall("/proc/self/mountinfo")): 2
+        else: 1
+      atomicStoreN(addr localEventsState, state, ATOMIC_RELEASE)
+    state == 2
+  else:
+    false
+
 proc readLeafMemory*(target: CgroupTarget; events: var MemoryEvents;
-                     peakBytes: var uint64; problem: var string): bool =
+                     peakBytes: var uint64; peakKnown: var bool;
+                     problem: var string;
+                     localEventsMount = memoryEventsAreLocal()): bool =
   ## The leaf's counters, read ONCE, after the tree's root was reaped and
   ## before the leaf is removed: `oom` from `memory.events.local`,
   ## `oom_kill` from the hierarchical `memory.events` (`MemoryEvents` says
-  ## why each), and `memory.peak`. False with `problem` when any cannot be
-  ## read (no memory controller on the leaf, a kernel before 5.19 without
-  ## `memory.peak`).
+  ## why each), and `memory.peak`. False with `problem` when the events
+  ## cannot be read (no memory controller on the leaf). A kernel before
+  ## 5.19 has no `memory.peak`: the events still classify the end, and
+  ## `peakKnown` is false, so nothing learns a peak nobody measured.
   events = MemoryEvents()
   peakBytes = 0'u64
+  peakKnown = false
   when defined(linux):
     let leaf = target.leafPath
     var text = ""
     var vanished = false
-    if not readCgroupFile(leaf / "memory.events.local", text, problem,
+    if not readCgroupFile(leaf / memoryFile("memory.events.local"), text, problem,
         vanished):
       return false
     let local = parseMemoryEvents(text)
     if not local.known:
-      problem = "no oom / oom_kill counts in " & leaf / "memory.events.local"
+      problem = "no oom / oom_kill counts in " & leaf / memoryFile("memory.events.local")
       return false
-    if not readCgroupFile(leaf / "memory.events", text, problem, vanished):
-      return false
-    let hierarchical = parseMemoryEvents(text)
-    if not hierarchical.known:
-      problem = "no oom / oom_kill counts in " & leaf / "memory.events"
-      return false
-    if not readCgroupFile(leaf / "memory.peak", text, problem, vanished):
-      return false
-    try:
-      peakBytes = uint64(parseBiggestUInt(text.strip()))
-    except ValueError:
-      problem = "cannot parse " & leaf / "memory.peak" & ": '" & text.strip() &
-        "'"
-      return false
+    var hierarchical: MemoryEvents
+    if not localEventsMount:
+      if not readCgroupFile(leaf / memoryFile("memory.events"), text, problem,
+          vanished):
+        return false
+      hierarchical = parseMemoryEvents(text)
+      if not hierarchical.known:
+        problem = "no oom / oom_kill counts in " & leaf / "memory.events"
+        return false
+    else:
+      # `memory_localevents`: `memory.events` counts the leaf alone, so the
+      # kills inside the tree's leaf are the sum of the leaf's and every
+      # sub-cgroup's own counts. A sub-cgroup the tree has already removed
+      # took its count with it; the hierarchical file would have kept it.
+      hierarchical = local
+      try:
+        for path in walkDirRec(leaf, yieldFilter = {pcDir},
+            followFilter = {pcDir}):
+          var sub = ""
+          var subProblem = ""
+          var subGone = false
+          if readCgroupFile(path / "memory.events.local", sub, subProblem,
+              subGone):
+            let counts = parseMemoryEvents(sub)
+            if counts.known:
+              hierarchical.oomKill += counts.oomKill
+      except OSError:
+        discard
     events = MemoryEvents(known: true, oom: local.oom,
       oomKill: hierarchical.oomKill)
+    var peakProblem = ""
+    if readCgroupFile(leaf / memoryFile("memory.peak"), text, peakProblem,
+        vanished):
+      try:
+        peakBytes = uint64(parseBiggestUInt(text.strip()))
+        peakKnown = true
+      except ValueError:
+        problem = "cannot parse " & leaf / "memory.peak" & ": '" &
+          text.strip() & "'"
+    else:
+      problem = "the peak is not measured: " & peakProblem
     true
   else:
     problem = "cgroups exist only on Linux"

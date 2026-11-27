@@ -70,7 +70,7 @@
 ## real cgroups of a test-owned root below the user's delegated subtree
 ## (`delegatedMemoryTestRoot`). Where the host gives the user no delegated
 ## memory controller, the host tests are reported SKIPPED with the reason.
-import std/[os, strutils, unittest]
+import std/[os, osproc, strutils, unittest]
 import runquota_core
 import runquota_process
 when defined(linux):
@@ -226,15 +226,38 @@ when defined(linux):
     "local " & pick(leaf / "memory.events.local") & "; hierarchical " &
       pick(leaf / "memory.events")
 
-  proc runReporting(spec: CommandSpec; label: string;
-                    info: var LaunchResult): ProcessCompletion =
+  proc runComparing(spec: CommandSpec; label: string;
+                    info: var LaunchResult; compareLocal: bool;
+                    localAgrees: var bool): ProcessCompletion =
     ## `runToEnd`, printing the leaf's counters after the root is reaped
     ## and before the leaf is removed.
     var child = launchProcess(spec)
     info = child.info
     result = child.waitForCompletion(60_000)
     echo "    counters (", label, "): ", countersOf(child.cgroupTarget.leafPath)
+    # The same kills counted the way a `memory_localevents` mount needs
+    # (the leaf's and its sub-cgroups' local counts summed) must agree
+    # with the hierarchical file while every sub-cgroup still exists.
+    var viaHierarchy, viaLocal: MemoryEvents
+    var peak = 0'u64
+    var peakKnown = false
+    var problem = ""
+    if compareLocal and readLeafMemory(child.cgroupTarget, viaHierarchy,
+        peak, peakKnown, problem, localEventsMount = false):
+      # Returned, not checked here: a `check` in a proc does not mark the
+      # calling test failed.
+      localAgrees = readLeafMemory(child.cgroupTarget, viaLocal, peak,
+        peakKnown, problem, localEventsMount = true) and
+        viaLocal == viaHierarchy
+      echo "    summed local oom_kill ", viaLocal.oomKill, ", hierarchical ",
+        viaHierarchy.oomKill
     child.close()
+
+  proc runReporting(spec: CommandSpec; label: string;
+                    info: var LaunchResult;
+                    compareLocal = false): ProcessCompletion =
+    var ignored = true
+    runComparing(spec, label, info, compareLocal, ignored)
 
   proc groupDir(root, group: string): string =
     targetFor(CgroupRoot(state: crsExplicit, path: root), group,
@@ -349,6 +372,30 @@ suite "memory cap rules":
       action = mcaAdvisory).capExceeded
     check memoryCapVerdict(MemoryEvents(), 0, 0, mcaKill, true) ==
       MemoryCapVerdict()
+
+  test "memory_localevents is read from the cgroup2 mount's options":
+    const plain = "29 1 0:26 / /sys/fs/cgroup rw,nosuid shared:4 - cgroup2 " &
+      "cgroup2 rw,nsdelegate,memory_recursiveprot\n"
+    const local = "29 1 0:26 / /sys/fs/cgroup rw,nosuid shared:4 - cgroup2 " &
+      "cgroup2 rw,nsdelegate,memory_localevents\n"
+    const elsewhere = "30 1 0:27 / /mnt/cg rw - cgroup2 cgroup2 " &
+      "rw,memory_localevents\n"
+    check not mountHasLocalEvents(plain)
+    check mountHasLocalEvents(local)
+    check not mountHasLocalEvents(elsewhere)
+    check mountHasLocalEvents(elsewhere, "/mnt/cg")
+    check not mountHasLocalEvents("")
+
+  when defined(linux):
+    test "a non-empty ld.so.preload counts as a preload":
+      let dir = getTempDir() / ("rq-preload-" & $getCurrentProcessId())
+      createDir(dir)
+      defer: removeDir(dir)
+      check not preloadFileSet(dir / "absent")
+      writeFile(dir / "empty", "")
+      check not preloadFileSet(dir / "empty")
+      writeFile(dir / "set", "/x/shim.so\n")
+      check preloadFileSet(dir / "set")
 
   test "the capability record's memory entry":
     let root = CgroupRoot(state: crsDefault, path: "/sys/fs/cgroup/u/runquota.slice")
@@ -496,6 +543,33 @@ when defined(linux):
           check leafFiles(64 * MiB, mcaAdvisory) == "max max 1"
           check leafFiles(0, mcaKill, measure = true) == "max max 1"
 
+    test "a memory-capped launch sweeps a dead launcher's empty cap leaf":
+      if testRoot.len == 0:
+        echo "SKIPPED: " & reason
+        skip()
+      else:
+        # A cap leaf left behind by a launcher that died before its
+        # clean-up, in the group a memory-only capped tree is launched in
+        # (no CPU cap, so the CPU path's sweep never runs). The launch must
+        # remove it. Mutation: sweeping only for CPU cap leaves.
+        let shared = targetFor(CgroupRoot(state: crsExplicit, path: testRoot),
+          "sweep", sessionPriorityNormal, reclaimed = false)
+        var problem = ""
+        check prepareTarget(shared, problem)
+        check removeEmptyCgroup(shared.leafPath)
+        let gone = startProcess("/bin/sh", args = ["-c", "exit 0"])
+        discard gone.waitForExit()
+        let deadPid = gone.processID
+        gone.close()
+        let stale = shared.dirPath / capLeafName(deadPid, 1)
+        createDir(stale)
+        var info: LaunchResult
+        let completion = runToEnd(cappedSpec([app, "--hold", "10"], testRoot,
+          "sweep", 64 * MiB), info)
+        check completion.exited and completion.exitCode == 0
+        check not dirExists(stale)
+        check cgroupDirsBelow(testRoot) == newSeq[string]()
+
     test "a cap kill inside a sub-cgroup of the tree's own leaf is the cap's":
       if testRoot.len == 0:
         echo "SKIPPED: " & reason
@@ -509,9 +583,11 @@ when defined(linux):
         # `oom_kill` includes. Both are the cap's kill.
         var info: LaunchResult
         for mode in ["plain", "controlled"]:
-          let killed = runReporting(cappedSpec([app, "--sub-alloc", mode,
+          var localAgrees = false
+          let killed = runComparing(cappedSpec([app, "--sub-alloc", mode,
             "96"], testRoot, "sub-" & mode, 32 * MiB),
-            "cap kill in a " & mode & " sub-cgroup", info)
+            "cap kill in a " & mode & " sub-cgroup", info, true, localAgrees)
+          check localAgrees
           checkpoint mode & ": " & killed.stdout & killed.stderr
           check killed.signaled
           check "parent-survived" notin killed.stdout
