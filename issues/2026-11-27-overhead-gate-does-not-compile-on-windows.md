@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Open |
+| Status | In progress -- `process_cost.nim` ported to Windows (`runquota` agents `2f00d634`); the main gate file is not |
 | Observed in | `runquota` @ `7c98da54` (`agents` tip); Nim 2.2.8 + WinLibs gcc 16.1.0, eli-pc (Windows 11 x86_64) |
 | Area | `benchmarks/lib/runquota_overhead_gate.nim`; `benchmarks/lib/runquota_overhead_gate/process_cost.nim` |
 | Expectation | RunQuota-Memory-Caps.md's § "The overhead rule" directs each new enforcement mechanism to be judged with this gate, naming a Windows arm (`--switch memory-cap`) explicitly, "each on its own platform, by its driver." |
@@ -56,3 +56,40 @@ verdict for any enforcement mechanism can only come from an ad hoc,
 non-statistical timing comparison outside the gate -- not the same
 guarantee the gate's confidence-interval methodology gives the Linux and
 (once run) macOS verdicts.
+
+## Progress, 2026-11-27 (rq-memcap-win)
+
+`process_cost.nim` itself now builds and runs on Windows (`runquota`
+agents `2f00d634`): `spawnChild`/`runMeasured` place the measured child in
+a fresh, limitless Job Object at creation
+(`PROC_THREAD_ATTRIBUTE_JOB_LIST`, the same mechanism the production
+launcher uses) and read `TotalUserTime`/`TotalKernelTime` from it --
+Windows has no `wait4`-style aggregation of a reaped child's own
+descendants, so without the job a grandchild's CPU would be invisible to
+`cpuSeconds` exactly the way the module header already warns a daemon's
+reaped `sqlite3` child would be if `/proc` weren't read. `processCpuSeconds`
+(for the daemon's own pid) and `loadAverage` get Windows arms too (the
+latter returns `""`: Windows has no load-average concept). Verified
+against a real grandchild-forking workload (a direct child that only
+waits on a burning grandchild): `cpuSeconds` reads the full burn, not
+~0, with a control (no job at all) that would show the gap if the job
+accounting weren't wired correctly.
+
+**Found and fixed along the way**, in both this file and
+`runquota_process.nim`'s own `buildWindowsEnvBlock`: an environment block
+built from zero entries is a single-NUL block, which `CreateProcessW`
+refuses with `ERROR_INVALID_PARAMETER` -- it needs a double-NUL to mean
+"zero variables," and with no entry there is nothing to borrow the second
+null from. This is reachable in production (`CommandSpec(inheritEnv:
+false)` with no declared `env`), had no test coverage (every existing
+isolated-environment test happened to declare at least one variable), and
+is now fixed and covered by a regression test with its own falsifying
+mutation.
+
+**Not done**: `runquota_overhead_gate.nim` itself (the main file) still
+imports `std/posix` unconditionally and declares several `Pid`-typed
+fields from it, which `process_cost.nim` now defines its own Windows
+stand-in for (`process_cost.Pid`) but the main file does not yet consume.
+Wiring the main file to build on Windows -- let alone running the
+`synthetic` case there, let alone a `memory-cap` switch arm -- is still
+open.
