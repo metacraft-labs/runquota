@@ -1,2 +1,10 @@
 # The packaged host configuration must equal HostConfigTemplate byte for byte.
 /packaging/etc/runquotad.toml text eol=lf
+
+# Every .nim file in this repo is LF. Without this, a Windows tool that
+# writes the file in text mode (Python's plain `open(path, "w")`, among
+# others) silently converts every line ending to CRLF on save, which then
+# conflicts the whole file against anyone else's LF edit of it -- this is
+# exactly what happened to runquota_process/enforcement.nim in agents
+# 4dd0d6b (462 lines, found and fixed by rq-memcap, 2026-11-27).
+*.nim text eol=lf
