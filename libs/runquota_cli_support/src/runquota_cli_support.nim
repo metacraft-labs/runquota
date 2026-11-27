@@ -19,6 +19,7 @@ import runquota_cli_support/jobserver_command
 import runquota_cli_support/sizing_command
 import runquota_cli_support/vm_command
 import runquota_cli_support/expect_growth_command
+import runquota_cli_support/memory_cap_unit
 
 proc wantsVersion*(args: openArray[string]): bool =
   args.len == 1 and args[0] in ["--version", "-V"]
@@ -241,16 +242,26 @@ proc printVirtualMachines(statusJson: string) =
       line.add(" capability=\"" & capability.getStr() & "\"")
     echo line
 
+proc memoryCapUnitJson(unit: EnclosingUnit; policy: UnitPolicy): JsonNode =
+  %*{"unit": unit.name, "user_manager": unit.userManager,
+     "known": policy.known, "delegate": policy.delegate,
+     "oom_policy": policy.oomPolicy, "problem": policy.problem,
+     "unsafe": memoryCapUnsafeReason(policy)}
+
 proc withEnforcement(daemonJson: string; record: EnforcementRecord;
-                     measurement: MeasurementRecord): string =
+                     measurement: MeasurementRecord;
+                     memoryCapUnit: JsonNode = nil): string =
   ## The daemon's status object with the client's enforcement record added
-  ## as `enforcement` and the measurement record as `measurement`. A daemon
-  ## answer that is not a JSON object is wrapped rather than lost.
+  ## as `enforcement`, the measurement record as `measurement`, and, when
+  ## placement is on, the enclosing unit's policy as `memory_cap_unit`. A
+  ## daemon answer that is not a JSON object is wrapped rather than lost.
   try:
     let parsed = parseJson(daemonJson)
     if parsed.kind == JObject:
       parsed["enforcement"] = parseJson(record.toJson())
       parsed["measurement"] = parseJson(measurement.toJson())
+      if not memoryCapUnit.isNil:
+        parsed["memory_cap_unit"] = memoryCapUnit
       return $parsed
     return $(%*{"daemon": parsed, "enforcement": parseJson(record.toJson()),
       "measurement": parseJson(measurement.toJson())})
@@ -273,26 +284,28 @@ proc printStatus(json: bool): int =
   # enforcement`).
   #
   # THE MEMORY-CAP MODE the host file sets for this client's launchers goes
-  # into the record too. MERGE HOOK: the record's `memoryCapMode` parameter
-  # arrives with the platform branch that enforces the cap; until then this
-  # build's `hostEnforcementRecord` has none, and `when compiles` keeps the
-  # call that does not pass it. Once both are in one tree, replace the
-  # `when` with the first call.
-  let memoryCapMode = launcherMemoryCapMode()
-  let enforcement =
-    when compiles(hostEnforcementRecord(memoryCapMode = memoryCapMode)):
-      hostEnforcementRecord(launcherCgroupRoot(),
-        jobPriorityOn = launcherJobPriorityOn(),
-        qosOn = launcherQosOn(),
-        memoryCapMode = memoryCapMode)
-    else:
-      hostEnforcementRecord(launcherCgroupRoot(),
-        jobPriorityOn = launcherJobPriorityOn(),
-        qosOn = launcherQosOn())
+  # into the record too, so the record says whether a cap is off, advisory
+  # or enforced here.
+  let enforcement = hostEnforcementRecord(launcherCgroupRoot(),
+    jobPriorityOn = launcherJobPriorityOn(),
+    qosOn = launcherQosOn(),
+    memoryCapMode = launcherMemoryCapMode())
+  # TRAP 2, the unit enclosing the task leaves: with placement on, the
+  # unit's `Delegate=` and `OOMPolicy=` decide whether one task's cap kill
+  # could stop the whole unit (`runquota_cli_support/memory_cap_unit`).
+  # Read here, by `systemctl show`, and never on the launch path.
+  var memoryUnit: EnclosingUnit
+  var memoryUnitPolicy: UnitPolicy
+  let placementOn = enforcement.placement == "on"
+  if placementOn:
+    memoryUnit = enclosingUnit(enforcement.cgroupRoot)
+    memoryUnitPolicy = queryUnitPolicy(memoryUnit)
   if json:
     let daemonJson =
       if statusJson.len > 0: statusJson else: inspectionStatusJson(status)
-    echo withEnforcement(daemonJson, enforcement, hostMeasurementRecord())
+    echo withEnforcement(daemonJson, enforcement, hostMeasurementRecord(),
+      (if placementOn: memoryCapUnitJson(memoryUnit, memoryUnitPolicy)
+       else: nil))
   else:
     echo "sessions: " & $status.activeSessions
     echo "leases: " & $status.activeLeases
@@ -330,6 +343,9 @@ proc printStatus(json: bool): int =
       discard
     for line in enforcement.renderLines():
       echo line
+    if placementOn:
+      for line in unitPolicyLines(memoryUnit, memoryUnitPolicy):
+        echo line
     for line in hostMeasurementRecord().renderLines():
       echo line
   0

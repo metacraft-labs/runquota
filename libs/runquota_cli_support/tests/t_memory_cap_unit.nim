@@ -1,0 +1,80 @@
+## Trap 2 in `runquota status`: the systemd unit enclosing the cgroup root
+## must keep `Delegate=yes` and must not set `OOMPolicy=stop` or `kill`, or
+## one task's cap kill could stop the whole unit.
+##
+## WHAT IS GUARDED, each with the change that makes it fail:
+##
+## * The unit is the deepest `.service` / `.scope` strictly above the root,
+##   with the user manager's units told apart from the system manager's.
+##   Mutation: taking the first unit from the top (an explicit root under a
+##   unit of the user's manager then names `user@<uid>.service`).
+## * Unsafe when `Delegate` is not `yes`, when `OOMPolicy` is `stop` or
+##   `kill`, and when either is unknown. Mutation: ignoring `OOMPolicy`
+##   (the `Delegate=yes OOMPolicy=stop` case then reads as safe).
+## * On this host, the real `systemctl show` of the unit enclosing the
+##   default root answers (when there is a systemd user manager to ask).
+##
+## NO MOCKS: the pure rules take `systemctl show` text; the host case runs
+## the real `systemctl`.
+import std/[os, posix, strutils, unittest]
+import runquota_cli_support/memory_cap_unit
+
+suite "the unit enclosing the cgroup root":
+  test "the deepest service or scope above the root":
+    let default = enclosingUnit(
+      "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/runquota.slice")
+    check default.name == "user@1000.service"
+    check not default.userManager
+    let explicit = enclosingUnit("/sys/fs/cgroup/user.slice/user-1000.slice/" &
+      "user@1000.service/app.slice/build.service/rq")
+    check explicit.name == "build.service"
+    check explicit.userManager
+    let scope = enclosingUnit("/sys/fs/cgroup/user.slice/user-1000.slice/" &
+      "user@1000.service/app.slice/x.scope/rq.slice")
+    check scope.name == "x.scope"
+    # The root itself is never its own enclosing unit.
+    check enclosingUnit("/sys/fs/cgroup/system.slice/a.service").name == ""
+    check enclosingUnit("/sys/fs/cgroup/a.slice/b.slice").name == ""
+    check enclosingUnit("").name == ""
+
+  test "unsafe unless Delegate=yes and OOMPolicy is not stop or kill":
+    check memoryCapUnsafeReason(parseUnitPolicy(
+      "Delegate=yes\nOOMPolicy=continue\n")) == ""
+    let stop = memoryCapUnsafeReason(parseUnitPolicy(
+      "Delegate=yes\nOOMPolicy=stop\n"))
+    check "OOMPolicy=stop" in stop
+    check "OOMPolicy=kill" in memoryCapUnsafeReason(parseUnitPolicy(
+      "OOMPolicy=kill\nDelegate=yes\n"))
+    check "Delegate=no" in memoryCapUnsafeReason(parseUnitPolicy(
+      "Delegate=no\nOOMPolicy=continue\n"))
+    let unknown = parseUnitPolicy("Delegate=yes\n")
+    check not unknown.known
+    check memoryCapUnsafeReason(unknown).len > 0
+
+  test "the status lines":
+    let unit = EnclosingUnit(name: "user@1000.service")
+    let safe = unitPolicyLines(unit, parseUnitPolicy(
+      "Delegate=yes\nOOMPolicy=continue\n"))
+    check safe == @["memory_cap_unit: user@1000.service delegate=yes " &
+      "oom_policy=continue"]
+    let unsafe = unitPolicyLines(unit, parseUnitPolicy(
+      "Delegate=no\nOOMPolicy=stop\n"))
+    check unsafe.len == 2
+    check unsafe[1].startsWith("memory_cap_unsafe: ")
+    check "user@1000.service" in unsafe[1]
+
+  test "this host's user manager answers":
+    let unit = EnclosingUnit(name: "user@" & $getuid() & ".service")
+    let policy = queryUnitPolicy(unit)
+    if not policy.known and findExe("systemctl").len == 0:
+      echo "SKIPPED: " & policy.problem
+      skip()
+    elif not policy.known:
+      # A container or CI host without a running user manager: say what
+      # systemctl answered rather than fail on the host.
+      echo "SKIPPED: " & policy.problem
+      skip()
+    else:
+      check policy.delegate.len > 0
+      check policy.oomPolicy.len > 0
+      echo "  ", unitPolicyLines(unit, policy).join(" / ")
