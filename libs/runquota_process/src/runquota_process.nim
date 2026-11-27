@@ -1603,7 +1603,11 @@ when defined(windows):
     ## already the env block's required trailing double-NUL once the last
     ## entry's own embedded `\0` (included in `len`) is counted -- the same
     ## trick `std/osproc`'s private `buildEnv` relies on, which this module
-    ## cannot call either.
+    ## cannot call either. With ZERO entries (`inheritEnv = false` and no
+    ## declared `env`) there is no entry to borrow that second null from, so
+    ## `len` must still be at least 1 -- one zeroed content byte, making the
+    ## terminator `newWideCString` appends the second -- or `CreateProcessW`
+    ## sees a single-NUL block and refuses with ERROR_INVALID_PARAMETER.
     var total = 0
     for key, val in pairs(env):
       total += key.len + val.len + 2 # "=" and the entry's own "\0"
@@ -1613,7 +1617,7 @@ when defined(windows):
       let entry = key & "=" & val
       copyMem(addr buf[pos], cstring(entry), entry.len + 1)
       pos += entry.len + 1
-    (buf, total)
+    (buf, max(total, 1))
 
   proc winMakeInheritablePipe(readEnd, writeEnd: var Handle) =
     var sa: SECURITY_ATTRIBUTES

@@ -73,3 +73,20 @@ suite "isolated child environment":
     entries.sort()
     expected.sort()
     check entries == expected
+
+  test "an isolated child with NO declared variables at all still launches":
+    ## `inheritEnv = false` and an empty `env` together give the launcher
+    ## zero entries to build a block from. On Windows this is the one case
+    ## `buildWindowsEnvBlock`'s "borrow the last entry's own trailing NUL
+    ## for the block's second terminator" trick cannot do -- with no entry
+    ## at all, a block built as exactly zero content bytes is a single-NUL
+    ## block, which `CreateProcessW` refuses with ERROR_INVALID_PARAMETER.
+    ## FALSIFYING MUTATION: return the un-maxed `total` (0) instead of
+    ## `max(total, 1)` from `buildWindowsEnvBlock` -- this launch then
+    ## raises instead of completing.
+    var child = launchProcess(commandSpec(
+      [getAppFilename(), DumpArgument], env = [], inheritEnv = false))
+    defer: child.close()
+    let completion = child.waitForCompletion(timeout = 10_000)
+    check completion.exited
+    check completion.exitCode == 0
