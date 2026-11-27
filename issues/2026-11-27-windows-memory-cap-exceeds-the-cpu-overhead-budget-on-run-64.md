@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Open, narrowing. A real bug in the Windows action itself (dead code at `-d:release`) is found and fixed; a suggestive (not yet precise) longer-action run with the fix shows overhead near zero, pointing at methodology over mechanism, but the recorded fail stands until a precise run replaces it |
+| Status | Open, data gathered, decision pending. Three gate runs now span near-zero to ~1s action length; CPU overhead falls monotonically with action length (2.4-5.9% -> 1.02% precise -> 0.48% noisy) but a precise run at ~0.1-0.2s still straddles the 1% budget exactly ([0.60%, 1.43%]), neither a clean pass nor a fail. Flagged to rq-reform-mgr rather than running a fourth test unilaterally |
 | Observed in | `runquota` @ `bb8ef2a8d1513f7b984c66621252c3b9ca445a99` (`agents`); eli-pc (Windows 11 x86_64, 32 CPUs) |
 | Area | `libs/runquota_process/src/runquota_process.nim` (`applyMemoryCapHard` / `applyMemoryCapNotification` / `startMemoryCapWatcher`), or `benchmarks/lib/runquota_overhead_gate.nim`'s `run64CaseWindowsMemoryCap` / `run64RunWindows` methodology -- which one is not yet established |
 | Expectation | `RunQuota-Memory-Caps.md` § "The overhead rule": the 95% CI of the wall and CPU time difference must include zero at the gate's ±0.5% resolution; a mechanism whose interval excludes zero is rejected or made opt-in |
@@ -104,3 +104,33 @@ not yet conclusive. Recorded in `reprobuild-pm`'s
    Windows's `kill` mode should not be turned on by default. That
    decision is rq-reform-mgr's / the operator's, not this driver's to
    make unilaterally.
+
+## Update, 2026-11-27 (rq-memcap-win): a precision run, and the full picture
+
+Ran the comparison again, `run64LoopTurns` raised to 100M (~0.1-0.2s of
+real CPU per action, ~4.3s wall per round with all 64 concurrent), 200
+rounds, 2008s. CPU overhead reached the gate's required ±0.5% precision
+this time: **1.02%, interval [0.60%, 1.43%]** -- straddling the 1%
+budget almost exactly. Per the gate's own rule that is neither a pass
+(needs the upper bound in budget) nor an early fail (needs the lower
+bound over it): a precise, genuinely ambiguous reading.
+
+Across all three runs (near-zero dead-loop action: 2.39% and 5.94%;
+~0.1-0.2s: 1.02% precise; ~1s: 0.48% noisy, 8 rounds), the trend is
+real and monotonic in the two precise readings: overhead falls as the
+action grows. Consistent with candidate 2 (a fixed per-launch cost
+diluting with a longer action) but not conclusive that it reaches zero
+-- a smaller fixed cost could still survive dilution. The watcher
+thread (`startMemoryCapWatcher`) is the one candidate that would NOT
+dilute with action length: one extra thread held for the action's whole
+duration competes for the host's cores regardless of how long the
+action's own work takes, unlike the two one-time
+`SetInformationJobObject` calls.
+
+**Not pursuing a fourth gate run unilaterally.** Three runs (23, 33 and
+45 minutes) in one session establish the shape of the question; what
+comes next -- a longer action still, profiling the watcher thread's own
+cost specifically, or accepting/rejecting a residual cost under 1% -- is
+a design decision, not one more data point. Flagged to rq-reform-mgr.
+Full detail in `reprobuild-pm`'s `spec/RunQuota-Memory-Caps.md` §
+"Verdicts".
