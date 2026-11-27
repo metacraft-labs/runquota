@@ -244,12 +244,14 @@ suite "observation_write_path_rules":
     check compiles(KillEvidence(bySignal: false, exitCode: 137'u32))
     check compiles(oomKilled(killedBySignal(9'u32)))
     check compiles(timedOut(killedWithExitCode(124'u32)))
+    check compiles(capExceeded(killedBySignal(9'u32)))
 
     # A KILL CANNOT BE NAMED WITHOUT THE THING THAT EVIDENCES IT. There is
     # no arity of these constructors that omits the evidence, and no other
     # way to reach the kinds that carry it.
     check not compiles(oomKilled())
     check not compiles(timedOut())
+    check not compiles(capExceeded())
     check not compiles(crashed())
 
     # A SUCCESS CANNOT CARRY A KILL'S EVIDENCE, because `lfSucceeded` has
@@ -399,8 +401,16 @@ suite "observation_write_path_rules":
         of lfTimedOut: timedOut(killedBySignal(9'u32))
         of lfCancelled: cancelled()
         of lfLaunchFailed: launchFailed()
+        of lfCapExceeded: capExceeded(killedBySignal(9'u32))
       reached.incl(observationTermination(finish))
-    check reached == {tExited, tSignalled, tTimeout, tOomKilled, tRefused}
+    check reached == {tExited, tSignalled, tTimeout, tOomKilled, tRefused,
+      tCapExceeded}
+    # A CAP KILL IS NOT AN OOM KILL ON THE SPINE: `oom_killed` keeps meaning
+    # killed for memory by something other than the tree's own cap.
+    check observationTermination(capExceeded(killedBySignal(9'u32))) ==
+      tCapExceeded
+    check observationTermination(oomKilled(killedBySignal(9'u32))) ==
+      tOomKilled
 
     # AND EACH WORD IS THE ONE THE KIND MEANS, not merely some word. The
     # set above is satisfied by any bijection; these are the mapping.
@@ -490,7 +500,9 @@ suite "observation_write_path_rules":
         of lfTimedOut: timedOut(killedBySignal(15'u32))
         of lfCancelled: cancelled()
         of lfLaunchFailed: launchFailed()
-      if observationTermination(finish) in {tSignalled, tOomKilled, tTimeout}:
+        of lfCapExceeded: capExceeded(killedWithExitCode(137'u32))
+      if observationTermination(finish) in {tSignalled, tOomKilled, tTimeout,
+          tCapExceeded}:
         check finish.exitStatus != 0'u32
 
   test "the spine's column and the wire's fields are not the same number":

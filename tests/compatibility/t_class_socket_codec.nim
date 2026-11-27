@@ -63,12 +63,11 @@ suite "class_socket_codec":
   test "the minor number":
     check ClassSocketsMinor == 13'u16
     check ClassSocketsMinor > ClassesMinor
-    when ClassSocketsServed:
-      check RqspProtocolMinor == ClassSocketsMinor
-    else:
-      # A platform whose daemon does not serve class sockets yet keeps the
-      # minor-12 behaviour and says so.
-      check RqspProtocolMinor == ClassesMinor
+    # Every platform's daemon announces at least the memory cap's minor
+    # (14), which passes this one; whether class sockets exist is
+    # `ClassSocketsServed`, and no client gates on the minor for them.
+    check RqspProtocolMinor >= ClassSocketsMinor
+    check RqspProtocolMinor == MemoryCapMinor
 
   test "the shared socket's HelloOk is the minor-12 bytes":
     check encodeHelloOk(sample()) == minor12HelloOk(sample())

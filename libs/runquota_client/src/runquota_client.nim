@@ -251,7 +251,12 @@ proc connect*(endpoint: Endpoint; clientName = "runquota-nim";
     # (this client in a container, the daemon on the host) knows that the
     # uid and pids above are this process's own view and not the daemon's
     # (`runquota_protocol/client_namespaces`).
-    desiredCapabilities: withNamespaceTokens("m1-lease", currentNamespaces())
+    #
+    # And the minor this client DECODES (`ClientMinorToken`), so a daemon
+    # knows it may add the optional blocks an older client would refuse
+    # (the grant's memory cap, `MemoryCapMinor`).
+    desiredCapabilities: withNamespaceTokens(
+      "m1-lease " & clientMinorAnnouncement(), currentNamespaces())
   )
   # THE CONNECTION IS OPEN FROM HERE ON, AND A FAILED HELLO CLOSES IT. Every
   # step below can raise: the send, the bounded read (a handshake timeout, a
@@ -951,7 +956,8 @@ proc requestLease*(session: var RunQuotaSession;
         resources: granted.resources,
         active: true,
         state: leaseClientGranted,
-        reclaimed: granted.reclaimed
+        reclaimed: granted.reclaimed,
+        memoryCap: granted.memoryCap
       )
     of rqLeaseDenied:
       var denied: LeaseDeniedMessage
@@ -1020,7 +1026,10 @@ proc decodeDecisionBatch(session: var RunQuotaSession; frame: RqspFrame): seq[Of
         resources: decision.resources,
         active: active,
         state: if decision.kind == leaseDecisionGranted: leaseClientGranted else: leaseClientQueued,
-        reclaimed: decision.kind == leaseDecisionGranted and decision.reclaimed
+        reclaimed: decision.kind == leaseDecisionGranted and decision.reclaimed,
+        memoryCap:
+          if decision.kind == leaseDecisionGranted: decision.memoryCap
+          else: GrantMemoryCap(known: false)
       ),
       queued: decision.kind == leaseDecisionQueued,
       diagnostic: decision.diagnostic
@@ -1725,6 +1734,26 @@ proc supportsFinishTotals*(client: RunQuotaClient): bool =
   ## `HelloOk` reported protocol minor `FinishTotalsMinor` or later.
   client.capabilities.protocolMinor >= FinishTotalsMinor
 
+proc supportsMemoryCap*(client: RunQuotaClient): bool =
+  ## Whether the daemon computes memory caps and reads what a launcher
+  ## reports of one (the `lfCapExceeded` finish, the finish's memory-cap
+  ## block, `ExpectGrowth`): its `HelloOk` reported `MemoryCapMinor` or
+  ## later.
+  client.capabilities.protocolMinor >= MemoryCapMinor
+
+proc finishForDaemon*(outcome: LeaseFinish; memoryCapSupported: bool):
+    LeaseFinish =
+  ## The finish as a daemon of that minor can read it. A daemon below
+  ## `MemoryCapMinor` refuses the `lfCapExceeded` ordinal as malformed, and a
+  ## refused finish strands the lease; what it CAN read of a cap kill is the
+  ## truth one level up: the tree was killed for memory (`lfOomKilled`), with
+  ## the same kill evidence. Such a daemon granted no cap, so this arises
+  ## only for a run whose cap came from `RUNQUOTA_MEMORY_CAP`.
+  if outcome.kind == lfCapExceeded and not memoryCapSupported:
+    oomKilled(outcome.kill)
+  else:
+    outcome
+
 proc finish*(lease: var RunQuotaLease; outcome = succeeded();
              finishDiagnostic = okDiagnostic();
              peakMemoryBytes = 0'u64; processCount = 0'u32;
@@ -1732,7 +1761,8 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
              totals = FinishTotals(known: false);
              cpuProfile = noCpuProfile();
              askExpectedDuration = false;
-             sizing = noFinishSizing()) =
+             sizing = noFinishSizing();
+             memoryCap = FinishMemoryCap(present: false)) =
   ## Report how this execution ended, and free what it held.
   ##
   ## ONE PARAMETER SAYS WHY IT ENDED, and it is a ``LeaseFinish``. It used
@@ -1760,15 +1790,21 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
   ## ``lease.expectedUncontendedMillis``. Asked only of a daemon at
   ## ``PressureMinor`` or above, which is the first that understands the
   ## question.
+  ##
+  ## ``memoryCap`` is what the launcher saw of the tree's memory cap: sent
+  ## only to a daemon at ``MemoryCapMinor``, which is also the first that
+  ## reads ``lfCapExceeded`` (``finishForDaemon`` says what an older one is
+  ## told instead).
   if not lease.active:
     return
+  let capSupported = lease.session[].client[].supportsMemoryCap()
   let carriesTotals = lease.session[].client[].supportsFinishTotals()
   let asks = askExpectedDuration and
     lease.session[].client[].supportsPressure()
   let msg = LeaseFinishedMessage(
     sessionId: lease.session[].id,
     leaseId: lease.id,
-    finish: outcome,
+    finish: finishForDaemon(outcome, capSupported),
     peakMemoryBytes: peakMemoryBytes,
     processCount: processCount,
     majorPageFaults: majorPageFaults,
@@ -1778,7 +1814,9 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
     cpuProfile: (if carriesTotals: cpuProfile else: noCpuProfile()),
     sizing: (if lease.session[].client[].supportsSizing(): sizing
              else: noFinishSizing()),
-    wantExpectedDuration: asks
+    wantExpectedDuration: asks,
+    memoryCap: (if capSupported: memoryCap
+                else: FinishMemoryCap(present: false))
   )
   let requestId = lease.session[].client[].requestFrame(rqLeaseFinished,
       encodeLeaseFinished(msg))
@@ -1794,6 +1832,29 @@ proc finish*(lease: var RunQuotaLease; outcome = succeeded();
   if acknowledged.expectedKnown:
     lease.expectedUncontendedMillis = acknowledged.expectedUncontendedMillis
   lease.state = leaseClientFinished
+
+proc expectGrowth*(client: var RunQuotaClient; commandStatsId: string;
+                   action: ExpectGrowthAction; sizeBytes = 0'u64;
+                   timeoutMs = 0): GrowthExpectationMessage =
+  ## Declare (`egSet`), clear (`egReset`) or read (`egQuery`) the expected
+  ## memory growth of a command (`runquota expect-growth`), and return the
+  ## command's cap figures after the request. Raises
+  ## ``RunQuotaClientError`` for a daemon below ``MemoryCapMinor`` or a
+  ## refusal (the diagnostic says why).
+  if not client.supportsMemoryCap():
+    client.lastDiagnostic = diagnostic(diagUnsupportedVersion,
+      "the RunQuota daemon predates memory caps (protocol minor " &
+      $client.capabilities.protocolMinor & ", needs " & $MemoryCapMinor & ")")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
+  let requestId = client.requestFrame(rqExpectGrowth,
+    encodeExpectGrowth(ExpectGrowthMessage(commandStatsId: commandStatsId,
+      action: action, sizeBytes: sizeBytes)), timeoutMs)
+  let frame = client.readResponse(requestId, timeoutMs)
+  if frame.header.messageKind != rqGrowthExpectation or
+      not decodeGrowthExpectation(frame.payload, result):
+    client.lastDiagnostic = diagnostic(diagProtocol,
+      "invalid GrowthExpectation payload")
+    raise newException(RunQuotaClientError, client.lastDiagnostic.message)
 
 proc supportsPoolDeclarations*(client: RunQuotaClient): bool =
   ## Whether the daemon this client is connected to understands

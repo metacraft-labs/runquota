@@ -3947,6 +3947,7 @@ proc observationTermination*(finish: LeaseFinish): Termination =
   of lfOomKilled: tOomKilled
   of lfTimedOut: tTimeout
   of lfCancelled, lfLaunchFailed: tRefused
+  of lfCapExceeded: tCapExceeded
 
 const MaxRememberedExecutions = 4096
   ## How many finished leases keep their execution id available for an

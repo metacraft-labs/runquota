@@ -1,3 +1,5 @@
+import std/strutils
+
 import runquota_protocol/types as protocolTypes
 import runquota_protocol/client_namespaces
 import runquota_protocol/virtual_machines
@@ -18,7 +20,16 @@ const ClassSocketsServed* = defined(linux)
   ## each platform has to be shown to do before its daemon relies on it.
   ## Until then a daemon elsewhere announces `ClassesMinor` and keeps that
   ## minor's behaviour (the class block accepted on its one socket).
-const RqspProtocolMinor* = (when ClassSocketsServed: 13'u16 else: 12'u16)
+const RqspProtocolMinor* = (when ClassSocketsServed: 14'u16 else: 14'u16)
+  ## MINOR 14 (`MemoryCapMinor`) ON BOTH ARMS. The memory cap is a feature of
+  ## every platform's daemon (the daemon computes the figure; each OS's
+  ## launcher enforces it with its own mechanism), so a daemon that does not
+  ## serve class sockets announces it too. Its minor then also passes
+  ## `ClassSocketsMinor`, which no client gates on: a client finds a class's
+  ## socket by its existence beside the endpoint, never by the minor, and
+  ## such a daemon creates none (`ClassSocketsServed`). The two arms stay
+  ## spelled out so the next minor that is not served everywhere has its
+  ## place to diverge again.
   ## MAJOR 2 BECAUSE ``LeaseFinished`` CHANGED SHAPE AND MEANING. The
   ## finish now travels as a CONCLUSION plus the evidence that conclusion
   ## requires, and the ``hardLimitOrOom`` boolean that used to trail it is
@@ -163,6 +174,35 @@ const ClassSocketsMinor* = 13'u16
   ## changed. A client below this minor sends the class block as at minor
   ## 12 (it knows no class socket); a client at it finds the class's socket
   ## by `RUNQUOTA_CLASS` and does not fall back to the shared one.
+const MemoryCapMinor* = 14'u16
+  ## The first daemon minor that computes a PER-TASK MEMORY CAP: the
+  ## optional cap block of `LeaseGranted` and of each granted decision of a
+  ## `LeaseDecisionBatch`, the `lfCapExceeded` finish with the memory-cap
+  ## block of `LeaseFinished` (presence bit 6 of its totals block), and
+  ## `ExpectGrowth` / `GrowthExpectation`. MINOR 14 ANNOUNCES THEM,
+  ## additively, in both directions:
+  ##
+  ## * CLIENT TO DAEMON, gated as every earlier minor: an older daemon
+  ##   refuses an unknown finish ordinal, an unknown presence bit and an
+  ##   unknown message kind, so a client sends none of them below this minor
+  ##   (a cap kill is reported to such a daemon as the OOM kill it is, and
+  ##   the block is dropped).
+  ## * DAEMON TO CLIENT, which no earlier minor needed: an older CLIENT
+  ##   decodes `LeaseGranted` and the decision batch strictly (no bytes
+  ##   after the flags), so a grant carrying the block would be refused by
+  ##   it -- and a refused grant is a lease held with nobody to run it. The
+  ##   `Hello` carries no minor, so the client ANNOUNCES its own minor with
+  ##   a token in `Hello.desiredCapabilities` (`ClientMinorToken`), which
+  ##   every daemon ignores token by token, and the daemon writes the block
+  ##   only on a connection whose client announced this minor or above. An
+  ##   older client announces nothing and is sent exactly the bytes minor 13
+  ##   sent it.
+const ClientMinorToken* = "rqsp-minor="
+  ## The `Hello.desiredCapabilities` token by which a client announces the
+  ## protocol minor it decodes (`rqsp-minor=14`): what lets a daemon add
+  ## optional trailing blocks to messages it SENDS, which an older client
+  ## would refuse (`MemoryCapMinor`). Absent means "an older client": every
+  ## daemon reads it as minor 0 for this purpose.
 const MaxPressureWaitsPerReport* = 64
   ## The most waits one `PressureReport` carries. A client with more keeps
   ## the rest for its next report; the daemon refuses a longer list, so a
@@ -212,6 +252,31 @@ proc defaultCapabilities*(platform: string; transport: string; cpuSlots: MilliCp
     memoryPressureAvailable: false,
     memoryPressureRequired: false
   )
+
+proc clientMinorAnnouncement*(minor = RqspProtocolMinor): string =
+  ## The `Hello.desiredCapabilities` token announcing the minor this client
+  ## decodes (`ClientMinorToken`).
+  ClientMinorToken & $minor
+
+proc announcedClientMinor*(desiredCapabilities: string): uint16 =
+  ## The minor a client announced in its `Hello`, or 0 when it announced
+  ## none (a client older than `MemoryCapMinor`) or wrote something that is
+  ## not a minor. Tokens are space separated and read one by one, like the
+  ## namespace tokens; a malformed one is ignored rather than refused, since
+  ## the only effect of reading it as 0 is that the daemon sends the bytes
+  ## an older client expects.
+  for token in desiredCapabilities.split(' '):
+    if token.len > ClientMinorToken.len and token.startsWith(ClientMinorToken):
+      var value = 0'u32
+      var ok = true
+      for c in token[ClientMinorToken.len .. ^1]:
+        if c notin {'0' .. '9'} or value > 65535'u32:
+          ok = false
+          break
+        value = value * 10'u32 + uint32(ord(c) - ord('0'))
+      if ok and value <= 65535'u32:
+        return uint16(value)
+  0'u16
 
 proc messageKindFromWire*(value: uint16; kind: var RqspMessageKind): bool =
   if value < uint16(ord(low(RqspMessageKind))) or value > uint16(ord(high(
@@ -630,6 +695,42 @@ const DecisionReclaimedBit = 1'u32
   ## Bit 0 of a decision's flags (the trailing block of a decision batch,
   ## and the trailing word of ``LeaseGranted``): a reclaimed grant. Other
   ## bits are reserved and ignored by the decoder.
+const DecisionMemoryCapBit = 2'u32
+  ## Bit 1 of a decision's flags (`MemoryCapMinor`): the decision carries a
+  ## memory-cap block, which follows the flags (after the flags word of
+  ## ``LeaseGranted``; after the batch's flags block, one block per flagged
+  ## decision in decision order). An older decoder ignores the bit but
+  ## refuses the bytes after it, which is why the daemon sets it only for a
+  ## client that announced `MemoryCapMinor` (`ClientMinorToken`).
+
+proc writeGrantMemoryCap(w: var BinaryWriter; cap: GrantMemoryCap) =
+  ## The grant's cap block: the cap, its basis, the command's largest
+  ## successful peak, the factor the daemon applied and the machine's memory
+  ## budget the cap was clamped to.
+  w.writeU64(cap.capBytes)
+  w.writeU8(uint8(ord(cap.basis)))
+  w.writeU64(cap.previousMaxBytes)
+  w.writeU32(cap.factorMilli)
+  w.writeU64(cap.budgetBytes)
+
+proc readGrantMemoryCap(r: var BinaryReader; cap: var GrantMemoryCap): bool =
+  ## Structural, plus the one fact about the bytes a client must be able to
+  ## rely on: a GRANT's basis is one the daemon decides (`learned`,
+  ## `declared`, `budget`). `run-size` and `run-lifted` are the launcher's
+  ## own and never come from a daemon; bytes naming one spell no grant.
+  var basisRaw: uint8
+  var decoded = GrantMemoryCap(known: true)
+  if not r.readU64(decoded.capBytes): return false
+  if not r.readU8(basisRaw): return false
+  if basisRaw notin [uint8(ord(mcbLearned)), uint8(ord(mcbDeclared)),
+      uint8(ord(mcbBudget))]:
+    return false
+  decoded.basis = MemoryCapBasis(int(basisRaw))
+  if not r.readU64(decoded.previousMaxBytes): return false
+  if not r.readU32(decoded.factorMilli): return false
+  if not r.readU64(decoded.budgetBytes): return false
+  cap = decoded
+  true
 
 proc writeWidthFields(w: var BinaryWriter; width: WidthRange) =
   w.writeU32(width.minMilli)
@@ -890,16 +991,26 @@ proc encodeLeaseDecisionBatch*(msg: LeaseDecisionBatchMessage): string =
     w.writeResourceVector(decision.resources)
     w.writeDiagnostic(decision.diagnostic)
   # THE FLAGS BLOCK, after the last decision, only when some decision is a
-  # reclaimed grant: a list cannot carry a trailing field per element, and
-  # without the block the batch is byte-identical to minor 7.
-  var anyReclaimed = false
+  # reclaimed grant or carries a memory cap: a list cannot carry a trailing
+  # field per element, and without the block the batch is byte-identical to
+  # minor 7. The cap blocks follow it, one per decision whose flags say so,
+  # in decision order. Whether a decision carries a cap is the DAEMON's
+  # choice, made per connection (`DecisionMemoryCapBit`): this encoder
+  # writes whatever it is given.
+  var anyFlags = false
   for decision in msg.decisions:
-    if decision.reclaimed:
-      anyReclaimed = true
-  if anyReclaimed:
+    if decision.reclaimed or decision.memoryCap.known:
+      anyFlags = true
+  if anyFlags:
     w.writeU32(uint32(msg.decisions.len))
     for decision in msg.decisions:
-      w.writeU32(if decision.reclaimed: DecisionReclaimedBit else: 0'u32)
+      var flags = 0'u32
+      if decision.reclaimed: flags = flags or DecisionReclaimedBit
+      if decision.memoryCap.known: flags = flags or DecisionMemoryCapBit
+      w.writeU32(flags)
+    for decision in msg.decisions:
+      if decision.memoryCap.known:
+        w.writeGrantMemoryCap(decision.memoryCap)
   w.data
 
 proc decodeLeaseDecisionBatch*(payload: string;
@@ -935,10 +1046,15 @@ proc decodeLeaseDecisionBatch*(payload: string;
     # One entry per decision or the block is malformed: which decision a
     # flag belongs to must not be guesswork.
     if flagsCount != count: return false
+    var capped: seq[int] = @[]
     for i in 0 ..< decisions.len:
       var flags: uint32
       if not r.readU32(flags): return false
       decisions[i].reclaimed = (flags and DecisionReclaimedBit) != 0'u32
+      if (flags and DecisionMemoryCapBit) != 0'u32:
+        capped.add(i)
+    for i in capped:
+      if not r.readGrantMemoryCap(decisions[i].memoryCap): return false
   if r.remaining != 0: return false
   msg = LeaseDecisionBatchMessage(sessionId: sessionId(sessionRaw),
       decisions: decisions)
@@ -962,10 +1078,16 @@ proc encodeLeaseGranted*(msg: LeaseGrantedMessage): string =
   w.writeU64(msg.sessionId.value)
   w.writeU64(msg.leaseId.value)
   w.writeResourceVector(msg.resources)
-  # Only for a reclaimed grant (``ReclaimedGrantsMinor``); otherwise the
-  # message is byte-identical to minor 7.
-  if msg.reclaimed:
-    w.writeU32(DecisionReclaimedBit)
+  # Only for a reclaimed grant (``ReclaimedGrantsMinor``) or one carrying a
+  # memory cap (``MemoryCapMinor``); otherwise the message is byte-identical
+  # to minor 7. The cap block follows the word.
+  var flags = 0'u32
+  if msg.reclaimed: flags = flags or DecisionReclaimedBit
+  if msg.memoryCap.known: flags = flags or DecisionMemoryCapBit
+  if flags != 0'u32:
+    w.writeU32(flags)
+  if msg.memoryCap.known:
+    w.writeGrantMemoryCap(msg.memoryCap)
   w.data
 
 proc decodeLeaseGranted*(payload: string; msg: var LeaseGrantedMessage): bool =
@@ -977,14 +1099,18 @@ proc decodeLeaseGranted*(payload: string; msg: var LeaseGrantedMessage): bool =
   if not r.readU64(sessionRaw): return false
   if not r.readU64(leaseRaw): return false
   if not r.readResourceVector(resources): return false
+  var memoryCap = GrantMemoryCap(known: false)
   if r.remaining != 0:
     if not r.readU32(flags): return false
+    if (flags and DecisionMemoryCapBit) != 0'u32:
+      if not r.readGrantMemoryCap(memoryCap): return false
   if r.remaining != 0: return false
   msg = LeaseGrantedMessage(
     sessionId: sessionId(sessionRaw),
     leaseId: leaseId(leaseRaw),
     resources: resources,
-    reclaimed: (flags and DecisionReclaimedBit) != 0'u32
+    reclaimed: (flags and DecisionReclaimedBit) != 0'u32,
+    memoryCap: memoryCap
   )
   true
 
@@ -1182,14 +1308,17 @@ proc leaseFinishFromWire*(kindRaw, exitCode, signal: uint32;
     if signal == 0'u32:
       return "a crashed finish names no signal"
     finish = crashed(signal)
-  of lfOomKilled, lfTimedOut:
+  of lfOomKilled, lfTimedOut, lfCapExceeded:
     if exitCode != 0'u32 and signal != 0'u32:
       return "a kill was reported by two kinds of evidence at once"
     var kill: KillEvidence
     if not killEvidence(exitCode, signal, kill):
       return "a kill was reported beside exit status 0 and no signal"
     finish =
-      if kind == lfOomKilled: oomKilled(kill) else: timedOut(kill)
+      case kind
+      of lfOomKilled: oomKilled(kill)
+      of lfCapExceeded: capExceeded(kill)
+      else: timedOut(kill)
   of lfCancelled, lfLaunchFailed:
     if exitCode != 0'u32 or signal != 0'u32:
       return "work that never produced a verdict carries one"
@@ -1208,13 +1337,54 @@ const
     ## The tree's read and written bytes (`SizingMinor`).
   finishBlockAfter = 32'u32
     ## The lease ids this execution declared it waited on (`SizingMinor`).
+  finishBlockMemoryCap = 64'u32
+    ## The launcher's memory-cap block (`MemoryCapMinor`).
   finishBlockKnownBits = finishBlockTotals or finishBlockProfile or
     finishBlockWantExpected or finishBlockMemoryProfile or finishBlockIo or
-    finishBlockAfter
+    finishBlockAfter or finishBlockMemoryCap
+  finishCapReachedBit = 1'u8
+  finishExceededAdvisoryBit = 2'u8
+  finishCapKnownFlags = finishCapReachedBit or finishExceededAdvisoryBit
+    ## The memory-cap block's flags byte. Unknown bits are refused, as the
+    ## presence bits are: a later flag arrives with a later minor, which a
+    ## client sends only to a daemon that announced it.
+
+proc writeFinishMemoryCap(w: var BinaryWriter; cap: FinishMemoryCap) =
+  w.writeU64(cap.capBytes)
+  w.writeU8(uint8(ord(cap.basis)))
+  w.writeU64(cap.treePeakBytes)
+  w.writeU8(uint8(ord(cap.peakSource)))
+  var flags = 0'u8
+  if cap.capReached: flags = flags or finishCapReachedBit
+  if cap.exceededAdvisory: flags = flags or finishExceededAdvisoryBit
+  w.writeU8(flags)
+
+proc readFinishMemoryCap(r: var BinaryReader; cap: var FinishMemoryCap): bool =
+  ## Structural: ordinals in range and no unknown flag. A block is present
+  ## only when a launcher enforced or measured a cap, so its basis is never
+  ## `none`: a launcher that applied no cap sends no block.
+  var basisRaw, sourceRaw, flags: uint8
+  var decoded = FinishMemoryCap(present: true)
+  if not r.readU64(decoded.capBytes): return false
+  if not r.readU8(basisRaw): return false
+  if basisRaw == uint8(ord(mcbNone)) or
+      basisRaw > uint8(ord(high(MemoryCapBasis))):
+    return false
+  decoded.basis = MemoryCapBasis(int(basisRaw))
+  if not r.readU64(decoded.treePeakBytes): return false
+  if not r.readU8(sourceRaw): return false
+  if sourceRaw > uint8(ord(high(MemoryPeakSource))): return false
+  decoded.peakSource = MemoryPeakSource(int(sourceRaw))
+  if not r.readU8(flags): return false
+  if (flags and not finishCapKnownFlags) != 0'u8: return false
+  decoded.capReached = (flags and finishCapReachedBit) != 0'u8
+  decoded.exceededAdvisory = (flags and finishExceededAdvisoryBit) != 0'u8
+  cap = decoded
+  true
 
 proc writeFinishTotalsBlock(w: var BinaryWriter; totals: FinishTotals;
                             profile: CpuProfile; wantExpected: bool;
-                            sizing: FinishSizing) =
+                            sizing: FinishSizing; memoryCap: FinishMemoryCap) =
   ## The optional trailing block of `LeaseFinished` (`FinishTotalsMinor`):
   ## a u32 of presence bits, then the totals (bit 0) and the profile
   ## (bit 1). Written only when there is something in it, so a finish with
@@ -1231,6 +1401,7 @@ proc writeFinishTotalsBlock(w: var BinaryWriter; totals: FinishTotals;
   let sendsAfter = sizing.afterKnown and
     sizing.afterLeases.len <= MaxAfterLeases
   if sendsAfter: bits = bits or finishBlockAfter
+  if memoryCap.present: bits = bits or finishBlockMemoryCap
   if bits == 0'u32:
     return
   w.writeU32(bits)
@@ -1261,11 +1432,15 @@ proc writeFinishTotalsBlock(w: var BinaryWriter; totals: FinishTotals;
     w.writeU16(uint16(sizing.afterLeases.len))
     for id in sizing.afterLeases:
       w.writeU64(id)
+  # The memory-cap block last, in bit order like the sizing fields.
+  if memoryCap.present:
+    w.writeFinishMemoryCap(memoryCap)
 
 proc readFinishTotalsBlock(r: var BinaryReader; totals: var FinishTotals;
                            profile: var CpuProfile;
                            wantExpected: var bool;
-                           sizing: var FinishSizing): bool =
+                           sizing: var FinishSizing;
+                           memoryCap: var FinishMemoryCap): bool =
   ## Reads the block `writeFinishTotalsBlock` wrote. Refuses unknown
   ## presence bits, a profile with a zero interval, and a profile longer
   ## than `MaxCpuProfileSamples`: a bound the sender is required to keep is
@@ -1324,6 +1499,8 @@ proc readFinishTotalsBlock(r: var BinaryReader; totals: var FinishTotals;
       var id: uint64
       if not r.readU64(id): return false
       sizing.afterLeases.add(id)
+  if (bits and finishBlockMemoryCap) != 0'u32:
+    if not r.readFinishMemoryCap(memoryCap): return false
   true
 
 type LeaseFinishedDecode* = enum
@@ -1355,7 +1532,7 @@ proc encodeLeaseFinished*(msg: LeaseFinishedMessage): string =
   w.writeU32(msg.pressureEvents)
   w.writeDiagnostic(msg.diagnostic)
   w.writeFinishTotalsBlock(msg.totals, msg.cpuProfile,
-    msg.wantExpectedDuration, msg.sizing)
+    msg.wantExpectedDuration, msg.sizing, msg.memoryCap)
   w.data
 
 proc decodeLeaseFinished*(payload: string;
@@ -1387,12 +1564,21 @@ proc decodeLeaseFinished*(payload: string;
   var profile = noCpuProfile()
   var wantExpected = false
   var sizing = noFinishSizing()
+  var memoryCap = FinishMemoryCap(present: false)
   if r.remaining != 0:
-    if not r.readFinishTotalsBlock(totals, profile, wantExpected, sizing):
+    if not r.readFinishTotalsBlock(totals, profile, wantExpected, sizing,
+        memoryCap):
       return lfdMalformedPayload
   if r.remaining != 0: return lfdMalformedPayload
   var finish: LeaseFinish
   if leaseFinishFromWire(kindRaw, exitCode, signal, finish).len > 0:
+    return lfdContradictoryFinish
+  # A CAP KILL NAMES A CAP. `lfCapExceeded` says the tree was killed by the
+  # cap its grant carried, and the block is where that cap and the peak
+  # that passed it are; without it the finish claims a breach of nothing,
+  # which is the same kind of unsupported conclusion the kill evidence rule
+  # refuses.
+  if finish.kind == lfCapExceeded and not memoryCap.present:
     return lfdContradictoryFinish
   msg = LeaseFinishedMessage(
     sessionId: sessionId(sessionRaw),
@@ -1406,7 +1592,8 @@ proc decodeLeaseFinished*(payload: string;
     totals: totals,
     cpuProfile: profile,
     sizing: sizing,
-    wantExpectedDuration: wantExpected
+    wantExpectedDuration: wantExpected,
+    memoryCap: memoryCap
   )
   lfdOk
 
@@ -2525,3 +2712,64 @@ proc decodeSizingAnswer*(payload: string; msg: var SizingAnswerMessage): bool =
   var r = reader(payload)
   if not r.readString(msg.json): return false
   r.remaining == 0
+
+# ---------------------------------------------------------------------------
+# Declared memory growth (`MemoryCapMinor`)
+# ---------------------------------------------------------------------------
+
+proc encodeExpectGrowth*(msg: ExpectGrowthMessage): string =
+  var w = writer()
+  w.writeBytes(msg.commandStatsId)
+  w.writeU8(uint8(ord(msg.action)))
+  w.writeU64(msg.sizeBytes)
+  w.data
+
+proc decodeExpectGrowth*(payload: string; msg: var ExpectGrowthMessage): bool =
+  ## Structural. An over-long command id is NOT truncated here, unlike a
+  ## lease request's: there it is a grouping hint, here it names the row a
+  ## declaration is written to, and a truncated id would declare growth for
+  ## a different command. The daemon refuses it with a diagnostic.
+  var r = reader(payload)
+  var decoded: ExpectGrowthMessage
+  var actionRaw: uint8
+  if not r.readBytes(decoded.commandStatsId): return false
+  if not r.readU8(actionRaw): return false
+  if actionRaw > uint8(ord(high(ExpectGrowthAction))): return false
+  decoded.action = ExpectGrowthAction(int(actionRaw))
+  if not r.readU64(decoded.sizeBytes): return false
+  if r.remaining != 0: return false
+  msg = decoded
+  true
+
+proc encodeGrowthExpectation*(msg: GrowthExpectationMessage): string =
+  var w = writer()
+  w.writeBool(msg.found)
+  w.writeU64(msg.maxObservedPeakBytes)
+  w.writeU64(msg.declaredCapBytes)
+  w.writeU64(msg.declaredByUid)
+  w.writeU64(msg.declaredUnixMillis)
+  w.writeU64(msg.lastBreachCapBytes)
+  w.writeU64(msg.lastBreachPeakBytes)
+  w.writeU64(msg.lastBreachUnixMillis)
+  w.writeU64(msg.conservativeMemoryBytes)
+  w.writeU32(msg.factorMilli)
+  w.data
+
+proc decodeGrowthExpectation*(payload: string;
+    msg: var GrowthExpectationMessage): bool =
+  var r = reader(payload)
+  var decoded: GrowthExpectationMessage
+  if not r.readBool(decoded.found): return false
+  if not r.readU64(decoded.maxObservedPeakBytes): return false
+  if not r.readU64(decoded.declaredCapBytes): return false
+  if not r.readU64(decoded.declaredByUid): return false
+  if not r.readU64(decoded.declaredUnixMillis): return false
+  if not r.readU64(decoded.lastBreachCapBytes): return false
+  if not r.readU64(decoded.lastBreachPeakBytes): return false
+  if not r.readU64(decoded.lastBreachUnixMillis): return false
+  if not r.readU64(decoded.conservativeMemoryBytes): return false
+  if not r.readU32(decoded.factorMilli): return false
+  if r.remaining != 0: return false
+  msg = decoded
+  true
+

@@ -138,6 +138,15 @@ type
       ## now, and optionally its busy CPU and pressure. The four kinds above
       ## and this one are sent only to a daemon whose `HelloOk` reports
       ## protocol minor >= `VirtualMachinesMinor`.
+    rqExpectGrowth = 56
+      ## Declare, clear or read a command's expected memory growth
+      ## (`runquota expect-growth`): the declared cap the next grants of that
+      ## command stats id honour. Answered with `rqGrowthExpectation`. Any
+      ## connection: the request names no session, and the declaration is
+      ## recorded with the peer's uid. Sent only to a daemon whose `HelloOk`
+      ## reports protocol minor >= `MemoryCapMinor`, for the reason
+      ## `rqDeclarePools` gives.
+    rqGrowthExpectation = 57
 
   MessageKind* = RqspMessageKind
 
@@ -346,6 +355,10 @@ type
     reclaimed*: bool
       ## A grant into predicted slack: the client runs its tree at the
       ## lower weight. Travels in the batch's optional trailing flags block.
+    memoryCap*: GrantMemoryCap
+      ## The memory cap the daemon computed for a granted host lease
+      ## (`MemoryCapMinor`). Travels after the flags block, flagged per
+      ## decision; `known` is false when the decision carries none.
 
   LeaseDecisionBatchMessage* = object
     sessionId*: SessionId
@@ -360,6 +373,9 @@ type
     resources*: ResourceVector
     reclaimed*: bool
       ## See ``LeaseDecision.reclaimed``; an optional trailing flags word.
+    memoryCap*: GrantMemoryCap
+      ## See ``LeaseDecision.memoryCap``; flagged in the trailing flags
+      ## word and carried after it.
 
   LeaseDeniedMessage* = object
     sessionId*: SessionId
@@ -443,6 +459,15 @@ type
     lfCancelled
     lfLaunchFailed
     lfTimedOut
+    lfCapExceeded
+      ## The tree was killed by the memory cap ITS OWN GRANT carried
+      ## (`MemoryCapMinor`). Appended, so every earlier ordinal on the wire
+      ## keeps its meaning. ``lfOomKilled`` keeps meaning "killed for memory
+      ## by something other than that cap" (a host-wide OOM, an ancestor's
+      ## limit). A cap-exceeded finish is an issue to report, never a
+      ## measurement of what the command needs, so the daemon learns nothing
+      ## from it; it carries kill evidence for the same reason an OOM kill
+      ## does, and it is malformed without the finish's memory-cap block.
 
   LeaseFinish* = object
     ## Why an execution ended, as the supervising client saw it, together
@@ -473,7 +498,7 @@ type
       exitCode*: uint32
     of lfCrashed:
       crashSignal*: uint32
-    of lfOomKilled, lfTimedOut:
+    of lfOomKilled, lfTimedOut, lfCapExceeded:
       kill*: KillEvidence
     of lfCancelled, lfLaunchFailed:
       discard
@@ -502,6 +527,11 @@ type
       ## (presence bit 2 of the totals block, protocol minor
       ## ``PressureMinor``). Set only towards a daemon at that minor: an
       ## older one refuses an unknown presence bit.
+    memoryCap*: FinishMemoryCap
+      ## What a launcher that enforced or measured a memory cap saw: the cap
+      ## it applied, its basis, the tree's peak by the cap's own mechanism
+      ## and the breach flags (presence bit 6 of the totals block,
+      ## `MemoryCapMinor`). Sent only towards a daemon at that minor.
 
   LeaseFinishedAckMessage* = object
     sessionId*: SessionId
@@ -1130,6 +1160,12 @@ proc crashed*(signal: uint32): LeaseFinish =
 proc oomKilled*(kill: KillEvidence): LeaseFinish =
   LeaseFinish(kind: lfOomKilled, kill: kill)
 
+proc capExceeded*(kill: KillEvidence): LeaseFinish =
+  ## The tree was killed by its own memory cap. Kill evidence as for an
+  ## OOM kill: the kernel's signal, or the non-zero status a parent that
+  ## reported its child's kill returned.
+  LeaseFinish(kind: lfCapExceeded, kill: kill)
+
 proc timedOut*(kill: KillEvidence): LeaseFinish =
   LeaseFinish(kind: lfTimedOut, kill: kill)
 
@@ -1178,7 +1214,7 @@ proc wireExitCode*(finish: LeaseFinish): uint32 =
   of lfSucceeded: 0'u32
   of lfFailed: finish.exitCode
   of lfCrashed: 0'u32
-  of lfOomKilled, lfTimedOut:
+  of lfOomKilled, lfTimedOut, lfCapExceeded:
     if finish.kill.bySignal: 0'u32 else: finish.kill.exitCode
   of lfCancelled, lfLaunchFailed: 0'u32
 
@@ -1187,7 +1223,7 @@ proc wireSignal*(finish: LeaseFinish): uint32 =
   ## only, like ``wireExitCode``.
   case finish.kind
   of lfCrashed: finish.crashSignal
-  of lfOomKilled, lfTimedOut:
+  of lfOomKilled, lfTimedOut, lfCapExceeded:
     if finish.kill.bySignal: finish.kill.signal else: 0'u32
   else: 0'u32
 
@@ -1211,7 +1247,7 @@ proc exitStatus*(finish: LeaseFinish): uint32 =
   of lfSucceeded: 0'u32
   of lfFailed: finish.exitCode
   of lfCrashed: SignalledExitStatusBase + finish.crashSignal
-  of lfOomKilled, lfTimedOut:
+  of lfOomKilled, lfTimedOut, lfCapExceeded:
     if finish.kill.bySignal:
       SignalledExitStatusBase + finish.kill.signal
     else:
@@ -1266,3 +1302,47 @@ const
     ## work per N on its request path, so the list is short.
   MaxSizingDeclarationBytes* = 128
     ## The longest project or entry point a session may declare.
+
+type
+  ExpectGrowthAction* = enum
+    ## What a `runquota expect-growth` request does to the command's
+    ## declaration.
+    egQuery = 0
+      ## Change nothing; answer with the figures.
+    egSet = 1
+      ## Set the declared cap to `sizeBytes`.
+    egReset = 2
+      ## Remove the declaration.
+
+  ExpectGrowthMessage* = object
+    ## `rqExpectGrowth` (`MemoryCapMinor`).
+    commandStatsId*: string
+    action*: ExpectGrowthAction
+    sizeBytes*: uint64
+      ## The declared cap for `egSet`; 0 otherwise.
+
+  GrowthExpectationMessage* = object
+    ## `rqGrowthExpectation`: the command's cap figures after the request
+    ## was applied. Every figure is 0 when the daemon knows nothing of the
+    ## command.
+    found*: bool
+      ## Whether the daemon holds any figure for the command (a learned row
+      ## or a declaration).
+    maxObservedPeakBytes*: uint64
+      ## The largest tree peak of a successful finish measured by the cap's
+      ## own mechanism (the figure the learned cap multiplies).
+    declaredCapBytes*: uint64
+    declaredByUid*: uint64
+    declaredUnixMillis*: uint64
+      ## The declaration in force, who made it and when; all 0 when none.
+    lastBreachCapBytes*: uint64
+    lastBreachPeakBytes*: uint64
+    lastBreachUnixMillis*: uint64
+      ## The last time a run passed its cap: the cap, the peak and the time;
+      ## all 0 when none is recorded.
+    conservativeMemoryBytes*: uint64
+      ## The admission figure (what a lease of the command reserves when its
+      ## client supplies no estimate).
+    factorMilli*: uint32
+      ## The factor in force, in thousandths.
+

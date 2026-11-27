@@ -76,6 +76,12 @@ type
       ## After a ``finish`` that asked for it (``askExpectedDuration``), the
       ## daemon's learned expected uncontended duration of this command at
       ## its granted width; 0 when the daemon knew none or was not asked.
+    memoryCap*: GrantMemoryCap
+      ## The memory cap the daemon computed for this lease at the grant
+      ## (`MemoryCapMinor`): the launcher enforces it, measures it, or says
+      ## why it could not (`runquota_exec.resolveMemoryCap`). `known` is
+      ## false for a daemon below that minor and for a lease without a
+      ## memory dimension (a sub-lease runs inside its parent's cap).
 
   OfferedLease* = object
     clientCandidateId*: uint64
