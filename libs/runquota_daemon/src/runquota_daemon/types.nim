@@ -645,6 +645,13 @@ type
       ## Open session groups by `sessionGroupKey`.
     leases*: Table[uint64, LeaseRow]
     estimates*: Table[string, LearnedEstimateRow]
+    estimateScopes*: HashSet[string]
+      ## Every scope (launching session name) `estimates` holds a learned
+      ## row in, so a per-command question is one lookup per scope rather
+      ## than a walk of every row (`growthExpectation`).
+    declarationCount*: int
+      ## Growth declarations held in `estimates` (`DeclarationScope`),
+      ## bounded by `MaxDeclarations`.
     cpuEstimates*: Table[string, CpuShapeEstimate]
       ## The learned CPU estimate per estimate key: totals, uncontended
       ## durations per width and the CPU shape (``cpu_shape``). In memory

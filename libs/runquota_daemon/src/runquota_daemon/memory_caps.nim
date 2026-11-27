@@ -32,6 +32,12 @@ const DeclarationScope* = "declared:"
   ## A session scope always starts with `session:`, so no session can name
   ## this one.
 
+const MaxDeclarations* = 4096
+  ## The most growth declarations one daemon holds. Each is kept in memory
+  ## and read by every grant of its command, and any local peer may make
+  ## one, so the number is bounded; a declaration past it is refused with a
+  ## message saying so, never silently dropped.
+
 proc saturatingMul(a, b: uint64): uint64 =
   if a != 0'u64 and b > high(uint64) div a: high(uint64) else: a * b
 
@@ -60,7 +66,8 @@ proc grantMemoryCap*(maxPeakBytes, declaredBytes, budgetBytes,
   ##
   ## * M > 0: min(B, max(⌈f × M⌉, D)), basis `learned`, or `declared` when D
   ##   is the larger;
-  ## * M = 0, D > 0: min(B, D), basis `declared`;
+  ## * M = 0, D > 0: min(B, max(D, B − H)), basis `declared` when D is the
+  ##   larger and `budget` otherwise -- a declaration only ever raises a cap;
   ## * otherwise B − H, basis `budget`: the memory admission had not promised
   ##   to anyone else when this lease was granted. The lease was admitted, so
   ##   this is at least its own effective memory, and the cap never undercuts
@@ -77,13 +84,20 @@ proc grantMemoryCap*(maxPeakBytes, declaredBytes, budgetBytes,
     else:
       result.capBytes = min(budgetBytes, learned)
       result.basis = mcbLearned
-  elif declaredBytes > 0'u64:
-    result.capBytes = min(budgetBytes, declaredBytes)
-    result.basis = mcbDeclared
   else:
-    result.capBytes =
+    let free =
       if othersBytes >= budgetBytes: 0'u64 else: budgetBytes - othersBytes
-    result.basis = mcbBudget
+    # A DECLARATION ONLY RAISES A CAP. With no recorded maximum the cap
+    # would otherwise be the free budget, and a declaration smaller than
+    # that would LOWER it -- turning "this command is expected to grow" into
+    # a tighter limit than the command had before anyone said anything. So
+    # the declaration stands only where it is the larger figure.
+    if declaredBytes > free:
+      result.capBytes = min(budgetBytes, declaredBytes)
+      result.basis = mcbDeclared
+    else:
+      result.capBytes = free
+      result.basis = mcbBudget
 
 proc finishBreachesCap*(finish: LeaseFinishedMessage): bool =
   ## A finish that passed its cap: killed by it, or a block that says an

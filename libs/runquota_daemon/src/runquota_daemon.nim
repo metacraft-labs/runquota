@@ -876,7 +876,16 @@ proc initDaemon*(config: DaemonConfig; deferCapture = false): RunQuotaDaemon =
     lostLeasesReaped: 0'u64
   )
   for row in loadLearnedEstimates(effectiveConfig.estimateDbPath):
+    # A cleared declaration is kept on disk (the writer upserts and never
+    # deletes) but is no declaration: it is not loaded, so it neither counts
+    # against `MaxDeclarations` nor costs a lookup.
+    if row.scope == DeclarationScope and row.declaredCapBytes == 0'u64:
+      continue
     result.estimates[estimateTableKey(row.scope, row.commandStatsId)] = row
+    if row.scope == DeclarationScope:
+      inc result.declarationCount
+    else:
+      result.estimateScopes.incl(row.scope)
   if not deferCapture:
     result.installCapture(openCapture(effectiveConfig,
       createParent = config.observationDbPath.len > 0,
@@ -2675,11 +2684,20 @@ proc estimatesJson(daemon: RunQuotaDaemon): string =
   for key in daemon.estimates.keys:
     keys.add(key)
   keys.sort()
+  # DECLARATIONS ARE LISTED APART FROM THE LEARNED ROWS, so nothing is
+  # skipped and nothing is mistaken for something else: a declaration row
+  # holds no learned figure, and listing it among the learned rows would
+  # show a command with a zero admission figure that was never measured.
+  # Every learned row carries its scope (the launching session's name).
   result = "{\"estimates\":["
-  for i, key in keys:
-    if i > 0:
-      result.add(",")
+  var first = true
+  for key in keys:
     let row = daemon.estimates[key]
+    if row.scope == DeclarationScope:
+      continue
+    if not first:
+      result.add(",")
+    first = false
     result.add("{" &
       "\"scope\":" & jsonEscape(row.scope) & "," &
       "\"command_stats_id\":" & jsonEscape(row.commandStatsId) & "," &
@@ -2694,6 +2712,21 @@ proc estimatesJson(daemon: RunQuotaDaemon): string =
       "\"last_breach_cap_bytes\":" & $row.lastBreachCapBytes & "," &
       "\"last_breach_peak_bytes\":" & $row.lastBreachPeakBytes & "," &
       "\"last_breach_unix_millis\":" & $row.lastBreachUnixMillis &
+    "}")
+  result.add("],\"declarations\":[")
+  first = true
+  for key in keys:
+    let row = daemon.estimates[key]
+    if row.scope != DeclarationScope:
+      continue
+    if not first:
+      result.add(",")
+    first = false
+    result.add("{" &
+      "\"command_stats_id\":" & jsonEscape(row.commandStatsId) & "," &
+      "\"declared_cap_bytes\":" & $row.declaredCapBytes & "," &
+      "\"declared_by_uid\":" & $row.declaredByUid & "," &
+      "\"declared_unix_millis\":" & $row.declaredUnixMillis &
     "}")
   result.add("],\"cpu_estimates\":[")
   var cpuKeys: seq[string] = @[]
@@ -3810,14 +3843,25 @@ proc updateEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
   var observed = finishPeakMemoryBytes(finish)
   if finish.memoryCap.present:
     observed = max(observed, finish.memoryCap.treePeakBytes)
+  # Every figure the row keeps SATURATES at int64.high, which is what the
+  # store can hold (`clientInt64`): a client-sent peak of 2^63 or more must
+  # neither wrap into a negative stored figure nor make the row unreadable
+  # at the next start. Saturated here, so the row in memory and the row on
+  # disk agree.
+  var clamped = finish
+  observed = uint64(clientInt64(observed))
+  clamped.memoryCap.treePeakBytes =
+    uint64(clientInt64(finish.memoryCap.treePeakBytes))
+  clamped.memoryCap.capBytes = uint64(clientInt64(finish.memoryCap.capBytes))
   let scope = daemon.sessions[lease.sessionId.value].sessionScope()
   let key = estimateTableKey(scope, lease.commandStatsId)
   var row = daemon.estimates.getOrDefault(key, LearnedEstimateRow(
     scope: scope, commandStatsId: lease.commandStatsId))
-  if not row.learnFromFinish(finish, observed, lease.resources.memory.value,
-      nowUnixMillis()):
+  if not row.learnFromFinish(clamped, observed,
+      uint64(clientInt64(lease.resources.memory.value)), nowUnixMillis()):
     return
   daemon.estimates[key] = row
+  daemon.estimateScopes.incl(scope)
   discard enqueueEstimateWrite(daemon.estimateStore, row)
 
 proc leaseMemoryCap(daemon: RunQuotaDaemon; lease: LeaseRow;
@@ -3865,18 +3909,26 @@ proc growthExpectation(daemon: RunQuotaDaemon;
   ## The cap figures of a command for `runquota expect-growth`: the
   ## declaration, and over every launcher's learned row of that id the
   ## largest successful peak, the highest admission figure and the most
-  ## recent breach. A walk of the table, on a request no hot path makes.
+  ## recent breach.
+  ##
+  ## O(SCOPES), NOT O(ROWS): one lookup per launcher scope the daemon has
+  ## learned anything in (`estimateScopes`, a handful of session names),
+  ## plus one for the declaration, so a query costs the same on a host that
+  ## has learned a million commands as on one that has learned ten.
   result.factorMilli = effectiveFactorMilli(daemon.config.memoryCapFactorMilli)
-  for row in daemon.estimates.values:
-    if row.commandStatsId != commandStatsId:
+  let declarationKey = estimateTableKey(DeclarationScope, commandStatsId)
+  if daemon.estimates.hasKey(declarationKey):
+    let row = daemon.estimates[declarationKey]
+    if row.declaredCapBytes > 0'u64:
+      result.found = true
+      result.declaredCapBytes = row.declaredCapBytes
+      result.declaredByUid = row.declaredByUid
+      result.declaredUnixMillis = row.declaredUnixMillis
+  for scope in daemon.estimateScopes:
+    let key = estimateTableKey(scope, commandStatsId)
+    if not daemon.estimates.hasKey(key):
       continue
-    if row.scope == DeclarationScope:
-      if row.declaredCapBytes > 0'u64:
-        result.found = true
-        result.declaredCapBytes = row.declaredCapBytes
-        result.declaredByUid = row.declaredByUid
-        result.declaredUnixMillis = row.declaredUnixMillis
-      continue
+    let row = daemon.estimates[key]
     result.found = true
     result.maxObservedPeakBytes = max(result.maxObservedPeakBytes,
       row.maxObservedPeakBytes)
@@ -7028,6 +7080,13 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
           humanBytes(MinDeclaredMemoryCapBytes) & ", got " & $msg.sizeBytes &
           " bytes", "a smaller declaration is a typo, not an expectation"))
       return
+    if msg.action == egSet and msg.sizeBytes > uint64(high(int64)):
+      # The store keeps integers as signed 64-bit; a larger size could not
+      # be persisted as written, and no machine has that much memory.
+      connection.sendError(frame.header.requestId, diagnostic(
+          diagInvalidArgument, "a declared memory cap must be at most " &
+          $high(int64) & " bytes, got " & $msg.sizeBytes))
+      return
     if msg.action != egQuery:
       let owner = ownerIdOf(context.peer)
       if owner.isNone:
@@ -7040,22 +7099,55 @@ proc handleRequest(daemon: var RunQuotaDaemon; connection: var LocalConnection;
             "expect-growth records the declaring uid from peer credentials"))
         return
       let key = estimateTableKey(DeclarationScope, msg.commandStatsId)
+      let existing = daemon.estimates.hasKey(key)
       var row = daemon.estimates.getOrDefault(key, LearnedEstimateRow(
         scope: DeclarationScope, commandStatsId: msg.commandStatsId))
+      let caller = cast[uint64](owner.get)
+      # ONLY THE DECLARING USER, OR ROOT, MAY CHANGE A DECLARATION. A
+      # declaration raises the cap of a command other users run too, and the
+      # uid is recorded so its owner is known; letting anyone else replace
+      # or clear it would make that record meaningless. A new declaration
+      # (no row, or a cleared one) may be made by anyone.
+      let held = existing and row.declaredCapBytes > 0'u64
+      if held and row.declaredByUid != caller and caller != 0'u64:
+        connection.sendError(frame.header.requestId, diagnostic(diagDenied,
+            "the growth declaration of " & msg.commandStatsId &
+            " was made by uid " & $row.declaredByUid &
+            "; only that user or root may replace or reset it",
+            "runquota expect-growth " & msg.commandStatsId &
+            " shows the declaration and who made it"))
+        return
+      if msg.action == egSet and not existing and
+          daemon.declarationCount >= MaxDeclarations:
+        # BOUNDED: every declaration is held in memory and read by every
+        # grant of its command, and the request comes from any local peer.
+        connection.sendError(frame.header.requestId, diagnostic(
+            diagDenied, "this daemon holds " & $MaxDeclarations &
+            " growth declarations already, the most it keeps",
+            "reset declarations that are no longer needed " &
+            "(runquota expect-growth <command-id> --reset)"))
+        return
       let now = nowUnixMillis()
       if msg.action == egSet:
         row.declaredCapBytes = msg.sizeBytes
-        row.declaredByUid = cast[uint64](owner.get)
+        row.declaredByUid = caller
         row.declaredUnixMillis = now
       else:
-        # The row stays, with its declaration cleared: the writer queue
-        # upserts and never deletes, and a zero declaration is none.
+        # Cleared, persisted as cleared (the writer upserts and never
+        # deletes), and dropped from memory: a cleared declaration is none,
+        # and is not reloaded at the next start.
         row.declaredCapBytes = 0'u64
         row.declaredByUid = 0'u64
         row.declaredUnixMillis = 0'u64
       row.updatedUnixMillis = now
-      if msg.action == egSet or daemon.estimates.hasKey(key):
+      if msg.action == egSet:
+        if not existing:
+          inc daemon.declarationCount
         daemon.estimates[key] = row
+        discard enqueueEstimateWrite(daemon.estimateStore, row)
+      elif existing:
+        daemon.estimates.del(key)
+        dec daemon.declarationCount
         discard enqueueEstimateWrite(daemon.estimateStore, row)
     connection.sendResponse(rqGrowthExpectation, frame.header.requestId,
         encodeGrowthExpectation(daemon.growthExpectation(msg.commandStatsId)))

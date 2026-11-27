@@ -181,6 +181,37 @@ when defined(posix):
       session.closeSession()
 
   suite "what a finish teaches the learned row":
+    test "a peak past int64 saturates, and the row survives a restart":
+      # The store holds signed 64-bit integers. Falsifying mutation: drop the
+      # daemon's saturation -- the row then holds 2^63 + 5 in memory, which
+      # is not what it would read back.
+      let daemon = startRqmDaemon("rqmsat")
+      var stopped = false
+      defer:
+        if not stopped: daemon.stop()
+      block:
+        var client = connectDefault()
+        defer: client.close()
+        var session = client.registerSession(SessionName, "0")
+        var lease = session.grantOf("huge-peak")
+        let peak = (1'u64 shl 63) + 5'u64
+        lease.finishWith(succeeded(), peakBytes = peak,
+          capBlock = measured(lease.memoryCap.capBytes, peak,
+            lease.memoryCap.basis))
+        let row = client.learnedRow("huge-peak")
+        check row.figure("max_observed_peak_bytes") == uint64(high(int64))
+        session.closeSession()
+      daemon.halt()
+      stopped = true
+      let restarted = startRqmDaemon("", root = daemon.root)
+      defer: restarted.stop()
+      var client = connectDefault()
+      defer: client.close()
+      let row = client.learnedRow("huge-peak")
+      check not row.isNil
+      check row.figure("max_observed_peak_bytes") == uint64(high(int64))
+      check row.figure("conservative_memory_bytes") == uint64(high(int64))
+
     test "test_rqm_cap_exceeded_does_not_learn":
       let daemon = startRqmDaemon("rqmexc")
       defer: daemon.stop()

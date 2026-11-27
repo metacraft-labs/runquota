@@ -26,8 +26,10 @@ const ExpectGrowthUsage* =
   "  runquota expect-growth COMMAND_ID [--to SIZE|--reset] [--json]\n" &
   "    declare that a command's memory is expected to grow: its next grants\n" &
   "    carry a memory cap of at least SIZE (bytes, or with a K, M, G or T\n" &
-  "    binary suffix; at least 1M). --reset removes the declaration; with\n" &
-  "    neither, prints the command's cap figures and changes nothing\n" &
+  "    binary suffix; at least 1M), never above the machine's memory budget;\n" &
+  "    a declaration only raises a cap. Only the declaring user or root may\n" &
+  "    replace or --reset a declaration; with neither option, prints the\n" &
+  "    command's cap figures and changes nothing\n" &
   "    (exit 1 when the daemon refuses or cannot be reached, 2 on bad\n" &
   "    arguments). RUNQUOTA_MEMORY_CAP=off|SIZE is the one-run form\n"
 
@@ -90,6 +92,10 @@ proc parseExpectGrowthArgs*(args: openArray[string];
     if options.sizeBytes < MinDeclaredMemoryCapBytes:
       error = "a declared memory cap must be at least 1 MiB, got " &
         $options.sizeBytes & " bytes"
+      return false
+    if options.sizeBytes > uint64(high(int64)):
+      error = "a declared memory cap must be at most " & $high(int64) &
+        " bytes, got " & $options.sizeBytes
       return false
     options.action = egSet
   elif sawReset:

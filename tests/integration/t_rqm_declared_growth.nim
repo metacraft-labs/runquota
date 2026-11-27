@@ -15,8 +15,13 @@
 ## * A successful finish of a run whose cap was lifted
 ##   (`RUNQUOTA_MEMORY_CAP=off`, basis `run-lifted`, cap 0, measured in its
 ##   leaf) raises M, and the next cap follows the new maximum.
-## * A command with no row takes a declaration-only row, and its cap is the
-##   declaration clamped to the budget.
+## * A command with no row takes a declaration-only row. A declaration only
+##   RAISES a cap: with no recorded peak the cap is the larger of the
+##   declaration and the free budget, clamped to the budget. Mutation: let
+##   the declaration stand when it is smaller (the old min(B, D)).
+## * Only the declaring uid or root may replace or reset a declaration, and
+##   a daemon holds at most `MaxDeclarations` of them.
+## * Declarations are listed apart from the learned rows in `estimates`.
 ## * The declaration survives a daemon restart (it is persisted with the
 ##   row).
 ## * Refusals: a size below 1 MiB, a malformed size, `--to` with `--reset`,
@@ -35,7 +40,9 @@ when defined(posix):
 
   import runquota_client
   import runquota_core
+  import runquota_persistence
   import runquota_protocol
+  import runquota_daemon/memory_caps
   import rqm_daemon
 
   proc grantOf(session: var RunQuotaSession; key: string;
@@ -71,12 +78,16 @@ when defined(posix):
       check cap.capBytes == 8'u64 * GiB
       check cap.previousMaxBytes == 1'u64 * GiB
 
-      # The command's, whichever launcher asks.
+      # The command's, whichever launcher asks: a launcher with no learned
+      # row of its own, granted while 10 GiB are held (free budget 6 GiB, so
+      # the 8 GiB declaration is the larger), is granted it too.
+      var hog = session.grantOf("hog", 10'u64 * GiB)
       var otherSession = client.registerSession("another-launcher", "0")
       let other = otherSession.capOf("grow")
       check other.basis == mcbDeclared
       check other.capBytes == 8'u64 * GiB
       otherSession.closeSession()
+      hog.release()
 
       # A query changes nothing, and says the same in JSON.
       let queried = daemon.rqmCli(["expect-growth", "grow", "--json"])
@@ -123,14 +134,23 @@ when defined(posix):
         defer: client.close()
         var session = client.registerSession(SessionName, "0")
         check daemon.rqmCli(["expect-growth", "fresh", "--to", "2G"]).code == 0
-        let fresh = session.capOf("fresh")
-        check fresh.basis == mcbDeclared
-        check fresh.capBytes == 2'u64 * GiB
-        check fresh.previousMaxBytes == 0'u64
+        # A DECLARATION ONLY RAISES A CAP. With nothing else held the free
+        # budget (16 GiB) is the larger, so the declaration changes nothing.
+        let unheld = session.capOf("fresh")
+        check unheld.basis == mcbBudget
+        check unheld.capBytes == BudgetBytes
+        check unheld.previousMaxBytes == 0'u64
         check daemon.rqmCli(["expect-growth", "huge", "--to", "64G"]).code == 0
         let huge = session.capOf("huge")
         check huge.basis == mcbDeclared
         check huge.capBytes == BudgetBytes
+        # With 15 GiB held by other work the free budget is 1 GiB, and the
+        # 2 GiB declaration is the larger: it stands.
+        var hog = session.grantOf("hog", 15'u64 * GiB)
+        let squeezed = session.capOf("fresh")
+        check squeezed.basis == mcbDeclared
+        check squeezed.capBytes == 2'u64 * GiB
+        hog.release()
         session.closeSession()
       # The declaration is persisted with the row.
       daemon.halt()
@@ -145,8 +165,69 @@ when defined(posix):
       var client = connectDefault()
       defer: client.close()
       var session = client.registerSession(SessionName, "0")
+      var hog = session.grantOf("hog", 15'u64 * GiB)
       check session.capOf("fresh").capBytes == 2'u64 * GiB
+      hog.release()
+      # Declarations are listed apart from the learned rows.
+      let inspected = parseJson(client.inspectionJson("estimates"))
+      var listed: seq[string] = @[]
+      for d in inspected["declarations"]:
+        listed.add(d["command_stats_id"].getStr())
+        check d["declared_by_uid"].getBiggestInt() == int64(getuid())
+      check "fresh" in listed and "huge" in listed
+      for row in inspected["estimates"]:
+        check row["scope"].getStr().startsWith("session:")
       session.closeSession()
+
+    test "only the declaring user or root may change a declaration":
+      # A declaration made by another uid (4242), as a restarted daemon finds
+      # it in its store. Falsifying mutation: drop the owner check -- the
+      # reset and the replacement below are then accepted.
+      let root = scratchDir("rqmown")
+      let store = startEstimateStore(root / "est.sqlite")
+      check enqueueEstimateWrite(store, LearnedEstimateRow(
+        scope: DeclarationScope, commandStatsId: "theirs",
+        declaredCapBytes: 20'u64 * GiB, declaredByUid: 4242'u64,
+        declaredUnixMillis: 1_800_000_000_000'u64,
+        updatedUnixMillis: 1_800_000_000_000'u64))
+      stopEstimateStore(store)
+      let daemon = startRqmDaemon("", root = root)
+      defer: daemon.stop()
+      let shown = daemon.rqmCli(["expect-growth", "theirs"])
+      check "declared by uid 4242" in shown.output
+      for args in [@["expect-growth", "theirs", "--reset"],
+                   @["expect-growth", "theirs", "--to", "32G"]]:
+        checkpoint(args.join(" "))
+        let answer = daemon.rqmCli(args)
+        checkpoint(answer.output)
+        check answer.code == 1
+        check "made by uid 4242" in answer.output
+        check "only that user or root" in answer.output
+      var client = connectDefault()
+      defer: client.close()
+      var session = client.registerSession(SessionName, "0")
+      let cap = session.capOf("theirs")
+      check cap.basis == mcbDeclared
+      check cap.capBytes == BudgetBytes
+      session.closeSession()
+
+    test "at most 4096 declarations":
+      # Falsifying mutation: drop the bound -- the 4097th is then accepted.
+      let daemon = startRqmDaemon("rqmmany")
+      defer: daemon.stop()
+      var client = connectDefault()
+      defer: client.close()
+      for i in 0 ..< MaxDeclarations:
+        discard client.expectGrowth("d" & $i, egSet, 2'u64 * GiB)
+      # Replacing one's own declaration is not a new one.
+      discard client.expectGrowth("d0", egSet, 3'u64 * GiB)
+      expect RunQuotaClientError:
+        discard client.expectGrowth("one-too-many", egSet, 2'u64 * GiB)
+      check $MaxDeclarations in client.lastDiagnostic.message
+      # A reset frees a place.
+      discard client.expectGrowth("d1", egReset)
+      check client.expectGrowth("one-more", egSet,
+        2'u64 * GiB).declaredCapBytes == 2'u64 * GiB
 
     test "refusals":
       let daemon = startRqmDaemon("rqmref")
@@ -158,7 +239,8 @@ when defined(posix):
                    @["expect-growth"],
                    @["expect-growth", "a", "b"],
                    @["expect-growth", repeat('x', MaxCommandStatsIdBytes + 1),
-                     "--to", "8G"]]:
+                     "--to", "8G"],
+                   @["expect-growth", "k", "--to", "10000000000000000000"]]:
         checkpoint(args.join(" "))
         let answer = daemon.rqmCli(args)
         checkpoint(answer.output)
@@ -173,6 +255,10 @@ when defined(posix):
       expect RunQuotaClientError:
         discard client.expectGrowth(repeat('y', MaxCommandStatsIdBytes + 1),
           egSet, 8'u64 * GiB)
+      # Past what the store can hold as written.
+      expect RunQuotaClientError:
+        discard client.expectGrowth("k", egSet, 10_000_000_000_000_000_000'u64)
+      check "at most" in client.lastDiagnostic.message
       # And a query of a command it knows nothing about says so.
       let unknown = daemon.rqmCli(["expect-growth", "never-seen"])
       check unknown.code == 0

@@ -399,7 +399,7 @@ returns it with the grant; the launcher (`run`, `acquire -- CMD`,
 | The command has | Cap |
 |---|---|
 | a largest successful peak *M* | the factor × *M* (2 by default), or a declared size when that is larger, never above the machine's budget |
-| only a declared size | that size, never above the budget |
+| only a declared size | that size or the free budget, whichever is larger, never above the budget |
 | neither | the memory the budget had left when the lease was granted |
 
 Only a successful run measured by the cap's own mechanism raises *M*. A run
@@ -415,6 +415,11 @@ memoryCap = "kill"       # or "advisory": measure and report, kill nothing
 memoryCapFactor = 2      # at least 1.5
 ```
 
+**Not every platform enforces it yet.** Where a cap applies and the launcher
+could not put it in place (no cgroup root on Linux; macOS and Windows, whose
+mechanisms are not built yet), the launcher says so on stderr as the command
+starts — `memory cap not enforced: <why>` — and the command runs uncapped.
+
 (`runquota config set enforcement.memoryCap kill`,
 `runquota config set enforcement.memoryCapFactor 2.5`). For one run,
 `RUNQUOTA_MEMORY_CAP` overrides it ([environment variables](/reference/environment_variables)):
@@ -425,15 +430,19 @@ its new peak), a size such as `8G` is that run's cap, and `advisory` or
 ## `runquota expect-growth`
 
 ```bash
-runquota expect-growth <command-id> --to 8G   # its next grants carry a cap of at least 8 GiB
+runquota expect-growth <command-id> --to 8G   # its next caps are at least 8 GiB (never above the budget)
 runquota expect-growth <command-id>            # print its cap figures; changes nothing
 runquota expect-growth <command-id> --reset    # remove the declaration
 ```
 
 The persistent form of `RUNQUOTA_MEMORY_CAP=<size>`: the daemon records the
 declared size with the declaring user's uid and the time, and every launcher
-that runs that command id is granted at least that cap. `--json` prints the
-figures as JSON. Sizes take a `K`, `M`, `G` or `T` binary suffix; a
+that runs that command id is granted a cap of at least that size, clamped to
+the machine's memory budget. A declaration only ever raises a cap: where the
+cap would be larger without it (a command with no recorded peak gets the free
+budget), the declaration changes nothing. Only the user who made a
+declaration, or root, may replace or reset it. `--json` prints the figures as
+JSON. Sizes take a `K`, `M`, `G` or `T` binary suffix; a
 declaration below 1 MiB is refused. Exit status 1 when the daemon refuses or
 cannot be reached, 2 on bad arguments.
 
