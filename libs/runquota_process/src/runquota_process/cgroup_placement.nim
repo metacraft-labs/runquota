@@ -433,6 +433,8 @@ proc memoryCapVerdict*(events: MemoryEvents; peakBytes, capBytes: uint64;
   ##   (a signal, or a non-zero exit from a parent that reported its
   ##   child's kill): the CAP was hit and the OOM killer killed in the leaf.
   ##   Cap exceeded, killed.
+  ##   Without kill evidence (a root the group kill skipped, or one that
+  ##   had already ended): cap reached, so the run is never learned from.
   ## * `oom` >= 1 and `oom_kill` = 0: the cap was hit and an allocation was
   ##   refused (ENOMEM: the kernel fails some allocations at the limit
   ##   instead of killing), nothing was killed. Cap reached.
@@ -453,6 +455,12 @@ proc memoryCapVerdict*(events: MemoryEvents; peakBytes, capBytes: uint64;
     if killEvidence:
       result.capExceeded = true
       result.capKilled = true
+    else:
+      # The cap was hit and the kernel killed in the leaf, but not the
+      # root: one it skipped (`oom_score_adj` -1000) or one that had ended.
+      # A root that then exits 0 must not read as a clean, measured run,
+      # or the learned maximum would rise to about the cap.
+      result.capReached = true
   elif events.oom >= 1'u64:
     result.capReached = true
   elif events.oomKill >= 1'u64:

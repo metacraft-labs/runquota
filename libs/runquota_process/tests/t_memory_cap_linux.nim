@@ -361,7 +361,13 @@ suite "memory cap rules":
       memoryCapVerdict(MemoryEvents(known: true, oom: oom, oomKill: kill),
         peak, cap, action, evidence)
     check v(1, 1).capKilled and v(1, 1).capExceeded
+    # The cap was hit and something in the leaf killed, but the root shows
+    # no kill evidence (an unkillable root, oom_score_adj -1000, that the
+    # group kill skips, or a root that ended first): not a kill of the
+    # tree, and not a clean run either -- cap reached, never learned.
     check not v(1, 1, evidence = false).capKilled
+    check not v(1, 1, evidence = false).capExceeded
+    check v(1, 1, evidence = false).capReached
     check v(1, 0).capReached and not v(1, 0).capKilled
     check v(0, 3).oomKilledOutsideCap and not v(0, 3).capExceeded
     check v(0, 0) == MemoryCapVerdict()
