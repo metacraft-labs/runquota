@@ -324,6 +324,47 @@ a directory removes it.
 directory when it exists. A launcher that itself runs inside a leased tree
 leaves its command where the outer launcher put it.
 
+**A limit you put around a build keeps its trees.** The default root sits
+directly in your `user@<uid>.service`, beside the cgroup your shell runs in.
+When the launcher runs under a cgroup with a limit of its own — for example a
+build started with `systemd-run --user --scope -p MemoryMax=8G repro build` —
+moving its trees to the default root would take them out from under that
+limit. So with placement on, the launcher reads the limits on its own cgroup
+and on each ancestor that the default root (or `RUNQUOTA_CGROUP_ROOT`) does
+not share: a `memory.max`, `memory.high` or `memory.swap.max` other than
+`max`, a `cpu.max` with a quota, or a `pids.max` below the task limit systemd
+puts on every unit by default (15% of the kernel's process limit; a host that
+lowers systemd's `DefaultTasksMax=` makes every unit look limited, which
+costs one question to systemd per scope). The deepest limited one then holds the trees:
+they are placed under `<that cgroup>/runquota`, so its limit and their own
+caps both apply. For that the cgroup must be delegated: start the scope with
+`-p Delegate=yes`. Only a service or a scope can be delegated (a slice
+cannot); a plain cgroup a delegated unit created inside itself counts as
+that unit's. The launcher looks for the `user.delegate` (or
+`trusted.delegate`) extended attribute systemd writes on a delegated unit's
+cgroup. Where it is missing (a user's own service manager may not write
+it), the launcher asks the manager that owns the unit once, with a short
+timeout (`systemctl --user show -p Delegate --value <unit>` for a unit of
+your user manager, `systemctl show ...` for one of the system manager), and
+records the answer, yes or no, in its own `user.runquota.delegated`
+attribute, so later launches do not ask again. The first launch moves the
+processes already in the scope into a `caller` sub-cgroup and enables the
+controllers below the scope. Without delegation the trees are not placed: they run in
+the scope, under its limit, at the fallback nice described below, and the
+reason names the scope, its limit, systemd's answer and `-p Delegate=yes`.
+None of this happens for a launcher that is not under a limited cgroup.
+`runquota status` neither asks about delegation nor writes anything: it
+reports a scope whose delegation no launch has asked about yet as not yet
+determined. (It still runs `systemctl show -p Delegate -p OOMPolicy` for the
+units above the cgroup root, to report them as described below.)
+
+The one limited cgroup trees leave on purpose is an agent session's scope,
+whose job is to bound the agent harness, not the builds it starts:
+the harness names it in `RUNQUOTA_AGENT_SESSION_SCOPE`
+([environment variables](/reference/environment_variables)). Only that exact
+cgroup name counts; a scope that merely looks like an agent session's is a
+limit like any other.
+
 With placement off, nothing below admission changes except that a
 reclaimed tree runs at nice +10, and `--cap` runs uncapped with a note on
 stderr. Where placement is on but unavailable (another OS, no delegated
