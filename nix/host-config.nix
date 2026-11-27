@@ -49,6 +49,17 @@ let
   percent = types.strMatching "(100(\\.0+)?|[1-9]?[0-9](\\.[0-9]+)?)";
   # A decimal fraction from 0 to 1 with at most three decimals.
   fraction = types.strMatching "(0(\\.[0-9]{1,3})?|1(\\.0{1,3})?)";
+  # The memory-cap factor as the file writes it (a bare number, at most
+  # three decimals: `parseFactorMilli`), and at least 1.5, the reader's
+  # floor (`MinMemoryCapFactorMilli`). Spelled so it is also a JSON number,
+  # which is how the floor is checked.
+  memoryCapFactor =
+    types.addCheck (types.strMatching "(0|[1-9][0-9]{0,5})(\\.[0-9]{1,3})?") (
+      text: builtins.fromJSON text >= 1.5
+    )
+    // {
+      description = "number of at least 1.5 with at most three decimals, such as \"2\" or \"1.5\"";
+    };
   # A string of the subset: no quote, no escape. An array item is split at
   # commas, so it carries none either.
   # A user or group name, or a decimal id: no quote, no escape, no space.
@@ -217,6 +228,25 @@ in
           `[enforcement] qos`: RunQuota's launchers put reclaimed and
           low-priority trees under the background policy (macOS).
         '';
+        memoryCap =
+          nullable
+            (types.enum [
+              "off"
+              "advisory"
+              "kill"
+            ])
+            ''
+              `[enforcement] memoryCap`: what RunQuota's launchers do with each
+              grant's memory cap: nothing (`off`, the daemon's default),
+              measure and report a breach (`advisory`), or kill the tree that
+              passes it (`kill`).
+            '';
+        memoryCapFactor = nullable memoryCapFactor ''
+          `[enforcement] memoryCapFactor`: the factor runquotad multiplies a
+          command's largest successful tree peak by to compute its memory
+          cap; at least 1.5 (the daemon's default is 2). A string, rendered
+          as a bare number.
+        '';
       };
 
       reservations = lib.mkOption {
@@ -359,6 +389,8 @@ in
         entry "cgroups" cfg.enforcement.cgroups onOff
         ++ entry "job-priority" cfg.enforcement.jobPriority onOff
         ++ entry "qos" cfg.enforcement.qos onOff
+        ++ entry "memoryCap" cfg.enforcement.memoryCap quoted
+        ++ entry "memoryCapFactor" cfg.enforcement.memoryCapFactor (value: value)
       )
       # A class declared without a key still gets its header: the reader
       # takes a table without keys as a class that reserves nothing.

@@ -31,6 +31,8 @@ max-hold = "30m"
 cgroups = "on"
 job-priority = "off"
 qos = "on"
+memoryCap = "advisory"
+memoryCapFactor = 2.5
 
 [reservation.ci]
 cpu-milli = 8000

@@ -39,6 +39,8 @@
     cgroups = true;
     jobPriority = false;
     qos = true;
+    memoryCap = "advisory";
+    memoryCapFactor = "2.5";
   };
   reservations = {
     ci = {

@@ -70,6 +70,10 @@ let
       benchmarkUserWithComma = refused { benchmark.allowedUsers = [ "a,b" ]; };
       benchmarkHoldZero = refused { benchmark.maxHold = "0m"; };
       poolNameWithNewline = refused { pools."a\n[admission]" = 1; };
+      memoryCapUnknown = refused { enforcement.memoryCap = "on"; };
+      memoryCapFactorBelowFloor = refused { enforcement.memoryCapFactor = "1.4"; };
+      memoryCapFactorNotANumber = refused { enforcement.memoryCapFactor = "two"; };
+      memoryCapFactorFourDecimals = refused { enforcement.memoryCapFactor = "2.0001"; };
     };
 
     crossKeyProblems = {

@@ -339,6 +339,28 @@ proc launcherQosOn*(): bool =
   else:
     false
 
+proc launcherMemoryCapMode*(): MemoryCapMode =
+  ## The host file's `[enforcement] memoryCap` for RunQuota's CLI launchers
+  ## (`mcmOff` when absent). A host file that cannot be read or parsed leaves
+  ## the cap off: a launcher never fails over a setting it only consults.
+  var problem = ""
+  enforcementMemoryCapMode(problem)
+
+proc memoryCapEnvRefusal*(): string =
+  ## Why this process's `RUNQUOTA_MEMORY_CAP` is not a value a launcher
+  ## accepts, or "" when it is (or is unset). Asked BEFORE the daemon is
+  ## contacted, so a typo never costs a lease or a queue wait: a value is
+  ## valid or not whatever the grant turns out to be.
+  resolveMemoryCap(GrantMemoryCap(known: false), mcmOff,
+    memoryCapFromEnvironment(), nested = false).error
+
+proc printMemoryCapReport*(report: string) =
+  ## The report of a tree that passed its memory cap, on stderr, as the
+  ## command ends (empty: nothing to say).
+  if report.len > 0:
+    stderr.write(report)
+    flushFile(stderr)
+
 proc chooseAdapter(options: RunOptions): int =
   case options.adapter
   of "none": -1
@@ -354,6 +376,10 @@ proc runRun*(args: seq[string];
   var error = ""
   if not parseRunArgs(args, options, error):
     stderr.writeLine("runquota run: " & error)
+    return 2
+  let capRefusal = memoryCapEnvRefusal()
+  if capRefusal.len > 0:
+    stderr.writeLine("runquota run: " & capRefusal)
     return 2
   if options.listAdapters:
     echo renderAdapterList()
@@ -462,6 +488,19 @@ proc runRun*(args: seq[string];
       describeFailure(failure.msg, client.lastDiagnostic))
     return 1
 
+  # THE MEMORY CAP: the grant's, as the host file and `RUNQUOTA_MEMORY_CAP`
+  # say to apply it. The variable was validated before the daemon was asked.
+  let memoryCap = resolveMemoryCap(lease.memoryCap, launcherMemoryCapMode(),
+    memoryCapFromEnvironment(),
+    nested = parentLeaseFromEnvironment().isSome)
+  if options.verbose:
+    stderr.writeLine("runquota run: memory cap " &
+      (if memoryCap.capBytes > 0'u64:
+        $memoryCap.capBytes & " bytes (" & $memoryCap.basis & ", " &
+          $memoryCap.action & ")"
+       elif memoryCap.measure: "lifted; measured"
+       else: "none: " & memoryCap.reason))
+
   var code = 0
   var ran = false
   when defined(posix):
@@ -479,6 +518,7 @@ proc runRun*(args: seq[string];
           # cap on the tree (the same quantity `slots` rounds up from).
           spec.cpuRateCapMilli = uint32(lease.resources.cpu.value)
       spec.applyPlacement(placement)
+      spec.applyMemoryCap(memoryCap)
       child = launchProcess(spec)
     except CatchableError as failure:
       lease.finish(outcome = launchFailed())
@@ -506,12 +546,21 @@ proc runRun*(args: seq[string];
     # The tree's totals and (with `profiles` on) its CPU profile, as
     # `runquota acquire -- CMD` sends them: they are what the daemon learns
     # a command's shape from, and predictive admission reads that shape.
-    lease.finish(outcome = finishOutcome(completion),
+    let outcome = finishOutcome(completion)
+    let capBlock = completion.finishMemoryCap(memoryCap)
+    # THE REPORT FIRST: it is about the command that just ended, and it
+    # must be said even when the daemon is gone by the time the finish is
+    # sent.
+    printMemoryCapReport(memoryCapReport(options.command.join(" "),
+      statsKey, lease.memoryCap, capBlock,
+      killed = outcome.kind == lfCapExceeded))
+    lease.finish(outcome = outcome,
       peakMemoryBytes = completion.peakResidentMemoryBytes,
       processCount = completion.processCount,
       totals = completion.totals,
       cpuProfile = completion.cpuProfile,
-      sizing = completion.finishSizing())
+      sizing = completion.finishSizing(),
+      memoryCap = capBlock)
     code = exitCodeOf(completion)
     ran = true
     lease.release()

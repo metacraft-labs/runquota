@@ -69,6 +69,7 @@ when defined(windows):
 
 import runquota_client
 import runquota_core
+import runquota_core/byte_sizes
 import runquota_exec
 import runquota_process
 import runquota_protocol
@@ -128,28 +129,12 @@ proc tokensForSlots*(slots: int): int =
   max(0, slots - 1)
 
 proc parseMemorySize*(text: string; value: var uint64): bool =
-  ## Bytes, or a whole number with a `KiB`, `MiB` or `GiB` suffix (also
-  ## `K`, `M`, `G`). Zero is refused: an explicit reservation of nothing is
-  ## the default spelled wrongly.
-  var digits = text.strip()
-  var multiplier = 1'u64
-  for (suffix, factor) in [("KiB", 1024'u64), ("MiB", 1024'u64 * 1024),
-      ("GiB", 1024'u64 * 1024 * 1024), ("K", 1024'u64),
-      ("M", 1024'u64 * 1024), ("G", 1024'u64 * 1024 * 1024)]:
-    if digits.endsWith(suffix):
-      digits = digits[0 ..< digits.len - suffix.len]
-      multiplier = factor
-      break
-  if digits.len == 0 or digits.len > 12:
-    return false
-  for ch in digits:
-    if ch notin {'0' .. '9'}:
-      return false
-  let number = parseBiggestUInt(digits)
-  if number == 0'u64 or number > high(uint64) div multiplier:
-    return false
-  value = uint64(number) * multiplier
-  true
+  ## Bytes, or a whole number with a binary suffix (`K`, `M`, `G`, `T`, or
+  ## `KiB` ... `TiB`). Zero is refused: an explicit reservation of nothing
+  ## is the default spelled wrongly. The one size parser every RunQuota
+  ## command line shares (`runquota_core/byte_sizes`), so `--mem 4G` and
+  ## `RUNQUOTA_MEMORY_CAP=4G` cannot mean two different sizes.
+  parseByteSize(text, value)
 
 proc isJobserverWord(word: string): bool =
   ## The `MAKEFLAGS` words that describe a jobserver or a job count. The
@@ -832,6 +817,10 @@ proc runJobserver*(args: seq[string];
   if not parseJobserverArgs(args, options, error):
     stderr.writeLine("runquota jobserver: " & error)
     return 2
+  let capRefusal = memoryCapEnvRefusal()
+  if capRefusal.len > 0:
+    stderr.writeLine("runquota jobserver: " & capRefusal)
+    return 2
   var removed: seq[string] = @[]
   let command = stripWidthFlags(options.command, removed)
   if removed.len > 0 and options.verbose:
@@ -924,6 +913,12 @@ proc runJobserver*(args: seq[string];
         jobPriorityOn = launcherJobPriorityOn(),
         qosOn = launcherQosOn())
       spec.applyPlacement(placement)
+      # The memory cap, as `runquota run` applies it; a bridge inside a
+      # parent lease's tree applies none (its parent's cap covers it).
+      let memoryCap = resolveMemoryCap(lease.memoryCap,
+        launcherMemoryCapMode(), memoryCapFromEnvironment(),
+        nested = parentLeaseFromEnvironment().isSome)
+      spec.applyMemoryCap(memoryCap)
       var child: LaunchedProcess
       try:
         child = launchProcess(spec)
@@ -959,12 +954,17 @@ proc runJobserver*(args: seq[string];
       # The FIFO goes before the finish and the release, in the order the
       # specification gives: nothing may find it once the slots are back.
       fifo.closeJobserverFifo()
-      lease.finish(outcome = finishOutcome(completion),
+      let outcome = finishOutcome(completion)
+      let capBlock = completion.finishMemoryCap(memoryCap)
+      printMemoryCapReport(memoryCapReport(command.join(" "), statsKey,
+        lease.memoryCap, capBlock, killed = outcome.kind == lfCapExceeded))
+      lease.finish(outcome = outcome,
         peakMemoryBytes = completion.peakResidentMemoryBytes,
         processCount = completion.processCount,
         totals = completion.totals,
         cpuProfile = completion.cpuProfile,
-        sizing = completion.finishSizing())
+        sizing = completion.finishSizing(),
+        memoryCap = capBlock)
       code = exitCodeOf(completion)
       ran = true
       lease.release()
@@ -1067,6 +1067,10 @@ proc runJobserver*(args: seq[string];
       # The bridge's whole width is out as tokens: a sub-lease of its lease
       # would count the same slots twice (see the module header).
       spec.unsetEnv = @[ParentLeaseEnvVar]
+      let memoryCap = resolveMemoryCap(lease.memoryCap,
+        launcherMemoryCapMode(), memoryCapFromEnvironment(),
+        nested = parentLeaseFromEnvironment().isSome)
+      spec.applyMemoryCap(memoryCap)
       var child: LaunchedProcess
       try:
         child = launchProcess(spec)
@@ -1095,12 +1099,17 @@ proc runJobserver*(args: seq[string];
       # order the specification gives: nothing may find it once the slots are
       # back.
       sem.closeJobserverSemaphore()
-      lease.finish(outcome = finishOutcome(completion),
+      let outcome = finishOutcome(completion)
+      let capBlock = completion.finishMemoryCap(memoryCap)
+      printMemoryCapReport(memoryCapReport(command.join(" "), statsKey,
+        lease.memoryCap, capBlock, killed = outcome.kind == lfCapExceeded))
+      lease.finish(outcome = outcome,
         peakMemoryBytes = completion.peakResidentMemoryBytes,
         processCount = completion.processCount,
         totals = completion.totals,
         cpuProfile = completion.cpuProfile,
-        sizing = completion.finishSizing())
+        sizing = completion.finishSizing(),
+        memoryCap = capBlock)
       code = exitCodeOf(completion)
       ran = true
       lease.release()

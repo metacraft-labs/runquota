@@ -713,23 +713,15 @@ proc standaloneUnixMillis(): uint64 =
   uint64(max(0'i64, int64(epochTime() * 1000.0)))
 
 proc standaloneOutcome(completion: ProcessCompletion): LeaseFinish =
-  ## The same mapping ``runquota_exec.finishOutcome`` makes, and for the
-  ## same reasons -- including the signal test coming before the cancel
-  ## test, so a child killed by SIGTERM is named ``crashed`` and lands on
-  ## ``signalled`` rather than losing the signal to a ``cancelled`` that
-  ## has nowhere to carry it.
-  let signal =
-    if completion.signaled: uint32(max(completion.signal, 0)) else: 0'u32
-  if signal != 0'u32:
-    crashed(signal)
-  elif completion.cancelled or completion.timedOut:
-    cancelled()
-  elif completion.exited and completion.exitCode > 0:
-    failed(uint32(completion.exitCode))
-  elif completion.exited:
-    succeeded()
-  else:
-    cancelled()
+  ## The mapping ``runquota_exec.finishOutcome`` makes, and for the same
+  ## reasons -- including the signal test coming before the cancel test, so
+  ## a child killed by SIGTERM is named ``crashed`` and lands on
+  ## ``signalled`` rather than losing the signal to a ``cancelled`` that has
+  ## nowhere to carry it, and a kill for memory (by the tree's cap or from
+  ## outside it) named before either. Delegated rather than copied: two
+  ## copies of this mapping are two answers waiting to disagree about the
+  ## same death, once one of them learns a new conclusion.
+  finishOutcome(completion)
 
 proc runStandaloneAcquire(label, statsKey: string;
                           command: seq[string]): int =
@@ -1008,6 +1000,13 @@ proc runDebugAcquire(args: seq[string]): int =
     else:
       echo "unknown acquire argument: " & args[i]
       return 2
+  if command.len > 0:
+    # A `RUNQUOTA_MEMORY_CAP` that is not a value is refused before anything
+    # is asked of the daemon, so a typo costs no lease and no queue wait.
+    let capRefusal = memoryCapEnvRefusal()
+    if capRefusal.len > 0:
+      stderr.writeLine("runquota acquire: " & capRefusal)
+      return 2
   # NO DAEMON IS NOT AN ERROR (OS-4, §"Standalone mode"). The CodeTracer
   # test runner explicitly MAY run without RunQuota and Reprobuild has
   # direct-mode invocations, so refusing here would fail work that has
@@ -1084,9 +1083,11 @@ proc runDebugAcquire(args: seq[string]): int =
       let execution = session.runWithLease(request, command,
           waitForQueued = true, cgroupRoot = launcherCgroupRoot(),
           jobPriorityOn = launcherJobPriorityOn(),
-          qosOn = launcherQosOn())
+          qosOn = launcherQosOn(),
+          memoryCapMode = launcherMemoryCapMode())
       stdout.write(execution.process.stdout)
       stderr.write(execution.process.stderr)
+      printMemoryCapReport(execution.memoryCapReport)
       session.closeSession()
       if execution.process.exited:
         return execution.process.exitCode

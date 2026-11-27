@@ -1,12 +1,13 @@
-import std/[options, os]
+import std/[options, os, strutils]
 
 import runquota_client
 import runquota_core
 import runquota_exec/types as execTypes
+import runquota_exec/memory_cap_launch
 import runquota_process
 import runquota_protocol
 
-export execTypes
+export execTypes, memory_cap_launch
 
 const libraryName* = "runquota_exec"
 
@@ -243,8 +244,29 @@ proc finishOutcome*(completion: ProcessCompletion): LeaseFinish =
   ##
   ## AND A CANCEL THE CHILD HONOURED IS STILL ``cancelled``: it exits of
   ## its own accord, no signal is recorded, and this falls through.
+  ##
+  ## A KILL FOR MEMORY IS NAMED BEFORE ANYTHING ELSE, because the same
+  ## signal or status reads as a crash or a failure otherwise. The launcher
+  ## that applied the cap knows which killed the tree
+  ## (`completion.capKilled` / `oomKilledOutsideCap`, classified by the
+  ## platform's mechanism), and each conclusion needs kill evidence: a
+  ## signal, or the non-zero status a parent that reported its child's kill
+  ## returned. Without evidence the conclusion is not stated. A cap kill is
+  ## named only with the measurement that goes with it
+  ## (`memoryCapMeasured`), because a cap-exceeded finish without the
+  ## memory-cap block is refused by the daemon and would strand the lease.
   let signal =
     if completion.signaled: uint32(max(completion.signal, 0)) else: 0'u32
+  let status =
+    if completion.exited and completion.exitCode > 0:
+      uint32(completion.exitCode)
+    else: 0'u32
+  var kill: KillEvidence
+  if (completion.capKilled or completion.oomKilledOutsideCap) and
+      killEvidence(status, signal, kill):
+    if completion.capKilled and completion.memoryCapMeasured:
+      return capExceeded(kill)
+    return oomKilled(kill)
   if signal != 0'u32:
     crashed(signal)
   elif completion.cancelled or completion.timedOut:
@@ -268,6 +290,10 @@ proc parentLeaseEnvEntry*(lease: RunQuotaLease): string =
   ## the host behind its own parent.
   ParentLeaseEnvVar & "=" & $lease.id.value
 
+proc memoryCapFromEnvironment*(): string =
+  ## `RUNQUOTA_MEMORY_CAP` as this process inherited it, "" when unset.
+  getEnv(MemoryCapEnvVar)
+
 proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
                    command: CommandSpec; releaseAfterFinish = true;
                    waitForQueued = false;
@@ -275,7 +301,9 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
                    placeTree = true;
                    cgroupRoot = currentCgroupRoot();
                    jobPriorityOn = currentJobPriorityOn();
-                   qosOn = currentQosOn()):
+                   qosOn = currentQosOn();
+                   memoryCapMode = mcmOff;
+                   memoryCapEnv = memoryCapFromEnvironment()):
     LeaseExecutionResult =
   ## `exportParentLease` gives the child `RUNQUOTA_PARENT_LEASE` naming the
   ## lease it runs under. It is layered over `command.env`, so it also
@@ -288,6 +316,12 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
   ## The default root reads only the environment, so placement is on only
   ## when `RUNQUOTA_CGROUP_ROOT` names a root; a launcher that honours the
   ## host file's switch passes the root it resolved with it.
+  ##
+  ## `memoryCapMode` is the host file's `[enforcement] memoryCap`, read by
+  ## the caller (this library reads no host file), and `memoryCapEnv` the
+  ## per-run override: together with the grant they decide the tree's memory
+  ## cap (`resolveMemoryCap`). A value of the variable that is not one raises
+  ## before anything is launched, and the lease is released.
   result = LeaseExecutionResult(
     state: esWaitingForLease
   )
@@ -298,11 +332,19 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
       session.requestLease(request)
   result.leaseId = lease.id.value
   try:
+    # Resolved before the lease is marked starting, so a refused variable
+    # releases a lease that never started anything (the `finally` below).
+    let cap = resolveMemoryCap(lease.memoryCap, memoryCapMode, memoryCapEnv,
+      nested = parentLeaseFromEnvironment().isSome)
+    if cap.error.len > 0:
+      raise newException(ValueError, cap.error)
     result.state = esStarting
     lease.markStarting()
     var spec = command
     # A reclaimed grant runs at the lower weight, whatever the caller asked.
     spec.niceIncrement = max(spec.niceIncrement, lease.reclaimedNice())
+    spec.applyMemoryCap(cap)
+    result.memoryCapNote = cap.reason
     if placeTree:
       spec.applyPlacement(session.treePlacement(lease, root = cgroupRoot,
         jobPriorityOn = jobPriorityOn, qosOn = qosOn))
@@ -320,14 +362,20 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
     )
     let completion = child.waitForCompletion()
     child.close()
+    let outcome = finishOutcome(completion)
+    let capBlock = completion.finishMemoryCap(cap)
     lease.finish(
-      outcome = finishOutcome(completion),
+      outcome = outcome,
       peakMemoryBytes = completion.peakResidentMemoryBytes,
       processCount = completion.processCount,
       totals = completion.totals,
       cpuProfile = completion.cpuProfile,
-      sizing = completion.finishSizing()
+      sizing = completion.finishSizing(),
+      memoryCap = capBlock
     )
+    result.memoryCapReport = memoryCapReport(command.argv.join(" "),
+      request.commandStatsId, lease.memoryCap, capBlock,
+      killed = outcome.kind == lfCapExceeded)
     result.process = completion
     result.stdoutBytes = completion.stdoutBytes
     result.stderrBytes = completion.stderrBytes
@@ -352,7 +400,9 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
                    waitForQueued = false;
                    cgroupRoot = currentCgroupRoot();
                    jobPriorityOn = currentJobPriorityOn();
-                   qosOn = currentQosOn()):
+                   qosOn = currentQosOn();
+                   memoryCapMode = mcmOff;
+                   memoryCapEnv = memoryCapFromEnvironment()):
     LeaseExecutionResult =
   session.runWithLease(
     request,
@@ -366,5 +416,7 @@ proc runWithLease*(session: var RunQuotaSession; request: ResourceRequest;
     waitForQueued = waitForQueued,
     cgroupRoot = cgroupRoot,
     jobPriorityOn = jobPriorityOn,
-    qosOn = qosOn
+    qosOn = qosOn,
+    memoryCapMode = memoryCapMode,
+    memoryCapEnv = memoryCapEnv
   )

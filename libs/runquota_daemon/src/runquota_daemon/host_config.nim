@@ -31,6 +31,7 @@
 
 import std/[options, os, strutils, tables]
 
+import runquota_core/memory_cap
 import ./cpu_pressure
 
 when defined(posix):
@@ -41,7 +42,8 @@ when defined(posix):
 # and it does not link the daemon. Applying the file to a `DaemonConfig` is
 # `resolveBudget` in `runquota_daemon` (at start and on every reload).
 # `./cpu_pressure`, imported for the threshold defaults, is standard-library
-# only as well.
+# only as well, and so is `runquota_core/memory_cap`, imported for the cap's
+# mode and factor bounds (it imports nothing at all).
 
 const
   HostConfigSchema* = "runquota.host-config.v1"
@@ -232,6 +234,17 @@ type
       ## by `runquotad`, which spawns no trees; the daemon only validates
       ## it. Off when absent (the macOS analogue of `[enforcement] cgroups`,
       ## off until the overhead gate passes it).
+    enforcementMemoryCap*: Option[MemoryCapMode]
+      ## `[enforcement] memoryCap`, `"off"`, `"advisory"` or `"kill"`: what
+      ## RunQuota's launchers on this host do with each grant's memory cap
+      ## (every OS). Read by the LAUNCHING CLIENT, which enforces the cap; the
+      ## daemon only validates it. Off when absent, until the overhead gate
+      ## lets it on.
+    memoryCapFactorMilli*: Option[uint32]
+      ## `[enforcement] memoryCapFactor`, a number of at least 1.5, kept in
+      ## thousandths: the factor `runquotad` multiplies a command's largest
+      ## successful tree peak by to compute its cap. Read by the DAEMON, which
+      ## computes every grant's cap.
     pressureHighPct*: Option[float64]
     pressureLowPct*: Option[float64]
       ## `[admission] pressure-high` / `pressure-low`, percentages 0..100,
@@ -307,6 +320,35 @@ proc parseInteger(raw, path: string; lineNo: int): uint64 =
     result = parseBiggestUInt(digits).uint64
   except ValueError:
     fail(path, lineNo, "integer out of range: `" & text & "`")
+
+proc parseFactorMilli*(raw: string; milli: var uint32): bool =
+  ## A plain decimal number with at most three decimals (`2`, `1.5`,
+  ## `2.25`), in thousandths. TOML writes an integer and a float the same
+  ## way for these values, and the subset reads both; a quoted string, a
+  ## sign, an exponent or a fourth decimal is not a factor. The floor is
+  ## the caller's to apply, so it can say what the floor is.
+  let text = raw.strip()
+  let dot = text.find('.')
+  let whole = if dot < 0: text else: text[0 ..< dot]
+  let fraction = if dot < 0: "" else: text[dot + 1 .. ^1]
+  if whole.len == 0 or whole.len > 6 or fraction.len > 3 or
+      (dot >= 0 and fraction.len == 0):
+    return false
+  for ch in whole & fraction:
+    if ch notin {'0' .. '9'}:
+      return false
+  var value = 0'u64
+  for ch in whole:
+    value = value * 10'u64 + uint64(ord(ch) - ord('0'))
+  value = value * 1000'u64
+  var scale = 100'u64
+  for ch in fraction:
+    value += uint64(ord(ch) - ord('0')) * scale
+    scale = scale div 10'u64
+  if value > uint64(high(uint32)):
+    return false
+  milli = uint32(value)
+  true
 
 proc parseQuoted(raw, path: string; lineNo: int): string =
   ## A double-quoted TOML basic string WITHOUT escapes: the subset has no use
@@ -679,9 +721,33 @@ proc parseHostConfig*(text, path: string;
         of "off": result.enforcementQos = some(false)
         else:
           fail(path, lineNo, "qos must be \"on\" or \"off\", got " & value)
+      of "memoryCap":
+        let raw = parseQuoted(value, path, lineNo)
+        case raw
+        of "off": result.enforcementMemoryCap = some(mcmOff)
+        of "advisory": result.enforcementMemoryCap = some(mcmAdvisory)
+        of "kill": result.enforcementMemoryCap = some(mcmKill)
+        else:
+          fail(path, lineNo, "memoryCap must be \"off\", \"advisory\" or " &
+            "\"kill\", got " & value)
+      of "memoryCapFactor":
+        # A FACTOR BELOW 1.5 IS REFUSED, NOT RAISED TO 1.5: a cap that close
+        # to the largest successful peak would kill healthy runs on ordinary
+        # run-to-run noise, and an operator who wrote 1.2 meant something
+        # this file cannot give them. Better the file does not parse and
+        # says why than a cap other than the one written down.
+        var milli = 0'u32
+        if not parseFactorMilli(value, milli):
+          fail(path, lineNo, "memoryCapFactor must be a number such as 2 " &
+            "or 1.5 (at most three decimals), got " & value)
+        if milli < MinMemoryCapFactorMilli:
+          fail(path, lineNo, "memoryCapFactor must be at least 1.5 (a " &
+            "smaller factor kills healthy runs on run-to-run noise), got " &
+            value)
+        result.memoryCapFactorMilli = some(milli)
       else:
         fail(path, lineNo, "unknown key `" & key & "` in [enforcement]; " &
-          "expected cgroups, job-priority or qos")
+          "expected cgroups, job-priority, qos, memoryCap or memoryCapFactor")
     else:
       let reserved = reservationClassOf(section)
       if reserved.len == 0:
@@ -820,6 +886,20 @@ proc enforcementQosOn*(problem: var string;
     problem = failure.msg
     false
 
+proc enforcementMemoryCapMode*(problem: var string;
+                               path = hostConfigPath): MemoryCapMode =
+  ## `[enforcement] memoryCap` of the host file, for a LAUNCHING CLIENT
+  ## (RunQuota's CLI launchers, Reprobuild): `mcmOff` unless the file turns
+  ## the cap on. A file that cannot be read or parsed answers `mcmOff` with
+  ## `problem` set: a launcher never fails over a setting it only consults.
+  ## Mirrors `enforcementCgroupsOn`.
+  problem = ""
+  try:
+    readHostConfig(path).enforcementMemoryCap.get(mcmOff)
+  except CatchableError as failure:
+    problem = failure.msg
+    mcmOff
+
 proc defaultMemoryBudgetBytes*(physicalBytes: uint64): uint64 =
   ## `DefaultMemoryBudgetPercent` of `physicalBytes`, or
   ## `FallbackMemoryBudgetBytes` when physical memory could not be read (0).
@@ -890,7 +970,7 @@ proc parseHostConfigKey*(key: string): HostConfigKey =
       "admission.pressure-low, admission.oversubscription, " &
       "reservation.CLASS.cpu-milli, reservation.CLASS.memory-bytes, " &
       "reservation.CLASS.lend, enforcement.cgroups, enforcement.job-priority, " &
-      "enforcement.qos")
+      "enforcement.qos, enforcement.memoryCap, enforcement.memoryCapFactor")
   result = HostConfigKey(section: key[0 ..< dot], name: key[dot + 1 .. ^1])
   case result.section
   of "machine":
@@ -911,9 +991,11 @@ proc parseHostConfigKey*(key: string): HostConfigKey =
         "predictive, horizon, pressure-high, pressure-low and " &
         "oversubscription")
   of "enforcement":
-    if result.name notin ["cgroups", "job-priority", "qos"]:
+    if result.name notin ["cgroups", "job-priority", "qos", "memoryCap",
+        "memoryCapFactor"]:
       raise newException(HostConfigError, "unknown key `" & key &
-        "`; [enforcement] has cgroups, job-priority and qos")
+        "`; [enforcement] has cgroups, job-priority, qos, memoryCap and " &
+        "memoryCapFactor")
   else:
     raise newException(HostConfigError, "unknown table `" & result.section &
       "` in `" & key & "`; expected machine, pools, admission, enforcement or " &
@@ -1046,6 +1128,15 @@ proc hostConfigEntry*(key: HostConfigKey; raw: string): string =
     if text notin ["true", "false"]:
       raise newException(HostConfigError, "`" & $key &
         "` takes true or false, got `" & raw & "`")
+    return key.name & " = " & text
+  if key.section == "enforcement" and key.name == "memoryCapFactor":
+    # A bare TOML number, as the spec writes it (`memoryCapFactor = 2`): the
+    # factor is a number, and the reader refuses a quoted one.
+    let text = raw.strip()
+    var milli = 0'u32
+    if not parseFactorMilli(text, milli):
+      raise newException(HostConfigError, "`" & $key &
+        "` takes a number such as 2 or 1.5, got `" & raw & "`")
     return key.name & " = " & text
   if key.section in ["admission", "enforcement"]:
     # `[enforcement] cgroups` is a quoted `on` / `off`, like
