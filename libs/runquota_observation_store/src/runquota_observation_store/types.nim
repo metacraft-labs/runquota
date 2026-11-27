@@ -26,6 +26,11 @@ type
     tTimeout = "timeout"
     tOomKilled = "oom_killed"
     tRefused = "refused"
+    tCapExceeded = "cap_exceeded"
+      ## Killed by the memory cap its own grant carried (schema version 9).
+      ## A row with it is NEVER a measurement of the command's need: the
+      ## tree was stopped on its way past a ceiling, so its peak is a floor
+      ## of what it would have used.
 
   DiskClass* = enum
     dcNvme = "nvme"

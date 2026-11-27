@@ -11,7 +11,7 @@
 ## registered in ``extension_registry`` (M12).
 
 const
-  spineSchemaVersion* = 8'i64
+  spineSchemaVersion* = 9'i64
     ## The schema version this build understands. A database whose
     ## ``user_version`` exceeds it is REFUSED, never degraded (see
     ## ``openObservationStore``).
@@ -409,8 +409,131 @@ begin
 end;
 """
 
+  # VERSION 9: THE `cap_exceeded` TERMINATION. A tree killed by the memory
+  # cap its own grant carried is neither an `oom_killed` row (that word keeps
+  # meaning killed for memory by something else: a host-wide OOM, an
+  # ancestor's limit) nor a measurement of the command's need, and a reader
+  # deciding what a command uses has to be able to leave it out by name.
+  #
+  # A CHECK CONSTRAINT CANNOT BE ALTERED IN SQLITE, so `executions` is
+  # REBUILT, by the procedure the SQLite documentation gives for any change
+  # `alter table` cannot make (https://www.sqlite.org/lang_altertable.html,
+  # "Making Other Kinds Of Table Schema Changes"), with two departures that
+  # this store's shape forces:
+  #
+  # * THE OLD TABLE IS NOT RENAMED AWAY AND THE NEW ONE INTO PLACE. A rename
+  #   rewrites the `references executions(...)` clauses of the tables that
+  #   point at it (the CPU and memory profiles, the merge quarantine and
+  #   every product's `ext_` table), so they would follow the OLD table to
+  #   its new name and be left pointing at a dropped one. Instead the rows
+  #   are copied aside into a plain table, `executions` is dropped and
+  #   created again under its own name, and the rows are copied back; the
+  #   referencing tables never see a name change.
+  # * FOREIGN KEYS ARE DEFERRED, NOT TURNED OFF. The step runs inside the
+  #   migration's own transaction, where `pragma foreign_keys` is a no-op.
+  #   `defer_foreign_keys` is honoured there and lapses at the commit: the
+  #   drop's implicit delete leaves every profile and extension row an
+  #   orphan for the length of the step, and the copy back re-parents each
+  #   one, so the commit's check passes only if every row came back. A row
+  #   lost on the way fails the commit and leaves the store at version 8.
+  #   https://www.sqlite.org/pragma.html#pragma_defer_foreign_keys
+  #
+  # The columns are listed in the order the earlier steps gave them (version
+  # 1's, then 2's, 4's and 8's additions), so a migrated store and a fresh
+  # one have the same table, and the copy names every column on both sides
+  # rather than relying on `select *`. Dropping the table drops its indexes
+  # and triggers, so both indexes and both triggers (version 1's
+  # immutability, version 6's owner reference) are created again from their
+  # original text -- as version 6 did when it lifted the immutability
+  # trigger for its one update. The `users` trigger that reads `executions`
+  # names it only in its body, which is resolved when it fires.
+  migrationV9 = """
+pragma defer_foreign_keys = on;
+
+create table executions_v8 as select * from executions;
+
+drop table executions;
+
+create table executions (
+  execution_id text not null,
+  host_id text not null references hosts(host_id),
+  host_profile_id text,
+  run_id text not null,
+  command_stats_id text not null
+    check (length(cast(command_stats_id as blob)) <= 64),
+  lease_id integer,
+  started_at_unix_millis integer not null,
+  finished_at_unix_millis integer not null,
+  duration_millis integer not null,
+  exit_status integer not null,
+  termination text not null
+    check (termination in
+      ('exited', 'signalled', 'timeout', 'oom_killed', 'refused',
+       'cap_exceeded')),
+  attempt integer not null,
+  retry_of text,
+  peak_rss_bytes integer not null,
+  cpu_user_millis integer,
+  cpu_sys_millis integer,
+  max_processes integer not null,
+  major_page_faults integer not null,
+  io_read_bytes integer,
+  io_write_bytes integer,
+  capture_completeness text not null
+    check (capture_completeness in ('complete', 'sampled', 'degraded')),
+  dropped_observations integer not null default 0,
+  owner_uid integer,
+  requested_at_unix_millis integer,
+  cpu_granted_milli integer
+    check (cpu_granted_milli is null or cpu_granted_milli >= 0),
+  after_execution_ids text,
+  primary key (host_id, execution_id),
+  foreign key (host_id, run_id) references runs(host_id, run_id),
+  foreign key (host_id, host_profile_id)
+    references host_profiles(host_id, profile_id)
+);
+
+insert into executions (execution_id, host_id, host_profile_id, run_id,
+  command_stats_id, lease_id, started_at_unix_millis,
+  finished_at_unix_millis, duration_millis, exit_status, termination,
+  attempt, retry_of, peak_rss_bytes, cpu_user_millis, cpu_sys_millis,
+  max_processes, major_page_faults, io_read_bytes, io_write_bytes,
+  capture_completeness, dropped_observations, owner_uid,
+  requested_at_unix_millis, cpu_granted_milli, after_execution_ids)
+select execution_id, host_id, host_profile_id, run_id,
+  command_stats_id, lease_id, started_at_unix_millis,
+  finished_at_unix_millis, duration_millis, exit_status, termination,
+  attempt, retry_of, peak_rss_bytes, cpu_user_millis, cpu_sys_millis,
+  max_processes, major_page_faults, io_read_bytes, io_write_bytes,
+  capture_completeness, dropped_observations, owner_uid,
+  requested_at_unix_millis, cpu_granted_milli, after_execution_ids
+from executions_v8;
+
+drop table executions_v8;
+
+create index executions_by_run on executions(host_id, run_id);
+create index executions_by_command_stats_id on executions(command_stats_id);
+
+create trigger executions_immutable
+before update on executions
+begin
+  select raise(abort,
+    'runquota: executions rows are immutable after write (OS-3)');
+end;
+
+create trigger executions_owner_is_a_user
+before insert on executions
+when new.owner_uid is not null
+  and not exists (select 1 from users where owner_uid = new.owner_uid)
+begin
+  select raise(abort,
+    'runquota: executions.owner_uid names no users row (constraint)');
+end;
+"""
+
   migrations* = [migrationV1, migrationV2, migrationV3, migrationV4,
-                 migrationV5, migrationV6, migrationV7, migrationV8]
+                 migrationV5, migrationV6, migrationV7, migrationV8,
+                 migrationV9]
     ## Index ``i`` migrates ``user_version`` ``i`` to ``i + 1``.
 
 static:

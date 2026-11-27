@@ -304,7 +304,7 @@ pragma user_version = 7;
 
     let store = openObservationStore(path)
     check store.status == ssOpen
-    check userVersion(path) == 8
+    check userVersion(path) == spineSchemaVersion
 
     let runs = store.readRuns()
     check runs.len == 1
@@ -386,9 +386,126 @@ pragma user_version = 7;
     check runSqlite(path, "drop table execution_memory_profiles;").ok
     let store = openObservationStore(path)
     check store.status == ssOpen
-    check userVersion(path) == 8
+    check userVersion(path) == spineSchemaVersion
     # And opening the migrated store again changes nothing.
     let fingerprint = schemaFingerprint(path)
     let again = openObservationStore(path)
     check again.status == ssOpen
     check schemaFingerprint(path) == fingerprint
+
+  test "a version-8 store with rows migrates to 9 and keeps every row":
+    # Schema 9 adds the `cap_exceeded` termination, which a CHECK constraint
+    # cannot be altered to allow, so `executions` is rebuilt. Every row must
+    # come back -- the executions, and the rows that point at them: a CPU
+    # profile, a memory profile and an extension table's row, whose foreign
+    # keys must name the rebuilt table and still hold -- the indexes and
+    # both triggers must be back, and the new word must be accepted.
+    # Falsifying mutations: copying the rows back with a filter (one
+    # execution lost) fails the step's commit on the orphaned profile and
+    # leaves the store at 8; dropping the trigger re-creation lets an
+    # update through.
+    let dir = scratchDir("v8")
+    defer: removeDir(dir)
+    let path = dir / "observations.sqlite"
+    var ladder = ""
+    for i in 0 ..< 8:
+      ladder.add(migrations[i] & "\n")
+    let created = runSqlite(path, ladder & """
+insert into hosts values ('host-8', 1000, 'boot-8');
+insert into host_profiles values ('host-8', 'prof-8', 'hash', 1000, null,
+  'cpu', 8, 16, 34359738368, 0, 'nvme', 'ext4', 'x86_64', 'linux', '6',
+  '6.1', 'bare-metal', 'local');
+insert into users values (1000, 'uid', '1000', 'someone', 1000, 1000);
+insert into runs (run_id, host_id, tool, tool_version, invocation_kind,
+  started_at_unix_millis, capture_completeness, dropped_observations)
+  values ('run-8', 'host-8', 'repro-build', '1', 'lease-session', 2000,
+  'complete', 0);
+insert into executions (execution_id, host_id, host_profile_id, run_id,
+  command_stats_id, lease_id, started_at_unix_millis,
+  finished_at_unix_millis, duration_millis, exit_status, termination,
+  attempt, peak_rss_bytes, cpu_user_millis, cpu_sys_millis, max_processes,
+  major_page_faults, capture_completeness, dropped_observations, owner_uid,
+  requested_at_unix_millis, cpu_granted_milli, after_execution_ids)
+  values ('exec-8a', 'host-8', 'prof-8', 'run-8', 'key-8', 3, 2100, 4100,
+  2000, 0, 'exited', 1, 536870912, 1500, 100, 1, 0, 'complete', 0, 1000,
+  2050, 2000, ''),
+  ('exec-8b', 'host-8', 'prof-8', 'run-8', 'key-8', 4, 2200, 4200,
+  2000, 137, 'oom_killed', 1, 1073741824, 900, 50, 2, 1, 'complete', 0,
+  1000, 2150, 1000, 'exec-8a');
+insert into execution_cpu_profiles values ('host-8', 'exec-8a', 1000,
+  x'e803e803', 'client-tree');
+insert into execution_memory_profiles values ('host-8', 'exec-8b', 1000,
+  x'0200', 'client-tree');
+create table ext_probe (
+  host_id text not null,
+  execution_id text not null,
+  figure integer,
+  primary key (host_id, execution_id),
+  foreign key (host_id, execution_id)
+    references executions(host_id, execution_id)
+);
+insert into ext_probe values ('host-8', 'exec-8b', 42);
+pragma user_version = 8;
+""")
+    check created.ok
+    check userVersion(path) == 8
+
+    let store = openObservationStore(path)
+    check store.status == ssOpen
+    check userVersion(path) == 9
+
+    let executions = store.readExecutions()
+    check executions.len == 2
+    for e in executions:
+      if e.executionId == "exec-8b":
+        check e.termination == tOomKilled
+        check e.exitStatus == 137
+        check e.ownerUid == some(1000'i64)
+        check e.cpuGrantedMilli == some(1000'i64)
+        check e.afterExecutionIds == some(@["exec-8a"])
+      else:
+        check e.executionId == "exec-8a"
+        check e.peakRssBytes == 536870912
+        check e.afterExecutionIds == some(newSeq[string]())
+    check store.readCpuProfiles().len == 1
+    check store.readMemoryProfiles().len == 1
+    let probe = runSqlite(path, "select figure from ext_probe;")
+    check probe.ok and probe.output.strip() == "42"
+    # The references still resolve, and still bind.
+    let fk = runSqlite(path, "pragma foreign_key_check;")
+    check fk.ok and fk.output.strip() == ""
+    check not runSqlite(path, "pragma foreign_keys = on;\n" &
+      "insert into ext_probe values ('host-8', 'exec-none', 1);").ok
+    # The indexes and both triggers are back.
+    let objects = runSqlite(path, "select name from sqlite_master where " &
+      "tbl_name = 'executions' and type in ('index', 'trigger') " &
+      "and name not like 'sqlite_autoindex_%' order by name;")
+    check objects.ok
+    check objects.output.strip().splitLines() == @[
+      "executions_by_command_stats_id", "executions_by_run",
+      "executions_immutable", "executions_owner_is_a_user"]
+    check not runSqlite(path,
+      "update executions set duration_millis = 1;").ok
+    check not runSqlite(path, "pragma foreign_keys = on;\n" &
+      "insert into executions (execution_id, host_id, run_id, " &
+      "command_stats_id, started_at_unix_millis, finished_at_unix_millis, " &
+      "duration_millis, exit_status, termination, attempt, peak_rss_bytes, " &
+      "max_processes, major_page_faults, capture_completeness, owner_uid) " &
+      "values ('exec-x', 'host-8', 'run-8', 'k', 1, 2, 1, 0, 'exited', 1, " &
+      "1, 1, 0, 'complete', 4242);").ok
+
+    # And a cap-exceeded execution is accepted.
+    let capped = ExecutionRow(executionId: "exec-9", hostId: "host-8",
+      hostProfileId: some("prof-8"), runId: "run-8", commandStatsId: "key-8",
+      startedAtUnixMillis: 5100, finishedAtUnixMillis: 6100,
+      durationMillis: 1000, exitStatus: 137, termination: tCapExceeded,
+      attempt: 1, peakRssBytes: 2147483648'i64,
+      captureCompleteness: ccComplete)
+    check store.appendBatch(newSeq[RunRow](), [capped])
+    var found = false
+    for e in store.readExecutions():
+      if e.executionId == "exec-9":
+        found = true
+        check e.termination == tCapExceeded
+    check found
+
