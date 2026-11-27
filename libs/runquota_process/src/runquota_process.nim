@@ -2121,7 +2121,8 @@ proc launchProcess*(spec: CommandSpec): LaunchedProcess =
         # A launch that creates a cap leaf first removes the empty cap
         # leaves of launchers that died before their clean-up, in the
         # directory it caps into: a memory-only cap leaf has no other
-        # sweep, and it would stay for good.
+        # sweep, and it would stay for good. It is the only sweep: the
+        # launcher libraries above leave it to this launch.
         sweepStaleCapLeaves(target)
       if target.placed:
         rootLock = lockCgroupRoot(target.root, exclusive = false)

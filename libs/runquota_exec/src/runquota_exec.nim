@@ -205,8 +205,8 @@ proc applyPlacement*(spec: var CommandSpec; placement: TreePlacement) =
   spec.cgroupPriority = placement.prioritySource
   spec.jobPriorityClass = placement.jobPriorityClass
   spec.qosTier = placement.qosTier
-  if placement.target.isCapLeaf:
-    sweepStaleCapLeaves(placement.target)
+  # Stale cap leaves of dead launchers are swept by the launch itself, which
+  # is the one that creates a cap leaf (CPU- or memory-capped alike).
 
 proc placementNote*(placement: TreePlacement; launch: LaunchResult): string =
   ## One phrase for a launcher's verbose output: the cgroup the tree runs
