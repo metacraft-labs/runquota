@@ -3000,6 +3000,15 @@ proc close*(child: var LaunchedProcess) =
     # The tree's leaf and its group directory go when empty; a tree that
     # left a process behind keeps them until that process ends (a later
     # launch of the group, or of a cap, removes them then).
+    when defined(linux):
+      # AFTER A GROUP KILL, the kernel has killed every process of the leaf
+      # but the ones other than the root may still be exiting when the root
+      # is reaped. Wait for them, briefly and only then, so the leaf is not
+      # left behind. Outside the root's lock: nothing else uses a cap leaf.
+      if child.cgroupTarget.isCapLeaf and (child.completion.capKilled or
+          child.completion.oomKilledOutsideCap):
+        discard waitUntilEmpty(child.cgroupTarget.leafPath,
+          GroupKillSettleMillis)
     releaseTarget(child.cgroupTarget)
     child.cgroupTarget = CgroupTarget()
     close(child.memoryCap.tracker)

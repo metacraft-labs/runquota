@@ -19,9 +19,23 @@
 ## * `test_rqm_host_oom_is_not_cap_exceeded`: a kill from an ancestor's
 ##   `memory.max`, with the leaf under its own larger cap, is a kill from
 ##   outside the cap -- also for a tree that earlier ran something in a
-##   sub-cgroup of its own leaf that hit a limit of its own. Mutation: read
-##   the hierarchical `memory.events` -- the sub-cgroup's OOM then counts as
-##   the leaf's, and the tree reads as cap-exceeded.
+##   sub-cgroup of its own leaf that hit a limit of its own. Mutation: take
+##   `oom` from the hierarchical `memory.events` -- the sub-cgroup's OOM
+##   then counts as the leaf's, and the tree reads as cap-exceeded.
+## * A cap kill of an allocator the tree moved into a sub-cgroup of its own
+##   leaf is the cap's (capKilled), both without a memory controller below
+##   the leaf (the kill is counted on the leaf itself) and with one (it is
+##   counted in the sub-cgroup, which only the leaf's HIERARCHICAL
+##   `oom_kill` includes); and the sub-cgroups go with the leaf. Mutations:
+##   `oom_kill` from `memory.events.local` (the controlled case reads as
+##   cap reached); not removing the tree's sub-cgroups (they and the leaf
+##   are left behind). The classification is the leaf's LOCAL `oom` (its
+##   own limit, the cap, was hit) with its HIERARCHICAL `oom_kill`; the
+##   host-OOM case above is what the local `oom` is for.
+## * Swap is taken away only by an enforced cap: kill mode writes
+##   `memory.swap.max` = 0, advisory and measure-only leaves leave it at
+##   `max` (all three set `memory.oom.group` = 1). Mutation: writing 0 for
+##   every leaf.
 ## * `test_rqm_no_ancestor_sets_oom_group`: after placement only the leaf
 ##   has `memory.oom.group` = 1, and a simulated host OOM (a limit on the
 ##   group directory) kills only its victim's tree while a sibling tree of
@@ -111,6 +125,36 @@ when defined(linux):
     echo cgroupOfPid(getCurrentProcessId())
     quit(0)
 
+  if paramCount() >= 3 and paramStr(1) == "--sub-alloc":
+    # A tree that runs its allocator in a sub-cgroup of its own leaf and
+    # passes the leaf's cap there. `plain`: the sub-cgroup has no memory
+    # controller (none enabled below the leaf), so its memory is the
+    # leaf's own. `controlled`: the tree parks itself in a second
+    # sub-cgroup and enables the memory controller below the leaf, so the
+    # allocator's memory -- and its OOM kill -- is counted in the
+    # sub-cgroup's memory cgroup, not the leaf's. Exits non-zero, saying
+    # what failed, when a step of the scenario does not work.
+    let controlled = paramStr(2) == "controlled"
+    let mib = parseInt(paramStr(3))
+    let leaf = CgroupMountPoint & cgroupOfPid(getCurrentProcessId())
+    let sub = leaf / "allocator"
+    createDir(sub)
+    if controlled:
+      createDir(leaf / "parked")
+      writeOrQuit(leaf / "parked" / "cgroup.procs", $getCurrentProcessId(), 40)
+      writeOrQuit(leaf / "cgroup.subtree_control", "+memory", 41)
+    let pid = fork()
+    if pid == 0:
+      if posix.write(posix.open(cstring(sub / "cgroup.procs"), O_WRONLY),
+          cstring("0"), 1) != 1:
+        exitnow(30)
+      discard allocateAndTouch(mib)
+      exitnow(0)
+    var status: cint
+    discard waitpid(pid, status, 0)
+    echo "parent-survived"
+    quit(0)
+
   if paramCount() >= 3 and paramStr(1) == "--nested-oom":
     # A tree that runs something in a sub-cgroup of its own leaf with a
     # limit of its own, which that something exceeds (an OOM counted in the
@@ -170,6 +214,26 @@ when defined(linux):
     var child = launchProcess(spec)
     info = child.info
     result = child.waitForCompletion(timeout)
+    child.close()
+
+  proc countersOf(leaf: string): string =
+    ## The leaf's oom / oom_kill counts, local and hierarchical, as text for
+    ## the test output (the evidence behind each classification).
+    proc pick(path: string): string =
+      let events = parseMemoryEvents(try: readFile(path)
+        except IOError, OSError: "")
+      "oom=" & $events.oom & " oom_kill=" & $events.oomKill
+    "local " & pick(leaf / "memory.events.local") & "; hierarchical " &
+      pick(leaf / "memory.events")
+
+  proc runReporting(spec: CommandSpec; label: string;
+                    info: var LaunchResult): ProcessCompletion =
+    ## `runToEnd`, printing the leaf's counters after the root is reaped
+    ## and before the leaf is removed.
+    var child = launchProcess(spec)
+    info = child.info
+    result = child.waitForCompletion(60_000)
+    echo "    counters (", label, "): ", countersOf(child.cgroupTarget.leafPath)
     child.close()
 
   proc groupDir(root, group: string): string =
@@ -395,8 +459,9 @@ when defined(linux):
         # of its own: the leaf's hierarchical counters then include that
         # OOM, its local ones do not.
         limitGroup(testRoot, "host-oom-nested", 48 * MiB)
-        let nested = runToEnd(cappedSpec([app, "--nested-oom", "16", "128"],
-          testRoot, "host-oom-nested", 256 * MiB), info)
+        let nested = runReporting(cappedSpec([app, "--nested-oom", "16",
+          "128"], testRoot, "host-oom-nested", 256 * MiB),
+          "ancestor kill after an inner OOM", info)
         check "inner-oom-done" in nested.stdout
         check nested.signaled
         check nested.signal == int(SIGKILL)
@@ -404,6 +469,58 @@ when defined(linux):
         check not nested.capExceeded and not nested.capKilled
         if not nested.signaled:
           echo "nested tree: ", nested.exitCode, " ", nested.stderr
+
+    test "swap is taken away only by an enforced cap":
+      if testRoot.len == 0:
+        echo "SKIPPED: " & reason
+        skip()
+      else:
+        # Advisory and measure-only runs must not change how the tree uses
+        # memory: memory.max stays max and swap stays as it was; only kill
+        # mode with a cap writes memory.swap.max = 0. All three set
+        # memory.oom.group = 1.
+        proc leafFiles(capBytes: uint64; action: MemoryCapAction;
+                       measure = false): string =
+          var spec = cappedSpec(["/bin/sh", "-c",
+            "d=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup); " &
+            "echo $(cat $d/memory.max) $(cat $d/memory.swap.max) " &
+            "$(cat $d/memory.oom.group)"], testRoot, "swap", capBytes, action)
+          spec.memoryCapMeasure = measure
+          var info: LaunchResult
+          runToEnd(spec, info).stdout.strip()
+        if not fileExists(testRoot.parentDir / "memory.swap.max"):
+          echo "SKIPPED: this kernel does not account swap"
+          skip()
+        else:
+          check leafFiles(64 * MiB, mcaKill) == $(64 * MiB) & " 0 1"
+          check leafFiles(64 * MiB, mcaAdvisory) == "max max 1"
+          check leafFiles(0, mcaKill, measure = true) == "max max 1"
+
+    test "a cap kill inside a sub-cgroup of the tree's own leaf is the cap's":
+      if testRoot.len == 0:
+        echo "SKIPPED: " & reason
+        skip()
+      else:
+        # The allocator runs in a sub-cgroup of the leaf, the tree passes
+        # the LEAF's cap (the limit hit is the leaf's: local `oom`), and the
+        # kill is counted where the victim's memory is charged. Without a
+        # memory controller below the leaf that is the leaf itself; with
+        # one it is the sub-cgroup, which only the leaf's HIERARCHICAL
+        # `oom_kill` includes. Both are the cap's kill.
+        var info: LaunchResult
+        for mode in ["plain", "controlled"]:
+          let killed = runReporting(cappedSpec([app, "--sub-alloc", mode,
+            "96"], testRoot, "sub-" & mode, 32 * MiB),
+            "cap kill in a " & mode & " sub-cgroup", info)
+          checkpoint mode & ": " & killed.stdout & killed.stderr
+          check killed.signaled
+          check "parent-survived" notin killed.stdout
+          check killed.capKilled
+          check killed.capExceeded
+          check not killed.capReached
+          check not killed.oomKilledOutsideCap
+        # The sub-cgroups the trees made are gone with their leaves.
+        check cgroupDirsBelow(testRoot) == newSeq[string]()
 
     test "test_rqm_no_ancestor_sets_oom_group":
       if testRoot.len == 0:

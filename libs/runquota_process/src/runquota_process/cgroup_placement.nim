@@ -25,7 +25,8 @@
 ## THE MEMORY CAP (`memoryCapTarget`). A tree with a memory cap gets a leaf
 ## of its own (one leaf carries both caps when a CPU cap applies too), with
 ## `memory.max` = the cap (`max` when the cap only measures),
-## `memory.swap.max` = 0 (a capped tree must not hide its growth in swap) and
+## `memory.swap.max` = 0 for an enforced cap only (a capped tree must not
+## hide its growth in swap; a measured one must not be changed) and
 ## `memory.oom.group` = 1, so the kernel's OOM killer kills the WHOLE tree or
 ## nothing: without it it picks one victim, and a `make` or a shell can
 ## survive the compiler it started. `+memory` is enabled in the root's and
@@ -58,7 +59,7 @@
 ## Static-helper library rules apply (no `ref` types): this module is part of
 ## `runquota_process`.
 
-import std/[os, strutils]
+import std/[os, strutils, times]
 when defined(posix):
   import std/posix
 
@@ -105,6 +106,9 @@ const
   PlacementAttempts* = 3
     ## How often a launch prepares its leaf and tries to start the child in
     ## it, when another launcher's clean-up removed the leaf in between.
+  GroupKillSettleMillis* = 2_000
+    ## How long `close` waits for a leaf the OOM killer killed as a group
+    ## to empty before removing it.
   CapLeafNameAttempts* = 4
     ## How many names a launch tries for a cap leaf of its own when the one
     ## it was given already exists (`CgroupTarget.freshLeaf`).
@@ -150,7 +154,8 @@ type
     memoryMax*: string
       ## "" writes no memory limit. Otherwise the leaf's `memory.max` text
       ## (bytes, or `max` for a tree that is only measured), written
-      ## together with `memory.swap.max` = 0 and `memory.oom.group` = 1.
+      ## together with `memory.oom.group` = 1 and, for an enforced cap
+      ## (bytes) only, `memory.swap.max` = 0.
       ## Only ever on a leaf of its own (`freshLeaf`): never on a shared
       ## leaf, and never on a directory above a leaf (trap 1, above).
     freshLeaf*: bool
@@ -198,12 +203,20 @@ type
       ## Why the memory settings asked for are not (all) in place, or "".
 
   MemoryEvents* = object
-    ## The counts of a leaf's `memory.events.local` that classify a tree's
-    ## end. `oom` is raised on the cgroup whose limit was hit (the leaf
-    ## itself only when the CAP was hit); `oom_kill` on the cgroup of each
-    ## process the OOM killer killed, whoever's limit it was. Counted for
-    ## that cgroup alone, unlike the hierarchical `memory.events`, which
-    ## also counts every descendant's events (kernel `memcg_memory_event`).
+    ## The two counts that classify a tree's end, each from the file that
+    ## answers its question (kernel `memcg_memory_event`: an event is
+    ## counted in the cgroup's `memory.events.local` and in the
+    ## hierarchical `memory.events` of it and every ancestor):
+    ##
+    ## * `oom`, from the leaf's `memory.events.local`: raised on the cgroup
+    ##   whose LIMIT was hit, so the leaf's own count says the CAP was hit.
+    ##   Its hierarchical count would also take in a limit of the tree's own
+    ##   below the leaf, which is not the cap.
+    ## * `oomKill`, from the leaf's hierarchical `memory.events`: raised on
+    ##   the memory cgroup of each killed process, whoever's limit it was.
+    ##   A tree that enables the memory controller below its leaf has its
+    ##   processes, and their kills, counted in sub-cgroups, so only the
+    ##   hierarchical count sees every kill inside the tree's leaf.
     known*: bool
     oom*: uint64
     oomKill*: uint64
@@ -425,10 +438,11 @@ proc memoryCapVerdict*(events: MemoryEvents; peakBytes, capBytes: uint64;
   ## * Otherwise the root's own conclusion; in advisory mode a peak above
   ##   the cap is a breach that killed nothing.
   ##
-  ## Only the LOCAL counts can tell these apart: the hierarchical
-  ## `memory.events` of the leaf also counts every cgroup below it, so a
-  ## tree that ran something in a sub-cgroup of its own, with a limit of
-  ## its own, would read as having exceeded its cap.
+  ## `oom` is the leaf's LOCAL count and `oomKill` its HIERARCHICAL one
+  ## (`MemoryEvents`): the hierarchical `oom` would read a limit of the
+  ## tree's own below the leaf as the cap, and the local `oom_kill` would
+  ## miss a cap kill of a process the tree had moved into a sub-cgroup with
+  ## a memory controller of its own.
   if not events.known:
     return
   if events.oom >= 1'u64 and events.oomKill >= 1'u64:
@@ -701,8 +715,8 @@ when defined(posix):
   proc writeMemoryLimits(target: CgroupTarget; memory: var MemoryPreparation;
                          vanished: var bool): bool =
     ## The leaf's memory limits, in an order that never leaves a limit
-    ## without the group kill: `memory.swap.max` and `memory.oom.group`
-    ## first, `memory.max` last, so a leaf whose `oom.group` cannot be set
+    ## without the group kill: `memory.swap.max` (enforced caps only) and
+    ## `memory.oom.group` first, `memory.max` last, so a leaf whose `oom.group` cannot be set
     ## gets no limit at all rather than a limit under which the kernel kills
     ## one process and leaves its parent running. False only when the leaf
     ## vanished (the caller prepares again); every other failure is a
@@ -710,11 +724,12 @@ when defined(posix):
     let leaf = target.leafPath
     var problem = ""
     var gone = false
-    # No swap for a capped tree: the cap is on memory the tree holds, and a
-    # tree that can push its growth into swap passes the cap unseen. A
-    # kernel that does not account swap has no such file, and nothing to
-    # escape into through it.
-    if fileExists(leaf / "memory.swap.max"):
+    # No swap for an ENFORCED cap: the cap is on memory the tree holds, and
+    # a tree that can push its growth into swap passes the cap unseen. Not
+    # for a leaf that only measures (`max`: advisory mode, a lifted run),
+    # which must not change how the tree uses memory. A kernel that does
+    # not account swap has no such file, and nothing to escape into.
+    if target.memoryMax != "max" and fileExists(leaf / "memory.swap.max"):
       if not writeCgroupFile(leaf / "memory.swap.max", "0", problem, gone):
         if gone:
           vanished = true
@@ -895,6 +910,47 @@ proc removeEmptyCgroup*(path: string): bool =
   else:
     false
 
+proc waitUntilEmpty*(dir: string; timeoutMillis: int): bool =
+  ## Whether `dir`'s subtree holds no process (`cgroup.events` `populated
+  ## 0`), waiting up to `timeoutMillis` for that. For a leaf whose tree the
+  ## kernel's OOM killer has just killed as a group: the root is reaped,
+  ## but the other killed processes may still be exiting, and removing the
+  ## leaf now would fail and leave it behind. True at once when the file
+  ## cannot be read (nothing to wait for).
+  when defined(linux):
+    let deadline = epochTime() + float(timeoutMillis) / 1000.0
+    while true:
+      let events = readSmall(dir / "cgroup.events")
+      if events.len == 0 or "populated 0" in events:
+        return true
+      if epochTime() >= deadline:
+        return false
+      sleep(10)
+  else:
+    true
+
+proc removeEmptyDescendants*(dir: string) =
+  ## `rmdir` of every empty cgroup below `dir`, deepest first: the
+  ## sub-cgroups a tree made inside its own cap leaf, which would otherwise
+  ## keep the leaf (and its group directory) from ever being removed. Only
+  ## for a cap leaf, which holds one tree, and only after that tree ended;
+  ## the kernel refuses any that still holds a process. Never follows a
+  ## symlink (cgroupfs has none) and never leaves `dir`.
+  var dirs: seq[string]
+  try:
+    for path in walkDirRec(dir, yieldFilter = {pcDir},
+        followFilter = {pcDir}):
+      dirs.add(path)
+  except OSError:
+    return
+  # Deepest first: a child's path is longer than its parent's.
+  for i in 0 ..< dirs.len:
+    for j in i + 1 ..< dirs.len:
+      if dirs[j].len > dirs[i].len:
+        swap(dirs[i], dirs[j])
+  for path in dirs:
+    discard removeEmptyCgroup(path)
+
 proc releaseTarget*(target: CgroupTarget) =
   ## After a tree ended: remove its leaf, then its group (or reclaimed)
   ## directory, each only if empty, under the root's exclusive lock
@@ -904,6 +960,8 @@ proc releaseTarget*(target: CgroupTarget) =
   if not target.placed:
     return
   let lock = lockCgroupRoot(target.root, exclusive = true)
+  if target.isCapLeaf:
+    removeEmptyDescendants(target.leafPath)
   if removeEmptyCgroup(target.leafPath):
     discard removeEmptyCgroup(target.dirPath)
   unlockCgroupRoot(lock)
@@ -935,6 +993,7 @@ proc sweepStaleCapLeaves*(target: CgroupTarget) =
       except ValueError:
         continue
       if not pidAlive(pid):
+        removeEmptyDescendants(target.dirPath / path)
         discard removeEmptyCgroup(target.dirPath / path)
   except OSError:
     discard
@@ -1082,11 +1141,12 @@ proc moveIntoTarget*(target: CgroupTarget; pid: int;
 
 proc readLeafMemory*(target: CgroupTarget; events: var MemoryEvents;
                      peakBytes: var uint64; problem: var string): bool =
-  ## The leaf's `memory.events.local` and `memory.peak`, read ONCE, after
-  ## the tree's root was reaped and before the leaf is removed. Never the
-  ## hierarchical `memory.events` (`memoryCapVerdict` says why). False with
-  ## `problem` when either cannot be read (no memory controller on the
-  ## leaf, a kernel before 5.19 without `memory.peak`).
+  ## The leaf's counters, read ONCE, after the tree's root was reaped and
+  ## before the leaf is removed: `oom` from `memory.events.local`,
+  ## `oom_kill` from the hierarchical `memory.events` (`MemoryEvents` says
+  ## why each), and `memory.peak`. False with `problem` when any cannot be
+  ## read (no memory controller on the leaf, a kernel before 5.19 without
+  ## `memory.peak`).
   events = MemoryEvents()
   peakBytes = 0'u64
   when defined(linux):
@@ -1096,20 +1156,26 @@ proc readLeafMemory*(target: CgroupTarget; events: var MemoryEvents;
     if not readCgroupFile(leaf / "memory.events.local", text, problem,
         vanished):
       return false
-    events = parseMemoryEvents(text)
-    if not events.known:
+    let local = parseMemoryEvents(text)
+    if not local.known:
       problem = "no oom / oom_kill counts in " & leaf / "memory.events.local"
       return false
+    if not readCgroupFile(leaf / "memory.events", text, problem, vanished):
+      return false
+    let hierarchical = parseMemoryEvents(text)
+    if not hierarchical.known:
+      problem = "no oom / oom_kill counts in " & leaf / "memory.events"
+      return false
     if not readCgroupFile(leaf / "memory.peak", text, problem, vanished):
-      events = MemoryEvents()
       return false
     try:
       peakBytes = uint64(parseBiggestUInt(text.strip()))
     except ValueError:
-      events = MemoryEvents()
       problem = "cannot parse " & leaf / "memory.peak" & ": '" & text.strip() &
         "'"
       return false
+    events = MemoryEvents(known: true, oom: local.oom,
+      oomKill: hierarchical.oomKill)
     true
   else:
     problem = "cgroups exist only on Linux"
