@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Open, data gathered, decision pending. Three gate runs now span near-zero to ~1s action length; CPU overhead falls monotonically with action length (2.4-5.9% -> 1.02% precise -> 0.48% noisy) but a precise run at ~0.1-0.2s still straddles the 1% budget exactly ([0.60%, 1.43%]), neither a clean pass nor a fail. Flagged to rq-reform-mgr rather than running a fourth test unilaterally |
+| Status | Root-caused and ruled on, 2026-11-28. NOT the Windows mechanism (the watcher thread profiles clean, 46.4us/launch; action-only CPU differential 0.36%). The ~1% is a cross-platform defect: `enqueueEstimateWrite` reachable from a finish's critical path (`issues/2026-11-28-memory-cap-learning-writes-on-the-finish-critical-path.md`), owned by rq-memcap. Windows `kill` mode stays off by default until a rerun shows zero after that fix |
 | Observed in | `runquota` @ `bb8ef2a8d1513f7b984c66621252c3b9ca445a99` (`agents`); eli-pc (Windows 11 x86_64, 32 CPUs) |
 | Area | `libs/runquota_process/src/runquota_process.nim` (`applyMemoryCapHard` / `applyMemoryCapNotification` / `startMemoryCapWatcher`), or `benchmarks/lib/runquota_overhead_gate.nim`'s `run64CaseWindowsMemoryCap` / `run64RunWindows` methodology -- which one is not yet established |
 | Expectation | `RunQuota-Memory-Caps.md` § "The overhead rule": the 95% CI of the wall and CPU time difference must include zero at the gate's ±0.5% resolution; a mechanism whose interval excludes zero is rejected or made opt-in |
@@ -134,3 +134,36 @@ cost specifically, or accepting/rejecting a residual cost under 1% -- is
 a design decision, not one more data point. Flagged to rq-reform-mgr.
 Full detail in `reprobuild-pm`'s `spec/RunQuota-Memory-Caps.md` §
 "Verdicts".
+
+## Resolution, 2026-11-28: root-caused, ruled on, not this driver's fix
+
+Directed by rq-reform-mgr to profile the watcher thread directly rather
+than guess further. A 2000-iteration micro-benchmark of
+`startMemoryCapWatcher`/`stopMemoryCapWatcher`/`applyMemoryCapHard`/
+`applyMemoryCapNotification` measured **46.4 µs total per launch** --
+`stopMemoryCapWatcher` was already a true blocking join on the
+completion port (`WaitForSingleObject(..., INFINITE)`), not polling, so
+there was no polling-to-blocking conversion to make. 20-40x too small
+to be the measured ~1-2 ms/action.
+
+Decomposed the third follow-up's recorded data instead (splitting `cpu`
+into its two components): daemon-only CPU differential **+2.47%**,
+action-only (where the Windows mechanism would show up) **+0.36%**,
+clean. The weighted blend (daemon ~31% of total CPU) matches the
+recorded 1.01% total exactly -- **the overhead is almost entirely on
+the daemon side**. Traced to `runquota_daemon.learnMemoryCapFromFinish`
+reaching `runquota_persistence.enqueueEstimateWrite` on every finish
+with a measured peak; the OFF arm never measures a peak (nothing else
+is switched on) so it never reaches this, the ON arm's cap mechanism
+inherently does. Filed as its own defect:
+`issues/2026-11-28-memory-cap-learning-writes-on-the-finish-critical-path.md`
+-- common `runquota_daemon`/`runquota_persistence` code, not
+Windows-specific.
+
+**rq-reform-mgr's ruling**: not a tradeoff against learning.
+Persistence is specified as asynchronous and batched; a write reachable
+from the action's critical path is a defect in that queue.
+rq-memcap (owns learning) moves it off the critical path. Windows
+`kill` mode stays off by default until a rerun of this gate shows zero
+after that fix; this driver reruns it once the fix lands. Recorded in
+`reprobuild-pm`'s `spec/RunQuota-Memory-Caps.md` § "Verdicts".
