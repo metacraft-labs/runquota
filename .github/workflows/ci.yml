@@ -1,63 +1,54 @@
 name: CI
 
-# THROWAWAY PROBE of the new jobs only; never merged.
+# THROWAWAY PROBE: the debug suite on the runner class the release probe used.
 on:
   workflow_dispatch:
 
 jobs:
-  packages-windows:
-    name: Packages (Windows)
-    # The Windows half of the `packages` job: `just build-package` and
-    # `just verify-package` for `msi` and `scoop`, the channels only a
-    # Windows host produces (WiX v3 is Windows-native). The MSI arm reads the
-    # database's own tables through WindowsInstaller and launches the staged
-    # tree with a scrubbed environment. The packaging recipe is a reprobuild
-    # project, so the environment is setup-dev-env's reprobuild flavor, the
-    # way ci-reprobuild.yml gets it, with the engine at the fleet pin.
+  choose-linux:
+    # The shared CI_RUNNER_MODE policy selects free hosted runners for public
+    # repos by default and preserves the org-controlled self-hosted fallback.
+    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@146ea35853f859bcf78cc5da7fa53705a825da30
+    with:
+      preferred: ubuntu-24.04
+      fallback: '["self-hosted","linux","x64"]'
+
+  test:
+    needs: [choose-linux]
+    name: Test
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [[self-hosted, linux, x64]]
     timeout-minutes: 90
-    # Hosted, as the Windows compile gate below is, and for the same reason.
-    runs-on: windows-2025
+    # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
+    # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
+    runs-on: ${{ fromJSON(needs.choose-linux.outputs.runs_on) }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Mint installation token for cross-repo sibling clones
-        id: ci_token
-        uses: actions/create-github-app-token@v2
+      - name: Setup Nix
+        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
         with:
-          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
-          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
-          owner: metacraft-labs
-
-      - name: Setup dev env (reprobuild flavor)
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
-        with:
-          env-flavor: reprobuild
-          gh-token: ${{ steps.ci_token.outputs.token }}
-          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
-          app-private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
-
-      - name: Refresh authentication before the package build
-        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@dev
-        with:
-          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
-          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
-          owner: metacraft-labs
-
-      - name: Build and verify every Windows package channel
-        shell: bash
-        run: |
-          set -euo pipefail
-          dev-exec just build
-          for channel in msi scoop; do
-            dev-exec just build-package "$channel"
-            dev-exec just verify-package "$channel"
-          done
-
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          nix-github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run tests
+        # Keep the complete environment rooted for the job. On the shared
+        # macOS hosts an unrooted helper disappeared from /nix/store while
+        # the suite was running. RUNNER_TEMP is removed after the job.
+        run: nix develop --profile "$RUNNER_TEMP/runquota-test-shell" --command just test
+      - name: Dev shell writes nothing into another repository
+        # The script enters `nix develop` itself, from a scratch repository
+        # and from a copy of this one; the outer shell only supplies `just`.
+        # It runs even when the suite failed: the two answer different
+        # questions.
+        if: success() || failure()
+        run: nix develop --profile "$RUNNER_TEMP/runquota-test-shell" --command just test-dev-shell
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: package-logs-windows
+          name: test-logs-${{ join(matrix.runner, '-') }}
           path: test-logs/
           retention-days: 30
 
