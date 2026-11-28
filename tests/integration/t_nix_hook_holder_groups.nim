@@ -291,6 +291,15 @@ when defined(linux):
     let unshare = findExe("unshare")
     prerequisite unshare.len > 0, "unshare is not on PATH (a prerequisite)"
     discard cliPath()      # refuse a stale build before anything starts
+    # The namespace itself is a prerequisite, said as such: `newuidmap`
+    # refuses a process whose real gid is not its account's primary group
+    # (a shell under `sg <group>` or `newgrp`), and a host without
+    # subordinate ids refuses everyone.
+    let probe = execCmdEx(quoteShell(unshare) &
+      " --map-auto --map-root-user true")
+    prerequisite probe.exitCode == 0,
+      "cannot create a user namespace with mapped ids (a prerequisite; " &
+      "run outside sg/newgrp): " & probe.output.strip()
     let root = scratchDir("rqgrp")
     defer: removeDir(root)
     var env = newStringTable(modeCaseSensitive)
