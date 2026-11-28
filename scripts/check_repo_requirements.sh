@@ -96,6 +96,13 @@ for recipe in build test lint format fmt t bump-version build-package verify-pac
   just --summary | tr ' ' '\n' | grep -Fxq "${recipe}" || fail "missing Justfile recipe ${recipe}"
 done
 
+# EVERY RECIPE HAS A CI SCHEDULE OR A RECORDED REASON. docs/ci.md is the
+# table; scripts/check_recipe_schedule.sh holds it to the Justfile and the
+# workflows. Pinned so that dropping the check from `just lint` fails here.
+require_file docs/ci.md
+require_file scripts/check_recipe_schedule.sh
+require_contains Justfile "bash scripts/check_recipe_schedule.sh"
+
 require_contains .github/workflows/ci.yml 'run: nix develop --profile "$RUNNER_TEMP/runquota-lint-shell" --command just lint'
 require_contains .github/workflows/ci.yml 'run: nix develop --profile "$RUNNER_TEMP/runquota-test-shell" --command just test'
 require_contains .github/workflows/ci.yml "run: nix build .#default"

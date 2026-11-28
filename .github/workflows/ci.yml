@@ -1,32 +1,10 @@
 name: CI
 
+# THROWAWAY PROBE of the new jobs only; never merged.
 on:
   workflow_dispatch:
-  merge_group:
-    types: [checks_requested]
-  push:
-    branches: [dev, stable]
-  pull_request:
-    branches-ignore: [agents]
-
-# Cancel superseded PR runs only: a new push to a PR makes its previous run
-# moot, and stale runs otherwise hold scarce self-hosted runners. Every other
-# event (mainline push, merge_group, tag, dispatch, schedule) gets a group
-# unique to its run_id, so it is never cancelled and never cancels anything.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  choose-macos:
-    # Native macOS jobs retain their full gates while the fleet repair lands.
-    # Owner: zah. Follow-up: metacraft-specs/issues/
-    # 2026-09-28-shared-macos-host-has-no-headroom-for-runquota-measurements.md
-    uses: metacraft-labs/devops-modules/.github/workflows/reusable-choose-runner.yml@146ea35853f859bcf78cc5da7fa53705a825da30
-    with:
-      preferred: macos-26
-      fallback: '["self-hosted","macos","arm64"]'
-
   choose-linux:
     # The shared CI_RUNNER_MODE policy selects free hosted runners for public
     # repos by default and preserves the org-controlled self-hosted fallback.
@@ -35,26 +13,25 @@ jobs:
       preferred: ubuntu-24.04
       fallback: '["self-hosted","linux","x64"]'
 
-  lint:
-    needs: [choose-linux, choose-macos]
-    name: Lint
+  test-release:
+    needs: [choose-linux]
+    name: Test (release build)
+    # `just test-release`: the same suite compiled with -d:release, in
+    # addition to the debug `test` job above and never instead of it. A
+    # memory-ordering defect does not show at -O0, so a clause about
+    # release/acquire fences that only the debug suite checks has asserted
+    # nothing. Both Linux architectures: ARM64 is the weakly ordered one.
+    # macOS ARM64 is weakly ordered too, but its shared host has no headroom
+    # for a second suite (see the choose-macos note above); Linux ARM64 runs
+    # the same code under the same memory model.
     strategy:
       fail-fast: false
       matrix:
-        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
-    # A CEILING ON THE JOB, BESIDE THE RUNNER'S CEILING ON EACH TEST.
-    # `scripts/run_tests.sh` bounds every test binary, which is where a wedge
-    # actually happens; this bounds everything the runner does not own -- a
-    # `nix develop` that never resolves, a `nim c` that will not finish, and
-    # the Windows job below, which does not use that runner at all. Without
-    # it a wedged job runs to GitHub's six-hour default, and this
-    # organisation's Windows pool is two slots wide: one such job holds half
-    # of it for six hours. The numbers are several times the longest healthy
-    # run of each job and are not a performance budget.
-    timeout-minutes: 45
+        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64]]
+    timeout-minutes: 120
     # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
     # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
-    runs-on: ${{ contains(matrix.runner, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
+    runs-on: ${{ contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || 'ubuntu-24.04-arm' }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Nix
@@ -63,59 +40,25 @@ jobs:
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
           nix-github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Run linters
-        run: nix develop --profile "$RUNNER_TEMP/runquota-lint-shell" --command just lint
+      - name: Run tests (release build)
+        run: nix develop --profile "$RUNNER_TEMP/runquota-test-shell" --command just test-release
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: lint-logs-${{ join(matrix.runner, '-') }}
+          name: test-release-logs-${{ join(matrix.runner, '-') }}
           path: test-logs/
           retention-days: 30
 
-  test:
-    needs: [choose-linux, choose-macos]
-    name: Test
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
-    timeout-minutes: 90
-    # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
-    # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
-    runs-on: ${{ contains(matrix.runner, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Nix
-        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
-        with:
-          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
-          substituters: ${{ vars.SUBSTITUTERS }}
-          nix-github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Run tests
-        # Keep the complete environment rooted for the job. On the shared
-        # macOS hosts an unrooted helper disappeared from /nix/store while
-        # the suite was running. RUNNER_TEMP is removed after the job.
-        run: nix develop --profile "$RUNNER_TEMP/runquota-test-shell" --command just test
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-logs-${{ join(matrix.runner, '-') }}
-          path: test-logs/
-          retention-days: 30
-
-  nix-build:
-    needs: [choose-linux, choose-macos]
-    name: Nix Build
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
+  packages:
+    needs: [choose-linux]
+    name: Packages (Linux)
+    # `just build-package <channel>` and `just verify-package <channel>` for
+    # every channel a Linux host produces. The verifier reads the shipped
+    # bytes back: the archive's member list, the .deb's control fields, the
+    # .rpm's file list. `packages-windows` does the same for MSI and Scoop.
     timeout-minutes: 60
-    # Temporary native Linux ARM64 migration for this build/test job; owner: zah.
-    # Follow-up: metacraft-specs/issues/2026-09-28-release-linux-arm64-runner-migration.md
-    runs-on: ${{ contains(matrix.runner, 'macos') && fromJSON(needs.choose-macos.outputs.runs_on) || contains(matrix.runner, 'linux') && contains(matrix.runner, 'x64') && fromJSON(needs.choose-linux.outputs.runs_on) || (contains(matrix.runner, 'linux') && contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || matrix.runner) }}
+    runs-on: ${{ fromJSON(needs.choose-linux.outputs.runs_on) }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Nix
@@ -124,60 +67,51 @@ jobs:
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
           nix-github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build default package
-        run: nix build .#default
+      - name: Provide the pinned Reprobuild CLI
+        # The packaging recipe is a reprobuild project, and the Nix dev shell
+        # carries no `repro`. This is the revision `pins/reprobuild.json` in
+        # metacraft-github-actions names: the flake's own input, which its dev
+        # shell already reads the packaging renderers from, so no second pin.
+        run: |
+          set -euo pipefail
+          flake_ref="$(nix eval --raw --impure --expr \
+            "(builtins.getFlake \"git+file://$PWD\").inputs.metacraft-github-actions.pins.reprobuild.flakeRef")"
+          repro_out="$(nix build --no-link --print-out-paths "${flake_ref}#default")"
+          echo "REPRO=${repro_out}/bin/repro" >> "$GITHUB_ENV"
+          echo "repro from ${flake_ref}: ${repro_out}"
+      - name: Build and verify every Linux package channel
+        run: |
+          set -euo pipefail
+          in_shell=(nix develop --profile "$RUNNER_TEMP/runquota-package-shell" --command)
+          "${in_shell[@]}" just build
+          for channel in tarball deb rpm arch nix; do
+            "${in_shell[@]}" just build-package "$channel"
+            "${in_shell[@]}" just verify-package "$channel"
+          done
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-${{ join(matrix.runner, '-') }}
+          name: package-logs
           path: test-logs/
           retention-days: 30
 
-  windows-compile-gate:
-    name: Windows compile gate
-    # THE JOB THIS REPOSITORY DID NOT HAVE WHEN IT NEEDED IT. Two Windows-only
-    # compile errors reached `dev` within two days of each other -- an
-    # unguarded `posix.close` in `runquota_ipc` (16184d1) and unguarded
-    # `std/posix` + `shm_lease/*` imports in `runquota_stats_table`'s publisher
-    # (fee60f4) -- and BOTH were found by a DOWNSTREAM consumer's Windows leg
-    # rather than here, because `lint`, `test` and `nix-build` all run on
-    # [eph-linux-x64-g2, eph-linux-arm64, eph-macos-arm64] and nothing in this
-    # file had ever compiled the tree for Windows.
-    #
-    # SCOPE, DELIBERATELY NARROWER THAN "run the suite". runquota's tests are
-    # POSIX-only by construction -- unix sockets, `std/posix`, a real
-    # `runquotad` -- so a Windows leg of `just test` would be mostly skips: a
-    # job that passes by doing nothing, which is worse than no job at all.
-    # What this one does instead is what would have caught both defects, and
-    # more: a real native `nim c` of every entrypoint, a `nim check` of every
-    # library, a smoke of the binaries it just produced, and the subset of the
-    # suite that is genuinely platform-neutral, compiled and RUN.
-    #
-    # WHY IT IS NOT MERELY THE CROSS-CHECK. `tests/unit/t_windows_compile_gate`
-    # runs `nim check --os:windows` from the Linux/macOS legs and catches the
-    # same two defects far more cheaply -- but it type-checks against the HOST
-    # stdlib and never invokes a C compiler or a linker. This job is where the
-    # generated C actually gets compiled, linked and executed on Windows.
-    #
-    # NO NIX. `flake.nix` declares four systems and none of them is Windows, so
-    # there is no `nix build` story here; inventing one would be a different
-    # project. The toolchain comes from `setup-dev-env`, the same way
-    # reprobuild's Windows job gets it.
-    #
-    # ITS OWN REQUIRED JOB RATHER THAN A MATRIX LEG: an unavailable Windows
-    # service then leaves this gate queued or pending, not green. There is no
-    # skip-as-pass branch.
+  packages-windows:
+    name: Packages (Windows)
+    # The Windows half of the `packages` job: `just build-package` and
+    # `just verify-package` for `msi` and `scoop`, the channels only a
+    # Windows host produces (WiX v3 is Windows-native). The MSI arm reads the
+    # database's own tables through WindowsInstaller and launches the staged
+    # tree with a scrubbed environment. The packaging recipe is a reprobuild
+    # project, so the environment is setup-dev-env's reprobuild flavor, the
+    # way ci-reprobuild.yml gets it, with the engine at the fleet pin.
     timeout-minutes: 90
-    # Temporary 0.1.0 validation exception: the persistent runner cannot
-    # remove a retained shim DLL, and both self-hosted x64 VM pools are
-    # declaratively paused. Track return to the fleet in issues/2026-09-28-
-    # windows-checkout-blocked-by-retained-shim.md. Owner: zah.
+    # Hosted, as the Windows compile gate below is, and for the same reason.
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
 
-      - name: Mint installation token for Windows dev environment
+      - name: Mint installation token for cross-repo sibling clones
         id: ci_token
         uses: actions/create-github-app-token@v2
         with:
@@ -185,163 +119,36 @@ jobs:
           private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
           owner: metacraft-labs
 
-      - name: Check out the pinned release toolchain setup
-        uses: actions/checkout@v4
+      - name: Setup dev env (reprobuild flavor)
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
-          repository: metacraft-labs/metacraft-github-actions
-          ref: f450cb0d688fb7d15cd475c792b1c9b6acae87c5
-          path: .release-tools
-          token: ${{ steps.ci_token.outputs.token }}
-          persist-credentials: false
+          env-flavor: reprobuild
+          gh-token: ${{ steps.ci_token.outputs.token }}
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          app-private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
 
-      - name: Install checksum-pinned Nim and LLVM-MinGW
-        shell: pwsh
-        env:
-          RELEASE_TARGET: windows-x86_64
-        run: ./.release-tools/release-tools/setup-windows.ps1
+      - name: Refresh authentication before the package build
+        uses: metacraft-labs/metacraft-github-actions/refresh-build-auth@dev
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
 
-      # THE CHECKOUT IS BARE, AND ONE DEPENDENCY IS PROVIDED BY NAME. No
-      # sibling repositories, so `config.nims` can resolve nothing by
-      # accident of layout -- the environment fee60f4's defect was found in.
-      # This step used to end "if a Windows build ever legitimately needs
-      # `nim-shm-lease`, this step fails and the fix is to provide it here,
-      # not to weaken the gate", and that day came: the published stats
-      # table's Windows arm reuses `nim-shm-lease`'s anchor exactly as the
-      # POSIX arms do. So it is provided here, at the revision `flake.lock`
-      # pins -- the one the Nix legs build against -- and through
-      # `SHM_LEASE_SRC`, never as a sibling.
-      - name: Provide nim-shm-lease at the pinned revision
-        shell: pwsh
-        run: ./scripts/provide_shm_lease.ps1 -Destination (Join-Path $env:RUNNER_TEMP "nim-shm-lease")
-
-      - name: Build every entrypoint natively
-        shell: pwsh
+      - name: Build and verify every Windows package channel
+        shell: bash
         run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force build/bin, build/nimcache | Out-Null
-          $rows = @(Get-Content -LiteralPath apps/entrypoints.txt |
-            ForEach-Object { $_.Trim() } |
-            Where-Object { $_ -ne '' -and -not $_.StartsWith('#') })
-          # A manifest this job failed to parse would otherwise sweep nothing
-          # and report success. The floor is the count in the tree today; it
-          # cannot be lowered without editing this file on purpose.
-          if ($rows.Count -lt 2) {
-            throw "apps/entrypoints.txt yielded $($rows.Count) rows; refusing to pass on an empty sweep"
-          }
-          foreach ($row in $rows) {
-            $fields = $row -split '\s+'
-            $name = $fields[0]
-            $path = $fields[1]
-            Write-Host "== nim c $path"
-            & nim c `
-              --cc:clang "--clang.exe:$env:RELEASE_CC" "--clang.linkerexe:$env:RELEASE_CC" `
-              --threads:on `
-              --hints:off `
-              --nimcache:"build/nimcache/$name" `
-              --out:"build/bin/$name.exe" `
-              $path
-            if ($LASTEXITCODE -ne 0) {
-              throw "nim c failed for $path with exit code $LASTEXITCODE"
-            }
-          }
+          set -euo pipefail
+          dev-exec just build
+          for channel in msi scoop; do
+            dev-exec just build-package "$channel"
+            dev-exec just verify-package "$channel"
+          done
 
-      - name: Type-check every library natively
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $libs = @(Get-Content -LiteralPath libs/libraries.txt |
-            ForEach-Object { $_.Trim() } |
-            Where-Object { $_ -ne '' -and -not $_.StartsWith('#') } |
-            ForEach-Object { ($_ -split '\s+')[0] })
-          # The libraries are NOT redundant with the entrypoints above:
-          # `runquota_c` is a `--app:staticlib` surface that no entrypoint and
-          # no other library imports, so nothing else in this job type-checks
-          # it. (`runquota_host_macos` IS in the entrypoints' import closure --
-          # `runquota_process` and `runquota_daemon` import it -- so it is
-          # covered either way; it is only absent from the generated C.)
-          #
-          # Same floor rule as the entrypoints above, and for the same reason:
-          # the count in the tree today, so a manifest this job failed to parse
-          # cannot sweep a subset and still report success. Dropping a library
-          # from the manifest means editing this file too. At a floor lower
-          # than the real count, deleting the last four rows would silently
-          # stop checking `runquota_stats_table` -- the very library whose
-          # unguarded POSIX imports this job exists to catch.
-          if ($libs.Count -lt 19) {
-            throw "libs/libraries.txt yielded $($libs.Count) rows; refusing to pass on an empty sweep"
-          }
-          $failed = @()
-          foreach ($lib in $libs) {
-            Write-Host "== nim check $lib"
-            & nim check `
-              --threads:on `
-              --hints:off `
-              --nimcache:"build/nimcache/check-$lib" `
-              "libs/$lib/src/$lib.nim"
-            # Every library is checked before the job fails, so one broken
-            # module does not hide the rest of the tree's Windows state.
-            if ($LASTEXITCODE -ne 0) { $failed += $lib }
-          }
-          if ($failed.Count -gt 0) {
-            throw "libraries that do not compile for Windows: $($failed -join ', ')"
-          }
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-logs-windows
+          path: test-logs/
+          retention-days: 30
 
-      # The binaries built above, actually executed. `nim c` linking is not the
-      # same claim as a process that starts: a Windows-only defect in module
-      # initialisation produces an executable that links and then dies.
-      - name: Smoke the built binaries
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $rows = @(Get-Content -LiteralPath apps/entrypoints.txt |
-            ForEach-Object { $_.Trim() } |
-            Where-Object { $_ -ne '' -and -not $_.StartsWith('#') })
-          foreach ($row in $rows) {
-            $name = ($row -split '\s+')[0]
-            $exe = "build/bin/$name.exe"
-            if (-not (Test-Path -LiteralPath $exe)) { throw "missing $exe" }
-            $output = @(& $exe --version)
-            if ($LASTEXITCODE -ne 0) {
-              throw "$exe --version exited $LASTEXITCODE"
-            }
-            # First line only, and `@(...)` above so a single-line result is
-            # still an array: `-notmatch` on a bare array FILTERS rather than
-            # testing, which would make this comparison always look true.
-            $firstLine = if ($output.Count -gt 0) { $output[0] } else { '' }
-            if ($firstLine -notmatch "^$name ") {
-              throw "$exe --version printed '$firstLine', expected it to start with '$name '"
-            }
-            Write-Host "== $exe --version -> $firstLine"
-          }
-
-      - name: Run the platform-neutral tests natively
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force build/test-bin | Out-Null
-          $tests = @(Get-Content -LiteralPath tests/windows/portable_tests.txt |
-            ForEach-Object { $_.Trim() } |
-            Where-Object { $_ -ne '' -and -not $_.StartsWith('#') })
-          # See the header of that manifest for what belongs in it and why the
-          # rest of the suite does not. The floor is what makes shrinking the
-          # list a deliberate act: a job whose test list quietly emptied would
-          # still be green.
-          if ($tests.Count -lt 5) {
-            throw "tests/windows/portable_tests.txt yielded $($tests.Count) rows; refusing to pass on an empty sweep"
-          }
-          $failed = @()
-          foreach ($test in $tests) {
-            $name = [System.IO.Path]::GetFileNameWithoutExtension($test)
-            Write-Host "== nim c -r $test"
-            & nim c -r `
-              --cc:clang "--clang.exe:$env:RELEASE_CC" "--clang.linkerexe:$env:RELEASE_CC" `
-              --threads:on `
-              --hints:off `
-              --nimcache:"build/nimcache/$name" `
-              --out:"build/test-bin/$name.exe" `
-              $test
-            if ($LASTEXITCODE -ne 0) { $failed += $test }
-          }
-          if ($failed.Count -gt 0) {
-            throw "platform-neutral tests failing on Windows: $($failed -join ', ')"
-          }
