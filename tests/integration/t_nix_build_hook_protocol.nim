@@ -570,13 +570,22 @@ when defined(linux) or defined(macosx):
       check fixture.granted() == 2000
       # The build ends (the worker lets go of the lock): the lease ends
       # within the bound, measured from the moment the lock went free to
-      # the first status that shows it gone.
+      # the START of the first status query that shows it gone. Each query
+      # starts the CLI (tens of ms; 50-150 ms on a loaded host), and the
+      # release happened before that query's end: timing to the end
+      # charges the holder with the observer's start-up (which is how
+      # Linux reached 471 ms), timing to the start can undercount by at
+      # most one query. What the bound then holds is the holder's ~400 ms
+      # (three free probes 100 ms apart, plus one) and the release round
+      # trip, with ~200 ms for scheduling on a loaded host. A holder late
+      # by a probe cycle or more still fails it.
       let freed = getMonoTime()
       fixture.dropLock(fd)
       var gone = -1
       while int((getMonoTime() - freed).inMilliseconds) < 5000:
+        let asked = getMonoTime()
         if fixture.granted() == 0:
-          gone = int((getMonoTime() - freed).inMilliseconds)
+          gone = int((asked - freed).inMilliseconds)
           break
         sleep(10)
       echo "lease ended ", gone, " ms after its build"

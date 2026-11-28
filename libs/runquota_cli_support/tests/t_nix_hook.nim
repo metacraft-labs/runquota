@@ -450,8 +450,8 @@ else:
       ## Records each call; `failAt` names the one that fails.
       CredentialOps(
         euid: proc (): int = (if root: 0 else: 1000),
-        clearGroups: proc (gid: int): cint =
-          calls[].add("setgroups " & $gid)
+        setGroups: proc (groups: seq[int]): cint =
+          calls[].add("setgroups " & groups.join(","))
           cint(if failAt == "setgroups": -1 else: 0),
         setGid: proc (gid: int): cint =
           calls[].add("setgid " & $gid)
@@ -465,10 +465,43 @@ else:
       let calls = new(seq[string])
       check dropPrivilegesWith(fakeOps(calls), 1000, 100) ==
         "as uid 1000 gid 100"
-      # The target gid reaches setgroups: darwin keeps it as the only group
-      # (an empty list there is {0}, `wheel`); Linux clears the list.
-      check calls[] == @["setgroups 100", "setgid 100", "setuid 1000",
-        "setuid 0"]
+      # Darwin keeps the gid as the only group (an empty list there is
+      # {0}, `wheel`); Linux clears the list.
+      let groups = when defined(macosx): "setgroups 100" else: "setgroups "
+      check calls[] == @[groups, "setgid 100", "setuid 1000", "setuid 0"]
+
+    test "the endpoint's group is the one supplementary group kept":
+      let calls = new(seq[string])
+      let status = when defined(macosx):
+          darwinGoodStatus.replace("Groups:\t100", "Groups:\t100 972")
+        else:
+          linuxGoodStatus.replace("Groups:\t", "Groups:\t972")
+      check dropPrivilegesWith(fakeOps(calls, status = status), 1000, 100,
+        endpointGroup = 972) ==
+        "as uid 1000 gid 100 and the endpoint's group 972"
+      let groups = when defined(macosx): "setgroups 100,972"
+                   else: "setgroups 972"
+      check calls[] == @[groups, "setgid 100", "setuid 1000", "setuid 0"]
+      # The check accepts exactly that list: without the group, or with
+      # another one too, the drop is refused.
+      for bad in [goodStatus,
+                  status.replace("972", "972 10")]:
+        expect PrivilegeDropError:
+          discard dropPrivilegesWith(fakeOps(new(seq[string]), status = bad),
+            1000, 100, endpointGroup = 972)
+      # And a status carrying the group is refused when no group was due.
+      expect PrivilegeDropError:
+        discard dropPrivilegesWith(fakeOps(new(seq[string]), status = status),
+          1000, 100)
+
+    test "the holder's group list on each platform":
+      check holderGroupList(100, -1, darwin = false).len == 0
+      check holderGroupList(100, 972, darwin = false) == @[972]
+      check holderGroupList(100, -1, darwin = true) == @[100]
+      check holderGroupList(100, 972, darwin = true) == @[100, 972]
+      # The endpoint's group equal to the gid adds nothing.
+      check holderGroupList(100, 100, darwin = true) == @[100]
+      check holderGroupList(100, 100, darwin = false).len == 0
 
     test "a failed step stops the drop before the next one":
       for step in ["setgroups", "setgid", "setuid"]:
@@ -545,6 +578,92 @@ else:
         check ("\nGid:\t" & $getgid() & "\t" & $getegid() & "\t") in own
         check ("\nGroups:\t" & $getegid()) in own
 
+  suite "the endpoint's group":
+    # THE ONE FAKE BESIDES THE CREDENTIAL OPS, JUSTIFIED: a non-member, an
+    # account with no name and a directory that cannot be read need other
+    # accounts or a broken host; the fake answers them on demand. The real
+    # lookups are exercised just below on this process's own account and
+    # in t_nix_hook_holder_groups (a real drop and connect).
+    proc fakeGroups(dirGroup = 972; dirProblem = ""; name = "alice";
+                    groups = @[100, 972]; groupsOk = true): GroupOps =
+      GroupOps(
+        directoryGroup: proc (dir: string; gid: var int): string =
+          gid = dirGroup
+          dirProblem,
+        userName: proc (uid: int): string = name,
+        groupsOf: proc (n: string; baseGid: int;
+                        found: var seq[int]): bool =
+          found = groups
+          groupsOk)
+
+    const socket = "/run/runquota/runquota.sock"
+
+    test "a member keeps the group that owns the endpoint's directory":
+      check endpointGroupFor(fakeGroups(), socket, false, 1000, 100) ==
+        (972, "")
+
+    test "a non-member keeps its gid alone, and is told why":
+      let found = endpointGroupFor(fakeGroups(groups = @[100, 1]), socket,
+        false, 1000, 100)
+      check found.group == -1
+      check "not a member" in found.diagnostic
+
+    test "a private endpoint adds no group":
+      check endpointGroupFor(fakeGroups(), socket, true, 1000, 100) ==
+        (-1, "")
+
+    test "an unknown requester name gives the gid alone and a diagnostic":
+      let found = endpointGroupFor(fakeGroups(name = ""), socket, false,
+        1000, 100)
+      check found.group == -1
+      check "no account name" in found.diagnostic
+      let unreadable = endpointGroupFor(fakeGroups(groupsOk = false), socket,
+        false, 1000, 100)
+      check unreadable.group == -1
+      check "cannot be read" in unreadable.diagnostic
+
+    test "a stat failure gives the gid alone and a diagnostic":
+      let found = endpointGroupFor(fakeGroups(dirProblem = "Permission denied"),
+        socket, false, 1000, 100)
+      check found.group == -1
+      check "/run/runquota" in found.diagnostic
+      check "Permission denied" in found.diagnostic
+
+    test "no group when none is needed":
+      # The directory's group is the requester's own gid; root drops nothing.
+      check endpointGroupFor(fakeGroups(dirGroup = 100), socket, false,
+        1000, 100) == (-1, "")
+      check endpointGroupFor(fakeGroups(), socket, false, 0, 0) == (-1, "")
+
+    test "the real lookups on this process's own account":
+      # A directory this process owns, given to one of its supplementary
+      # groups (an owner may chgrp to a group it is in): a member.
+      let mine = int(getgid())
+      var others: seq[int] = @[]
+      var list: array[0 .. 255, Gid]
+      let n = getgroups(cint(list.len), addr list)
+      for i in 0 ..< max(0, int(n)):
+        if int(list[i]) != mine: others.add(int(list[i]))
+      let dir = createTempDir("rqnixeg", "")
+      defer: removeDir(dir)
+      if others.len > 0:
+        require chown(dir.cstring, Uid(high(uint32)), Gid(others[0])) == 0
+        let found = endpointGroupFor(systemGroupOps(), dir / "rq.sock", false,
+          int(getuid()), mine)
+        check found == (others[0], "")
+      # An account whose gid does not fit a C int: darwin's `nobody` is
+      # -2, 4294967294 as a gid. Its groups are read, its own gid among them.
+      let nobody = getpwnam("nobody")
+      require nobody != nil
+      var nobodyGroups: seq[int] = @[]
+      check systemGroupOps().groupsOf("nobody", int(nobody.pw_gid),
+        nobodyGroups)
+      check int(nobody.pw_gid) in nobodyGroups
+      # A directory that does not exist: the gid alone, with the reason.
+      let gone = endpointGroupFor(systemGroupOps(), dir / "no" / "rq.sock",
+        false, int(getuid()), mine)
+      check gone.group == -1 and gone.diagnostic.len > 0
+
   suite "holder arguments":
     test "out-of-range values are refused, not converted":
       var options: HoldOptions
@@ -554,6 +673,13 @@ else:
       check not parseHoldArgs(["--cpu-milli", "0"], options)
       check not parseHoldArgs(["--cpu-milli"], options)
       check not parseHoldArgs(["--bogus", "1"], options)
+      check parseHoldArgs(["--cpu-milli", "1000"], options)
+      check options.endpointGroup == -1
+      check parseHoldArgs(["--cpu-milli", "1000", "--endpoint-group", "972"],
+        options)
+      check options.endpointGroup == 972
+      check not parseHoldArgs(["--cpu-milli", "1000", "--endpoint-group",
+        "-5"], options)
 
   suite "derivation file":
     test "only a bounded regular file is read":

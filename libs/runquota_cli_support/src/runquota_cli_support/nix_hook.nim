@@ -189,6 +189,7 @@ when defined(macosx):
   import nix_hook_darwin
 
 import runquota_client
+from runquota_ipc import defaultEndpoint
 import runquota_core
 
 const
@@ -1079,15 +1080,8 @@ type
     ## The system calls of the privilege drop, injectable so the order, the
     ## failure paths and the checks can be tested without root.
     euid*: proc (): int
-    clearGroups*: proc (gid: int): cint
-      ## Leave only `gid`, or no group at all. Linux: `setgroups(0, NULL)`,
-      ## an empty list. Darwin: `setgroups(1, [gid])`, because XNU turns
-      ## an empty list into `{0}` -- the group `wheel` (`setgroups_internal`,
-      ## `bsd/kern/kern_prot.c`: `if (ngrp < 1) { ngrp = 1; newgroups[0] =
-      ## 0; }`) -- and keeps the effective gid as the list's first entry.
-      ## On darwin the call also opts the process out of directory-service
-      ## group resolution (`CRF_NOMEMBERD`, `kauth_cred_model_setgroups` in
-      ## `bsd/kern/kern_credential.c`), which `setuid` then leaves off.
+    setGroups*: proc (groups: seq[int]): cint
+      ## `setgroups(2)` with exactly `groups` (`holderGroupList`).
     setGid*: proc (gid: int): cint     ## setgid(2): real, effective, saved
     setUid*: proc (uid: int): cint     ## setuid(2): real, effective, saved
     status*: proc (): string
@@ -1120,23 +1114,47 @@ when defined(posix):
   proc systemCredentialOps*(): CredentialOps =
     CredentialOps(
       euid: proc (): int = int(geteuid()),
-      clearGroups: proc (gid: int): cint =
-        when defined(macosx):
-          var only = Gid(gid)
-          setgroupsCall(1, addr only)
-        else:
-          setgroupsCall(0, nil),
+      setGroups: proc (groups: seq[int]): cint =
+        var list = newSeq[Gid](groups.len)
+        for i, group in groups: list[i] = Gid(group)
+        if list.len == 0: setgroupsCall(0, nil)
+        else: setgroupsCall(csize_t(list.len), addr list[0]),
       setGid: proc (gid: int): cint = setgid(Gid(gid)),
       setUid: proc (uid: int): cint = setuid(Uid(uid)),
       status: proc (): string =
         when defined(macosx): darwinCredentialStatus()
         else: readFile("/proc/self/status"))
 
-proc darwinCredentialProblem*(status: string; uid, gid: int): string =
+proc holderGroupList*(gid, endpointGroup: int; darwin: bool): seq[int] =
+  ## The group list a dropped holder gets (Build-Engine § Nix daemon builds
+  ## under leases, "The endpoint's group"): the endpoint's group when there
+  ## is one (`endpointGroup >= 0`; see `endpointGroupFor`), and on darwin
+  ## the requester's gid first. Linux: empty, or the endpoint's group
+  ## alone. Darwin: `[gid]` or `[gid, endpoint group]`, because XNU turns an
+  ## empty list into `{0}` -- the group `wheel` (`setgroups_internal`,
+  ## `bsd/kern/kern_prot.c`: `if (ngrp < 1) { ngrp = 1; newgroups[0] = 0;
+  ## }`) -- and keeps the effective gid as the list's first entry. On darwin
+  ## `setgroups` also opts the process out of directory-service group
+  ## resolution (`CRF_NOMEMBERD`, `kauth_cred_model_setgroups` in
+  ## `bsd/kern/kern_credential.c`), which `setuid` then leaves off.
+  if darwin: result.add(gid)
+  if endpointGroup >= 0 and endpointGroup != gid:
+    result.add(endpointGroup)
+
+proc sameGroups(fields: seq[string]; want: seq[int]): bool =
+  ## Whether a status line's groups are exactly `want`, as sets (Linux
+  ## lists them sorted, darwin in the order they were set).
+  if fields.len != want.len: return false
+  for group in want:
+    if $group notin fields: return false
+  true
+
+proc darwinCredentialProblem*(status: string; uid, gid: int;
+                              endpointGroup = -1): string =
   ## What in a `darwinCredentialStatus` shows a drop to `uid`/`gid`
   ## incomplete, or "": the real, effective and saved uids and gids are
-  ## the target and the group list holds `gid` and nothing else (the
-  ## effective gid is its first entry, so after `setgid` it is not empty).
+  ## the target and the group list is exactly `holderGroupList` (the
+  ## effective gid first, then the endpoint's group when there is one).
   var seen: seq[string] = @[]
   for line in status.splitLines():
     let colon = line.find(':')
@@ -1151,19 +1169,22 @@ proc darwinCredentialProblem*(status: string; uid, gid: int): string =
         if field != $want: return key & " is " & fields.join(" ")
       seen.add(key)
     of "Groups":
-      for field in fields:
-        if field != $gid: return "supplementary groups " & fields.join(" ")
+      let want = holderGroupList(gid, endpointGroup, darwin = true)
+      if fields.len == 0 or fields[0] != $gid or not sameGroups(fields, want):
+        return "supplementary groups " & fields.join(" ")
       seen.add(key)
     else: discard
   for key in ["Uid", "Gid", "Groups"]:
     if key notin seen: return key & " is missing"
   ""
 
-proc linuxCredentialProblem*(status: string; uid, gid: int): string =
+proc linuxCredentialProblem*(status: string; uid, gid: int;
+                             endpointGroup = -1): string =
   ## What in `/proc/self/status` shows a drop to `uid`/`gid` incomplete, or
   ## "": every one of the real, effective, saved and filesystem uids and
-  ## gids is the target, there are no supplementary groups, and the
-  ## permitted, effective and ambient capability sets are empty.
+  ## gids is the target, the supplementary groups are exactly
+  ## `holderGroupList` (none, or the endpoint's group), and the permitted,
+  ## effective and ambient capability sets are empty.
   var seen: seq[string] = @[]
   for line in status.splitLines():
     let colon = line.find(':')
@@ -1178,7 +1199,9 @@ proc linuxCredentialProblem*(status: string; uid, gid: int): string =
         if field != $want: return key & " is " & fields.join(" ")
       seen.add(key)
     of "Groups":
-      if fields.len != 0: return "supplementary groups " & fields.join(" ")
+      if not sameGroups(fields, holderGroupList(gid, endpointGroup,
+          darwin = false)):
+        return "supplementary groups " & fields.join(" ")
       seen.add(key)
     of "CapPrm", "CapEff", "CapAmb":
       if fields.len != 1: return key & " is malformed"
@@ -1193,25 +1216,31 @@ proc linuxCredentialProblem*(status: string; uid, gid: int): string =
     if key notin seen: return key & " is missing"
   ""
 
-proc credentialProblem*(status: string; uid, gid: int): string =
+proc credentialProblem*(status: string; uid, gid: int;
+                        endpointGroup = -1): string =
   ## The platform's check of `CredentialOps.status` after a drop: Linux's
   ## (`linuxCredentialProblem`) everywhere but darwin.
-  when defined(macosx): darwinCredentialProblem(status, uid, gid)
-  else: linuxCredentialProblem(status, uid, gid)
+  when defined(macosx):
+    darwinCredentialProblem(status, uid, gid, endpointGroup)
+  else:
+    linuxCredentialProblem(status, uid, gid, endpointGroup)
 
-proc dropPrivilegesWith*(ops: CredentialOps; uid, gid: int): string =
+proc dropPrivilegesWith*(ops: CredentialOps; uid, gid: int;
+                         endpointGroup = -1): string =
   ## Become `uid`/`gid` when running as root and the requester is someone
-  ## else. Returns what happened, for the log. Raises
+  ## else, keeping `endpointGroup` (-1: none) as the only supplementary
+  ## group (`holderGroupList`). Returns what happened, for the log. Raises
   ## `PrivilegeDropError` -- and the caller must then not connect -- when
   ## any step fails or the result is not exactly the target: groups are
-  ## cleared before the gid changes and the gid before the uid (after
+  ## set before the gid changes and the gid before the uid (after
   ## `setuid` there is no right left to do either).
   if ops.euid() != 0 or uid < 0 or uid == 0:
     return ""
   if gid < 0:
     raise newException(PrivilegeDropError,
       "the requester's group is unknown")
-  if ops.clearGroups(gid) != 0:
+  if ops.setGroups(holderGroupList(gid, endpointGroup,
+      darwin = defined(macosx))) != 0:
     raise newException(PrivilegeDropError, "setgroups: " &
       osErrorMsg(osLastError()))
   if ops.setGid(gid) != 0:
@@ -1222,10 +1251,112 @@ proc dropPrivilegesWith*(ops: CredentialOps; uid, gid: int): string =
       osErrorMsg(osLastError()))
   if ops.setUid(0) == 0:
     raise newException(PrivilegeDropError, "root could be regained")
-  let problem = credentialProblem(ops.status(), uid, gid)
+  let problem = credentialProblem(ops.status(), uid, gid, endpointGroup)
   if problem.len > 0:
     raise newException(PrivilegeDropError, "after the drop: " & problem)
-  "as uid " & $uid & " gid " & $gid
+  "as uid " & $uid & " gid " & $gid &
+    (if endpointGroup >= 0 and endpointGroup != gid:
+       " and the endpoint's group " & $endpointGroup else: "")
+
+# ---------------------------------------------------------------------------
+# The endpoint's group
+# ---------------------------------------------------------------------------
+
+type
+  GroupOps* = object
+    ## The account and filesystem lookups behind `endpointGroupFor`,
+    ## injectable so that membership, non-membership and every failure can
+    ## be tested without a second account or root.
+    directoryGroup*: proc (dir: string; gid: var int): string
+      ## The group that owns `dir` (`stat`), or why it cannot be read.
+    userName*: proc (uid: int): string
+      ## The account name of `uid` (`getpwuid`), "" when there is none.
+    groupsOf*: proc (name: string; baseGid: int; groups: var seq[int]): bool
+      ## Every group of account `name`, `baseGid` included
+      ## (`getgrouplist`); false when the database cannot answer.
+
+proc endpointGroupFor*(ops: GroupOps; endpointPath: string;
+                       privateScope: bool; uid, gid: int):
+    tuple[group: int, diagnostic: string] =
+  ## The group a holder dropped to `uid`/`gid` keeps besides `gid`: the
+  ## group that owns the directory of `endpointPath` -- the endpoint the
+  ## hook itself would connect to, never one a client names -- exactly when
+  ## the requester is a member of it by the account database. -1 when
+  ## there is none, with `diagnostic` saying why when that is not simply
+  ## "no group needed" (Build-Engine § Nix daemon builds under leases, "The
+  ## endpoint's group"). A private endpoint is owned by the daemon's user
+  ## and adds no group.
+  result = (-1, "")
+  if uid <= 0 or privateScope or endpointPath.len == 0:
+    return
+  let dir = parentDir(endpointPath)
+  var owner = -1
+  let problem = ops.directoryGroup(dir, owner)
+  if problem.len > 0 or owner < 0:
+    result.diagnostic = "the endpoint directory " & dir &
+      " cannot be read (" & problem & "); the holder keeps its gid alone"
+    return
+  if owner == gid:
+    return                      # its own gid already admits it
+  let name = ops.userName(uid)
+  if name.len == 0:
+    result.diagnostic = "uid " & $uid & " has no account name; the " &
+      "holder keeps its gid alone"
+    return
+  var groups: seq[int] = @[]
+  if not ops.groupsOf(name, gid, groups):
+    result.diagnostic = "the groups of " & name & " cannot be read; the " &
+      "holder keeps its gid alone"
+    return
+  if owner notin groups:
+    result.diagnostic = name & " is not a member of group " & $owner &
+      ", which owns " & dir & "; its holder cannot reach the endpoint"
+    return
+  result.group = owner
+
+when defined(posix):
+  when defined(macosx):
+    proc getgrouplistCall(user: cstring; group: cint; groups: ptr cint;
+                          ngroups: var cint): cint {.
+      importc: "getgrouplist", header: "<unistd.h>".}
+  else:
+    proc getgrouplistCall(user: cstring; group: Gid; groups: ptr Gid;
+                          ngroups: var cint): cint {.
+      importc: "getgrouplist", header: "<grp.h>".}
+
+  proc systemGroupOps*(): GroupOps =
+    GroupOps(
+      directoryGroup: proc (dir: string; gid: var int): string =
+        var info: Stat
+        if stat(dir.cstring, info) != 0:
+          return osErrorMsg(osLastError())
+        if not S_ISDIR(info.st_mode):
+          return "not a directory"
+        gid = int(info.st_gid)
+        "",
+      userName: proc (uid: int): string =
+        let entry = getpwuid(Uid(uid))
+        if entry == nil or entry.pw_name == nil: "" else: $entry.pw_name,
+      groupsOf: proc (name: string; baseGid: int; groups: var seq[int]): bool =
+        var room = 64
+        while room <= 65536:
+          var count = cint(room)
+          when defined(macosx):
+            var list = newSeq[cint](room)
+            let rc = getgrouplistCall(name.cstring,
+              cast[cint](uint32(baseGid)), addr list[0], count)
+          else:
+            var list = newSeq[Gid](room)
+            let rc = getgrouplistCall(name.cstring, Gid(baseGid),
+              addr list[0], count)
+          if rc >= 0:
+            groups.setLen(0)
+            for i in 0 ..< min(int(count), room):
+              # darwin passes gids as int: -2 (nobody) is 4294967294.
+              groups.add(int(cast[uint32](list[i])))
+            return true
+          room *= 4
+        false)
 
 # ---------------------------------------------------------------------------
 # The holder
@@ -1237,10 +1368,12 @@ type
     cpuMilli*: uint32
     memoryBytes*: uint64
     uid*, gid*: int
+    endpointGroup*: int    ## -1: none (`endpointGroupFor`).
     unclaimedMillis*: int
 
 proc parseHoldArgs*(args: openArray[string]; options: var HoldOptions): bool =
-  options = HoldOptions(uid: -1, gid: -1, unclaimedMillis: 10_000)
+  options = HoldOptions(uid: -1, gid: -1, endpointGroup: -1,
+    unclaimedMillis: 10_000)
   var i = 0
   try:
     while i < args.len:
@@ -1255,6 +1388,9 @@ proc parseHoldArgs*(args: openArray[string]; options: var HoldOptions): bool =
       of "--memory-bytes": options.memoryBytes = uint64(parseBiggestUInt(value))
       of "--uid": options.uid = parseInt(value)
       of "--gid": options.gid = parseInt(value)
+      of "--endpoint-group":
+        options.endpointGroup = parseInt(value)
+        if options.endpointGroup < 0: return false
       of "--unclaimed-millis":
         options.unclaimedMillis = clamp(parseInt(value), 0, 3_600_000)
       else: return false
@@ -1467,7 +1603,7 @@ when defined(posix):
       let hook = getppid()
       try:
         discard dropPrivilegesWith(systemCredentialOps(), options.uid,
-          options.gid)
+          options.gid, options.endpointGroup)
       except CatchableError as failure:
         discard emit("refused cannot act as the requester: " & failure.msg)
         return 1
@@ -1630,7 +1766,7 @@ when defined(posix):
         try:
           try:
             discard dropPrivilegesWith(systemCredentialOps(), options.uid,
-              options.gid)
+              options.gid, options.endpointGroup)
           except CatchableError as failure:
             discard emit("refused cannot act as the requester: " &
               failure.msg)
@@ -1680,6 +1816,7 @@ when defined(posix):
       settings: HookSettings
       requester: Requester
       requesterKnown: bool
+      endpointGroup: int   ## The holders' extra group, -1: none.
       workerPid: int
       pending: Table[string, Holder]
       claimed: seq[Holder]
@@ -1713,6 +1850,8 @@ when defined(posix):
       args.add(["--uid", $state.requester.uid])
       args.add(["--gid", $(if state.requester.gid >= 0: state.requester.gid
                            else: NoGroupGid)])
+      if state.endpointGroup >= 0:
+        args.add(["--endpoint-group", $state.endpointGroup])
     let process = startProcess(getAppFilename(), args = args,
       env = holderEnv(state.requester), options = {poStdErrToStdOut})
     Holder(process: process, output: LineReader(
@@ -1784,12 +1923,28 @@ when defined(posix):
     if not state.requesterKnown:
       state.requester = findRequester(state.workerPid)
       state.requesterKnown = true
+      # The group the holders keep so they can reach the endpoint this hook
+      # would connect to (its own endpoint, from the daemon's environment;
+      # never one the client names). Only a root hook drops privileges.
+      var groupNote = ""
+      if geteuid() == 0 and state.requester.uid > 0:
+        let found = endpointGroupFor(systemGroupOps(),
+          defaultEndpoint().path,
+          getEnv("RUNQUOTA_ENDPOINT_SCOPE", "host") == "private",
+          state.requester.uid,
+          if state.requester.gid >= 0: state.requester.gid else: NoGroupGid)
+        state.endpointGroup = found.group
+        groupNote = found.diagnostic
+        if found.group >= 0:
+          groupNote = "keeping the endpoint's group " & $found.group
       # Talkative (`-v`): who the leases are for, and how that was found.
       stderr.write(nixLogLine("runquota: leases for uid " &
         $state.requester.uid & " in group '" &
         (if state.requester.group.len > 0: state.requester.group
-         else: "interactive") & "' (" & state.requester.how & ")",
+         else: "interactive") & "' (" & state.requester.how &
+        (if groupNote.len > 0: "; " & groupNote else: "") & ")",
         level = 4) & "\n")
+
     var holder = state.pending.getOrDefault(request.drvPath)
     if holder == nil:
       let cap = max(1, min(state.settings.maxJobs, hostCpuCount()))
@@ -1855,7 +2010,7 @@ when defined(posix):
     if args.len >= 1 and args[0] == HoldFlag:
       return runHolder(args[1 .. ^1], clientVersion)
     let input = newFileStream(stdin)
-    var state = HookState(workerPid: int(getppid()))
+    var state = HookState(workerPid: int(getppid()), endpointGroup: -1)
     try:
       state.settings = readHookSettings(input)
     except CatchableError:
