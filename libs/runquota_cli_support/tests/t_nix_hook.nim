@@ -585,12 +585,16 @@ else:
     # lookups are exercised just below on this process's own account and
     # in t_nix_hook_holder_groups (a real drop and connect).
     proc fakeGroups(dirGroup = 972; dirProblem = ""; name = "alice";
-                    groups = @[100, 972]; groupsOk = true): GroupOps =
+                    primary = 100; groups = @[100, 972];
+                    groupsOk = true): GroupOps =
       GroupOps(
         directoryGroup: proc (dir: string; gid: var int): string =
           gid = dirGroup
           dirProblem,
-        userName: proc (uid: int): string = name,
+        account: proc (uid: int; n: var string; g: var int): bool =
+          n = name
+          g = primary
+          name.len > 0,
         groupsOf: proc (n: string; baseGid: int;
                         found: var seq[int]): bool =
           found = groups
@@ -599,41 +603,59 @@ else:
     const socket = "/run/runquota/runquota.sock"
 
     test "a member keeps the group that owns the endpoint's directory":
-      check endpointGroupFor(fakeGroups(), socket, false, 1000, 100) ==
+      check endpointGroupFor(fakeGroups(), socket, false, 1000, 100, 972) ==
         (972, "")
 
     test "a non-member keeps its gid alone, and is told why":
       let found = endpointGroupFor(fakeGroups(groups = @[100, 1]), socket,
-        false, 1000, 100)
+        false, 1000, 100, 972)
       check found.group == -1
       check "not a member" in found.diagnostic
 
     test "a private endpoint adds no group":
-      check endpointGroupFor(fakeGroups(), socket, true, 1000, 100) ==
+      check endpointGroupFor(fakeGroups(), socket, true, 1000, 100, 972) ==
         (-1, "")
 
     test "an unknown requester name gives the gid alone and a diagnostic":
       let found = endpointGroupFor(fakeGroups(name = ""), socket, false,
-        1000, 100)
+        1000, 100, 972)
       check found.group == -1
       check "no account name" in found.diagnostic
       let unreadable = endpointGroupFor(fakeGroups(groupsOk = false), socket,
-        false, 1000, 100)
+        false, 1000, 100, 972)
       check unreadable.group == -1
       check "cannot be read" in unreadable.diagnostic
 
     test "a stat failure gives the gid alone and a diagnostic":
       let found = endpointGroupFor(fakeGroups(dirProblem = "Permission denied"),
-        socket, false, 1000, 100)
+        socket, false, 1000, 100, 972)
       check found.group == -1
       check "/run/runquota" in found.diagnostic
       check "Permission denied" in found.diagnostic
 
+    test "a group the policy is not configured with is not kept":
+      # The directory's group is not RUNQUOTA_ENDPOINT_GROUP's: a
+      # misconfigured endpoint path must not choose a holder's group.
+      let other = endpointGroupFor(fakeGroups(dirGroup = 4), socket, false,
+        1000, 100, 972)
+      check other.group == -1
+      check "configured group" in other.diagnostic
+      # Never gid 0, even when the requester is in it and it is configured.
+      let rootGroup = endpointGroupFor(fakeGroups(dirGroup = 0,
+        groups = @[100, 0]), socket, false, 1000, 100, 0)
+      check rootGroup.group == -1
+
+    test "the account's primary group counts as membership":
+      # getgrouplist lists the base gid and the groups naming the account,
+      # not the account's passwd group when the base differs from it.
+      check endpointGroupFor(fakeGroups(primary = 972, groups = @[65534]),
+        socket, false, 1000, 65534, 972) == (972, "")
+
     test "no group when none is needed":
       # The directory's group is the requester's own gid; root drops nothing.
       check endpointGroupFor(fakeGroups(dirGroup = 100), socket, false,
-        1000, 100) == (-1, "")
-      check endpointGroupFor(fakeGroups(), socket, false, 0, 0) == (-1, "")
+        1000, 100, 972) == (-1, "")
+      check endpointGroupFor(fakeGroups(), socket, false, 0, 0, 972) == (-1, "")
 
     test "the real lookups on this process's own account":
       # A directory this process owns, given to one of its supplementary
@@ -646,11 +668,19 @@ else:
         if int(list[i]) != mine: others.add(int(list[i]))
       let dir = createTempDir("rqnixeg", "")
       defer: removeDir(dir)
-      if others.len > 0:
-        require chown(dir.cstring, Uid(high(uint32)), Gid(others[0])) == 0
-        let found = endpointGroupFor(systemGroupOps(), dir / "rq.sock", false,
-          int(getuid()), mine)
-        check found == (others[0], "")
+      # A prerequisite: an account with no supplementary group cannot show
+      # a real membership, and failing says so rather than passing empty.
+      checkpoint("this account needs a supplementary group")
+      require others.len > 0
+      require chown(dir.cstring, Uid(high(uint32)), Gid(others[0])) == 0
+      let found = endpointGroupFor(systemGroupOps(), dir / "rq.sock", false,
+        int(getuid()), mine, others[0])
+      check found == (others[0], "")
+      # A symbolic link to that directory is not the endpoint's directory.
+      createSymlink(dir, dir & ".link")
+      defer: removeFile(dir & ".link")
+      check endpointGroupFor(systemGroupOps(), dir & ".link" / "rq.sock",
+        false, int(getuid()), mine, others[0]).group == -1
       # An account whose gid does not fit a C int: darwin's `nobody` is
       # -2, 4294967294 as a gid. Its groups are read, its own gid among them.
       let nobody = getpwnam("nobody")
@@ -661,7 +691,7 @@ else:
       check int(nobody.pw_gid) in nobodyGroups
       # A directory that does not exist: the gid alone, with the reason.
       let gone = endpointGroupFor(systemGroupOps(), dir / "no" / "rq.sock",
-        false, int(getuid()), mine)
+        false, int(getuid()), mine, others[0])
       check gone.group == -1 and gone.diagnostic.len > 0
 
   suite "holder arguments":

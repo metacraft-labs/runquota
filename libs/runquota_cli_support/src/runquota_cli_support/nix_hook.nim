@@ -193,7 +193,8 @@ when defined(macosx):
   import nix_hook_darwin
 
 import runquota_client
-from runquota_ipc import defaultEndpoint
+from runquota_ipc import defaultEndpoint, rendezvousPolicy,
+  endpointDirectoryTrust, rendezvousPrivate, trustOk
 import runquota_core
 
 const
@@ -1273,14 +1274,16 @@ type
     ## be tested without a second account or root.
     directoryGroup*: proc (dir: string; gid: var int): string
       ## The group that owns `dir` (`stat`), or why it cannot be read.
-    userName*: proc (uid: int): string
-      ## The account name of `uid` (`getpwuid`), "" when there is none.
+    account*: proc (uid: int; name: var string; primaryGid: var int): bool
+      ## The account of `uid` (`getpwuid`): its name and its primary gid;
+      ## false when there is none.
     groupsOf*: proc (name: string; baseGid: int; groups: var seq[int]): bool
       ## Every group of account `name`, `baseGid` included
       ## (`getgrouplist`); false when the database cannot answer.
 
 proc endpointGroupFor*(ops: GroupOps; endpointPath: string;
-                       privateScope: bool; uid, gid: int):
+                       privateScope: bool; uid, gid: int;
+                       configuredGroup: int):
     tuple[group: int, diagnostic: string] =
   ## The group a holder dropped to `uid`/`gid` keeps besides `gid`: the
   ## group that owns the directory of `endpointPath` -- the endpoint the
@@ -1289,7 +1292,12 @@ proc endpointGroupFor*(ops: GroupOps; endpointPath: string;
   ## there is none, with `diagnostic` saying why when that is not simply
   ## "no group needed" (Build-Engine § Nix daemon builds under leases, "The
   ## endpoint's group"). A private endpoint is owned by the daemon's user
-  ## and adds no group.
+  ## and adds no group. The directory's group must also be the group the
+  ## endpoint policy is configured with (`configuredGroup`, the gid of
+  ## `RUNQUOTA_ENDPOINT_GROUP`; -1 when there is none), and is never gid 0:
+  ## a misconfigured endpoint path (its parent `/run`, `/` or `/tmp`) must
+  ## not hand a holder the root group. Membership is the account's primary
+  ## group or a group that lists it (`getgrouplist`).
   result = (-1, "")
   if uid <= 0 or privateScope or endpointPath.len == 0:
     return
@@ -1302,8 +1310,14 @@ proc endpointGroupFor*(ops: GroupOps; endpointPath: string;
     return
   if owner == gid:
     return                      # its own gid already admits it
-  let name = ops.userName(uid)
-  if name.len == 0:
+  if owner == 0 or owner != configuredGroup:
+    result.diagnostic = "the endpoint directory " & dir & " belongs to " &
+      "group " & $owner & ", not to the endpoint's configured group (" &
+      $configuredGroup & "); the holder keeps its gid alone"
+    return
+  var name = ""
+  var primary = -1
+  if not ops.account(uid, name, primary) or name.len == 0:
     result.diagnostic = "uid " & $uid & " has no account name; the " &
       "holder keeps its gid alone"
     return
@@ -1312,7 +1326,7 @@ proc endpointGroupFor*(ops: GroupOps; endpointPath: string;
     result.diagnostic = "the groups of " & name & " cannot be read; the " &
       "holder keeps its gid alone"
     return
-  if owner notin groups:
+  if owner notin groups and owner != primary:
     result.diagnostic = name & " is not a member of group " & $owner &
       ", which owns " & dir & "; its holder cannot reach the endpoint"
     return
@@ -1331,16 +1345,20 @@ when defined(posix):
   proc systemGroupOps*(): GroupOps =
     GroupOps(
       directoryGroup: proc (dir: string; gid: var int): string =
+        # lstat: a symbolic link is not the endpoint's directory.
         var info: Stat
-        if stat(dir.cstring, info) != 0:
+        if lstat(dir.cstring, info) != 0:
           return osErrorMsg(osLastError())
         if not S_ISDIR(info.st_mode):
           return "not a directory"
         gid = int(info.st_gid)
         "",
-      userName: proc (uid: int): string =
+      account: proc (uid: int; name: var string; primaryGid: var int): bool =
         let entry = getpwuid(Uid(uid))
-        if entry == nil or entry.pw_name == nil: "" else: $entry.pw_name,
+        if entry == nil or entry.pw_name == nil: return false
+        name = $entry.pw_name
+        primaryGid = int(entry.pw_gid)
+        true,
       groupsOf: proc (name: string; baseGid: int; groups: var seq[int]): bool =
         var room = 64
         while room <= 65536:
@@ -1390,11 +1408,17 @@ proc parseHoldArgs*(args: openArray[string]; options: var HoldOptions): bool =
         if milli > uint64(high(uint32)): return false
         options.cpuMilli = uint32(milli)
       of "--memory-bytes": options.memoryBytes = uint64(parseBiggestUInt(value))
-      of "--uid": options.uid = parseInt(value)
-      of "--gid": options.gid = parseInt(value)
+      of "--uid":
+        options.uid = parseInt(value)
+        if options.uid > int(high(uint32)): return false
+      of "--gid":
+        options.gid = parseInt(value)
+        if options.gid > int(high(uint32)): return false
       of "--endpoint-group":
         options.endpointGroup = parseInt(value)
-        if options.endpointGroup < 0: return false
+        if options.endpointGroup < 0 or
+            options.endpointGroup > int(high(uint32)):
+          return false
       of "--unclaimed-millis":
         options.unclaimedMillis = clamp(parseInt(value), 0, 3_600_000)
       else: return false
@@ -1932,15 +1956,30 @@ when defined(posix):
       # never one the client names). Only a root hook drops privileges.
       var groupNote = ""
       if geteuid() == 0 and state.requester.uid > 0:
-        let found = endpointGroupFor(systemGroupOps(),
-          defaultEndpoint().path,
-          getEnv("RUNQUOTA_ENDPOINT_SCOPE", "host") == "private",
-          state.requester.uid,
-          if state.requester.gid >= 0: state.requester.gid else: NoGroupGid)
-        state.endpointGroup = found.group
-        groupNote = found.diagnostic
-        if found.group >= 0:
-          groupNote = "keeping the endpoint's group " & $found.group
+        # The endpoint and its policy as the holder will see them (it gets
+        # this process's endpoint variables): a directory the policy does
+        # not trust (owner, group, mode; `endpointDirectoryTrust`) gives no
+        # group, and neither does a scope the policy refuses.
+        try:
+          let endpoint = defaultEndpoint()
+          let policy = rendezvousPolicy()
+          let trust = endpointDirectoryTrust(endpoint, policy)
+          if policy.scope != rendezvousPrivate and trust.reason != trustOk:
+            groupNote = "the endpoint directory is not trusted (" &
+              trust.message & "); the holders keep their gid alone"
+          else:
+            let found = endpointGroupFor(systemGroupOps(), endpoint.path,
+              policy.scope == rendezvousPrivate, state.requester.uid,
+              if state.requester.gid >= 0: state.requester.gid
+              else: NoGroupGid,
+              int(policy.groupGid))
+            state.endpointGroup = found.group
+            groupNote = found.diagnostic
+            if found.group >= 0:
+              groupNote = "keeping the endpoint's group " & $found.group
+        except CatchableError as failure:
+          groupNote = "the endpoint policy is invalid (" & failure.msg &
+            "); the holders keep their gid alone"
       # Talkative (`-v`): who the leases are for, and how that was found.
       stderr.write(nixLogLine("runquota: leases for uid " &
         $state.requester.uid & " in group '" &
