@@ -56,19 +56,29 @@
 ## two daemons. The scratch directory, store included, is removed at the
 ## end, whether the case passed or not. Each case also checks that no lease
 ## holder of its private `runquotad` is left running (found by the endpoint
-## in its environment, read-only; nothing is signalled).
+## in its environment, read-only, `tests/support/process_listing`; nothing
+## is signalled).
 ##
-## THE TOOLS ARE PREREQUISITES. `nix-daemon` and `nix-build` must be on
-## `PATH`; their absence fails the test rather than skipping it.
+## THE TOOLS ARE PREREQUISITES. `nix-daemon`, `nix-build` and `flock` must be
+## on `PATH`; their absence fails the test rather than skipping it. (macOS
+## ships no `flock(1)`; util-linux's builds there and is what was used.)
 ##
-## Linux only: the hook's requester lookup reads `sock_diag` and `/proc`.
+## Linux and darwin, like the hook's requester lookup and release probe. On
+## darwin nothing in the case changes: the private daemon is unprivileged on
+## both, which is why its hook, the watcher and the lease holder all run as
+## this user and no privilege is dropped. The darwin-specific path that
+## matters here is the release: the watcher reads the worker's descriptors,
+## and a watcher that saw no lock would give every lease back at once (the
+## budget is then exceeded); one that never saw the lock go free would keep
+## the first leases and the later builds would never start.
 
-when defined(linux):
+when defined(linux) or defined(macosx):
   import std/[json, os, osproc, posix, streams, strtabs, strutils, times,
     unittest]
 
   import daemon_binary
   import private_daemon_fixture
+  import process_listing
 
   const
     BudgetCpus = 4
@@ -162,6 +172,12 @@ builtins.genList (i: builtins.derivation {
     writeNixConf(root, hook)
     fixture.nixSocket = root / "nix.sock"
     let store = root / "store"
+    # The store directory exists before any client names it: the darwin
+    # client (Nix 2.35.2 on m3) opens the `?store=` directory itself and
+    # fails with "opening file ...: No such file or directory" when the
+    # daemon has not created it yet. Linux clients do not, and the
+    # directory is the one the daemon would create.
+    createDir(store)
     fixture.storeUri = "unix://" & fixture.nixSocket & "?store=" & store
     var env = privateEnv(fixture.rqSocket)
     env["NIX_CONF_DIR"] = root / "conf"
@@ -244,6 +260,12 @@ builtins.genList (i: builtins.derivation {
       var group = "?"
       for (sessionId, name) in groups:
         if sessionId == lease["session_id"].getInt(): group = name
+      if group == "?":
+        # Its session registered after `sessions --json` answered (the two
+        # queries are not one snapshot; seen on darwin, where a CLI call is
+        # slower). The lease lives at least 1.5 s, so a later sample
+        # records it with its group.
+        continue
       seen.add(SeenLease(id: id, group: group,
         label: lease["label"].getStr(),
         cpuMilli: lease["resources"]["cpu_milli"].getInt()))
@@ -273,27 +295,6 @@ builtins.genList (i: builtins.derivation {
     if build.running:
       return (-1, "still running after " & $seconds & " s")
     (code, build.outputStream.readAll())
-
-  proc holdersOf(rqSocket: string): seq[int] =
-    ## Lease holders still running for this case's private `runquotad`: the
-    ## processes whose environment names its socket and whose command line
-    ## is a holder's. Read-only.
-    let marker = "RUNQUOTA_SOCKET=" & rqSocket & "\0"
-    for kind, dir in walkDir("/proc"):
-      let name = extractFilename(dir)
-      if name.len == 0 or not name[0].isDigit: continue
-      try:
-        if "--hold" notin readFile(dir / "cmdline"): continue
-        if marker in readFile(dir / "environ"): result.add(parseInt(name))
-      except CatchableError:
-        discard
-
-  proc noHoldersLeft(rqSocket: string): bool =
-    ## A holder exits at most ~400 ms after its build's locks go free.
-    for _ in 0 ..< 40:
-      if holdersOf(rqSocket).len == 0: return true
-      sleep(100)
-    false
 
   type Ledger = object
     peak: int

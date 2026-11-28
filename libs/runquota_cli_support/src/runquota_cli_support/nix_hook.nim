@@ -89,6 +89,21 @@
 ##   process group, which the worker kills when that operation ends, so a
 ##   claimed lease is still given back after it.
 ##
+## ON DARWIN the holder is two processes, because the release signal needs
+## root there: no `/proc/locks` exists, and the kernel shows a process's
+## descriptors (where the worker's output locks are) only to root or to the
+## same uid. The process the hook starts stays as the hook's user and is the
+## WATCHER (`watchHolder`); it forks the LEASE HOLDER, which drops to the
+## requester and holds the lease exactly as above. The watcher forwards the
+## claim, probes the worker's descriptors every `ProbeMillis`
+## (`anyLockHeldBy`: an open descriptor on the lock file that took a
+## `flock`), and after `ReleaseMisses` free probes closes the pipe to the
+## lease holder, which then gives the lease back. Before the claim the
+## watcher stands in for `PR_SET_PDEATHSIG`: when the hook's end of its
+## standard input closes, it kills the queued lease holder; and a lease
+## holder whose watcher is gone stops waiting for its grant
+## (`requestLeaseWaiting`'s `cancelled`).
+##
 ## THE REQUESTER. The worker serves one client connection. The hook is the
 ## worker's child; it finds the worker's accepted socket (the one that
 ## carries the daemon socket's name), asks the kernel for its peer and for
@@ -106,6 +121,15 @@
 ## to the hook's own user. The RunQuota endpoint is the hook's own (the
 ## daemon's environment), never the client's.
 ##
+## On darwin the same three steps use darwin's sources (`nix_hook_darwin`):
+## the worker's accepted socket and its peer's pcb from the worker's
+## descriptors (`proc_pidfdinfo`); the uid that created the peer socket
+## from the kernel's list of local sockets (`net.local.stream.pcblist64`,
+## `so_uid`); then a process of that uid holding a socket with that pcb,
+## pinned by its start time read before the socket check and again after
+## its environment is read (`KERN_PROCARGS2`), since darwin has no
+## descriptor that pins a process.
+##
 ## WHEN THERE IS NO RUNQUOTAD, builds still run: the hook answers
 ## `# decline`, says once per build operation that the builds are unadmitted,
 ## and tries the daemon again after `UnavailableRetryMillis`.
@@ -122,32 +146,47 @@
 ## * Every `try` is answered; an error deciding it answers `# decline`.
 ## * The environment read from a client process is that of a process whose
 ##   real uid is the kernel's owner of the client socket, read through a
-##   pinned `/proc/<pid>` directory, bounded, and only three variables are
-##   kept (the group name validated as a session group name).
-## * The privilege drop is setgroups(0), setgid, setuid, in that order;
-##   any failure stops the holder before it connects; the result is checked
-##   (all four uids and gids, no supplementary groups, no capabilities, and
-##   setuid(0) refused); a root hook that knows the uid but not the gid
-##   drops to `NoGroupGid`, never keeps root's group.
+##   pinned `/proc/<pid>` directory (darwin: a process whose start time is
+##   the same before the socket check and after the read), bounded, and
+##   only three variables are kept (the group name validated as a session
+##   group name).
+## * The privilege drop is setgroups, setgid, setuid, in that order
+##   (setgroups(0) on Linux; setgroups(1, [gid]) on darwin, where an empty
+##   list means `{0}`); any failure stops the holder before it connects; the
+##   result is checked (Linux: all four uids and gids, no supplementary
+##   groups, no capabilities; darwin: the real, effective and saved ids and
+##   a group list of the gid alone; and setuid(0) refused); a root hook
+##   that knows the uid but not the gid drops to `NoGroupGid`, never keeps
+##   root's group.
 ## * A holder closes every file descriptor it inherited past standard
 ##   input, output and error before it does anything else.
+## * The darwin watcher, which keeps the hook's credential, takes input only
+##   from the hook (the `claim` line, bounded) and from the kernel; it
+##   writes nothing to the hook, opens no file and takes no lock, and its
+##   only effect is closing the pipe to its own lease holder or killing that
+##   child.
 ## * No file is written, and no path is created; the only files read are
 ##   `/proc` entries and the derivation (a regular file, bounded).
 ##
 ## PLATFORMS. The hook and its holder are POSIX code (process groups, `poll`
-## on pipes, the privilege drop), and the requester lookup is Linux only
-## (`sock_diag` and `/proc`). Elsewhere on POSIX the lookup reports the
-## requester unknown. Where there is no POSIX -- Windows, which has no
-## `nix-daemon` build hook -- only the portable parts are compiled (the wire
-## format, the settings, the derivation and `/proc/locks` parsers, the
-## session and credential checks), and the verb refuses, naming the
-## platform, with a non-zero exit (`runNixBuildHook`).
+## on pipes, the privilege drop). The requester lookup and the release probe
+## are Linux (`sock_diag`, `/proc`, `/proc/locks`) and darwin (`libproc`,
+## `sysctl`, see `nix_hook_darwin`). Elsewhere on POSIX the lookup reports
+## the requester unknown and the release probe reads `/proc/locks`. Where
+## there is no POSIX -- Windows, which has no `nix-daemon` build hook -- only
+## the portable parts are compiled (the wire format, the settings, the
+## derivation, `/proc/locks` and `KERN_PROCARGS2` parsers, the session and
+## credential checks), and the verb refuses, naming the platform, with a
+## non-zero exit (`runNixBuildHook`).
 
 import std/[json, monotimes, os, osproc, streams, strtabs, strutils, tables,
   times, uri]
 
 when defined(posix):
   import std/posix
+
+when defined(macosx):
+  import nix_hook_darwin
 
 import runquota_client
 import runquota_core
@@ -156,7 +195,8 @@ const
   HookVerb* = "nix-build-hook"
   HoldFlag* = "--hold"
   ProbeMillis* = 100
-    ## How often a holder looks at `/proc/locks`.
+    ## How often a holder looks at `/proc/locks` (a darwin watcher, at the
+    ## worker's descriptors).
   ReleaseMisses* = 3
     ## Consecutive free probes before a holder decides the build has ended.
     ## The lease therefore outlives its build by at most
@@ -185,7 +225,8 @@ const
     ## Nix says nothing about a build's memory).
   NoGroupGid* = 65534
     ## The kernel's overflow gid (`nogroup`): what a root holder takes as its
-    ## group when the requester's gid is unknown. It grants nothing.
+    ## group when the requester's gid is unknown. It grants nothing. (macOS
+    ## names no group 65534; a gid no group has grants nothing there too.)
   SettingNameLimit* = 256
   SettingValueLimit* = 4096
   DrvPathLimit* = 4096
@@ -198,6 +239,15 @@ const
     ## any real environment).
   SessionValueLimit* = 64
     ## Bound on the priority and cache-TTL values taken from a client.
+  ClaimLineLimit* = 1024 * 1024
+    ## Bound on one `claim` line from the hook to a darwin holder's watcher
+    ## (a worker pid and one lock path per output, each path at most
+    ## `DrvPathLimit` plus an output name).
+  HolderLineLimit* = 4096
+    ## Bound on one line from a holder to the hook.
+  WatcherReapMillis* = 10_000
+    ## How long a darwin watcher waits for its lease holder to give its
+    ## lease back and exit before it kills it.
   SessionVars* = [SessionGroupEnvVar, SessionPriorityEnvVar,
     SessionCacheTtlEnvVar]
   HolderEndpointVars* = ["RUNQUOTA_SOCKET", "RUNQUOTA_ENDPOINT_SCOPE",
@@ -530,16 +580,32 @@ when defined(posix):
     false
 
   proc anyLockHeldBy*(paths: openArray[string]; pid: int): bool =
-    var text = ""
-    try:
-      text = readFile("/proc/locks")
-    except IOError:
-      return false
-    let locks = parseProcLocks(text)
-    for path in paths:
-      if locks.lockHeldBy(path, pid):
-        return true
-    false
+    ## Whether the process `pid` holds Nix's lock on one of `paths` (a
+    ## `flock(2)` on the file now at that path). Never takes, tests or
+    ## opens the lock itself: a probe that took it, even for an instant,
+    ## could make the worker's own non-blocking `flock` fail.
+    when defined(macosx):
+      # Darwin has no `/proc/locks`. The kernel's list of `pid`'s
+      # descriptors says which files it has open and whether a `flock` was
+      # taken through each (`fileLockHeldBy`). Reading another uid's list
+      # needs root, which only the watcher of a root hook has.
+      var files: seq[(uint64, uint64)] = @[]
+      for path in paths:
+        var info: Stat
+        if stat(path.cstring, info) == 0:
+          files.add((uint64(cast[uint32](info.st_dev)), uint64(info.st_ino)))
+      fileLockHeldBy(pid, files)
+    else:
+      var text = ""
+      try:
+        text = readFile("/proc/locks")
+      except IOError:
+        return false
+      let locks = parseProcLocks(text)
+      for path in paths:
+        if locks.lockHeldBy(path, pid):
+          return true
+      false
 
 # ---------------------------------------------------------------------------
 # The requester
@@ -562,6 +628,37 @@ proc parseEnviron*(data: string): Table[string, string] =
     let eq = entry.find('=')
     if eq > 0:
       result[entry[0 ..< eq]] = entry[eq + 1 .. ^1]
+
+proc parseProcArgs2*(data: string): tuple[argv, env: seq[string]] =
+  ## Darwin's `KERN_PROCARGS2` block: `argc` as a native 32-bit integer,
+  ## the executable path, NUL padding, then `argc` NUL-terminated arguments
+  ## and the environment strings, ended by an empty string (anything after
+  ## it -- the `apple[]` strings -- is not environment). This is the layout
+  ## `exec_copyout_strings` writes (XNU `bsd/kern/kern_exec.c`) and
+  ## `sysctl_procargsx` returns; `ps -E` reads it the same way. Malformed
+  ## or truncated input yields what could be read.
+  if data.len < 4:
+    return
+  var argc = 0
+  for i in countdown(3, 0):
+    argc = (argc shl 8) or int(uint8(data[i]))
+  if argc < 0 or argc > data.len:
+    return
+  var pos = 4
+  # The executable path, then its NUL padding.
+  while pos < data.len and data[pos] != '\0': inc pos
+  while pos < data.len and data[pos] == '\0': inc pos
+  proc next(data: string; pos: var int): string =
+    let start = pos
+    while pos < data.len and data[pos] != '\0': inc pos
+    result = data[start ..< pos]
+    if pos < data.len: inc pos   # the NUL
+  while result.argv.len < argc and pos < data.len:
+    result.argv.add(next(data, pos))
+  while pos < data.len:
+    let entry = next(data, pos)
+    if entry.len == 0: break
+    result.env.add(entry)
 
 proc sessionFromEnviron*(requester: var Requester; data: string) =
   ## The session variables of a client's environment, validated: a group
@@ -853,10 +950,96 @@ when defined(linux):
         discard posix.close(dirFd)
     result.how = "no process of uid " & $result.uid &
       " holds the client end (another PID namespace?)"
+elif defined(macosx):
+  proc requesterOfProcess(pid: int; before: ProcessIdentity;
+                          uid: int): Requester =
+    ## The client process `pid`, seen as `before` and since found holding
+    ## the client end. Its environment and gid are kept only when it runs
+    ## as `uid` and is STILL THE SAME PROCESS after the read: darwin has no
+    ## descriptor that pins a process, so the pin is its start time read
+    ## before the socket check and again after the environment (a pid is
+    ## reused only once its process is gone, and the new one starts later).
+    result = Requester(uid: uid, gid: -1, pid: pid,
+      how: "client pid " & $pid)
+    if before.ruid != uid:
+      result.how.add(" does not run as uid " & $uid &
+        "; its environment is not read")
+      return
+    var environ = ""
+    try:
+      environ = parseProcArgs2(procArgs(pid, EnvironLimit)).env.join("\0")
+    except IOError:
+      result.how.add("; its environment could not be read")
+      return
+    var after: ProcessIdentity
+    if not processIdentity(pid, after) or not sameProcess(before, after) or
+        after.ruid != uid:
+      result.how.add("; it exited before its environment was read")
+      return
+    result.gid = before.rgid
+    result.sessionFromEnviron(environ)
+
+  proc findRequester*(workerPid: int;
+                      budgetMillis = RequesterLookupMillis): Requester =
+    ## The client of the daemon worker `workerPid` on darwin (see the
+    ## module header): the worker's accepted socket from its descriptors,
+    ## the uid that created the client's end from the kernel's socket list,
+    ## then a process of that uid holding the client's end. Returns within
+    ## about `budgetMillis`.
+    let deadline = getMonoTime() + initDuration(milliseconds = budgetMillis)
+    result = Requester(uid: -1, gid: -1, how: "the client was not found")
+    var accepted: seq[UnixSocketEnd] = @[]
+    for socket in unixSocketsOf(workerPid):
+      # The accepted connection carries the listening socket's path (XNU
+      # copies it, `unp_connect`); a listening socket the worker inherited
+      # carries it too but has no peer.
+      if socket.path.startsWith("/") and socket.conn != 0:
+        accepted.add(socket)
+    if accepted.len > 1:
+      let daemonSocket = getEnv("NIX_DAEMON_SOCKET_PATH",
+        "/nix/var/nix/daemon-socket/socket")
+      var named: seq[UnixSocketEnd] = @[]
+      for socket in accepted:
+        if socket.path == daemonSocket: named.add(socket)
+      accepted = named
+    if accepted.len != 1:
+      result.how = "the worker has " & $accepted.len &
+        " named client connections"
+      return
+    # THE REQUESTER IS THE KERNEL'S OWNER OF THE CLIENT'S SOCKET: the uid of
+    # the credential that created it, which the client cannot choose.
+    let clientEnd = accepted[0].conn
+    var uid = -1
+    case socketOwner(clientEnd, uid)
+    of 1:
+      result.uid = uid
+    of 0:
+      result.how = "the client end of the connection was not found"
+      return
+    else:
+      result.how = "the kernel's list of local sockets could not be read"
+      return
+    let me = getCurrentProcessId()
+    # Ascending, so the first holder found is the lowest pid: the client
+    # before any child it forked (pids wrap, so this is a preference only).
+    for pid in allPids():
+      if getMonoTime() > deadline:
+        result.how = "no client process found within " & $budgetMillis &
+          " ms"
+        return
+      if pid == workerPid or pid == me: continue
+      var before: ProcessIdentity
+      if not processIdentity(pid, before) or before.uid != result.uid:
+        continue
+      if not holdsSocket(pid, clientEnd):
+        continue
+      return requesterOfProcess(pid, before, result.uid)
+    result.how = "no process of uid " & $result.uid & " holds the client end"
 else:
   proc findRequester*(workerPid: int;
                       budgetMillis = RequesterLookupMillis): Requester =
-    Requester(uid: -1, gid: -1, how: "requester lookup is Linux only")
+    Requester(uid: -1, gid: -1,
+      how: "requester lookup is Linux and darwin only")
 
 # ---------------------------------------------------------------------------
 # Messages to the client
@@ -880,10 +1063,39 @@ type
     ## The system calls of the privilege drop, injectable so the order, the
     ## failure paths and the checks can be tested without root.
     euid*: proc (): int
-    clearGroups*: proc (): cint        ## setgroups(0, NULL)
+    clearGroups*: proc (gid: int): cint
+      ## Leave only `gid`, or no group at all. Linux: `setgroups(0, NULL)`,
+      ## an empty list. Darwin: `setgroups(1, [gid])`, because XNU turns
+      ## an empty list into `{0}` -- the group `wheel` (`setgroups_internal`,
+      ## `bsd/kern/kern_prot.c`: `if (ngrp < 1) { ngrp = 1; newgroups[0] =
+      ## 0; }`) -- and keeps the effective gid as the list's first entry.
+      ## On darwin the call also opts the process out of directory-service
+      ## group resolution (`CRF_NOMEMBERD`, `kauth_cred_model_setgroups` in
+      ## `bsd/kern/kern_credential.c`), which `setuid` then leaves off.
     setGid*: proc (gid: int): cint     ## setgid(2): real, effective, saved
     setUid*: proc (uid: int): cint     ## setuid(2): real, effective, saved
-    status*: proc (): string           ## /proc/self/status
+    status*: proc (): string
+      ## The kernel's view of this process's credential: `/proc/self/status`
+      ## on Linux, `darwinCredentialStatus` on darwin.
+
+when defined(macosx):
+  proc darwinCredentialStatus*(): string =
+    ## This process's credential as the kernel holds it (`KERN_PROC_PID`),
+    ## in the shape of the `/proc/self/status` lines it stands in for:
+    ## `Uid:` real, effective, saved; `Gid:` the same; `Groups:` the
+    ## kernel's group list. Darwin has no filesystem ids and no capability
+    ## sets. Raises `OSError` when the kernel does not answer.
+    var credential: SelfCredential
+    if not selfCredential(credential):
+      raise newException(OSError,
+        "the kernel did not report this process's credential")
+    result = "Uid:\t" & $credential.ruid & "\t" & $credential.euid & "\t" &
+      $credential.svuid & "\nGid:\t" & $credential.rgid & "\t" &
+      $credential.egid & "\t" & $credential.svgid & "\nGroups:\t"
+    for i, group in credential.groups:
+      if i > 0: result.add(' ')
+      result.add($group)
+    result.add('\n')
 
 when defined(posix):
   proc setgroupsCall(size: csize_t; list: ptr Gid): cint {.
@@ -892,12 +1104,46 @@ when defined(posix):
   proc systemCredentialOps*(): CredentialOps =
     CredentialOps(
       euid: proc (): int = int(geteuid()),
-      clearGroups: proc (): cint = setgroupsCall(0, nil),
+      clearGroups: proc (gid: int): cint =
+        when defined(macosx):
+          var only = Gid(gid)
+          setgroupsCall(1, addr only)
+        else:
+          setgroupsCall(0, nil),
       setGid: proc (gid: int): cint = setgid(Gid(gid)),
       setUid: proc (uid: int): cint = setuid(Uid(uid)),
-      status: proc (): string = readFile("/proc/self/status"))
+      status: proc (): string =
+        when defined(macosx): darwinCredentialStatus()
+        else: readFile("/proc/self/status"))
 
-proc credentialProblem*(status: string; uid, gid: int): string =
+proc darwinCredentialProblem*(status: string; uid, gid: int): string =
+  ## What in a `darwinCredentialStatus` shows a drop to `uid`/`gid`
+  ## incomplete, or "": the real, effective and saved uids and gids are
+  ## the target and the group list holds `gid` and nothing else (the
+  ## effective gid is its first entry, so after `setgid` it is not empty).
+  var seen: seq[string] = @[]
+  for line in status.splitLines():
+    let colon = line.find(':')
+    if colon <= 0: continue
+    let key = line[0 ..< colon]
+    let fields = line[colon + 1 .. ^1].splitWhitespace()
+    case key
+    of "Uid", "Gid":
+      let want = if key == "Uid": uid else: gid
+      if fields.len != 3: return key & " has " & $fields.len & " fields"
+      for field in fields:
+        if field != $want: return key & " is " & fields.join(" ")
+      seen.add(key)
+    of "Groups":
+      for field in fields:
+        if field != $gid: return "supplementary groups " & fields.join(" ")
+      seen.add(key)
+    else: discard
+  for key in ["Uid", "Gid", "Groups"]:
+    if key notin seen: return key & " is missing"
+  ""
+
+proc linuxCredentialProblem*(status: string; uid, gid: int): string =
   ## What in `/proc/self/status` shows a drop to `uid`/`gid` incomplete, or
   ## "": every one of the real, effective, saved and filesystem uids and
   ## gids is the target, there are no supplementary groups, and the
@@ -931,6 +1177,12 @@ proc credentialProblem*(status: string; uid, gid: int): string =
     if key notin seen: return key & " is missing"
   ""
 
+proc credentialProblem*(status: string; uid, gid: int): string =
+  ## The platform's check of `CredentialOps.status` after a drop: Linux's
+  ## (`linuxCredentialProblem`) everywhere but darwin.
+  when defined(macosx): darwinCredentialProblem(status, uid, gid)
+  else: linuxCredentialProblem(status, uid, gid)
+
 proc dropPrivilegesWith*(ops: CredentialOps; uid, gid: int): string =
   ## Become `uid`/`gid` when running as root and the requester is someone
   ## else. Returns what happened, for the log. Raises
@@ -943,7 +1195,7 @@ proc dropPrivilegesWith*(ops: CredentialOps; uid, gid: int): string =
   if gid < 0:
     raise newException(PrivilegeDropError,
       "the requester's group is unknown")
-  if ops.clearGroups() != 0:
+  if ops.clearGroups(gid) != 0:
     raise newException(PrivilegeDropError, "setgroups: " &
       osErrorMsg(osLastError()))
   if ops.setGid(gid) != 0:
@@ -996,6 +1248,56 @@ proc parseHoldArgs*(args: openArray[string]; options: var HoldOptions): bool =
   options.cpuMilli > 0
 
 when defined(posix):
+  type
+    LineReader* = object
+      ## Lines from a descriptor, read without stdio buffering, so that
+      ## `poll` on the descriptor says whether a line can be had.
+      fd*: cint
+      limit*: int       ## A longer line is an error (-1), not an allocation.
+      buffer: string
+
+  proc readLine*(reader: var LineReader; waitMillis: int;
+                 line: var string): int =
+    ## The next line: 1 read, 0 nothing within `waitMillis` (negative:
+    ## wait forever), -1 end of input or a line over `limit`.
+    let deadline = getMonoTime() + initDuration(milliseconds = max(0,
+      waitMillis))
+    while true:
+      let nl = reader.buffer.find('\n')
+      if nl >= 0:
+        line = reader.buffer[0 ..< nl]
+        reader.buffer = reader.buffer[nl + 1 .. ^1]
+        return 1
+      if reader.buffer.len > reader.limit:
+        return -1
+      var timeout = -1
+      if waitMillis >= 0:
+        timeout = max(0, int((deadline - getMonoTime()).inMilliseconds))
+      var fds = [TPollfd(fd: reader.fd, events: POLLIN)]
+      let ready = poll(addr fds[0], Tnfds(1), cint(timeout))
+      if ready > 0:
+        var chunk = newString(4096)
+        let got = posix.read(reader.fd, addr chunk[0], chunk.len)
+        if got < 0 and osLastError() == OSErrorCode(EINTR):
+          continue
+        if got <= 0:
+          return -1
+        reader.buffer.add(chunk[0 ..< got])
+      elif ready < 0 and osLastError() != OSErrorCode(EINTR):
+        return -1
+      elif waitMillis >= 0 and getMonoTime() >= deadline:
+        return 0
+
+  when defined(macosx):
+    proc watcherGone(): bool {.nimcall, gcsafe.} =
+      ## A darwin lease holder's test, while its request is queued, of
+      ## whether its watcher is still there: nothing is written on the pipe
+      ## from the watcher before the claim, and a claim comes only after the
+      ## grant, so standard input readable (data or end of file) means the
+      ## watcher's end closed.
+      var fds = [TPollfd(fd: 0, events: POLLIN)]
+      poll(addr fds[0], Tnfds(1), 0) != 0
+
   proc emit(line: string): bool =
     ## One line to the hook; false once the hook is gone.
     try:
@@ -1005,21 +1307,26 @@ when defined(posix):
     except IOError:
       false
 
-  proc closeInheritedFds() =
+  proc closeInheritedFds*() =
     ## Closes every descriptor past standard input, output and error. The
     ## hook inherits the worker's descriptors (the builder-output pipe on 4
     ## and 5 among them) and its other holders' pipes; none of them is this
     ## holder's to keep, and a holder that runs as a user must not carry root's.
     var fds: seq[cint] = @[]
-    try:
-      for _, path in walkDir("/proc/self/fd"):
-        try:
-          let fd = parseInt(extractFilename(path))
-          if fd > 2: fds.add(cint(fd))
-        except ValueError:
-          discard
-    except OSError:
-      discard
+    when defined(macosx):
+      # No `/proc/self/fd`: the kernel lists this process's descriptors.
+      for entry in listFds(getCurrentProcessId()):
+        if entry.fd > 2: fds.add(cint(entry.fd))
+    else:
+      try:
+        for _, path in walkDir("/proc/self/fd"):
+          try:
+            let fd = parseInt(extractFilename(path))
+            if fd > 2: fds.add(cint(fd))
+          except ValueError:
+            discard
+      except OSError:
+        discard
     for fd in fds:
       discard posix.close(fd)   # the listing's own fd is already closed: EBADF
 
@@ -1037,51 +1344,28 @@ when defined(posix):
     ## https://man7.org/linux/man-pages/man2/prctl.2.html; set after the
     ## privilege drop, which clears it). Once claimed it must outlive the hook,
     ## which the worker kills as soon as its build operation is over.
+    ## (Darwin has no `PR_SET_PDEATHSIG`; its watcher stands in for it, see
+    ## `watchHolder`.)
     when defined(linux):
       discard prctlCall(PrSetPdeathsig,
         culong(if tied: SIGKILL else: cint(0)))
       if tied and getppid() != hook:
         quit(0)
 
-  proc waitForLine(timeoutMillis: int; line: var string): int =
-    ## One line on standard input: 1 read, 0 timeout, -1 end of input.
-    var fds = [TPollfd(fd: 0, events: POLLIN)]
-    let ready = poll(addr fds[0], Tnfds(1), cint(timeoutMillis))
-    if ready == 0: return 0
-    if ready < 0: return -1
-    try:
-      if stdin.readLine(line): return 1
-    except IOError:
-      discard
-    -1
+  type
+    HeldUntil = proc (worker: int; locks: seq[string]) {.closure.}
+      ## Returns when the claimed build is over and the lease must go back.
 
-  proc runHolder*(args: seq[string]; clientVersion: string): int =
-    ## `runquota nix-build-hook --hold ...`: one lease for one derivation
-    ## build. Speaks to the hook in lines on standard input and output:
-    ## it writes `granted <milli>`, `unavailable <why>` or `refused <why>`;
-    ## the hook writes `claim <worker pid> <lock path>...` (tab separated),
-    ## which the holder confirms with `claimed`.
-    closeInheritedFds()
-    var options: HoldOptions
-    if not parseHoldArgs(args, options):
-      discard emit("refused bad holder arguments")
-      return 2
-    let hook = getppid()
-    try:
-      discard dropPrivilegesWith(systemCredentialOps(), options.uid,
-        options.gid)
-    except CatchableError as failure:
-      discard emit("refused cannot act as the requester: " & failure.msg)
-      return 1
-    when defined(linux):
-      # Nothing this process could exec may gain privileges again.
-      discard prctlCall(PrSetNoNewPrivs, culong(1), culong(0), culong(0),
-        culong(0))
-    # Out of the hook's process group: the worker kills that group when its
-    # build operation ends, and a claimed holder still has to give its lease
-    # back after that.
-    discard setsid()
-    tieToHook(true, hook)
+  proc holdLease(options: HoldOptions; clientVersion: string;
+                 cancelled: proc (): bool {.nimcall, gcsafe.};
+                 onClaim: proc () {.closure.};
+                 heldUntil: HeldUntil): int =
+    ## The lease holder proper, already running as the requester: one lease
+    ## for one derivation build. Speaks to the hook in lines on standard
+    ## input and output: it writes `granted <milli>`, `unavailable <why>` or
+    ## `refused <why>`; the hook writes `claim <worker pid> <lock path>...`
+    ## (tab separated), which the holder confirms with `claimed`. While the
+    ## request is queued, `cancelled` (when given) is asked every poll.
     var client: RunQuotaClient
     try:
       client = connectDefault()
@@ -1097,14 +1381,19 @@ when defined(posix):
       let request = resourceRequest(options.label, milliCpu(options.cpuMilli),
         bytes(options.memoryBytes))
       lease = session.requestLeaseWaiting(request,
-        pollMillis = HolderGrantPollMillis)
+        pollMillis = HolderGrantPollMillis, cancelled = cancelled)
     except CatchableError as failure:
+      if cancelled != nil and cancelled():
+        # Nobody is waiting for this lease any more; the daemon drops the
+        # queued request when the connection closes.
+        return 0
       discard emit("refused " & failure.msg.replace('\n', ' '))
       return 1
+    var input = LineReader(fd: 0, limit: ClaimLineLimit)
     var line = ""
     let answer =
       if emit("granted " & $lease.resources.cpu.value):
-        waitForLine(options.unclaimedMillis, line)
+        input.readLine(options.unclaimedMillis, line)
       else: -1
     if answer != 1 or not line.startsWith("claim "):
       # Never claimed: the derivation was built by someone else, the worker
@@ -1121,7 +1410,7 @@ when defined(posix):
     try: worker = parseInt(fields[0])
     except ValueError: return 1
     let locks = fields[1 .. ^1]
-    tieToHook(false, hook)
+    if onClaim != nil: onClaim()
     discard emit("claimed")
     try:
       lease.markStarting()
@@ -1130,21 +1419,190 @@ when defined(posix):
       lease.markRunning(childProcessId = uint64(worker))
     except CatchableError:
       discard
-    var misses = 0
-    while misses < ReleaseMisses:
-      sleep(ProbeMillis)
-      if not dirExists("/proc" / $worker):
-        break
-      if anyLockHeldBy(locks, worker):
-        misses = 0
-      else:
-        inc misses
+    heldUntil(worker, locks)
     try:
       lease.release()
       session.closeSession()
     except CatchableError:
       discard
     0
+
+  when not defined(macosx):
+    proc runHolder*(args: seq[string]; clientVersion: string): int =
+      ## `runquota nix-build-hook --hold ...`: one lease for one derivation
+      ## build (`holdLease`). It drops to the requester, ties itself to the
+      ## hook until its grant is claimed, and once claimed holds the lease
+      ## while the worker holds the build's output locks (`/proc/locks`).
+      closeInheritedFds()
+      var options: HoldOptions
+      if not parseHoldArgs(args, options):
+        discard emit("refused bad holder arguments")
+        return 2
+      let hook = getppid()
+      try:
+        discard dropPrivilegesWith(systemCredentialOps(), options.uid,
+          options.gid)
+      except CatchableError as failure:
+        discard emit("refused cannot act as the requester: " & failure.msg)
+        return 1
+      when defined(linux):
+        # Nothing this process could exec may gain privileges again.
+        discard prctlCall(PrSetNoNewPrivs, culong(1), culong(0), culong(0),
+          culong(0))
+      # Out of the hook's process group: the worker kills that group when its
+      # build operation ends, and a claimed holder still has to give its lease
+      # back after that.
+      discard setsid()
+      tieToHook(true, hook)
+      holdLease(options, clientVersion, cancelled = nil,
+        onClaim = proc () = tieToHook(false, hook),
+        heldUntil = proc (worker: int; locks: seq[string]) =
+          var misses = 0
+          while misses < ReleaseMisses:
+            sleep(ProbeMillis)
+            if not dirExists("/proc" / $worker):
+              break
+            if anyLockHeldBy(locks, worker):
+              misses = 0
+            else:
+              inc misses)
+
+  else:
+    proc childExited(child: Pid): bool =
+      ## Whether the watcher's lease holder has exited (it is reaped then).
+      var status: cint
+      let reaped = waitpid(child, status, WNOHANG)
+      reaped == child or (reaped < 0 and osLastError() != OSErrorCode(EINTR))
+
+    proc reapWithin(child: Pid; millis: int) =
+      ## Waits for the lease holder to exit, and kills it (its own child, by
+      ## a pid that cannot be reused before it is reaped) if it has not
+      ## within `millis`.
+      let deadline = getMonoTime() + initDuration(milliseconds = millis)
+      while getMonoTime() < deadline:
+        if childExited(child): return
+        sleep(20)
+      discard kill(child, SIGKILL)
+      var status: cint
+      discard waitpid(child, status, 0)
+
+    proc watchHolder(child: Pid; toChild: cint): int =
+      ## THE WATCHER, darwin's stand-in for `/proc/locks` and
+      ## `PR_SET_PDEATHSIG`. It keeps the hook's credential (root, under a
+      ## multi-user daemon) because only root can read the descriptors of
+      ## the root worker, and it does nothing a user could steer: its only
+      ## input is the hook's `claim` line (the hook is root too); it reads
+      ## the kernel's view of the worker; its only output is closing the
+      ## pipe to its lease holder, which then gives the lease back. It
+      ## writes nothing to the hook, opens no file and takes no lock.
+      ##
+      ## * Before the claim it watches the hook: the hook's end of standard
+      ##   input closing means the hook is gone, and the queued lease holder
+      ##   is killed, as `PR_SET_PDEATHSIG` kills a Linux holder.
+      ## * It forwards the claim to the lease holder and from then on
+      ##   ignores the hook, which the worker kills when its build operation
+      ##   ends while the build it claimed may still be running.
+      ## * It probes every `ProbeMillis` whether the worker -- the same
+      ##   process, by its start time -- still holds a `flock` on one of the
+      ##   build's output locks (`anyLockHeldBy`), and after `ReleaseMisses`
+      ##   free probes, or once the worker is gone, closes the pipe.
+      # Standard output and error are the pipe to the hook, and they belong
+      # to the lease holder: the hook reads the end of that pipe as the
+      # holder's exit, which must not wait for this process.
+      let devNull = posix.open("/dev/null", O_RDWR)
+      if devNull >= 0:
+        discard dup2(devNull, 1)
+        discard dup2(devNull, 2)
+        discard posix.close(devNull)
+      var fromHook = LineReader(fd: 0, limit: ClaimLineLimit)
+      var line = ""
+      while true:
+        if childExited(child):
+          return 0
+        let got = fromHook.readLine(ProbeMillis, line)
+        if got < 0:
+          # The hook is gone before it claimed this lease.
+          discard kill(child, SIGKILL)
+          var status: cint
+          discard waitpid(child, status, 0)
+          return 0
+        if got == 1 and line.startsWith("claim "):
+          break
+      let fields = line["claim ".len .. ^1].split('\t')
+      var worker = 0
+      try: worker = parseInt(fields[0])
+      except ValueError: worker = 0
+      let forwarded = line & "\n"
+      discard posix.write(toChild, forwarded.cstring, forwarded.len)
+      var identity: ProcessIdentity
+      let known = worker > 0 and processIdentity(worker, identity)
+      var misses = if known: 0 else: ReleaseMisses
+      while misses < ReleaseMisses:
+        sleep(ProbeMillis)
+        if childExited(child):
+          # It gave up (its grant was already gone) or was killed.
+          return 0
+        var now: ProcessIdentity
+        if not processIdentity(worker, now) or not sameProcess(now, identity):
+          break
+        if anyLockHeldBy(fields[1 .. ^1], worker):
+          misses = 0
+        else:
+          inc misses
+      discard posix.close(toChild)
+      reapWithin(child, WatcherReapMillis)
+      0
+
+    proc runHolder*(args: seq[string]; clientVersion: string): int =
+      ## `runquota nix-build-hook --hold ...` on darwin: TWO PROCESSES. The
+      ## process the hook starts stays as the hook's user and becomes the
+      ## watcher (`watchHolder`); its child drops to the requester and holds
+      ## the lease (`holdLease`). The child talks to the hook directly on
+      ## standard output; its standard input is a pipe from the watcher,
+      ## which forwards the claim and closes the pipe when the build is over.
+      closeInheritedFds()
+      var options: HoldOptions
+      if not parseHoldArgs(args, options):
+        discard emit("refused bad holder arguments")
+        return 2
+      # A write to a pipe whose reader is gone is an error to handle, not a
+      # signal that kills the process.
+      signal(SIGPIPE, SIG_IGN)
+      # Out of the hook's process group, both processes: the worker kills
+      # that group when its build operation ends, and a claimed lease must
+      # still be given back after that.
+      discard setsid()
+      var toChild: array[2, cint]
+      if pipe(toChild) != 0:
+        discard emit("refused cannot create the holder's pipe: " &
+          osErrorMsg(osLastError()))
+        return 1
+      let child = fork()
+      if child < 0:
+        discard emit("refused cannot fork the holder: " &
+          osErrorMsg(osLastError()))
+        return 1
+      if child == 0:
+        # The lease holder.
+        discard posix.close(toChild[1])
+        discard dup2(toChild[0], 0)
+        discard posix.close(toChild[0])
+        try:
+          discard dropPrivilegesWith(systemCredentialOps(), options.uid,
+            options.gid)
+        except CatchableError as failure:
+          discard emit("refused cannot act as the requester: " & failure.msg)
+          exitnow(1)
+        exitnow(cint(holdLease(options, clientVersion,
+          cancelled = watcherGone,
+          onClaim = nil,
+          heldUntil = proc (worker: int; locks: seq[string]) =
+            # Until the watcher closes the pipe (or dies).
+            var input = LineReader(fd: 0, limit: ClaimLineLimit)
+            var ignored = ""
+            while input.readLine(-1, ignored) >= 0: discard)))
+      discard posix.close(toChild[0])
+      watchHolder(child, toChild[1])
 
 # ---------------------------------------------------------------------------
 # The hook
@@ -1170,9 +1628,8 @@ when defined(posix):
   type
     Holder = ref object
       process: Process
-      fd: cint
-      buffer: string
-      event: string     ## The first event line, once read.
+      output: LineReader   ## What the holder writes.
+      event: string        ## The first event line, once read.
 
     HookState = object
       settings: HookSettings
@@ -1187,28 +1644,7 @@ when defined(posix):
   proc nextLine(holder: Holder; waitMillis: int; line: var string): int =
     ## The holder's next line: 1 read, 0 nothing within `waitMillis`, -1 the
     ## holder closed its output (or wrote something that is not a line).
-    let deadline = getMonoTime() + initDuration(milliseconds = waitMillis)
-    while true:
-      let nl = holder.buffer.find('\n')
-      if nl >= 0:
-        line = holder.buffer[0 ..< nl]
-        holder.buffer = holder.buffer[nl + 1 .. ^1]
-        return 1
-      if holder.buffer.len > 4096:
-        return -1
-      var fds = [TPollfd(fd: holder.fd, events: POLLIN)]
-      let remaining = max(0, int((deadline - getMonoTime()).inMilliseconds))
-      let ready = poll(addr fds[0], Tnfds(1), cint(remaining))
-      if ready > 0:
-        var chunk = newString(512)
-        let got = posix.read(holder.fd, addr chunk[0], chunk.len)
-        if got <= 0:
-          return -1
-        holder.buffer.add(chunk[0 ..< got])
-      elif ready < 0 and osLastError() != OSErrorCode(EINTR):
-        return -1
-      elif getMonoTime() >= deadline:
-        return 0
+    holder.output.readLine(waitMillis, line)
 
   proc readEvent(holder: Holder; waitMillis: int): bool =
     ## Reads what the holder has written; true once its first event is in.
@@ -1234,7 +1670,8 @@ when defined(posix):
                            else: NoGroupGid)])
     let process = startProcess(getAppFilename(), args = args,
       env = holderEnv(state.requester), options = {poStdErrToStdOut})
-    Holder(process: process, fd: cint(process.outputHandle))
+    Holder(process: process, output: LineReader(
+      fd: cint(process.outputHandle), limit: HolderLineLimit))
 
   proc endHolder(holder: Holder) =
     ## Ends a holder this hook started (its own child, by its pid, which

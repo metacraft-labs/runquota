@@ -29,6 +29,21 @@
 ## clearing the supplementary groups, carrying on after a failed step, or
 ## not checking the result (`privilege drop`).
 ##
+## ON DARWIN the same cases run against darwin's sources: the lock is seen
+## through the holder process's descriptor list (`FWASLOCKED` on an open
+## descriptor of the lock file) instead of `/proc/locks`; the requester
+## through the worker's descriptors and the kernel's socket list instead of
+## `sock_diag`, and its environment from `KERN_PROCARGS2`; the credential
+## check reads `KERN_PROC_PID` instead of `/proc/self/status`. Mutations
+## that fail a case there: a lock probe that ignores `FWASLOCKED` or the
+## inode (`proc locks`); an owner lookup that answers -1, or a client
+## process found without matching its socket's pcb (`requester`); a holder
+## that closes no descriptor because there is no `/proc/self/fd` (`holder
+## descriptors`). `KERN_PROCARGS2` parsing and both platforms' credential
+## checks are pure and run on every host. What the real darwin
+## `setgroups`/`setgid`/`setuid` leave behind needs root and is not tested
+## here (the injected ops only show that the target gid reaches setgroups).
+##
 ## WITHOUT POSIX (Windows) the hook is not built: what is tested there is
 ## that the verb refuses, naming the platform, with a non-zero exit; the
 ## cases above are reported skipped.
@@ -50,7 +65,7 @@ when not defined(posix):
       skip()
 else:
   import std/[os, osproc, posix, streams, strtabs, strutils, tables, tempfiles,
-    unittest]
+    times, unittest]
 
   import runquota_cli_support/nix_hook
 
@@ -238,6 +253,62 @@ else:
       check not anyLockHeldBy([path], int(holder))
       check not anyLockHeldBy([dir / "missing.lock"], int(holder))
 
+    test "an open descriptor is not a held lock until it takes the flock":
+      let dir = getTempDir() / "rqnixop" & $getCurrentProcessId()
+      createDir(dir)
+      defer: removeDir(dir)
+      let path = dir / "out.lock"
+      writeFile(path, "")
+      # The child opens the lock file, says so, waits, then takes the
+      # flock and says so again.
+      var ready: array[2, cint]
+      var go: array[2, cint]
+      require pipe(ready) == 0 and pipe(go) == 0
+      let holder = fork()
+      if holder == 0:
+        let fd = posix.open(path.cstring, O_RDWR)
+        var b = 'o'
+        discard posix.write(ready[1], addr b, 1)
+        discard posix.read(go[0], addr b, 1)
+        if fd < 0 or flockCall(fd, LockEx) != 0: exitnow(1)
+        b = 'l'
+        discard posix.write(ready[1], addr b, 1)
+        discard posix.sleep(30)
+        exitnow(0)
+      require holder > 0
+      var b = ' '
+      require posix.read(ready[0], addr b, 1) == 1
+      # Open, not locked: a probe that took any open descriptor of the file
+      # for a lock (on darwin, one that ignored FWASLOCKED) fails here.
+      check not anyLockHeldBy([path], int(holder))
+      discard posix.write(go[1], addr b, 1)
+      require posix.read(ready[0], addr b, 1) == 1
+      check anyLockHeldBy([path], int(holder))
+      discard kill(holder, SIGKILL)
+      var status: cint
+      discard waitpid(holder, status, 0)
+      for fd in [ready[0], ready[1], go[0], go[1]]: discard posix.close(fd)
+
+  suite "holder descriptors":
+    test "a holder closes every descriptor it inherited past 0-2":
+      var sink: array[2, cint]
+      require pipe(sink) == 0
+      let file = posix.open("/dev/null".cstring, O_RDONLY)
+      require file > 2
+      let child = fork()
+      if child == 0:
+        closeInheritedFds()
+        for fd in [sink[0], sink[1], file]:
+          if fcntl(fd, F_GETFD) != -1: exitnow(1)
+        for fd in [cint(0), cint(1), cint(2)]:
+          if fcntl(fd, F_GETFD) == -1: exitnow(2)
+        exitnow(0)
+      require child > 0
+      var status: cint
+      require waitpid(child, status, 0) == child
+      check WIFEXITED(status) and WEXITSTATUS(status) == 0
+      for fd in [sink[0], sink[1], file]: discard posix.close(fd)
+
   suite "requester":
     test "environment and ids":
       let env = parseEnviron("A=1\0RUNQUOTA_SESSION=host:w1\0EMPTY=\0")
@@ -250,7 +321,26 @@ else:
       check socketInode("socket:[123]") == 123'u64
       check socketInode("pipe:[123]") == 0'u64
 
-    when defined(linux):
+    test "darwin's KERN_PROCARGS2 block":
+      # argc 2, the executable path and its padding, two arguments, two
+      # variables, the empty string that ends them, then apple[] strings
+      # that are not environment.
+      let block2 = "\x02\x00\x00\x00/bin/x\0\0\0\0x\0-v\0" &
+        "RUNQUOTA_SESSION=g1\0HOME=/h\0\0executable_path=/bin/x\0"
+      let parsed = parseProcArgs2(block2)
+      check parsed.argv == @["x", "-v"]
+      check parsed.env == @["RUNQUOTA_SESSION=g1", "HOME=/h"]
+      # A variable that looks like a session past the end of the
+      # environment is not read.
+      let after = parseProcArgs2("\x01\x00\x00\x00/x\0x\0A=1\0\0" &
+        "RUNQUOTA_SESSION=apple\0")
+      check after.env == @["A=1"]
+      # Truncated or nonsensical blocks yield what could be read.
+      check parseProcArgs2("").env.len == 0
+      check parseProcArgs2("\xff\xff\xff\x7f/x\0").argv.len == 0
+      check parseProcArgs2("\x05\x00\x00\x00/x\0a\0").argv == @["a"]
+
+    when defined(linux) or defined(macosx):
       test "the client of an accepted connection, and its group":
         # This process plays the worker: it listens on a named socket and
         # accepts one client, a re-executed copy of this binary whose
@@ -277,7 +367,13 @@ else:
         require cint(accepted) >= 0
         # The listening socket carries the same name but has no peer; it must
         # not count as a second connection.
+        let started = epochTime()
         let found = findRequester(getCurrentProcessId())
+        let tookMillis = int((epochTime() - started) * 1000)
+        echo "requester lookup: ", tookMillis, " ms (", found.how, ")"
+        # Bounded: the process walk stops at `RequesterLookupMillis`; the
+        # socket queries before it are single kernel calls.
+        check tookMillis < 4 * RequesterLookupMillis
         check found.pid == client.processID
         check found.group == "the-client-group"
         check found.priority == "low"
@@ -338,17 +434,24 @@ else:
         delEnv(key)
 
   suite "privilege drop":
-    const goodStatus = "Name:\tx\nUid:\t1000\t1000\t1000\t1000\n" &
-      "Gid:\t100\t100\t100\t100\nGroups:\t\nCapPrm:\t0000000000000000\n" &
-      "CapEff:\t0000000000000000\nCapAmb:\t0000000000000000\n"
+    const
+      linuxGoodStatus = "Name:\tx\nUid:\t1000\t1000\t1000\t1000\n" &
+        "Gid:\t100\t100\t100\t100\nGroups:\t\nCapPrm:\t0000000000000000\n" &
+        "CapEff:\t0000000000000000\nCapAmb:\t0000000000000000\n"
+      # `darwinCredentialStatus`: real, effective, saved; the kernel's group
+      # list, whose first entry is the effective gid.
+      darwinGoodStatus = "Uid:\t1000\t1000\t1000\nGid:\t100\t100\t100\n" &
+        "Groups:\t100\n"
+      goodStatus = when defined(macosx): darwinGoodStatus
+                   else: linuxGoodStatus
 
     proc fakeOps(calls: ref seq[string]; root = true; failAt = "";
                  regain = false; status = goodStatus): CredentialOps =
       ## Records each call; `failAt` names the one that fails.
       CredentialOps(
         euid: proc (): int = (if root: 0 else: 1000),
-        clearGroups: proc (): cint =
-          calls[].add("setgroups")
+        clearGroups: proc (gid: int): cint =
+          calls[].add("setgroups " & $gid)
           cint(if failAt == "setgroups": -1 else: 0),
         setGid: proc (gid: int): cint =
           calls[].add("setgid " & $gid)
@@ -362,7 +465,10 @@ else:
       let calls = new(seq[string])
       check dropPrivilegesWith(fakeOps(calls), 1000, 100) ==
         "as uid 1000 gid 100"
-      check calls[] == @["setgroups", "setgid 100", "setuid 1000", "setuid 0"]
+      # The target gid reaches setgroups: darwin keeps it as the only group
+      # (an empty list there is {0}, `wheel`); Linux clears the list.
+      check calls[] == @["setgroups 100", "setgid 100", "setuid 1000",
+        "setuid 0"]
 
     test "a failed step stops the drop before the next one":
       for step in ["setgroups", "setgid", "setuid"]:
@@ -375,17 +481,43 @@ else:
       let calls = new(seq[string])
       expect PrivilegeDropError:
         discard dropPrivilegesWith(fakeOps(calls, regain = true), 1000, 100)
-      for bad in [goodStatus.replace("Groups:\t", "Groups:\t0 10"),
-                  goodStatus.replace("Uid:\t1000\t1000\t1000\t1000",
-                    "Uid:\t1000\t0\t1000\t1000"),
-                  goodStatus.replace("Gid:\t100\t100\t100\t100",
-                    "Gid:\t100\t100\t0\t100"),
-                  goodStatus.replace("CapEff:\t0000000000000000",
-                    "CapEff:\t000001ffffffffff"),
-                  goodStatus.replace("CapAmb:\t0000000000000000\n", "")]:
+      let bad = when defined(macosx):
+          @[darwinGoodStatus.replace("Groups:\t100", "Groups:\t100 0"),
+            darwinGoodStatus.replace("Groups:\t100", "Groups:\t0"),
+            darwinGoodStatus.replace("Uid:\t1000\t1000\t1000",
+              "Uid:\t1000\t1000\t0"),
+            darwinGoodStatus.replace("Gid:\t100\t100\t100",
+              "Gid:\t100\t0\t100"),
+            darwinGoodStatus.replace("Groups:\t100\n", "")]
+        else:
+          @[linuxGoodStatus.replace("Groups:\t", "Groups:\t0 10"),
+            linuxGoodStatus.replace("Uid:\t1000\t1000\t1000\t1000",
+              "Uid:\t1000\t0\t1000\t1000"),
+            linuxGoodStatus.replace("Gid:\t100\t100\t100\t100",
+              "Gid:\t100\t100\t0\t100"),
+            linuxGoodStatus.replace("CapEff:\t0000000000000000",
+              "CapEff:\t000001ffffffffff"),
+            linuxGoodStatus.replace("CapAmb:\t0000000000000000\n", "")]
+      for status in bad:
         expect PrivilegeDropError:
-          discard dropPrivilegesWith(fakeOps(new(seq[string]), status = bad),
-            1000, 100)
+          discard dropPrivilegesWith(fakeOps(new(seq[string]),
+            status = status), 1000, 100)
+
+    test "each platform's check, on the other's shape too":
+      # Both checks are pure, so both are tested on every host.
+      check linuxCredentialProblem(linuxGoodStatus, 1000, 100) == ""
+      check darwinCredentialProblem(darwinGoodStatus, 1000, 100) == ""
+      # A status of the other platform's shape is never accepted.
+      check linuxCredentialProblem(darwinGoodStatus, 1000, 100).len > 0
+      check darwinCredentialProblem(linuxGoodStatus, 1000, 100).len > 0
+      # Darwin: wheel (0) left in the list -- what setgroups(0, NULL) leaves
+      # there -- is a supplementary group, and so is any other.
+      check darwinCredentialProblem(darwinGoodStatus.replace("Groups:\t100",
+        "Groups:\t100 0"), 1000, 100).startsWith("supplementary groups")
+      check darwinCredentialProblem(darwinGoodStatus.replace("Groups:\t100",
+        "Groups:\t20 12 61"), 1000, 100).startsWith("supplementary groups")
+      check darwinCredentialProblem("Uid:\t1000\t1000\t1000\n" &
+        "Gid:\t100\t100\t100\n", 1000, 100) == "Groups is missing"
 
     test "an unknown group is refused, never kept":
       let calls = new(seq[string])
@@ -400,11 +532,18 @@ else:
         check calls[].len == 0
 
     test "the check reads this process's real status":
-      let own = readFile("/proc/self/status")
+      # The kernel's view: `/proc/self/status` on Linux, `KERN_PROC_PID` on
+      # darwin.
+      let own = systemCredentialOps().status()
       # An unprivileged test process has no capabilities and its own ids.
       let problem = credentialProblem(own, int(getuid()), int(getgid()))
       check problem.len == 0 or problem.startsWith("supplementary groups")
       check credentialProblem(own, int(getuid()) + 1, int(getgid())).len > 0
+      when defined(macosx):
+        # The kernel's ids, in the order the check reads them.
+        check own.startsWith("Uid:\t" & $getuid() & "\t" & $geteuid() & "\t")
+        check ("\nGid:\t" & $getgid() & "\t" & $getegid() & "\t") in own
+        check ("\nGroups:\t" & $getegid()) in own
 
   suite "holder arguments":
     test "out-of-range values are refused, not converted":

@@ -40,21 +40,40 @@
 ## the worker is this process, writing exactly what Nix's `HookInstance` and
 ## `DerivationBuildingGoal::tryBuildHook` write.
 ##
+## * `a_queued_holder_dies_with_a_killed_hook` -- the worker kills the hook
+##   while one holder is claimed and one queued: the queued one dies and
+##   its request leaves the daemon's queue, the claimed one stays until the
+##   worker lets go. Mutations that fail it: no `PR_SET_PDEATHSIG` (Linux);
+##   a darwin watcher that ignores its hook's pipe closing.
+## * In `every_try_is_answered_in_bound` the queue is empty once the hook
+##   has stopped; a darwin lease holder that does not notice its watcher
+##   was killed stays queued, and fails it.
+## * `a_lease_ends_within_half_a_second_of_its_build` -- once the worker
+##   (this test) lets go of a claimed build's lock, the lease is gone within
+##   `ReleaseBoundMillis`, and the holder has exited. Mutations that fail
+##   it: a holder (Linux) or watcher (darwin) that never sees the lock go
+##   free; ten times `ReleaseMisses`.
+##
 ## ISOLATION. A private `runquotad` on a socket in a fresh 0700 scratch
 ## directory. Only the hook and the daemon this test started are signalled,
 ## by their `Process`; holders are the hook's children and are only
-## observed (read-only `/proc`), never signalled. The scratch directory is
-## removed at the end.
+## observed (read-only: `/proc` on Linux, `libproc` and `KERN_PROCARGS2` on
+## darwin, `tests/support/process_listing`), never signalled. The scratch
+## directory is removed at the end.
 ##
-## Linux only, like the hook's requester lookup.
+## Linux and darwin, like the hook's requester lookup and release probe. On
+## darwin a holder is two processes, the watcher the hook starts and the
+## lease holder it forks; the secrets case checks both, and the cases that
+## end with no holder left look for either.
 
-when defined(linux):
+when defined(linux) or defined(macosx):
   import std/[json, monotimes, os, osproc, posix, streams, strtabs, strutils,
     times,
     unittest]
 
   import daemon_binary
   import private_daemon_fixture
+  import process_listing
   import runquota_cli_support/nix_hook
 
   const
@@ -64,6 +83,10 @@ when defined(linux):
       ## The hook's own bound is under a second (`RequesterLookupMillis +
       ## ImmediateGrantMillis + ClaimConfirmMillis` plus a process start);
       ## the margin is for a loaded host.
+    ReleaseBoundMillis = 600
+      ## A lease outlives its build by `ReleaseMisses` probes `ProbeMillis`
+      ## apart plus up to one probe (~400 ms); the rest is the release
+      ## round trip and the status query that observes it.
     LockEx = cint(2)
     LockUn = cint(8)
 
@@ -229,18 +252,20 @@ when defined(linux):
       sleep(100)
     false
 
-  proc childrenOf(pid: int): seq[int] =
-    ## Live children of `pid`, from `/proc/<n>/stat` (read-only).
-    for kind, dir in walkDir("/proc"):
-      let name = extractFilename(dir)
-      if name.len == 0 or not name[0].isDigit: continue
-      try:
-        let stat = readFile(dir / "stat")
-        let fields = stat[stat.rfind(')') + 2 .. ^1].splitWhitespace()
-        if fields.len > 1 and fields[0] != "Z" and parseInt(fields[1]) == pid:
-          result.add(parseInt(name))
-      except CatchableError:
-        discard
+  proc queued(fixture: Fixture): int =
+    ## Lease requests the daemon holds in its queue.
+    let (code, text) = cli(privateEnv(fixture.rqSocket), ["leases", "--json"])
+    prerequisite code == 0, "runquota leases failed: " & text
+    for lease in parseJson(text)["leases"]:
+      if lease["state"].getStr() == "queued": inc result
+
+  proc queuedBecomesZero(fixture: Fixture): bool =
+    ## A queued request whose holder is gone leaves the queue when its
+    ## connection closes; one that waits on for nothing does not.
+    for _ in 0 ..< 20:
+      if fixture.queued() == 0: return true
+      sleep(100)
+    false
 
   proc childrenGone(pid: int): bool =
     for _ in 0 ..< 50:
@@ -254,9 +279,7 @@ when defined(linux):
     ## itself to every process it sees started, whatever its environment).
     ## The same layer adds them to the holder; they are not the hook's to
     ## remove, and the secret check still covers their values.
-    let environ = readFile("/proc" / $fixture.hook.process.processID /
-      "environ")
-    for entry in environ.split('\0'):
+    for entry in processEnviron(fixture.hook.process.processID):
       let eq = entry.find('=')
       if eq > 0 and not fixture.hookEnv.hasKey(entry[0 ..< eq]):
         result.add(entry[0 ..< eq])
@@ -282,17 +305,25 @@ when defined(linux):
         sleep(200)
       check answer == "decline"
       check fixture.granted() == 2000
-      # The holder: one child of the hook, holding the lease.
+      # The holder: one child of the hook, holding the lease. On darwin that
+      # child is the watcher and the lease is held by ITS child; both are
+      # checked.
       let holders = childrenOf(fixture.hook.process.processID)
       check holders.len == 1
-      for pid in holders:
-        let argv = readFile("/proc" / $pid / "cmdline")
-        check holdsNoSecret(argv)
-        let environ = readFile("/proc" / $pid / "environ")
+      var holderProcesses = holders
+      when defined(macosx):
+        for pid in holders:
+          let leaseHolders = childrenOf(pid)
+          check leaseHolders.len == 1
+          holderProcesses.add(leaseHolders)
+      for pid in holderProcesses:
+        let argv = processArgv(pid)
+        check argv.len > 0
+        check holdsNoSecret(argv.join("\0"))
+        let environ = processEnviron(pid).join("\0")
         check holdsNoSecret(environ)
         let ambient = injectedByExec(fixture)
-        for entry in environ.split('\0'):
-          if entry.len == 0: continue
+        for entry in processEnviron(pid):
           let key = entry[0 ..< max(0, entry.find('='))]
           let allowed = key in HolderEndpointVars or key in SessionVars or
             key in ambient
@@ -304,6 +335,7 @@ when defined(linux):
       fixture.dropLock(lockFd)
       check fixture.grantedBecomes(0)
       check childrenGone(fixture.hook.process.processID)
+      check noHoldersLeft(fixture.rqSocket)
       # End of the build operation: the hook exits on its own.
       fixture.hook.process.inputStream.close()
       check fixture.hook.process.waitForExit(5000) == 0
@@ -354,11 +386,18 @@ when defined(linux):
       check fixture.nextReply(elapsed) == "decline-permanently"
       check elapsed <= ReplyBoundMillis
       check fixture.hook.process.waitForExit(5000) == 0
-      # Its queued holder stopped with it; the claimed one holds on while
-      # the worker builds, and lets go when the worker does.
+      # Its queued holder stopped with it, and its request left the queue
+      # (on darwin the hook killed the watcher, and the lease holder saw
+      # its watcher gone); the claimed one holds on while the worker
+      # builds, and lets go when the worker does.
+      check fixture.queuedBecomesZero()
       check fixture.granted() == 4000
       fixture.dropLock(firstFd)
       check fixture.grantedBecomes(0)
+      # Neither holder is left: the queued one stopped with the hook (on
+      # darwin, its lease holder noticed its watcher was gone), the claimed
+      # one when the worker let go.
+      check noHoldersLeft(fixture.rqSocket)
       for line in fixture.hook.transcript:
         check holdsNoSecret(line)
 
@@ -411,3 +450,79 @@ when defined(linux):
       check fixture.granted() == 2000
       fixture.dropLock(bFd)
       check fixture.grantedBecomes(0)
+
+    test "a_queued_holder_dies_with_a_killed_hook":
+      var fixture: Fixture
+      defer: fixture.stop()
+      fixture.startDaemon(cpus = 2)
+      fixture.startHook()
+      fixture.send(preamble("local?real=" & fixture.root / "store",
+        cores = 2, maxJobs = 4))
+      # A is claimed and holds the budget; B's holder is queued behind it.
+      let (a, lockOfA) = fixture.writeDrv("a")
+      let aFd = fixture.takeLock(lockOfA)
+      var answer = ""
+      for _ in 0 ..< 10:
+        answer = fixture.ask(a, willing = true)
+        if answer != "postpone": break
+        sleep(200)
+      check answer == "decline"
+      let (b, _) = fixture.writeDrv("b")
+      check fixture.ask(b, willing = true) == "postpone"
+      check fixture.queued() == 1
+      let withB = holdersOf(fixture.rqSocket).len
+      # The worker kills the hook (as it does when its build operation
+      # ends); the hook cannot end its holders itself. B's holder dies with
+      # it (Linux: PR_SET_PDEATHSIG; darwin: the watcher sees the hook's
+      # pipe close and kills its lease holder), and B's request leaves the
+      # queue. A's claimed holder outlives the hook.
+      fixture.hook.process.kill()
+      discard fixture.hook.process.waitForExit(5000)
+      check fixture.queuedBecomesZero()
+      check fixture.granted() == 2000
+      var remaining = -1
+      for _ in 0 ..< 20:
+        remaining = holdersOf(fixture.rqSocket).len
+        if remaining < withB: break
+        sleep(100)
+      # A's holder alone: one process on Linux, a watcher and its lease
+      # holder on darwin.
+      check remaining == (when defined(macosx): 2 else: 1)
+      fixture.dropLock(aFd)
+      check fixture.grantedBecomes(0)
+      check noHoldersLeft(fixture.rqSocket)
+
+    test "a_lease_ends_within_half_a_second_of_its_build":
+      var fixture: Fixture
+      defer: fixture.stop()
+      fixture.startDaemon(cpus = 2)
+      fixture.startHook()
+      fixture.send(preamble("local?real=" & fixture.root / "store",
+        cores = 2, maxJobs = 4))
+      let (drv, lock) = fixture.writeDrv("r")
+      let fd = fixture.takeLock(lock)
+      var answer = ""
+      for _ in 0 ..< 10:
+        answer = fixture.ask(drv, willing = true)
+        if answer != "postpone": break
+        sleep(200)
+      check answer == "decline"
+      check fixture.granted() == 2000
+      # The build runs a while: the lease stays while the lock is held.
+      sleep(1000)
+      check fixture.granted() == 2000
+      # The build ends (the worker lets go of the lock): the lease ends
+      # within the bound, measured from the moment the lock went free to
+      # the first status that shows it gone.
+      let freed = getMonoTime()
+      fixture.dropLock(fd)
+      var gone = -1
+      while int((getMonoTime() - freed).inMilliseconds) < 5000:
+        if fixture.granted() == 0:
+          gone = int((getMonoTime() - freed).inMilliseconds)
+          break
+        sleep(10)
+      echo "lease ended ", gone, " ms after its build"
+      check gone >= 0
+      check gone <= ReleaseBoundMillis
+      check noHoldersLeft(fixture.rqSocket)
