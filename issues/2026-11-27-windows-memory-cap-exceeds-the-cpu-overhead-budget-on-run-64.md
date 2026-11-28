@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Root-caused and ruled on, 2026-11-28. NOT the Windows mechanism (the watcher thread profiles clean, 46.4us/launch; action-only CPU differential 0.36%). The ~1% is a cross-platform defect: `enqueueEstimateWrite` reachable from a finish's critical path (`issues/2026-11-28-memory-cap-learning-writes-on-the-finish-critical-path.md`), owned by rq-memcap. Windows `kill` mode stays off by default until a rerun shows zero after that fix |
+| Status | Root-caused and ruled on, 2026-11-28. NOT the Windows mechanism (the watcher thread profiles clean, 46.4us/launch; action-only CPU differential 0.36%). The ~1% is a cross-platform defect: the estimate-store's background writer durably rewrites an unchanged row every ~50ms flush interval while any capped action is active (`issues/2026-11-28-estimate-writer-durably-rewrites-an-unchanged-row-every-flush-interval.md`), owned by rq-memcap. Windows `kill` mode stays off by default until a rerun shows zero after that fix |
 | Observed in | `runquota` @ `bb8ef2a8d1513f7b984c66621252c3b9ca445a99` (`agents`); eli-pc (Windows 11 x86_64, 32 CPUs) |
 | Area | `libs/runquota_process/src/runquota_process.nim` (`applyMemoryCapHard` / `applyMemoryCapNotification` / `startMemoryCapWatcher`), or `benchmarks/lib/runquota_overhead_gate.nim`'s `run64CaseWindowsMemoryCap` / `run64RunWindows` methodology -- which one is not yet established |
 | Expectation | `RunQuota-Memory-Caps.md` § "The overhead rule": the 95% CI of the wall and CPU time difference must include zero at the gate's ±0.5% resolution; a mechanism whose interval excludes zero is rejected or made opt-in |
@@ -151,19 +151,30 @@ into its two components): daemon-only CPU differential **+2.47%**,
 action-only (where the Windows mechanism would show up) **+0.36%**,
 clean. The weighted blend (daemon ~31% of total CPU) matches the
 recorded 1.01% total exactly -- **the overhead is almost entirely on
-the daemon side**. Traced to `runquota_daemon.learnMemoryCapFromFinish`
-reaching `runquota_persistence.enqueueEstimateWrite` on every finish
-with a measured peak; the OFF arm never measures a peak (nothing else
-is switched on) so it never reaches this, the ON arm's cap mechanism
-inherently does. Filed as its own defect:
-`issues/2026-11-28-memory-cap-learning-writes-on-the-finish-critical-path.md`
--- common `runquota_daemon`/`runquota_persistence` code, not
-Windows-specific.
+the daemon side**.
+
+**Corrected, 2026-11-28 (rq-memcap, via rq-reform-mgr), after reading
+the code at `1b5ca6a0`:** the finish does NOT wait on a write --
+`enqueueEstimateWrite` only appends to a bounded in-memory queue,
+genuinely cheap, never on the finish's own critical path. The real
+daemon-side cost is the writer thread (`writerMain`) itself: it wakes
+every ~50 ms and, whenever a key is pending, commits a real SQLite
+write for it -- WITH NO CHECK that anything actually changed since the
+last flush. `run-64`'s continuous stream of capped actions keeps the
+one estimate key pending across many consecutive flushes for the whole
+run, and since the synthetic action's own peak never changes, the same
+figure is committed over and over for no new information. The OFF arm
+never enqueues anything at all, so it pays none of this. Filed as its
+own defect, retitled for the corrected mechanism:
+`issues/2026-11-28-estimate-writer-durably-rewrites-an-unchanged-row-every-flush-interval.md`
+-- common `runquota_persistence` code, not Windows-specific.
 
 **rq-reform-mgr's ruling**: not a tradeoff against learning.
-Persistence is specified as asynchronous and batched; a write reachable
-from the action's critical path is a defect in that queue.
-rq-memcap (owns learning) moves it off the critical path. Windows
-`kill` mode stays off by default until a rerun of this gate shows zero
-after that fix; this driver reruns it once the fix lands. Recorded in
-`reprobuild-pm`'s `spec/RunQuota-Memory-Caps.md` § "Verdicts".
+Persistence is already asynchronous and batched, as specified; the
+defect is that the writer commits unconditionally every interval rather
+than only when a decision-relevant figure changes (or at most once per
+key per interval, with a flush on a clean stop). rq-memcap (owns
+learning) is building that fix. Windows `kill` mode stays off by
+default until a rerun of this gate shows zero after it lands; this
+driver reruns it once it does. Recorded in `reprobuild-pm`'s
+`spec/RunQuota-Memory-Caps.md` § "Verdicts".
