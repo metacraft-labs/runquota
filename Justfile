@@ -28,7 +28,8 @@ t: test
 # reads it too, and the tests that compile a fixture binary of their own pass
 # `-d:release` down to that inner compile when they were themselves built with
 # it. Slower than `just test` and meant to be run in addition to it, not
-# instead of it.
+# instead of it: ci.yml's `test-release` job runs it on both Linux
+# architectures. Every recipe's CI schedule is in docs/ci.md.
 test-release:
     mkdir -p test-logs
     rc=0; \
@@ -42,6 +43,7 @@ lint:
     bash scripts/check_nim_sources.sh 2>&1 | tee -a test-logs/lint.log
     bash scripts/check_nix_host_config.sh 2>&1 | tee -a test-logs/lint.log
     bash scripts/check_recipe_test_discovery.sh 2>&1 | tee -a test-logs/lint.log
+    bash scripts/check_recipe_schedule.sh 2>&1 | tee -a test-logs/lint.log
 
 format:
     bash scripts/format_sources.sh
@@ -151,7 +153,8 @@ check-static-helpers:
     bash scripts/static_helper_gate.sh
 
 # Entering the dev shell from another git repository must write nothing there.
-# Runs `nix develop`, so it is not part of the in-shell test recipes.
+# Runs `nix develop`, so it is not part of the in-shell test recipes; ci.yml's
+# `test` job runs it as a step of its own.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
 

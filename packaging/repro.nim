@@ -119,38 +119,52 @@ package `runquota-packages`:
   defaultToolProvisioning "tarball"
 
   uses:
-    # Every producer's tools, as a UNION ACROSS FORMATS AND HOSTS — the
-    # `uses:` block is a macro-time literal list and cannot be
-    # conditioned on the target. A tool named here is provisioned only
-    # when an edge that names it is actually built, so the Linux tools
-    # cost a Windows run nothing.
+    # EACH HOST'S TOOLS, ON THAT HOST ONLY, selected by the same
+    # `when defined(windows)` that picks the producers in `build:` below.
+    # The engine realizes every tool a package names here for its shell
+    # actions, on the host the build runs on, so a tool that has no
+    # realization on that host stops the whole build before its first
+    # edge. WiX v3 is Windows-only (native PE executables, no Nix or
+    # Linux tarball record), and `dpkg-deb`, `rpmbuild`, `patchelf`,
+    # `readelf` and `bsdtar` have no Windows record. Named for every
+    # host, the union refused `just build-package deb` on Linux with
+    #   tool-resolution failed: package "wix-candle" ... does not declare
+    #   provisioning: nixPackage metadata
+    # This list used to be that union, on the belief that a `uses:` block
+    # could not be conditioned and that a tool was provisioned only when
+    # an edge naming it was built. Neither holds any longer.
     #
-    # MSI (the Windows leg, and this milestone's named ask).
-    "wix-candle"
-    "wix-light"
     # TARBALL, on both legs: the relocatable fallback, and on Windows
     # also the archive a Scoop manifest describes.
     "tar"
     "gzip"
-    # The POSIX staging path's trio. Windows staging uses the engine's
-    # own `fs.copyFile` builtin and needs none of them.
+    # On both legs too. On Linux they stage the tree; on Windows the
+    # Scoop producer's hash edge runs coreutils' `sha256sum` (reached
+    # through `install-file`'s package) under `sh`.
     "install-file"
     "sh"
-    "find"
-    # deb and rpm.
-    "dpkg-deb"
-    "rpmbuild"
-    "diff"
-    "sed"
-    # The §5 Linux contract: the RPATH and ELF-interpreter rewrite, and
-    # the closure walk that fills the private libdir they point at.
-    "patchelf"
-    "readelf"
-    # ARCH's `.MTREE`. libarchive's tar is the only one that writes an
-    # mtree, and `grep` is what the mtree step's own post-conditions
-    # run.
-    "bsdtar"
-    "grep"
+    when defined(windows):
+      # MSI. Windows staging uses the engine's own `fs.copyFile` builtin
+      # and needs none of the POSIX staging tools below.
+      "wix-candle"
+      "wix-light"
+    else:
+      # The rest of the POSIX staging path.
+      "find"
+      # deb and rpm.
+      "dpkg-deb"
+      "rpmbuild"
+      "diff"
+      "sed"
+      # The §5 Linux contract: the RPATH and ELF-interpreter rewrite, and
+      # the closure walk that fills the private libdir they point at.
+      "patchelf"
+      "readelf"
+      # ARCH's `.MTREE`. libarchive's tar is the only one that writes an
+      # mtree, and `grep` is what the mtree step's own post-conditions
+      # run.
+      "bsdtar"
+      "grep"
 
   build:
     let targetOs = hostTargetOs()

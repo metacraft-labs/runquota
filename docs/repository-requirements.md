@@ -57,6 +57,15 @@ RunQuota implements the Metacraft repository requirements locally through:
   than pretending to run the suite. Its Linux-side counterpart is
   `tests/unit/t_windows_compile_gate.nim`, which cross-checks the same
   manifests with `nim check --os:windows`.
+- `docs/ci.md`, which lists every `Justfile` recipe with the workflow job
+  that runs it, or the reason CI does not. `scripts/check_recipe_schedule.sh`
+  (in `just lint`) fails when a recipe has no row or a `ci` row's workflow
+  does not call it. `ci.yml` also runs the release-mode suite
+  (`just test-release`, Linux x64 and ARM64), the dev-shell isolation test
+  (`just test-dev-shell`, in every `test` leg) and the package channels
+  (`just build-package` and `just verify-package`, job `packages`, for the
+  Linux channels; `docs/ci.md` says why the Windows channels are not run
+  yet).
 - `.github/actionlint.yaml` declaring the self-hosted runner pools, so
   actionlint's runner-label check stays enabled rather than being drowned in
   unknown-label reports.
