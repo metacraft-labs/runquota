@@ -138,15 +138,18 @@ package `runquota-packages`:
     # also the archive a Scoop manifest describes.
     "tar"
     "gzip"
+    # On both legs too. On Linux they stage the tree; on Windows the
+    # Scoop producer's hash edge runs coreutils' `sha256sum` (reached
+    # through `install-file`'s package) under `sh`.
+    "install-file"
+    "sh"
     when defined(windows):
       # MSI. Windows staging uses the engine's own `fs.copyFile` builtin
       # and needs none of the POSIX staging tools below.
       "wix-candle"
       "wix-light"
     else:
-      # The POSIX staging path's trio.
-      "install-file"
-      "sh"
+      # The rest of the POSIX staging path.
       "find"
       # deb and rpm.
       "dpkg-deb"
