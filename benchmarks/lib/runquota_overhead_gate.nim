@@ -1159,6 +1159,10 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
     if cfg.switch == "qos":
       raise newException(CaseUnavailable, "--switch=qos judges the macOS " &
         "priority policy and this is not macOS")
+  when not defined(linux):
+    if cfg.switch == "cgroups":
+      raise newException(CaseUnavailable, "--switch=cgroups judges Linux " &
+        "cgroup v2 placement and this is not Linux")
   when defined(windows):
     if memoryCapOn:
       if cfg.switch != MemoryCapSwitch:
@@ -1222,7 +1226,10 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
     daemons[arm] = startDaemon(cfg, scratch, arm, switches[arm])
     dirs[arm] = scratch / $arm / "work"
     createDir(dirs[arm])
-  let script = run64Script(cfg.cliBin)
+  when defined(windows):
+    let self = getAppFilename()
+  else:
+    let script = run64Script(cfg.cliBin)
   proc armEnv(arm: Arm): seq[string] =
     runEnv(daemons[arm].socket, switches[arm], cgroupRoots[arm],
       (if cfg.switch == "qos": (if arm == armOn: "on" else: "off") else: ""),
@@ -1268,34 +1275,50 @@ proc run64Case(cfg: GateConfig; scratch: string): GateCase =
   let dying = memoryCapJson
   result.name = "run-64"
   result.run = proc (arm: Arm; round: int): RunCost =
-    let daemon = daemons[arm]
-    let before = processCpuSeconds(daemon.pid)
-    let log = scratch / $arm / "run.log"
-    result = runMeasured(["/bin/sh", "-c", script], armEnv(arm),
-      dirs[arm], log)
-    if dying.kind == JObject:
-      # After the latest run of this arm: the report is built from these
-      # details once the rounds end, so it carries the last reading.
-      dying["nr_dying_descendants"]["after"][$arm] =
-        %nrDyingDescendants(cgroupRoots[arm])
-    let after = settledDaemonCpuSeconds(daemon.pid)
-    result.daemonCpuSeconds = after - before
-    result.cpuSeconds += result.daemonCpuSeconds
-    var ran = 0
-    for kind, path in walkDir(dirs[arm]):
-      if kind == pcFile and path.extractFilename.startsWith("out-"):
-        if readFile(path).strip() == $run64LoopTurns: inc ran
-        removeFile(path)
-    if result.exitStatus != 0 or ran != run64ActionCount:
-      var tail = ""
+    when defined(windows):
+      # `run64Script`'s shell `&`/`wait` fan-out has no portable Windows
+      # equivalent (there is no `/bin/sh`); `run64RunWindows` is the same
+      # driver `run64CaseWindowsMemoryCap` uses, without a POSIX shell
+      # (`process_cost.runMeasuredFanOut`). It does its own "ran" counting
+      # and raises its own `OSError` on a short or failing round, so this
+      # branch only adds the round number to that message.
       try:
-        let lines = readFile(log).splitLines()
-        tail = lines[max(0, lines.len - 30) .. ^1].join("\n")
-      except IOError:
-        discard
-      raise newException(OSError, "the " & $arm & " run (round " & $round &
-        ") exited " & $result.exitStatus & " with " & $ran & " of " &
-        $run64ActionCount & " actions done; " & log & ":\n" & tail)
+        result = run64RunWindows(cfg, arm, daemons[arm], armEnv(arm),
+          dirs[arm], self)
+      except OSError as err:
+        raise newException(OSError, "round " & $round & ": " & err.msg)
+      if dying.kind == JObject:
+        dying["nr_dying_descendants"]["after"][$arm] =
+          %nrDyingDescendants(cgroupRoots[arm])
+    else:
+      let daemon = daemons[arm]
+      let before = processCpuSeconds(daemon.pid)
+      let log = scratch / $arm / "run.log"
+      result = runMeasured(["/bin/sh", "-c", script], armEnv(arm),
+        dirs[arm], log)
+      if dying.kind == JObject:
+        # After the latest run of this arm: the report is built from these
+        # details once the rounds end, so it carries the last reading.
+        dying["nr_dying_descendants"]["after"][$arm] =
+          %nrDyingDescendants(cgroupRoots[arm])
+      let after = settledDaemonCpuSeconds(daemon.pid)
+      result.daemonCpuSeconds = after - before
+      result.cpuSeconds += result.daemonCpuSeconds
+      var ran = 0
+      for kind, path in walkDir(dirs[arm]):
+        if kind == pcFile and path.extractFilename.startsWith("out-"):
+          if readFile(path).strip() == $run64LoopTurns: inc ran
+          removeFile(path)
+      if result.exitStatus != 0 or ran != run64ActionCount:
+        var tail = ""
+        try:
+          let lines = readFile(log).splitLines()
+          tail = lines[max(0, lines.len - 30) .. ^1].join("\n")
+        except IOError:
+          discard
+        raise newException(OSError, "the " & $arm & " run (round " & $round &
+          ") exited " & $result.exitStatus & " with " & $ran & " of " &
+          $run64ActionCount & " actions done; " & log & ":\n" & tail)
   result.stop = proc () =
     for arm in Arm:
       stopDaemon(daemons[arm])
