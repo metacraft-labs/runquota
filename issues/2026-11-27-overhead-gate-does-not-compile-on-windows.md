@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Resolved. The gate builds and runs real, full-precision verdicts on Windows, `synthetic` and `run-64` (plain and `--switch=memory-cap`) both. Two Windows defects found along the way are fixed (part 3, part 4 below). What the Windows memory-cap verdict itself found -- a confirmed overhead-budget fail, not a gate defect -- is tracked separately: `issues/2026-11-27-windows-memory-cap-exceeds-the-cpu-overhead-budget-on-run-64.md` |
+| Status | Resolved. The gate builds and runs real, full-precision verdicts on Windows: `synthetic`, `run-64` plain, `run-64 --switch=memory-cap`. (The Status line above previously said "run-64, plain and --switch=memory-cap, both" before part 5 below -- the plain case was not actually ported yet at that point; corrected.) `--switch=cgroups` now refuses cleanly on Windows instead of silently measuring nothing. `reprobuild-64` is separately blocked on needing `nix`/a built `reprobuild` engine, unrelated to any Windows gap in this file, and stays open. Several Windows defects found along the way are fixed (parts 3, 4, 5 below). What the Windows memory-cap verdict itself found -- a confirmed overhead-budget fail, not a gate defect -- is tracked separately: `issues/2026-11-27-windows-memory-cap-exceeds-the-cpu-overhead-budget-on-run-64.md` |
 | Observed in | `runquota` @ `7c98da54` (`agents` tip); Nim 2.2.8 + WinLibs gcc 16.1.0, eli-pc (Windows 11 x86_64) |
 | Area | `benchmarks/lib/runquota_overhead_gate.nim`; `benchmarks/lib/runquota_overhead_gate/process_cost.nim` |
 | Expectation | RunQuota-Memory-Caps.md's § "The overhead rule" directs each new enforcement mechanism to be judged with this gate, naming a Windows arm (`--switch memory-cap`) explicitly, "each on its own platform, by its driver." |
@@ -237,3 +237,56 @@ this benchmark tool (`runquota_process.nim`'s own job-based CPU accounting
 never goes through `FILETIME`, so production launches were never affected).
 A second full-precision run with the fix is in progress; its verdict will
 be recorded in RunQuota-Memory-Caps.md § "Verdicts".
+
+## Progress, 2026-11-28 (rq-win-tests), part 5 -- the plain and cgroups/qos cases of `run-64` now have a Windows form
+
+Part 2's "still open (narrowed)" note above was read too broadly: it named
+`run64Script`'s shell `&`/`wait` fan-out as the open piece, but by part 3
+that fan-out had a Windows replacement (`run64RunWindows`,
+`process_cost.runMeasuredFanOut`) -- for the `--switch=memory-cap` arm
+only (`run64CaseWindowsMemoryCap`). `run64Case`'s shared body, reached by
+the PLAIN case (no `--switch` at all -- the one that judges RunQuota's own
+measurement switches end to end, not a cgroup mechanism) and by
+`--switch=cgroups`, still built `result.run` as an unconditional
+`runMeasured(["/bin/sh", "-c", script], ...)`. Confirmed: `--case=run-64`
+with no switch failed immediately with `CreateProcessW` "The system cannot
+find the file specified" -- there is no `/bin/sh` on Windows.
+
+Fixed (`runquota` `agents` `d7125e3a`) by making that one call site
+conditional: `when defined(windows): run64RunWindows(...) else:
+runMeasured(["/bin/sh", "-c", script], ...)`, reusing the existing driver
+rather than building a second one -- the 64 actions, each `runquota run`
+of a spin loop, are identical in both cases, only the fan-out mechanism
+differs. `--switch=cgroups` is now refused on non-Linux hosts (mirroring
+the file's existing `--switch=qos`-on-non-macOS refusal): Windows has no
+cgroup to place a tree under, so without the refusal it would have
+fallen through to the same Windows run and silently compared two
+identical arms.
+
+**Verified end to end** against real `runquota.exe`/`runquotad.exe` built
+from source: `--case=run-64` (no switch) now runs the full 64-action,
+150000-loop-turn-per-action workload and produces a genuine statistical
+verdict (a short smoke run: `FAIL`, wall overhead ~11-21% across three
+runs -- not a formal verdict, `--measure=all` against the default
+baseline on a 5-10 round smoke run, consistent with real measurement
+switches costing something, not a crash). `--switch=cgroups` now refuses
+cleanly (`exit 4`, `CaseUnavailable`) instead of silently measuring
+nothing. `--switch=memory-cap` (rq-memcap-win's own path, untouched by
+this change) still runs correctly -- a regression check, not a new port.
+`nim check --os:linux` and `--os:macosx` both pass, with no new warnings
+beyond the file's pre-existing ones (confirmed by a before/after diff of
+the hint/warning list, not by inspection alone). The full local suite
+(234 tests), the static-helper gate and lint are all green afterward on
+a real Windows host.
+
+**`reprobuild-64` remains open**, and is not a Windows gap at all:
+`reprobuildCase` (the case's own proc) has no shell dependency of its own
+-- it calls the `reprobuild` engine binary directly, with no `/bin/sh`
+anywhere in its body. It is blocked on needing a `reprobuild` engine built
+against this RunQuota checkout, which on this host needs `nix` (per
+`scripts/run-overhead-gate.sh`'s own `reprobuild-64` branch: `nix develop
+"${reprobuild_root}" --command ...`), unavailable here for the same
+reason noted throughout this workspace's `AGENTS.md`. Whoever has a route
+to a real `reprobuild` build against this checkout -- Linux, macOS, or a
+Windows host with `nix` reachable some other way -- can try it directly;
+nothing in `runquota_overhead_gate.nim` itself needs porting for it.
