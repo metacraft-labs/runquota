@@ -32,7 +32,10 @@
 ## a user namespace whose ids 1..65535 map to the invoking user's
 ## subordinate ranges, with `setgroups` allowed. Account names and group
 ## memberships come from the host's `/etc/passwd` and `/etc/group`, read
-## inside the namespace by the same numbers. Nothing outside the scratch
+## inside the namespace by the same numbers. The scratch directory is made
+## in `/tmp`, not under TMPDIR: the dropped ids are other uids, and a
+## private TMPDIR (`nix develop` makes a 0700 one) would refuse them before
+## the endpoint could. Nothing outside the scratch
 ## directory is touched, and nothing is signalled but the daemon this test
 ## started. NO MOCKS: the drop, the lookups, the daemon and the connect are
 ## the real ones.
@@ -46,7 +49,8 @@
 ## as real root with `sudo` (see the RQE-M14 notes).
 
 when defined(linux):
-  import std/[os, osproc, posix, streams, strtabs, strutils, unittest]
+  import std/[os, osproc, posix, streams, strtabs, strutils, tempfiles,
+    unittest]
 
   import std/json
 
@@ -68,8 +72,9 @@ when defined(linux):
     var groups: seq[int] = @[]
     if systemGroupOps().groupsOf(name, gid, groups): groups else: @[]
 
-  proc dropAndConnect(uid, gid, endpointGroup: int): tuple[status: string,
-      dropped: string, connected: string] =
+  proc dropAndConnect(uid, gid, endpointGroup: int; root: string):
+      tuple[status: string, dropped: string, connected: string,
+            reach: string] =
     ## In a forked child: the real drop, then a session. The child writes
     ## its findings to a pipe; the parent (still root) reads them.
     var channel: array[2, cint]
@@ -87,6 +92,11 @@ when defined(linux):
         if line.startsWith("Groups:"):
           report.add("groups=" & line["Groups:".len .. ^1].strip() & "\n")
       try:
+        # The control for the refusal: the dropped process can reach the
+        # scratch directory itself, so a refused connect is the endpoint
+        # directory's group at work and not an unreachable ancestor.
+        report.add("reach=" & (if access(root.cstring, X_OK) == 0: "ok"
+                               else: "denied " & $strerror(errno)) & "\n")
         var client = connectDefault()
         var session = client.registerSession("holder-groups", "test")
         session.closeSession()
@@ -110,6 +120,7 @@ when defined(linux):
       if line.startsWith("groups="): result.status = line[7 .. ^1]
       elif line.startsWith("dropped="): result.dropped = line[8 .. ^1]
       elif line.startsWith("connected="): result.connected = line[10 .. ^1]
+      elif line.startsWith("reach="): result.reach = line[6 .. ^1]
 
   proc hookCase(root: string; env: StringTableRef; uid, gid, gate: int) =
     ## The shipped hook, run as root of the namespace with this process as
@@ -261,18 +272,20 @@ when defined(linux):
     # Member.
     let member = endpointGroupFor(systemGroupOps(), socket, false, uid, gid,
       gate)
-    let m = dropAndConnect(uid, gid, member.group)
+    let m = dropAndConnect(uid, gid, member.group, root)
     echo "case member group=", member.group, " gate=", gate, " diag=",
-      member.diagnostic, " status=[", m.status, "] dropped=", m.dropped,
+      member.diagnostic, " reach=[", m.reach, "] status=[", m.status,
+      "] dropped=", m.dropped,
       " connected=", m.connected
     # Non-member.
     let nuid = int(nobody.pw_uid)
     let ngid = int(nobody.pw_gid)
     let other = endpointGroupFor(systemGroupOps(), socket, false, nuid, ngid,
       gate)
-    let o = dropAndConnect(nuid, ngid, other.group)
+    let o = dropAndConnect(nuid, ngid, other.group, root)
     echo "case nonmember group=", other.group, " diag=", other.diagnostic,
-      " status=[", o.status, "] dropped=", o.dropped, " connected=",
+      " reach=[", o.reach, "] status=[", o.status, "] dropped=", o.dropped,
+      " connected=",
       o.connected
     hookCase(root, env, uid, gid, gate)
 
@@ -300,7 +313,22 @@ when defined(linux):
     prerequisite probe.exitCode == 0,
       "cannot create a user namespace with mapped ids (a prerequisite; " &
       "run outside sg/newgrp): " & probe.output.strip()
-    let root = scratchDir("rqgrp")
+    # THE SCRATCH DIRECTORY MUST BE REACHABLE BY THE DROPPED IDS: they are
+    # other uids, and a private TMPDIR (`nix develop` sets a 0700
+    # `/tmp/nix-shell.*`) would refuse them on its way to the endpoint,
+    # for a reason that has nothing to do with the endpoint's group. So it
+    # is made in `/tmp` itself, whatever TMPDIR says, and every ancestor is
+    # checked to be searchable by others.
+    let root = createTempDir("rqgrp", "", "/tmp")
+    var ancestor = root
+    while true:
+      ancestor = parentDir(ancestor)
+      if ancestor.len == 0: break
+      var info: Stat
+      prerequisite stat(ancestor.cstring, info) == 0 and
+        (int(info.st_mode) and 0o001) != 0,
+        ancestor & " is not searchable by other users (a prerequisite)"
+      if ancestor == "/": break
     defer: removeDir(root)
     var env = newStringTable(modeCaseSensitive)
     for key, value in envPairs(): env[key] = value
@@ -327,6 +355,7 @@ when defined(linux):
       check memberLine.field("group") == gate
       check " dropped=as uid " in memberLine
       check memberLine.field("status") == gate
+      check memberLine.field("reach") == "ok"
       check memberLine.field("connected") == "yes"
 
     test "the_root_hook_passes_the_group_to_its_holder":
@@ -346,4 +375,5 @@ when defined(linux):
       check "not a member" in otherLine
       check " dropped=as uid " in otherLine
       check otherLine.field("status") == ""
+      check otherLine.field("reach") == "ok"
       check otherLine.field("connected") == "no"
