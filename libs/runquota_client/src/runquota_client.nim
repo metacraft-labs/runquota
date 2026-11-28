@@ -1137,7 +1137,15 @@ proc pollNextGrantBounded*(session: var RunQuotaSession;
   GrantPollFrame(kind: grantPollFrame, decisions: session.decodeDecisionBatch(frame))
 
 proc requestLeaseWaiting*(session: var RunQuotaSession; request: ResourceRequest;
-                          pollMillis = 50; maxPolls = 0): RunQuotaLease =
+                          pollMillis = 50; maxPolls = 0;
+                          cancelled: proc (): bool {.nimcall, gcsafe.} = nil): RunQuotaLease =
+  ## Offers `request` and waits for its grant, polling every `pollMillis`.
+  ## `cancelled`, when given, is asked before each poll: once it answers
+  ## true the wait stops with `RunQuotaClientError` and the request is left
+  ## queued for the daemon to drop when this connection closes (the caller
+  ## closes it). A caller whose reason to wait can disappear -- the nix
+  ## build hook's holder, whose hook went away -- uses it so a queued
+  ## request does not outlive that reason until it is granted.
   if not session.active:
     session.client[].lastDiagnostic = diagnostic(diagInvalidArgument, "session is not active")
     raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
@@ -1159,6 +1167,11 @@ proc requestLeaseWaiting*(session: var RunQuotaSession; request: ResourceRequest
     raise newException(RunQuotaClientError, session.client[].lastDiagnostic.message)
   var polls = 0
   while maxPolls <= 0 or polls < maxPolls:
+    if cancelled != nil and cancelled():
+      session.client[].lastDiagnostic = diagnostic(diagDenied,
+        "the wait for a lease grant was cancelled")
+      raise newException(RunQuotaClientError,
+        session.client[].lastDiagnostic.message)
     let grants = session.pollNextGrant()
     for grant in grants:
       if grant.clientCandidateId == candidateId and not grant.queued:
