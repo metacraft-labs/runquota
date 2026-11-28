@@ -67,8 +67,9 @@
 ## (`runquota nix-build-hook --hold`), which:
 ##
 ## * runs as the requesting user: a root hook's holder drops to that user's
-##   uid and gid, clears its supplementary groups and checks that no
-##   privilege is left before it connects, so the daemon reads the right
+##   uid and gid, keeps no supplementary group but the endpoint's (when the
+##   requester is a member of it) and checks that no privilege is left
+##   before it connects, so the daemon reads the right
 ##   owner from peer credentials and the lease lands in that user's group,
 ##   never in root's;
 ## * gets only the RunQuota endpoint variables of the daemon's environment
@@ -150,14 +151,17 @@
 ##   the same before the socket check and after the read), bounded, and
 ##   only three variables are kept (the group name validated as a session
 ##   group name).
-## * The privilege drop is setgroups, setgid, setuid, in that order
-##   (setgroups(0) on Linux; setgroups(1, [gid]) on darwin, where an empty
-##   list means `{0}`); any failure stops the holder before it connects; the
-##   result is checked (Linux: all four uids and gids, no supplementary
-##   groups, no capabilities; darwin: the real, effective and saved ids and
-##   a group list of the gid alone; and setuid(0) refused); a root hook
-##   that knows the uid but not the gid drops to `NoGroupGid`, never keeps
-##   root's group.
+## * The privilege drop is setgroups, setgid, setuid, in that order, with
+##   the group list of `holderGroupList`: the endpoint's group alone or none
+##   on Linux; the gid first, then the endpoint's group, on darwin, where an
+##   empty list means `{0}`. The endpoint's group is the one that owns the
+##   directory of the hook's own endpoint, kept exactly when the requester
+##   is a member of it (`endpointGroupFor`). Any failure stops the holder
+##   before it connects; the result is checked (Linux: all four uids and
+##   gids, exactly that group list, no capabilities; darwin: the real,
+##   effective and saved ids and exactly that group list; and setuid(0)
+##   refused); a root hook that knows the uid but not the gid drops to
+##   `NoGroupGid`, never keeps root's group.
 ## * A holder closes every file descriptor it inherited past standard
 ##   input, output and error before it does anything else.
 ## * The darwin watcher, which keeps the hook's credential, takes input only
