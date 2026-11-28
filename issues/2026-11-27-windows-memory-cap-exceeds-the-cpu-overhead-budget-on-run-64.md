@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Root-caused and ruled on, 2026-11-28. NOT the Windows mechanism (the watcher thread profiles clean, 46.4us/launch; action-only CPU differential 0.36%). The ~1% is a cross-platform defect: the estimate-store's background writer durably rewrites an unchanged row every ~50ms flush interval while any capped action is active (`issues/2026-11-28-estimate-writer-durably-rewrites-an-unchanged-row-every-flush-interval.md`), owned by rq-memcap. Windows `kill` mode stays off by default until a rerun shows zero after that fix |
+| Status | Root-caused and ruled on, 2026-11-28. NOT the Windows mechanism (the watcher thread profiles clean, 46.4us/launch; action-only CPU differential 0.36%). The ~1% is a cross-platform defect: the estimate-store's background writer durably rewrites an unchanged row every ~50ms flush interval while any capped action is active (filed as `issues/2026-11-28-estimate-writer-durably-rewrites-an-unchanged-row-every-flush-interval.md`, now closed: the writer commits a key's row at most once per 30 s unless a decision figure changed -- see `git log -- libs/runquota_persistence`). Windows `kill` mode stays off by default until a rerun of the gate shows zero after that fix |
 | Observed in | `runquota` @ `bb8ef2a8d1513f7b984c66621252c3b9ca445a99` (`agents`); eli-pc (Windows 11 x86_64, 32 CPUs) |
 | Area | `libs/runquota_process/src/runquota_process.nim` (`applyMemoryCapHard` / `applyMemoryCapNotification` / `startMemoryCapWatcher`), or `benchmarks/lib/runquota_overhead_gate.nim`'s `run64CaseWindowsMemoryCap` / `run64RunWindows` methodology -- which one is not yet established |
 | Expectation | `RunQuota-Memory-Caps.md` § "The overhead rule": the 95% CI of the wall and CPU time difference must include zero at the gate's ±0.5% resolution; a mechanism whose interval excludes zero is rejected or made opt-in |
@@ -167,6 +167,7 @@ figure is committed over and over for no new information. The OFF arm
 never enqueues anything at all, so it pays none of this. Filed as its
 own defect, retitled for the corrected mechanism:
 `issues/2026-11-28-estimate-writer-durably-rewrites-an-unchanged-row-every-flush-interval.md`
+(since closed by the writer's refresh interval)
 -- common `runquota_persistence` code, not Windows-specific.
 
 **rq-reform-mgr's ruling**: not a tradeoff against learning.

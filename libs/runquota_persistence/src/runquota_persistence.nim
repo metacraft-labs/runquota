@@ -1,4 +1,4 @@
-import std/[locks, os, strutils, times]
+import std/[heapqueue, locks, monotimes, os, strutils, tables, times]
 
 import runquota_core/process_owned
 import runquota_core/sqlite_inproc
@@ -9,6 +9,32 @@ export types
 
 const libraryName* = "runquota_persistence"
 const EstimateSchemaVersion* = 1'u32
+
+const DefaultEstimateRefreshIntervalMillis* = 30_000'i64
+  ## How often, at most, the writer commits a key's row when nothing a
+  ## decision reads has changed since that key was last committed -- when
+  ## only the sample count, the recent peak, the outcome, the time or the
+  ## time of a breach identical to the last one moved.
+  ##
+  ## With the memory cap on, every finish carries a measured peak and so
+  ## changes its command's row. Committing each one made the writer's
+  ## SQLite work, which is daemon CPU, grow with the finish rate of every
+  ## command that repeats, while the figures admission and the cap read
+  ## (`decisionFigures`) change on a small minority of finishes. Those are
+  ## still committed with the next batch; the row in the daemon's memory,
+  ## which is what admission reads, has every finish at once either way.
+  ##
+  ## The saving is for keys that finish more than once per interval; a key
+  ## seen once is committed with the next batch as before. Thirty seconds
+  ## bounds what a crash can lose to half a minute of sample counts per
+  ## command, which the next finishes relearn; a clean stop loses nothing
+  ## (`stopEstimateStore` commits every waiting row).
+
+const DefaultEstimateWaitingCapacity* = 4096
+  ## The most rows the writer holds back at once (one per key). A row that
+  ## would make it more sends the longest-waiting one to the store with the
+  ## current batch instead, so the held-back set never grows past this
+  ## whatever the number of distinct command keys.
 
 proc libraryInfo*(): LibraryInfo =
   LibraryInfo(name: libraryName)
@@ -51,6 +77,11 @@ var writerPending: OwnedStrings
 var writerThread: Thread[void]
 var writerFailedBatches = 0'u64
 var writerFailedRows = 0'u64
+var writerRowsWritten = 0'u64
+var writerRefreshMillis = DefaultEstimateRefreshIntervalMillis
+var writerWaitingCapacity = DefaultEstimateWaitingCapacity
+  ## Set by `startEstimateStore` before the writer thread exists; read only
+  ## by that thread.
 
 proc ensureWriterLock() =
   ## THE SAME SHAPE AS THE GUARD ``runquota_observation_store/writer`` NO
@@ -60,12 +91,13 @@ proc ensureWriterLock() =
   ##
   ## Every caller is on the main thread before any other thread exists.
   ## ``startEstimateStore`` is called UNCONDITIONALLY from ``initDaemon``,
-  ## with no capture-enabled arm to miss, so the only other two callers --
-  ## ``estimateWriteFailures`` and ``estimateWriteFailedRows``, reached from
-  ## the status JSON on a connection worker -- cannot be the first. Both
-  ## tests that drive this module (``t_estimate_queue_ownership``,
-  ## ``t_estimate_store_sqlite_streams``) call ``startEstimateStore`` before
-  ## they create a thread.
+  ## with no capture-enabled arm to miss, so the only other callers --
+  ## ``estimateWriteFailures``, ``estimateWriteFailedRows`` and
+  ## ``estimateRowsWritten``, reached from the status JSON on a connection
+  ## worker -- cannot be the first. Every test that drives this module
+  ## (``t_estimate_queue_ownership``, ``t_estimate_store_sqlite_streams``,
+  ## ``t_rqm_estimate_columns``, ``t_estimate_refresh_interval``) calls
+  ## ``startEstimateStore`` before it creates a thread or reads a counter.
   ##
   ## ``enqueueEstimateWrite`` AND ``stopEstimateStore`` take ``writerLock``
   ## without calling this, and neither needs to: BOTH return early unless
@@ -353,6 +385,18 @@ proc estimateWriteFailedRows*(): uint64 =
   finally:
     release(writerLock)
 
+proc estimateRowsWritten*(): uint64 =
+  ## Rows the background writer has committed since the process started:
+  ## how often the store is actually written, which the refresh interval
+  ## keeps below the finish rate. Rows written synchronously
+  ## (`writeEstimateNow`) are not counted.
+  ensureWriterLock()
+  acquire(writerLock)
+  try:
+    writerRowsWritten
+  finally:
+    release(writerLock)
+
 proc pendingKey(scope, commandStatsId: string): string =
   ## The identity the queue deduplicates on, LENGTH-PREFIXED so that no pair
   ## can spell another pair's key: without the lengths a scope ending in the
@@ -405,6 +449,161 @@ proc takePendingRows(): seq[LearnedEstimateRow] =
   for encoded in writerPending.takeAll():
     result.add(decodePending(encoded))
 
+type
+  DecisionFigures = object
+    ## The figures of a row that some decision reads: the conservative
+    ## figure (admission's fallback estimate), the largest measured peak
+    ## (the learned memory cap) and the last breach's cap and peak (what a
+    ## report says was exceeded). The breach's TIME is not among them: a
+    ## command that keeps passing the same cap by the same amount records
+    ## a new time on every finish, and that is bookkeeping like the sample
+    ## count. A new breach, or one with a different cap or peak, differs
+    ## here and is committed at once.
+    ##
+    ## The declaration figures are not compared: a declaration is written
+    ## synchronously (`writeEstimateNow`) and never reaches this queue, and
+    ## learning never changes them.
+    conservative, maxPeak, breachCap, breachPeak: uint64
+
+  KeyState = object
+    committedAt: MonoTime
+      ## When this key's last row was COMMITTED. Stamped only after the
+      ## batch landed, so a row lost to a failed batch or to the pending
+      ## queue's cap does not hold the key's next row back.
+    committed: DecisionFigures
+      ## The decision figures that commit carried. A row whose figures
+      ## differ is committed at once, whatever the time.
+    waiting: bool
+    row: LearnedEstimateRow
+      ## The newest held-back row of this key while `waiting`; reset to an
+      ## empty row as soon as it stops waiting, so a key that is not
+      ## waiting costs only its figures and its commit time.
+    due: MonoTime
+
+  DueEntry = object
+    due: MonoTime
+    key: string
+
+  RefreshState = object
+    ## The writer's own bookkeeping for the refresh interval. Created,
+    ## used and freed on the writer thread alone -- never under
+    ## `writerLock` and never by a connection worker -- so it may be
+    ## ordinary Nim containers: the cross-thread ownership problem the
+    ## pending queue has does not arise. A key absent from `keys` has not
+    ## been committed within the interval, which is what lets `prune`
+    ## forget it.
+    ##
+    ## SIZE. `keys` holds every key committed within about one interval
+    ## (prune runs once per interval, so up to two), which is bounded by the
+    ## rate at which distinct keys finish, NOT by
+    ## `DefaultEstimateWaitingCapacity`: that caps only the keys holding a
+    ## row back. A key not waiting holds no row. The table starts empty
+    ## with each writer, so after a restart every key's first finish is
+    ## committed at once.
+    keys: Table[string, KeyState]
+    dueOrder: HeapQueue[DueEntry]
+      ## Waiting keys by due time. Entries are not removed when a key stops
+      ## waiting; one whose key no longer waits with that due time is
+      ## skipped when it reaches the top.
+    waitingCount: int
+    nextPrune: MonoTime
+
+proc `<`(a, b: DueEntry): bool = a.due < b.due
+
+proc decisionFigures(row: LearnedEstimateRow): DecisionFigures =
+  DecisionFigures(conservative: row.conservativeMemoryBytes,
+    maxPeak: row.maxObservedPeakBytes, breachCap: row.lastBreachCapBytes,
+    breachPeak: row.lastBreachPeakBytes)
+
+proc refreshInterval(): Duration =
+  initDuration(milliseconds = writerRefreshMillis)
+
+proc takeWaiting(state: var RefreshState; key: string;
+                 batch: var seq[LearnedEstimateRow]) =
+  ## Send `key`'s held-back row to the store with `batch`.
+  state.keys.withValue(key, entry):
+    if entry.waiting:
+      batch.add(entry.row)
+      entry.row = LearnedEstimateRow()
+      entry.waiting = false
+      dec state.waitingCount
+
+proc popValid(state: var RefreshState): string =
+  ## The waiting key due first, removed from `dueOrder`; "" when none
+  ## waits. Stale entries are dropped on the way.
+  while state.dueOrder.len > 0:
+    let top = state.dueOrder.pop()
+    state.keys.withValue(top.key, entry):
+      if entry.waiting and entry.due == top.due:
+        return top.key
+  ""
+
+proc admit(state: var RefreshState; rows: seq[LearnedEstimateRow];
+           now: MonoTime; stopping: bool): seq[LearnedEstimateRow] =
+  ## The rows to commit in this pass: each queued row that is new, carries
+  ## changed decision figures, or whose key's last commit is an interval
+  ## old; every held-back row that has come due (all of them when
+  ## `stopping`); and, when holding a row back would pass the capacity,
+  ## the longest-waiting one. The rest are held back, newest per key.
+  for row in rows:
+    let key = pendingKey(row.scope, row.commandStatsId)
+    var holdBack = false
+    state.keys.withValue(key, entry):
+      holdBack = entry.committed == decisionFigures(row) and
+        now - entry.committedAt < refreshInterval()
+      if holdBack:
+        if not entry.waiting:
+          entry.waiting = true
+          entry.due = entry.committedAt + refreshInterval()
+          inc state.waitingCount
+          state.dueOrder.push(DueEntry(due: entry.due, key: key))
+        entry.row = row
+      elif entry.waiting:
+        # This row is newer than the held-back one and carries all of it;
+        # the held-back one must never reach the store after it.
+        entry.row = LearnedEstimateRow()
+        entry.waiting = false
+        dec state.waitingCount
+    if not holdBack:
+      result.add(row)
+    while state.waitingCount > writerWaitingCapacity:
+      let oldest = state.popValid()
+      if oldest.len == 0: break
+      state.takeWaiting(oldest, result)
+  # The heap's top is the earliest due time, stale or not, so when it is not
+  # due nothing is.
+  while state.dueOrder.len > 0 and (stopping or state.dueOrder[0].due <= now):
+    let top = state.dueOrder.pop()
+    var current = false
+    state.keys.withValue(top.key, entry):
+      current = entry.waiting and entry.due == top.due
+    if current:
+      state.takeWaiting(top.key, result)
+
+proc noteCommitted(state: var RefreshState; batch: seq[LearnedEstimateRow];
+                   now: MonoTime) =
+  ## Stamp each committed row's key: committed now, with these figures.
+  for row in batch:
+    let key = pendingKey(row.scope, row.commandStatsId)
+    let figures = decisionFigures(row)
+    var entry = addr state.keys.mgetOrPut(key, KeyState())
+    entry.committedAt = now
+    entry.committed = figures
+
+proc prune(state: var RefreshState; now: MonoTime) =
+  ## Forget keys committed more than an interval ago that hold nothing
+  ## back: an absent key is treated exactly like one of them. Once per
+  ## interval, in one pass over the table, on the writer thread.
+  if now < state.nextPrune:
+    return
+  state.nextPrune = now + refreshInterval()
+  var stale: seq[string] = @[]
+  for key, entry in state.keys:
+    if not entry.waiting and now - entry.committedAt >= refreshInterval():
+      stale.add(key)
+  for key in stale:
+    state.keys.del(key)
+
 proc writerMain() {.thread.} =
   {.cast(gcsafe).}:
     # THE SCHEMA IS ENSURED ONCE PER WRITER, not once per batch: it is a
@@ -412,18 +611,25 @@ proc writerMain() {.thread.} =
     # them every 50 ms was one more round trip into SQLite per batch for
     # nothing. A failure is retried with the next batch.
     var schemaReady = false
+    var refresh = RefreshState()
     try:
       while true:
         sleep(50)
-        var batch: seq[LearnedEstimateRow] = @[]
+        var queued: seq[LearnedEstimateRow] = @[]
         var shouldStop = false
         acquire(writerLock)
         try:
           shouldStop = writerStop
           if writerPending.len > 0:
-            batch = takePendingRows()
+            queued = takePendingRows()
         finally:
           release(writerLock)
+        # THE REFRESH INTERVAL IS APPLIED HERE, outside the lock, so a
+        # finish's enqueue does no more than it did before it existed. The
+        # stop takes every held-back row: a clean stop loses nothing.
+        let now = getMonoTime()
+        let batch = refresh.admit(queued, now, stopping = shouldStop)
+        refresh.prune(now)
         if batch.len > 0 and writerDbPath.len > 0:
           # THE RESULT IS CHECKED. `discard writeBatch(...)` was the line
           # that made a whole batch failing to reach the store look exactly
@@ -431,7 +637,14 @@ proc writerMain() {.thread.} =
           if not schemaReady:
             schemaReady = initEstimateSchema(writerDbPath)
           let landed = schemaReady and writeBatch(writerDbPath, batch)
-          if not landed:
+          if landed:
+            refresh.noteCommitted(batch, getMonoTime())
+            acquire(writerLock)
+            try:
+              writerRowsWritten += uint64(batch.len)
+            finally:
+              release(writerLock)
+          else:
             noteEstimateWriteFailure(batch.len)
             # A FAILED BATCH RE-ENSURES THE SCHEMA ON THE NEXT ONE. The store
             # may have been deleted or replaced under the writer -- the pool
@@ -443,7 +656,13 @@ proc writerMain() {.thread.} =
     finally:
       discard
 
-proc startEstimateStore*(path: string; queueCapacity = 128): EstimateStore =
+proc startEstimateStore*(path: string; queueCapacity = 128;
+    refreshIntervalMillis = DefaultEstimateRefreshIntervalMillis;
+    waitingCapacity = DefaultEstimateWaitingCapacity): EstimateStore =
+  ## Start the background writer for the store at `path` (none for an empty
+  ## path: estimates are then kept in memory only). The interval and the
+  ## held-back capacity are the defaults everywhere but the tests that
+  ## exercise them.
   ensureWriterLock()
   if path.len == 0:
     return EstimateStore(mode: pmInMemory, dbPath: "", queueCapacity: 0)
@@ -452,6 +671,8 @@ proc startEstimateStore*(path: string; queueCapacity = 128): EstimateStore =
     writerDbPath = path
     writerCapacity = max(1, queueCapacity)
     writerStop = false
+    writerRefreshMillis = refreshIntervalMillis
+    writerWaitingCapacity = max(0, waitingCapacity)
     writerPending.clear()
   finally:
     release(writerLock)

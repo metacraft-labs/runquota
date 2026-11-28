@@ -3112,6 +3112,9 @@ proc observationsJson(daemon: RunQuotaDaemon): string =
     # dropped estimate and a reader cannot derive either from the other.
     "\"estimate_write_failures\":" & $estimateWriteFailures() & "," &
     "\"estimate_write_failed_rows\":" & $estimateWriteFailedRows() & "," &
+    # ROWS THE WRITER COMMITTED: how often the store is actually written,
+    # which the refresh interval keeps below the finish rate.
+    "\"estimate_rows_written\":" & $estimateRowsWritten() & "," &
     aggregatePublicationJson() & "," &
     retentionJson(daemon.config.retentionSweepIntervalMillis) & "," &
     ambientSamplingJson(daemon.config.ambientSampleIntervalMillis) & "," &
@@ -3862,6 +3865,8 @@ proc updateEstimateFromFinish(daemon: var RunQuotaDaemon; lease: LeaseRow;
     return
   daemon.estimates[key] = row
   daemon.estimateScopes.incl(scope)
+  # Queued on every finish; the store's writer decides how soon it reaches
+  # the disk (`runquota_persistence.DefaultEstimateRefreshIntervalMillis`).
   discard enqueueEstimateWrite(daemon.estimateStore, row)
 
 proc leaseMemoryCap(daemon: RunQuotaDaemon; lease: LeaseRow;
