@@ -45,6 +45,10 @@
 ##   its request leaves the daemon's queue, the claimed one stays until the
 ##   worker lets go. Mutations that fail it: no `PR_SET_PDEATHSIG` (Linux);
 ##   a darwin watcher that ignores its hook's pipe closing.
+## * `a_stopped_queued_holder_is_still_ended_with_its_hook` -- a queued
+##   lease holder its requester stopped (SIGSTOP) is still ended when the
+##   hook stops, and its request leaves the queue. Mutation that fails it:
+##   a darwin hook that kills the watcher but not its process group.
 ## * In `every_try_is_answered_in_bound` the queue is empty once the hook
 ##   has stopped; a darwin lease holder that does not notice its watcher
 ##   was killed stays queued, and fails it.
@@ -58,7 +62,8 @@
 ## directory. Only the hook and the daemon this test started are signalled,
 ## by their `Process`; holders are the hook's children and are only
 ## observed (read-only: `/proc` on Linux, `libproc` and `KERN_PROCARGS2` on
-## darwin, `tests/support/process_listing`), never signalled. The scratch
+## darwin, `tests/support/process_listing`), never signalled but for the
+## one SIGSTOP of the stopped-holder case. The scratch
 ## directory is removed at the end.
 ##
 ## Linux and darwin, like the hook's requester lookup and release probe. On
@@ -488,6 +493,58 @@ when defined(linux) or defined(macosx):
       # A's holder alone: one process on Linux, a watcher and its lease
       # holder on darwin.
       check remaining == (when defined(macosx): 2 else: 1)
+      fixture.dropLock(aFd)
+      check fixture.grantedBecomes(0)
+      check noHoldersLeft(fixture.rqSocket)
+
+    test "a_stopped_queued_holder_is_still_ended_with_its_hook":
+      # The requester can stop its own lease holder (same uid). A stopped
+      # holder notices nothing, so the hook itself must end it: on darwin
+      # that holder is the watcher's child, and killing the watcher alone
+      # would leave its request queued for good. THE ONE SIGNAL THIS FILE
+      # SENDS TO A PROCESS IT DID NOT START: SIGSTOP to a holder of its own
+      # hook, as the requester could; the hook then SIGKILLs it.
+      var fixture: Fixture
+      defer: fixture.stop()
+      fixture.startDaemon(cpus = 2)
+      fixture.startHook()
+      fixture.send(preamble("local?real=" & fixture.root / "store",
+        cores = 2, maxJobs = 4))
+      let (a, lockOfA) = fixture.writeDrv("a")
+      let aFd = fixture.takeLock(lockOfA)
+      var answer = ""
+      for _ in 0 ..< 10:
+        answer = fixture.ask(a, willing = true)
+        if answer != "postpone": break
+        sleep(200)
+      check answer == "decline"
+      let before = childrenOf(fixture.hook.process.processID)
+      let (b, _) = fixture.writeDrv("b")
+      check fixture.ask(b, willing = true) == "postpone"
+      check fixture.queued() == 1
+      var queuedHolder = 0
+      for pid in childrenOf(fixture.hook.process.processID):
+        if pid notin before: queuedHolder = pid
+      require queuedHolder > 0
+      # The process holding B's request: the holder on Linux, the
+      # watcher's child on darwin.
+      var leaseHolder = queuedHolder
+      when defined(macosx):
+        for _ in 0 ..< 20:
+          let kids = childrenOf(queuedHolder)
+          if kids.len == 1:
+            leaseHolder = kids[0]
+            break
+          sleep(50)
+        require leaseHolder != queuedHolder
+      require kill(Pid(leaseHolder), SIGSTOP) == 0
+      # The hook stops being asked; it ends its queued holder on the way out.
+      fixture.send(wireString("try") & wireU64(1) & wireString("s") &
+        wireString(b) & wireU64(1'u64 shl 40))
+      var elapsed = 0
+      check fixture.nextReply(elapsed) == "decline-permanently"
+      check fixture.hook.process.waitForExit(5000) == 0
+      check fixture.queuedBecomesZero()
       fixture.dropLock(aFd)
       check fixture.grantedBecomes(0)
       check noHoldersLeft(fixture.rqSocket)

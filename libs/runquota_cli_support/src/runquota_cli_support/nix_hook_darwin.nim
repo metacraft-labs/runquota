@@ -159,17 +159,30 @@ static int rq_darwin_list_pids(int *pids, int cap) {
 /* The uid that created the local stream socket whose pcb handle is
    `pcb`: 1 found (in *uid), 0 not found, -1 the list cannot be read or
    its records are not the layout above. */
-static int rq_darwin_socket_owner(unsigned long long pcb, unsigned *uid) {
+static int rq_darwin_socket_owner(unsigned long long pcb,
+    unsigned long long peer, unsigned *uid) {
+  /* The kernel sizes its answer for the sockets that exist now plus an
+     eighth (`unp_pcblist64`); sockets created between the two calls can
+     outgrow that (ENOMEM), so the read is retried with twice the room. */
   size_t len = 0;
-  if (sysctlbyname("net.local.stream.pcblist64", NULL, &len, NULL, 0) != 0)
-    return -1;
-  if (len < sizeof(struct rq_xunpgen) || len > (64u << 20)) return -1;
-  char *buf = malloc(len);
-  if (buf == NULL) return -1;
-  if (sysctlbyname("net.local.stream.pcblist64", buf, &len, NULL, 0) != 0) {
+  char *buf = NULL;
+  int attempt;
+  for (attempt = 0; attempt < 4; attempt++) {
+    size_t want = 0;
+    if (sysctlbyname("net.local.stream.pcblist64", NULL, &want, NULL, 0) != 0)
+      return -1;
+    want = want << attempt;
+    if (want < sizeof(struct rq_xunpgen) || want > (256u << 20)) return -1;
+    buf = malloc(want);
+    if (buf == NULL) return -1;
+    len = want;
+    if (sysctlbyname("net.local.stream.pcblist64", buf, &len, NULL, 0) == 0)
+      break;
     free(buf);
-    return -1;
+    buf = NULL;
+    if (errno != ENOMEM) return -1;
   }
+  if (buf == NULL) return -1;
   int result = -1;
   struct rq_xunpgen gen;
   memcpy(&gen, buf, sizeof gen);
@@ -184,7 +197,10 @@ static int rq_darwin_socket_owner(unsigned long long pcb, unsigned *uid) {
         result = -1;   /* not the layout declared above: read nothing */
         break;
       }
-      if (rec.xu_unpp == pcb && pcb != 0) {
+      /* The record must be the client end AND be connected to the
+         worker's own socket: a pcb handle is derived from an address, and
+         a socket created at a freed address would otherwise match. */
+      if (rec.xu_unpp == pcb && pcb != 0 && rec.xunp_conn == peer) {
         *uid = rec.xu_socket.so_uid;
         result = 1;
         break;
@@ -251,7 +267,7 @@ static int rq_darwin_argmax(void) {
     importc: "rq_darwin_list_pids", nodecl.}
   proc rqFdRoom(pid: cint): cint {.importc: "rq_darwin_fd_room", nodecl.}
   proc rqPidRoom(): cint {.importc: "rq_darwin_pid_room", nodecl.}
-  proc rqSocketOwner(pcb: culonglong; uid: var cuint): cint {.
+  proc rqSocketOwner(pcb, peer: culonglong; uid: var cuint): cint {.
     importc: "rq_darwin_socket_owner", nodecl.}
   proc rqSelfCred(ruid, euid, svuid, rgid, egid, svgid: var cuint;
                   ngroups: var cint; groups: ptr cuint): cint {.
@@ -295,17 +311,24 @@ static int rq_darwin_argmax(void) {
       rgid*, egid*, svgid*: int
       groups*: seq[int]
 
-  proc listFds*(pid: int): seq[DarwinFd] =
-    ## The open descriptors of `pid`; empty when it is gone or not ours to
-    ## read.
+  proc listFds*(pid: int; ok: var bool): seq[DarwinFd] =
+    ## The open descriptors of `pid`; `ok` false when they could not be
+    ## read (it is gone, or not ours to read).
+    ok = false
     let room = min(int(rqFdRoom(cint(pid))), FdListLimit)
     if room <= 0: return
     var fds = newSeq[cint](room)
     var types = newSeq[cuint](room)
     let n = rqListFds(cint(pid), addr fds[0], addr types[0], cint(room))
-    for i in 0 ..< max(0, int(n)):
+    if n < 0: return
+    ok = true
+    for i in 0 ..< int(n):
       result.add(DarwinFd(fd: int(fds[i]), kind: uint32(types[i])))
 
+  proc listFds*(pid: int): seq[DarwinFd] =
+    ## The open descriptors of `pid`; empty when they cannot be read.
+    var ok = false
+    listFds(pid, ok)
 
   proc unixSocketsOf*(pid: int): seq[UnixSocketEnd] =
     ## The AF_UNIX sockets `pid` holds.
@@ -324,11 +347,12 @@ static int rq_darwin_argmax(void) {
       if socket.pcb == pcb: return true
     false
 
-  proc socketOwner*(pcb: uint64; uid: var int): int =
-    ## The uid that created the local stream socket `pcb`: 1 found, 0 no
-    ## such socket, -1 unreadable (see the module header).
+  proc socketOwner*(pcb, peer: uint64; uid: var int): int =
+    ## The uid that created the local stream socket `pcb`, which must be
+    ## connected to the socket `peer`: 1 found, 0 no such socket, -1
+    ## unreadable (see the module header).
     var owner: cuint
-    result = int(rqSocketOwner(culonglong(pcb), owner))
+    result = int(rqSocketOwner(culonglong(pcb), culonglong(peer), owner))
     if result == 1: uid = int(owner)
 
   proc processIdentity*(pid: int; identity: var ProcessIdentity): bool =
@@ -354,24 +378,33 @@ static int rq_darwin_argmax(void) {
       if pids[i] > 0: result.add(int(pids[i]))
     result.sort()
 
-  proc fileLockHeldBy*(pid: int; files: openArray[(uint64, uint64)]): bool =
+  proc fileLockProbe*(pid: int; files: openArray[(uint64, uint64)]): int =
     ## Whether `pid` has a descriptor that took a `flock(2)` on one of
-    ## `files` (device, inode). Nix holds an output lock exactly as long as
-    ## it keeps that descriptor (`PathLocks`, `src/libstore/unix/pathlocks.cc`:
-    ## a descriptor is kept only once its `flock` succeeded, and closing it
-    ## is the release), so an open descriptor marked `FWASLOCKED` is a held
-    ## lock. Reads only: the lock file is never opened.
-    if files.len == 0: return false
-    for entry in listFds(pid):
+    ## `files` (device, inode): 1 held, 0 free, -1 the descriptors could not
+    ## all be read (a caller must not take that for free). Nix holds an
+    ## output lock exactly as long as it keeps that descriptor (`PathLocks`,
+    ## `src/libstore/unix/pathlocks.cc`: a descriptor is kept only once its
+    ## `flock` succeeded, and closing it is the release; Nix never unlocks
+    ## an output lock with `LOCK_UN`, which would leave `FWASLOCKED` set),
+    ## so an open descriptor marked `FWASLOCKED` is a held lock. Reads only:
+    ## the lock file is never opened.
+    if files.len == 0: return 0
+    var ok = false
+    let entries = listFds(pid, ok)
+    if not ok: return -1
+    result = 0
+    for entry in entries:
       if entry.kind != ProxFdTypeVnode: continue
       var dev, ino: culonglong
       var flags: cuint
-      if rqVnode(cint(pid), cint(entry.fd), dev, ino, flags) != 1: continue
+      if rqVnode(cint(pid), cint(entry.fd), dev, ino, flags) != 1:
+        # Closed since the listing, or unreadable: not proof of either.
+        result = -1
+        continue
       if (uint32(flags) and FWasLocked) == 0: continue
       for (fileDev, fileIno) in files:
         if uint64(dev) == fileDev and uint64(ino) == fileIno:
-          return true
-    false
+          return 1
 
   proc selfCredential*(credential: var SelfCredential): bool =
     var ruid, euid, svuid, rgid, egid, svgid: cuint

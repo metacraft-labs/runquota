@@ -579,22 +579,28 @@ when defined(posix):
         return true
     false
 
+  when defined(macosx):
+    proc lockProbe*(paths: openArray[string]; pid: int): int =
+      ## Darwin: whether `pid` holds Nix's lock on one of `paths`: 1 held,
+      ## 0 free, -1 its descriptors could not all be read. Darwin has no
+      ## `/proc/locks`; the kernel's list of `pid`'s descriptors says which
+      ## files it has open and whether a `flock` was taken through each
+      ## (`fileLockProbe`). Reading another uid's list needs root, which
+      ## only the watcher of a root hook has.
+      var files: seq[(uint64, uint64)] = @[]
+      for path in paths:
+        var info: Stat
+        if stat(path.cstring, info) == 0:
+          files.add((uint64(cast[uint32](info.st_dev)), uint64(info.st_ino)))
+      fileLockProbe(pid, files)
+
   proc anyLockHeldBy*(paths: openArray[string]; pid: int): bool =
     ## Whether the process `pid` holds Nix's lock on one of `paths` (a
     ## `flock(2)` on the file now at that path). Never takes, tests or
     ## opens the lock itself: a probe that took it, even for an instant,
     ## could make the worker's own non-blocking `flock` fail.
     when defined(macosx):
-      # Darwin has no `/proc/locks`. The kernel's list of `pid`'s
-      # descriptors says which files it has open and whether a `flock` was
-      # taken through each (`fileLockHeldBy`). Reading another uid's list
-      # needs root, which only the watcher of a root hook has.
-      var files: seq[(uint64, uint64)] = @[]
-      for path in paths:
-        var info: Stat
-        if stat(path.cstring, info) == 0:
-          files.add((uint64(cast[uint32](info.st_dev)), uint64(info.st_ino)))
-      fileLockHeldBy(pid, files)
+      lockProbe(paths, pid) == 1
     else:
       var text = ""
       try:
@@ -1010,8 +1016,18 @@ elif defined(macosx):
     # the credential that created it, which the client cannot choose.
     let clientEnd = accepted[0].conn
     var uid = -1
-    case socketOwner(clientEnd, uid)
+    case socketOwner(clientEnd, accepted[0].pcb, uid)
     of 1:
+      # The connection is still the one the owner was read for: a client
+      # end that closed and was replaced at the same address in between
+      # would show a different peer here.
+      var still = false
+      for socket in unixSocketsOf(workerPid):
+        if socket.pcb == accepted[0].pcb and socket.conn == clientEnd:
+          still = true
+      if not still:
+        result.how = "the client connection changed during the lookup"
+        return
       result.uid = uid
     of 0:
       result.how = "the client end of the connection was not found"
@@ -1296,7 +1312,8 @@ when defined(posix):
       ## grant, so standard input readable (data or end of file) means the
       ## watcher's end closed.
       var fds = [TPollfd(fd: 0, events: POLLIN)]
-      poll(addr fds[0], Tnfds(1), 0) != 0
+      poll(addr fds[0], Tnfds(1), 0) > 0 and
+        (fds[0].revents and (POLLIN or POLLHUP or POLLERR)) != 0
 
   proc emit(line: string): bool =
     ## One line to the hook; false once the hook is gone.
@@ -1307,6 +1324,9 @@ when defined(posix):
     except IOError:
       false
 
+  proc getdtablesizeCall(): cint {.importc: "getdtablesize",
+    header: "<unistd.h>".}
+
   proc closeInheritedFds*() =
     ## Closes every descriptor past standard input, output and error. The
     ## hook inherits the worker's descriptors (the builder-output pipe on 4
@@ -1315,8 +1335,14 @@ when defined(posix):
     var fds: seq[cint] = @[]
     when defined(macosx):
       # No `/proc/self/fd`: the kernel lists this process's descriptors.
-      for entry in listFds(getCurrentProcessId()):
+      # When it cannot, every possible descriptor is closed instead: a
+      # holder must not keep what it inherited because a listing failed.
+      var listed = false
+      for entry in listFds(getCurrentProcessId(), listed):
         if entry.fd > 2: fds.add(cint(entry.fd))
+      if not listed:
+        for fd in 3 ..< min(int(getdtablesizeCall()), 1 shl 16):
+          fds.add(cint(fd))
     else:
       try:
         for _, path in walkDir("/proc/self/fd"):
@@ -1533,7 +1559,17 @@ when defined(posix):
       try: worker = parseInt(fields[0])
       except ValueError: worker = 0
       let forwarded = line & "\n"
-      discard posix.write(toChild, forwarded.cstring, forwarded.len)
+      var sent = 0
+      while sent < forwarded.len:
+        let n = posix.write(toChild, unsafeAddr forwarded[sent],
+          forwarded.len - sent)
+        if n > 0:
+          sent += n
+        elif n < 0 and osLastError() == OSErrorCode(EINTR):
+          continue
+        else:
+          break   # the lease holder is gone; childExited ends the watch
+
       var identity: ProcessIdentity
       let known = worker > 0 and processIdentity(worker, identity)
       var misses = if known: 0 else: ReleaseMisses
@@ -1545,10 +1581,10 @@ when defined(posix):
         var now: ProcessIdentity
         if not processIdentity(worker, now) or not sameProcess(now, identity):
           break
-        if anyLockHeldBy(fields[1 .. ^1], worker):
-          misses = 0
-        else:
-          inc misses
+        case lockProbe(fields[1 .. ^1], worker)
+        of 1: misses = 0
+        of 0: inc misses
+        else: discard   # unreadable: neither held nor free; probe again
       discard posix.close(toChild)
       reapWithin(child, WatcherReapMillis)
       0
@@ -1587,20 +1623,29 @@ when defined(posix):
         discard posix.close(toChild[1])
         discard dup2(toChild[0], 0)
         discard posix.close(toChild[0])
+        # THE FORKED CHILD NEVER RETURNS into the caller's code: whatever
+        # happens, it ends here with `exitnow` (no exit handlers of the
+        # process it was forked from run).
+        var code = 1
         try:
-          discard dropPrivilegesWith(systemCredentialOps(), options.uid,
-            options.gid)
-        except CatchableError as failure:
-          discard emit("refused cannot act as the requester: " & failure.msg)
-          exitnow(1)
-        exitnow(cint(holdLease(options, clientVersion,
-          cancelled = watcherGone,
-          onClaim = nil,
-          heldUntil = proc (worker: int; locks: seq[string]) =
-            # Until the watcher closes the pipe (or dies).
-            var input = LineReader(fd: 0, limit: ClaimLineLimit)
-            var ignored = ""
-            while input.readLine(-1, ignored) >= 0: discard)))
+          try:
+            discard dropPrivilegesWith(systemCredentialOps(), options.uid,
+              options.gid)
+          except CatchableError as failure:
+            discard emit("refused cannot act as the requester: " &
+              failure.msg)
+            exitnow(1)
+          code = holdLease(options, clientVersion,
+            cancelled = watcherGone,
+            onClaim = nil,
+            heldUntil = proc (worker: int; locks: seq[string]) =
+              # Until the watcher closes the pipe (or dies).
+              var input = LineReader(fd: 0, limit: ClaimLineLimit)
+              var ignored = ""
+              while input.readLine(-1, ignored) >= 0: discard)
+        except CatchableError, Defect:
+          code = 1
+        exitnow(cint(code))
       discard posix.close(toChild[0])
       watchHolder(child, toChild[1])
 
@@ -1677,7 +1722,20 @@ when defined(posix):
     ## Ends a holder this hook started (its own child, by its pid, which
     ## cannot be reused before it is waited for). SIGKILL, so a stopped
     ## holder cannot hold the worker here.
+    ##
+    ## On darwin the process is the watcher, and the lease holder is its
+    ## child, running as the requester, who can stop it (same uid) so that
+    ## it never notices its watcher die. The watcher made itself a process
+    ## group leader (`setsid`) before it forked, so the group is killed
+    ## first -- while the watcher is unreaped its pid, and so that group
+    ## id, can belong to no one else -- then the watcher by pid, in case it
+    ## had not yet called `setsid`. (A lease holder forked in the instant
+    ## between the two is not killed here; it stops waiting when it sees
+    ## its watcher's pipe close, unless its requester stopped it.)
     try:
+      when defined(macosx):
+        let pid = Pid(holder.process.processID)
+        discard kill(-pid, SIGKILL)
       if holder.process.running:
         holder.process.kill()
         discard holder.process.waitForExit(2000)
