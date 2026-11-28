@@ -104,3 +104,28 @@ switch text of each arm, the measurements that are not implemented (and so
 not measured), the daemons' own report of what they measured, and host load
 and CPU pressure at start and end. `RUNQUOTA_GATE_CPUS` pins the run to a
 `taskset` CPU list.
+
+## The estimate writer's cost per finish
+
+`benchmarks/lib/runquota_finish_learning_bench.nim` measures the daemon CPU
+that committing learned estimates costs, per finish, on Linux. Two arms
+send the same finishes of one command, each with a memory-cap block, to a
+private `runquotad`: `store` has an estimate store, as in production;
+`no-store` runs with `--estimate-db ""`, so it learns the same rows in
+memory and commits nothing. The difference between the arms is the
+writer's cost. Rounds alternate the arm order (ABBA), and the tool prints
+each round, the mean and the spread per arm, and the difference of the
+means. The figure is the daemon's `utime + stime` from `/proc`, in clock
+ticks, so the resolution per finish is one tick over `--finishes`.
+
+```
+just build   # or RUNQUOTA_BUILD_MODE=release just build
+nim c -d:release --out:build/bench_flb \
+  benchmarks/lib/runquota_finish_learning_bench.nim
+./build/bench_flb [--finishes=2000] [--pace-ms=60] [--repeat=4] [--no-block]
+```
+
+The default pacing (60 ms between finishes) models one command repeating
+within the writer's refresh interval, as the overhead gate's rounds do. A
+build whose actions all have distinct command keys commits each once and
+is not what this measures.
